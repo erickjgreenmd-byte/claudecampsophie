@@ -277,7 +277,12 @@ export function billingRoutes(): Hono<AppEnv> {
       now,
     );
     const provider = deps.providers.subscriptions;
-    if (provider.isMock && !MOCK_PROVIDER_ENVIRONMENTS.has(deps.config.environment)) {
+    // A labeled mock outside development/test, or the unavailable provider selected when the key
+    // is missing: store billing is not connected, which is not the same as the store being down.
+    if (
+      (provider.isMock && !MOCK_PROVIDER_ENVIRONMENTS.has(deps.config.environment)) ||
+      provider.name === 'not_configured'
+    ) {
       throw new ApiError(
         'NOT_CONFIGURED',
         'Store billing isn’t connected yet, so your plan can’t be checked right now.',

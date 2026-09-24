@@ -5,14 +5,17 @@
 #   scripts/verify.sh                         # whole repository (what CI runs)
 #   scripts/verify.sh --only api,web,db        # only these workspace dirs (while others are mid-edit)
 #   scripts/verify.sh --no-tests               # static checks only
+#   scripts/verify.sh --no-artifacts           # skip building and secret-scanning release artifacts
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 RUN_TESTS=1
+RUN_ARTIFACTS=1
 ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-tests) RUN_TESTS=0 ;;
+    --no-artifacts) RUN_ARTIFACTS=0 ;;
     --only) ONLY="$2"; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -34,6 +37,10 @@ if [ -z "$ONLY" ]; then
   echo "▶ typecheck"; pnpm -s typecheck
   if [ "$RUN_TESTS" = 1 ]; then echo "▶ tests"; pnpm -s test; fi
   echo "▶ finance"; pnpm -s finance:check
+  if [ "$RUN_ARTIFACTS" = 1 ]; then
+    # Same release builds, scan and negative control as CI (AC_SECURITY_04); nothing is deployed.
+    echo "▶ release artifacts"; bash scripts/scan-release-artifacts.sh
+  fi
 else
   IFS=',' read -r -a names <<< "$ONLY"
   dirs=()

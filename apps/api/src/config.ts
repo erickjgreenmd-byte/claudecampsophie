@@ -4,8 +4,12 @@ import type { Db } from './db.ts';
 
 /**
  * Runtime configuration. Only names appear in source; values come from Worker secrets/vars.
- * `productionReadiness()` is the AC_DEPLOY_07 gate: production refuses to serve with mock consent,
- * mock billing, mock AI, missing ZDR evidence or missing secrets.
+ * `productionReadiness()` is the AC_DEPLOY_07 report: every check must be ready before production
+ * serves real families. Mock consent and mock billing are never wired outside development and test
+ * (src/index.ts), and scans never reach a mock AI there (checkChildDataGate). Fake catalog data is
+ * reported here and refused by a database marked production (migration 0770); nothing else stops a
+ * production Worker from serving it while the database is unmarked, so an unmarked database blocks
+ * readiness (`database_environment`).
  */
 
 export type Environment = 'development' | 'test' | 'staging' | 'production';
@@ -46,7 +50,16 @@ export interface ApiConfig {
     readonly consent: 'development_mock' | 'unavailable' | 'configured';
     /** CONSENT_PROVIDER when `consent` is `configured`, otherwise null. */
     readonly consentAdapter: string | null;
-    readonly billing: 'development_mock' | 'revenuecat';
+    /**
+     * Store subscription state, selected explicitly like consent (AC_DEPLOY_07):
+     * - `development_mock`: the labeled subscriber-state mock, only in development and test;
+     * - `unavailable`: staging/production without REVENUECAT_SECRET_API_KEY; every fetch fails, so
+     *   nothing is granted or revoked from an empty mock state;
+     * - `revenuecat`: the RevenueCat REST client.
+     */
+    readonly billing: 'development_mock' | 'unavailable' | 'revenuecat';
+    /** Optional adult web billing client (Stripe, STRIPE_SECRET_KEY), same rule as `billing`. */
+    readonly webBilling: 'development_mock' | 'unavailable' | 'stripe';
     readonly ai: 'development_mock' | 'openai';
     readonly storage: 'development_mock' | 'supabase';
     /** No transactional email adapter exists yet; invitations go to a development outbox. */
@@ -152,7 +165,8 @@ export function loadConfig(
       // No real consent adapter is implemented yet, so nothing can mark consent as configured;
       // naming an unknown provider is a configuration error rather than a silent mock.
       ...consentProvider(env.CONSENT_PROVIDER, environment, errors),
-      billing: env.REVENUECAT_SECRET_API_KEY ? 'revenuecat' : 'development_mock',
+      billing: env.REVENUECAT_SECRET_API_KEY ? 'revenuecat' : mockOrUnavailable(environment),
+      webBilling: env.STRIPE_SECRET_KEY ? 'stripe' : mockOrUnavailable(environment),
       ai: env.OPENAI_API_KEY ? 'openai' : 'development_mock',
       storage: env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY ? 'supabase' : 'development_mock',
       email: 'development_mock',
@@ -191,6 +205,11 @@ export const MOCK_ENVIRONMENTS: ReadonlySet<Environment> = new Set<Environment>(
   'test',
 ]);
 
+/** Without credentials: the labeled mock in development/test, no provider anywhere else. */
+function mockOrUnavailable(environment: Environment): 'development_mock' | 'unavailable' {
+  return MOCK_ENVIRONMENTS.has(environment) ? 'development_mock' : 'unavailable';
+}
+
 function consentProvider(
   value: string | undefined,
   environment: Environment,
@@ -221,6 +240,17 @@ export interface ReadinessFacts {
    * never invented). Unknown (not looked up) reads as blocked.
    */
   readonly spendBudgetForCurrentMonth?: boolean;
+  /**
+   * Live fixture or fake rows per catalog (reviewed resources, store product and ad-free mappings,
+   * provider offers, affiliate/sponsor approvals, sponsors and sponsor campaigns), as defined by
+   * migration 0770 app.fake_catalog_rows(). Unknown (not looked up) reads as blocked.
+   */
+  readonly fakeCatalogRows?: Readonly<Record<string, number>>;
+  /**
+   * The environment the database itself is marked as (private.deployment), or null when it was never
+   * marked. Only a database marked production refuses fixture and fake catalog rows.
+   */
+  readonly databaseEnvironment?: Environment | null;
 }
 
 /** UTC calendar month key used by public.spend_budgets.period_key, e.g. "2026-09". */
@@ -230,15 +260,38 @@ export function utcPeriodKey(now: Date): string {
 
 /** Looks up the database facts for the owner readiness report. */
 export async function loadReadinessFacts(db: Db, now: Date): Promise<ReadinessFacts> {
-  const [row] = await db.asService(
-    (tx) => tx<{ present: boolean }[]>`
+  return db.asService(async (tx) => {
+    const [row] = await tx<{ present: boolean; database_environment: Environment | null }[]>`
       select exists (
         select 1 from public.spend_budgets
          where scope = 'global' and period_key = ${utcPeriodKey(now)}
-      ) as present
-    `,
-  );
-  return { now, spendBudgetForCurrentMonth: row?.present === true };
+      ) as present, app.database_environment() as database_environment
+    `;
+    const catalogs = await tx<{ catalog: string; fake_rows: number }[]>`
+      select catalog, fake_rows from app.fake_catalog_rows()
+    `;
+    return {
+      now,
+      spendBudgetForCurrentMonth: row?.present === true,
+      fakeCatalogRows: Object.fromEntries(catalogs.map((c) => [c.catalog, c.fake_rows])),
+      databaseEnvironment: row?.database_environment ?? null,
+    };
+  });
+}
+
+function catalogDataItem(facts: ReadinessFacts): { ok: boolean; detail: string } {
+  const base =
+    'No live fixture or fake catalog rows (reviewed resources, store product and ad-free mappings, provider offers, affiliate/sponsor approvals, sponsors and sponsor campaigns)';
+  if (facts.fakeCatalogRows === undefined) return { ok: false, detail: `${base}; not checked` };
+  const found = Object.entries(facts.fakeCatalogRows)
+    .filter(([, n]) => n > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+  if (found.length === 0) return { ok: true, detail: base };
+  const counts = found.map(([catalog, n]) => `${catalog} ${n}`).join(', ');
+  return {
+    ok: false,
+    detail: `${base}; found ${counts} (retire, revoke, deactivate, suspend or end them)`,
+  };
 }
 
 /** AC_DEPLOY_07 / AC_RELEASE_02: what would block serving real families. */
@@ -251,6 +304,7 @@ export function productionReadiness(
     status: ok ? 'ready' : 'blocked',
     detail,
   });
+  const catalog = catalogDataItem(facts);
   return [
     item(
       'consent_provider',
@@ -260,7 +314,12 @@ export function productionReadiness(
     item(
       'billing_provider',
       config.providers.billing === 'revenuecat',
-      'RevenueCat server credentials (mock billing is development-only)',
+      'RevenueCat server credentials (mock billing is development-only; without them no purchase can be verified)',
+    ),
+    item(
+      'web_billing_provider',
+      !config.flags.stripeWebBillingEnabled || config.providers.webBilling === 'stripe',
+      'Stripe server credentials when optional adult web billing is enabled (mock is development-only)',
     ),
     item(
       'ai_provider',
@@ -277,6 +336,16 @@ export function productionReadiness(
       'ai_spend_budget',
       facts.spendBudgetForCurrentMonth === true,
       `Owner-set AI spend cap for ${utcPeriodKey(facts.now)} (UTC); set each month's cap before it starts`,
+    ),
+    item('catalog_data', catalog.ok, catalog.detail),
+    item(
+      'database_environment',
+      facts.databaseEnvironment === 'production',
+      `Database marked production (private.deployment), so it refuses fixture and fake catalog rows; ${
+        facts.databaseEnvironment === undefined
+          ? 'not checked'
+          : `currently ${facts.databaseEnvironment ?? 'unmarked'}`
+      }`,
     ),
     item(
       'storage_provider',

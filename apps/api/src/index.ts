@@ -24,6 +24,8 @@ import {
   createStripeClient,
   createStripeClientMock,
   createSubscriberStateMock,
+  type StripeBillingClient,
+  type SubscriberStateProvider,
 } from './providers/billing.ts';
 
 /**
@@ -109,6 +111,80 @@ export function selectConsentProvider(
   return { ok: true, provider };
 }
 
+/**
+ * Staging/production without billing credentials: every call fails, so webhooks answer "retry
+ * later", syncs report the store as unreachable and the stale-entitlement sweep skips the family.
+ * Nothing is granted or revoked. Not a mock, like the unavailable consent provider.
+ */
+function createUnavailableSubscriberState(): SubscriberStateProvider {
+  return {
+    name: 'not_configured',
+    isMock: false,
+    fetchSubscriptions: () => Promise.reject(new Error('billing provider not configured')),
+  };
+}
+
+function createUnavailableStripeClient(): StripeBillingClient {
+  const refuse = () => Promise.reject(new Error('web billing provider not configured'));
+  return {
+    name: 'not_configured',
+    isMock: false,
+    addDiscountToDraftInvoice: refuse,
+    invoiceForCharge: refuse,
+  };
+}
+
+/**
+ * The billing clients the configuration selects (AC_DEPLOY_07), explicitly and failing closed like
+ * consent: the labeled mocks only in development/test, the real clients only with their server
+ * keys, and never a mock outside development/test whatever the configuration says.
+ */
+export function selectBillingProviders(
+  config: ApiConfig,
+  env: WorkerEnv,
+):
+  | { ok: true; subscriptions: SubscriberStateProvider; stripe: StripeBillingClient }
+  | RuntimeFailure {
+  let subscriptions: SubscriberStateProvider;
+  switch (config.providers.billing) {
+    case 'development_mock':
+      subscriptions = createSubscriberStateMock();
+      break;
+    case 'unavailable':
+      subscriptions = createUnavailableSubscriberState();
+      break;
+    case 'revenuecat':
+      if (typeof env.REVENUECAT_SECRET_API_KEY !== 'string' || !env.REVENUECAT_SECRET_API_KEY) {
+        return NOT_CONFIGURED;
+      }
+      subscriptions = createRevenueCatProvider(env.REVENUECAT_SECRET_API_KEY);
+      break;
+    default:
+      return NOT_CONFIGURED;
+  }
+  let stripe: StripeBillingClient;
+  switch (config.providers.webBilling) {
+    case 'development_mock':
+      stripe = createStripeClientMock();
+      break;
+    case 'unavailable':
+      stripe = createUnavailableStripeClient();
+      break;
+    case 'stripe':
+      if (typeof env.STRIPE_SECRET_KEY !== 'string' || !env.STRIPE_SECRET_KEY) {
+        return NOT_CONFIGURED;
+      }
+      stripe = createStripeClient(env.STRIPE_SECRET_KEY);
+      break;
+    default:
+      return NOT_CONFIGURED;
+  }
+  if ((subscriptions.isMock || stripe.isMock) && !MOCK_ENVIRONMENTS.has(config.environment)) {
+    return NOT_READY;
+  }
+  return { ok: true, subscriptions, stripe };
+}
+
 /** Builds the per-invocation dependencies shared by HTTP requests and Cron Triggers. */
 export function buildRuntime(env: WorkerEnv): RuntimeResult {
   const loaded = loadConfig(stringEnv(env));
@@ -123,6 +199,8 @@ export function buildRuntime(env: WorkerEnv): RuntimeResult {
   }
   const consent = selectConsentProvider(config, env);
   if (!consent.ok) return consent;
+  const billing = selectBillingProviders(config, env);
+  if (!billing.ok) return billing;
   // One client configuration for the Worker and the tests (BUG-063: array parameters need types).
   const sql = createPostgresClient(env.HYPERDRIVE.connectionString);
   const db = createDb(sql);
@@ -146,14 +224,8 @@ export function buildRuntime(env: WorkerEnv): RuntimeResult {
             })
           : createMemoryStorageMock(),
       email: createOutboxEmailMock(),
-      subscriptions:
-        typeof env.REVENUECAT_SECRET_API_KEY === 'string'
-          ? createRevenueCatProvider(env.REVENUECAT_SECRET_API_KEY)
-          : createSubscriberStateMock(),
-      stripe:
-        typeof env.STRIPE_SECRET_KEY === 'string'
-          ? createStripeClient(env.STRIPE_SECRET_KEY)
-          : createStripeClientMock(),
+      subscriptions: billing.subscriptions,
+      stripe: billing.stripe,
     },
     log: (event) => console.log(JSON.stringify(event)),
   };

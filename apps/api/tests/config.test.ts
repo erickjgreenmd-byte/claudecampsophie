@@ -57,4 +57,52 @@ describe('provider configuration is honest (AC_DEPLOY_07)', () => {
       consent_provider: 'blocked',
     });
   });
+
+  it('the billing mocks are selected only in development and test (AC_DEPLOY_07)', () => {
+    const selected = (vars: Record<string, string>) => {
+      const loaded = loadConfig({ ...TEST_ENV, ...vars });
+      if (!loaded.ok) throw new Error(`config should load: ${JSON.stringify(loaded.errors)}`);
+      return [loaded.config.providers.billing, loaded.config.providers.webBilling];
+    };
+    for (const APP_ENV of ['development', 'test']) {
+      expect({ APP_ENV, billing: selected({ APP_ENV }) }).toEqual({
+        APP_ENV,
+        billing: ['development_mock', 'development_mock'],
+      });
+    }
+    // Staging and production without server keys have no billing provider, never the mocks.
+    for (const APP_ENV of ['staging', 'production']) {
+      expect({ APP_ENV, billing: selected({ APP_ENV }) }).toEqual({
+        APP_ENV,
+        billing: ['unavailable', 'unavailable'],
+      });
+    }
+    for (const APP_ENV of ['development', 'test', 'staging', 'production']) {
+      const keys = {
+        REVENUECAT_SECRET_API_KEY: 'revenuecat-config-test-value',
+        STRIPE_SECRET_KEY: 'stripe-config-test-value',
+      };
+      expect({ APP_ENV, billing: selected({ APP_ENV, ...keys }) }).toEqual({
+        APP_ENV,
+        billing: ['revenuecat', 'stripe'],
+      });
+    }
+  });
+
+  it('optional web billing blocks readiness only when it is enabled without Stripe credentials', () => {
+    const webBilling = (vars: Record<string, string>) => {
+      const loaded = loadConfig({ ...TEST_ENV, APP_ENV: 'production', ...vars });
+      if (!loaded.ok) throw new Error('config should load');
+      return productionReadiness(loaded.config).find((i) => i.check === 'web_billing_provider')
+        ?.status;
+    };
+    expect(webBilling({})).toBe('ready');
+    expect(webBilling({ OPTIONAL_STRIPE_WEB_BILLING_ENABLED: 'true' })).toBe('blocked');
+    expect(
+      webBilling({
+        OPTIONAL_STRIPE_WEB_BILLING_ENABLED: 'true',
+        STRIPE_SECRET_KEY: 'stripe-config-test-value',
+      }),
+    ).toBe('ready');
+  });
 });

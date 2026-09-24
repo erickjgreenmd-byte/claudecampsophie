@@ -292,7 +292,13 @@ function toCandidate(r: CampaignRow): CampaignCandidate {
  */
 export async function loadCampaignCandidates(
   tx: Tx,
-  filter: { placement?: Placement; campaignId?: string; servingOnly?: boolean } = {},
+  filter: {
+    placement?: Placement;
+    campaignId?: string;
+    servingOnly?: boolean;
+    /** Leave out fixture and fake campaigns (migration 0770); the production serve path. */
+    withoutFakes?: boolean;
+  } = {},
 ): Promise<CampaignCandidate[]> {
   const rows = await tx<CampaignRow[]>`
     select c.id, c.status, s.status as sponsor_status, cr.sponsor_name, s.allowed_domains,
@@ -306,6 +312,7 @@ export async function loadCampaignCandidates(
      where (${filter.placement ?? null}::text is null or c.placement = ${filter.placement ?? null})
        and (${filter.campaignId ?? null}::uuid is null or c.id = ${filter.campaignId ?? null})
        and (${filter.servingOnly ?? false} = false or c.status in ('scheduled', 'active'))
+       and (${filter.withoutFakes ?? false} = false or not app.sponsor_campaign_is_fake(c))
      order by c.id
   `;
   return rows.map(toCandidate);
@@ -367,7 +374,12 @@ export interface CatalogRow {
 
 export async function loadCatalog(
   tx: Tx,
-  filter: { id?: string; approvedOnly?: boolean } = {},
+  filter: {
+    id?: string;
+    approvedOnly?: boolean;
+    /** Leave out fixture and fake resources (migration 0770); the production serve path. */
+    withoutFakes?: boolean;
+  } = {},
 ): Promise<CatalogRow[]> {
   return tx<CatalogRow[]>`
     select id, stable_key, title, description, skills, subjects, grade_min, grade_max, kind, merchant, merchant_url,
@@ -376,6 +388,7 @@ export async function loadCatalog(
       from public.resource_catalog
      where (${filter.id ?? null}::uuid is null or id = ${filter.id ?? null})
        and (${filter.approvedOnly ?? false} = false or status = 'approved')
+       and (${filter.withoutFakes ?? false} = false or not app.resource_is_fake(resource_catalog))
      order by stable_key
   `;
 }

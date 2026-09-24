@@ -926,4 +926,27 @@ describe('the labeled subscriber-state mock never answers outside development/te
       await staging.close();
     }
   });
+  it('staging without a RevenueCat key says billing is not connected, not that the store is down', async () => {
+    const staging = await createTestApi({ APP_ENV: 'staging' });
+    try {
+      const fam = await seedFamily(staging.db);
+      const token = await parentToken(fam.ownerId);
+      // The provider the Worker selects when the key is missing (index.ts selectBillingProviders).
+      const refuse = vi.fn(() => Promise.reject(new Error('billing provider not configured')));
+      Object.assign(staging.providers, {
+        subscriptions: {
+          ...staging.providers.subscriptions,
+          name: 'not_configured',
+          isMock: false,
+          fetchSubscriptions: refuse,
+        },
+      });
+      const res = await staging.request('/v1/billing/sync', { method: 'POST', token });
+      expect(res.status).toBe(503);
+      expect((await json<{ error: { code: string } }>(res)).error.code).toBe('NOT_CONFIGURED');
+      expect(refuse).not.toHaveBeenCalled();
+    } finally {
+      await staging.close();
+    }
+  });
 });

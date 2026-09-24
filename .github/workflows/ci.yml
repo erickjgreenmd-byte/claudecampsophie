@@ -55,3 +55,10 @@ jobs:
         run: pnpm finance:check
       - name: Gate audit (fails if zero tests ran)
         run: node scripts/assert-test-count.mjs
+      # AC_SECURITY_04: scan what would actually ship, not only tracked files. Nothing is deployed:
+      # the web portal is built, the Worker is bundled with a wrangler dry run, the app is exported
+      # for web and its native-embedded public config is written, all with fake values of the
+      # documented public shape in every VITE_*/EXPO_PUBLIC_* variable. A negative control then
+      # plants fake secret keys in those variables and requires the scan to find them.
+      - name: Build release artifacts and secret-scan them
+        run: bash scripts/scan-release-artifacts.sh "$RUNNER_TEMP/release-artifacts"

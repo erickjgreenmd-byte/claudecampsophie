@@ -35,6 +35,12 @@ const CHECK_LABEL: Readonly<Record<string, string>> = {
   zdr_evidence: 'Zero data retention approval',
   parent_jwt_keys: 'Parent sign-in keys',
   cors: 'Allowed web origins (CORS)',
+  web_billing_provider: 'Web billing (Stripe, optional)',
+  catalog_data: 'Catalog data (no fixtures or fakes)',
+  database_environment: 'Database marked production',
+  storage_provider: 'Homework photo storage (Supabase)',
+  email_provider: 'Email provider',
+  ai_spend_budget: 'AI spend cap for this month',
 };
 
 function Readiness() {

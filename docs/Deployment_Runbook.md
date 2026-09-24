@@ -16,7 +16,9 @@ step is actually performed.
 | production | `pencillift-api-production` | Supabase production project | RevenueCat production | OpenAI with recorded ZDR approval | contracted provider |
 
 `APP_ENV=production` refuses to serve with the development consent mock (HTTP 503 `BLOCKED_EXTERNAL`), and the
-scan job never runs a mock AI provider in production (`checkChildDataGate`).
+scan job never runs a mock AI provider in production (`checkChildDataGate`). Labeled mocks (consent, RevenueCat,
+Stripe) are wired only in development and test: staging and production without the server keys get an
+unavailable provider that refuses every call, never a mock (§3.1).
 
 ## 2. Configuration (names only — values are never committed)
 
@@ -45,31 +47,107 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 
 ## 3. Release order (staging first, then production)
 
-1. **Verify the tree**: `scripts/verify.sh` (format → lint → typecheck → all tests → finance model) exits 0 on the
-   exact commit; CI green on the same SHA.
+1. **Verify the tree**: `scripts/verify.sh` (format → lint → typecheck → all tests → finance model → release
+   artifact build, secret scan and negative control, §3.2) exits 0 on the exact commit; CI green on the same SHA.
 2. **Database**: `supabase link --project-ref <staging-ref>` then `supabase db push`. Migrations are forward-only
-   and ordered by file name (0001 … 0740 at the time of writing; list `supabase/migrations`). 0720 creates a trigger on
+   and ordered by file name (0001 … 0770 at the time of writing; list `supabase/migrations`). 0720 creates a trigger on
    `auth.sessions`: confirm the hosted project accepts it (Owner Action 20) — if it is refused the migration fails
    loudly and a Supabase Auth hook must replace it. Before production, rehearse on a restored copy (§6). Confirm
    `select count(*) from pg_policies` and run the schema invariant queries from `supabase/tests/schema_invariants.test.ts`
    against the linked database (read-only) and record the output.
 3. **Worker**: set secrets (§2), replace Hyperdrive placeholders, `cd apps/api && pnpm deploy:staging`.
-   Check `GET /health` (200) and `GET /v1/admin/readiness` with an owner MFA session: every row must be
-   `configured` or explicitly `blocked` with a reason — never a mock silently accepted.
+   Check `GET /health` (200) and `GET /v1/admin/readiness` with an owner MFA session: every row is `ready` or
+   explicitly `blocked` with a reason — never a mock silently accepted. Production launches only when every row
+   is `ready` (§3.1).
 4. **Cron**: confirm the `*/5 * * * *` trigger in the Cloudflare dashboard and a `scheduled_tick` log line;
    `select status, count(*) from public.jobs group by 1` must show jobs moving, no growing `queued` backlog.
 5. **Webhooks**: RevenueCat → `https://<api>/webhooks/revenuecat` with the `Authorization` value; send a sandbox
    test event and confirm a `billing_provider_events` row with `status = 'processed'` or `'ignored'`.
-6. **Web portal**: `pnpm --filter @pencillift/web build` → deploy `apps/web/dist` (Cloudflare Pages or the chosen
-   static host) with `Referrer-Policy: no-referrer` and a CSP allowing only the API origin. Public pages
-   (privacy, terms, support, account deletion) must be reachable before store review (AC_DEPLOY_04).
-7. **Mobile**: `eas build --platform ios --profile preview` and `eas build --platform android --profile preview`
+6. **Web portal**: `pnpm --filter @pencillift/web build` with the release public values (`VITE_API_BASE_URL`,
+   `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`; nothing else), then scan that exact build:
+   `node scripts/scan-secrets.mjs --artifacts apps/web/dist` must pass before it is uploaded (§3.2). Deploy
+   `apps/web/dist` (Cloudflare Pages or the chosen static host) with `Referrer-Policy: no-referrer` and a CSP
+   allowing only the API origin. Public pages (privacy, terms, support, account deletion) must be reachable
+   before store review (AC_DEPLOY_04).
+7. **Mobile**: before each EAS build, with the `EXPO_PUBLIC_*` values that build uses, scan the public config it
+   embeds: `cd apps/mobile && mkdir -p <dir> && npx expo config --type public --json > <dir>/app.config.json`,
+   then `node scripts/scan-secrets.mjs --artifacts <dir>` must pass (§3.2).
+   `eas build --platform ios --profile preview` and `eas build --platform android --profile preview`
    (internal), then the `production` profile; `app.config.ts` needs `extra.eas.projectId` from the owner's Expo
    project, app icons/splash (brand assets), and an iOS privacy manifest that declares the collected data types
    (photos, email address, user content) — signing and store metadata per owner actions #5 and #11.
 8. **DNS and TLS**: point `pencillift.com` (public site and portal) and the API hostname at Cloudflare (owner action
    #8); certificates are issued by Cloudflare's edge. Enforce HTTPS-only and HSTS on both hostnames, and confirm the
    public legal pages load over HTTPS before store review. Record the hostnames in `docs/Connections.md`.
+
+### 3.1 Readiness gates (AC_DEPLOY_07)
+
+`GET /v1/admin/readiness` (`productionReadiness()` in `apps/api/src/config.ts`) reports each check as `ready` or
+`blocked`. Checks added or changed for the mock-billing and fake-catalog clauses, and what enforces them:
+
+| Check | Ready when | Enforced beyond the report |
+|---|---|---|
+| `billing_provider` | `REVENUECAT_SECRET_API_KEY` is set | Staging/production without it get an unavailable client (`selectBillingProviders`, `apps/api/src/index.ts`): RevenueCat webhooks answer 503 and are retried later, `POST /v1/billing/sync` reports the store as unreachable, the stale-entitlement sweep skips the family. Nothing is granted or revoked from an empty mock state. |
+| `web_billing_provider` | Optional web billing is off, or `STRIPE_SECRET_KEY` is set | Same rule for the Stripe client |
+| `catalog_data` | No live fixture or fake catalog rows (`app.fake_catalog_rows()`, migration 0770); the detail gives counts per catalog | A database marked production refuses them (below) |
+| `database_environment` | This database is marked `production` | The mark activates the fixture guard (fake rows are refused on write and the mark is refused while any exist). A production Worker also leaves fake resources and campaigns out of what it serves (`withoutFakes`), but launch only once this check is `ready` |
+
+A catalog row is **fake** when it carries the labeled-fixture convention (`fixture:` evidence or licence
+references, including sponsor creative image licences; `fixture.`, `fixture_`, `fixture-` or `fixture:` product,
+plan and offer ids; `fixture-` resource keys), points at a host reserved for documentation and testing
+(`example.com`/`.net`/`.org`, `.example`, `.test`, `.invalid`, `.localhost`: resource merchant URLs, sponsor
+creative destinations and sponsor allowed domains), or is a merchant resource marked `available` that the
+catalog's own link check never confirmed. A sponsor campaign is fake when its creative or its sponsor is. It is
+**live** while it can be served: resources not retired, affiliate/sponsor approvals pending or approved, store
+product and ad-free mappings active, provider offers ready, sponsors active, sponsor campaigns in review,
+scheduled, active or paused. Rows are never deleted: retire, revoke, deactivate, suspend the sponsor, end the
+campaign or mark the offer `failed` (with a reason) to clear one.
+
+Mark each deployed database once, with the migration role (the API's service role can read the mark but never
+change it):
+
+```sql
+insert into private.deployment (environment) values ('production')  -- 'staging' on the staging project
+  on conflict (singleton) do update set environment = excluded.environment;
+```
+
+Marking `production` is refused while any live fake row exists. Once marked, inserting or updating a live fake row
+in any of the seven catalogs fails (a draft creative or campaign may be stored, but cannot go to review). Staging stays `staging`, so labeled fixtures keep working there and its
+`database_environment` check stays blocked (correct: it must not serve real families).
+
+### 3.2 Secret scanning (AC_SECURITY_04)
+
+- **Tracked files**: `node scripts/scan-secrets.mjs` (CI) and `--staged` (pre-commit gate, `scripts/verify.sh`).
+- **Release-shaped builds (CI)**: `scripts/scan-release-artifacts.sh` (CI's last step; `scripts/verify.sh` in
+  whole-repository mode, `--no-artifacts` skips it) builds the web portal, the Worker bundle (`wrangler deploy
+  --dry-run --env production`; nothing is deployed), the Expo web export and the public app config that native
+  builds embed (`npx expo config --type public --json`), and runs `node scripts/scan-secrets.mjs --artifacts` on
+  all four. Every `VITE_*`/`EXPO_PUBLIC_*` variable holds an obviously fake value of the documented public shape
+  (a legacy anon-role key, RevenueCat `appl_`/`goog_` keys, `.invalid` URLs), assembled at run time, so the
+  bundles carry these variables as a release build does and the allowlist is exercised on real output.
+- **Negative control (CI)**: the same script rebuilds the web portal and the app config with a fake service-role
+  key and a fake `sb_secret_` key in the publishable-key variables and fails unless the scan finds both. A build
+  that stops embedding those variables where the scan looks, or a scan that stops seeing them, fails CI.
+- **The release builds themselves**: CI never holds the release values, so a secret pasted into a public build
+  variable at release time is only caught by scanning that exact build. Scan `apps/web/dist` before upload
+  (§3 step 6) and the app config before each EAS build (§3 step 7); a failed scan stops the release.
+- **Detectors**: the same in both modes. JWTs are decoded (compact or whitespace-formatted JSON), so a Supabase
+  service-role key is found whatever the base64 alignment of its role claim. A value is found at the start of a
+  word or right after an escape a string literal or URL puts in front of it (`\n`, `\u0022`, `\x22`, `%20`),
+  never inside a longer word. In artifacts every other signed JWT also fails, except the documented public
+  client values (`docs/Connections.md`): the Supabase publishable/anon key and the RevenueCat public SDK keys.
+  The allowlist is `DOCUMENTED_PUBLIC` in the script.
+- **Files**: minified bundles are scanned whole, and findings give `file:line:column` and the detector, never
+  the value. Source maps are scanned as the original sources they embed (findings name the source); their VLQ
+  `mappings` are skipped. Binary files are read byte for byte and as UTF-16. gzip, brotli (`.br`) and zstd
+  files are scanned decompressed. Symlinked directories are followed, each real directory once. A zip or other
+  archive, or a compressed file that cannot be decompressed, fails the scan as unscannable (exit 2): unpack it
+  and pass the directory. A missing or empty artifact directory fails the scan.
+- **Not covered yet**: EAS native builds (.ipa/.aab) and deployed endpoints, which need a deployment (owner
+  actions #5, #8). When they exist, unpack the build and pass the directory to `--artifacts`.
+- **Last local run** (2026-09-24, `scripts/scan-release-artifacts.sh`): web portal, Worker bundle (production
+  env), Expo web export and app config, 69 files / 11.2 MiB → `Artifact secret scan passed`; negative control:
+  the planted service-role key (web portal, 2 findings) and secret key (app config, 1 finding) were found.
 
 ## 4. Scheduled work and durable jobs
 

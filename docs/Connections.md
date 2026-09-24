@@ -21,3 +21,5 @@ Every row is a named blocker, not a passing check. Configuration *names* only â€
 - Only the Supabase URL/publishable key, API base URL and RevenueCat public SDK keys may ship in client bundles. Everything compiled into an EAS bundle is public.
 - Development MCP/CLI credentials never become runtime credentials.
 - Production readiness (`AC_DEPLOY_07`) refuses to start with mock consent, mock billing, mock AI or missing ZDR evidence.
+- Outside development/test a missing consent or billing credential selects a provider that refuses every call, never a mock (BUG-067, BUG-079); a production Worker never serves fixture or fake catalog rows, and a database marked production refuses them (BUG-080).
+- `scripts/scan-secrets.mjs` `DOCUMENTED_PUBLIC` is the enforced list of client-public values; release-shaped builds are scanned in CI with a negative control (BUG-081).

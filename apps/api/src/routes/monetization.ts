@@ -152,7 +152,10 @@ async function serveStillLive(
   now: Date,
 ): Promise<CampaignCandidate | null> {
   const { config } = c.var.deps;
-  const [campaign] = await loadCampaignCandidates(tx, { campaignId: serve.campaign_id });
+  const [campaign] = await loadCampaignCandidates(tx, {
+    campaignId: serve.campaign_id,
+    withoutFakes: config.environment === 'production',
+  });
   if (!campaign) return null;
   // The follow-up request must come from the same kind of property the card was served on.
   const property = servedProperty(c, serve.platform, serve.locale);
@@ -238,6 +241,8 @@ export function monetizationRoutes(): Hono<AppEnv> {
         campaigns: await loadCampaignCandidates(tx, {
           placement: query.placement,
           servingOnly: true,
+          // A database not yet marked production does not refuse fake rows (migration 0770).
+          withoutFakes: deps.config.environment === 'production',
         }),
         placement: query.placement,
         platform,
@@ -461,7 +466,11 @@ export function monetizationRoutes(): Hono<AppEnv> {
     const body = await deps.db.asService(async (tx) => {
       const mode = await merchantModeFor(c, tx, property, now);
       const prefs = await loadPrefs(tx, familyId);
-      const rows = await loadCatalog(tx, { approvedOnly: true });
+      const rows = await loadCatalog(tx, {
+        approvedOnly: true,
+        // A database not yet marked production does not refuse fake rows (migration 0770).
+        withoutFakes: deps.config.environment === 'production',
+      });
       const ranked = rankResources(
         rows.map((row) => ({
           id: row.id,
@@ -527,7 +536,11 @@ export function monetizationRoutes(): Hono<AppEnv> {
     const query = parseQuery(c, resourcesQuerySchema.pick({ platform: true, locale: true }));
     const property = servedProperty(c, query.platform, query.locale ?? DEFAULT_LOCALE);
     const body = await deps.db.asService(async (tx) => {
-      const [row] = await loadCatalog(tx, { id: id.data, approvedOnly: true });
+      const [row] = await loadCatalog(tx, {
+        id: id.data,
+        approvedOnly: true,
+        withoutFakes: deps.config.environment === 'production',
+      });
       // Invalid, retired or unavailable products fail safely (AC_MON_12).
       if (!row || row.availability === 'unavailable') {
         throw new ApiError('NOT_FOUND', 'This resource is no longer available');
