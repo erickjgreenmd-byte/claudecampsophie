@@ -1,6 +1,7 @@
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
 import type { AppDeps } from '../middleware/context.ts';
 import { applySnapshots } from '../services/billing-sync.ts';
+import { purgeExpiredServes } from '../services/monetization-retention.ts';
 import { runDonationAccrual, runGeneration } from '../services/p17-jobs.ts';
 
 /**
@@ -57,6 +58,7 @@ export interface TickReport {
   expiredReservations: number;
   retentionPurgedPages: number;
   spendAlerts: number;
+  placementServesPurged: number;
   entitlementsReconciled: number;
   inactivity: { notified: number; deleted: number };
   jobs: { succeeded: number; retried: number; deadLettered: number };
@@ -350,6 +352,8 @@ export async function runScheduledTick(
   const expiredReservations = await expireStaleReservations(deps);
   const retentionPurgedPages = await purgeExpiredScans(deps);
   const spendAlerts = (await recordSpendAlerts(deps)).length;
+  // P16.5: short-lived placement anti-duplication state is kept 7 days at most.
+  const placementServesPurged = (await purgeExpiredServes(deps.db, now)).deleted;
   const entitlementsReconciled = await reconcileStaleEntitlements(deps);
   // The inactivity scan aggregates activity across tables, so it runs once a day (03:00 UTC tick).
   const inactivity =
@@ -363,6 +367,7 @@ export async function runScheduledTick(
     expiredReservations,
     retentionPurgedPages,
     spendAlerts,
+    placementServesPurged,
     entitlementsReconciled,
     inactivity,
     jobs,
