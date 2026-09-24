@@ -1,0 +1,21 @@
+/** Stable error codes for expected (parent/administrator-configured) scheduling failures. */
+export const SCHEDULING_ERROR_CODES = [
+  'INVALID_TIME_ZONE',
+  'INVALID_INSTANT',
+  'INVALID_LOCAL_TIME',
+  'INVALID_CALENDAR_DATE',
+  'INVALID_DATE_RANGE',
+  'INVALID_WEEKDAY',
+  'INVALID_WEEK_KEY',
+  'INVALID_SCHEDULE_VERSION',
+  'INVALID_SUBJECT',
+  'DUPLICATE_SUBJECT',
+  'INVALID_DURATION',
+  'INVALID_QUIET_HOURS',
+  'INVALID_REVIEW_VERSIONS',
+  'INVALID_JOB_STATUS',
+  'INVALID_COUNT',
+  'INVALID_AUDIENCE',
+  'INVALID_NOTIFICATION_FLAG',
+] as const;
+export type SchedulingErrorCode = (typeof SCHEDULING_ERROR_CODES)[number];
