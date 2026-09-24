@@ -96,8 +96,12 @@ async function changeRows(fam: SeededFamily) {
 }
 
 /** Gives a family verified paid capacity through the real sync path (mock provider state). */
-async function subscribe(fam: Family, productId: string): Promise<BillingStatus> {
-  api.providers.subscriptions.state.set(fam.ref, [snapshot(fam.ref, { productId })]);
+async function subscribe(
+  fam: Family,
+  productId: string,
+  channel: ProviderSubscriptionSnapshot['channel'] = 'app_store',
+): Promise<BillingStatus> {
+  api.providers.subscriptions.state.set(fam.ref, [snapshot(fam.ref, { productId, channel })]);
   const res = await sync(fam.token);
   expect(res.status).toBe(200);
   return billingStatusResponseSchema.parse(await res.json());
@@ -110,6 +114,7 @@ beforeAll(async () => {
     ['app_store', 'pl_family_2', 'sandbox', 2, 4999, true],
     ['app_store', 'pl_family_3', 'sandbox', 3, null, true],
     ['play_store', 'pl_family_2', 'sandbox', 2, 4998, true],
+    ['play_store', 'pl_family_3', 'sandbox', 3, 5997, true],
     ['app_store', 'pl_family_retired', 'sandbox', 2, null, false],
     ['app_store', 'pl_family_2_prod', 'production', 2, null, true],
   ] as const) {
@@ -191,6 +196,13 @@ describe('GET /v1/billing/status (spec P11, P14 subscription)', () => {
         productId: 'pl_family_2',
         paidSlots: 2,
         storePriceCents: 4998,
+        priceCheck: 'matches_approved',
+      },
+      {
+        channel: 'play_store',
+        productId: 'pl_family_3',
+        paidSlots: 3,
+        storePriceCents: 5997,
         priceCheck: 'matches_approved',
       },
     ]);
@@ -362,7 +374,10 @@ describe('POST /v1/billing/sync (AC_BILLING_02/05, AC_CAPACITY_05/10)', () => {
 
   it('marks the parent’s upgrade request applied only once verified capacity covers it', async () => {
     const fam = await family();
-    expect((await change(fam.token, { kind: 'upgrade', toSlots: 2 })).status).toBe(201);
+    // Google Play sells 2 children at the approved price (the App Store fixture does not).
+    expect(
+      (await change(fam.token, { kind: 'upgrade', toSlots: 2, channel: 'play_store' })).status,
+    ).toBe(201);
     // No provider state yet: the request stays open and nothing is granted.
     await sync(fam.token);
     expect((await changeRows(fam)).map((r) => r.status)).toEqual(['pending_purchase']);
@@ -371,7 +386,7 @@ describe('POST /v1/billing/sync (AC_BILLING_02/05, AC_CAPACITY_05/10)', () => {
       toSlots: 2,
       status: 'pending_purchase',
     });
-    const body = await subscribe(fam, 'pl_family_2');
+    const body = await subscribe(fam, 'pl_family_2', 'play_store');
     expect(body.paidSlots).toBe(2);
     expect(body.requestedChange).toBeNull();
     expect((await changeRows(fam)).map((r) => r.status)).toEqual(['applied']);
@@ -389,7 +404,8 @@ describe('POST /v1/billing/capacity-changes (AC_CAPACITY_04/08/09)', () => {
 
   it('an upgrade records intent only: paid capacity is unchanged until the store confirms', async () => {
     const fam = await family({ childCount: 2 });
-    const res = await change(fam.token, { kind: 'upgrade', toSlots: 2 });
+    // Google Play sells 2 children at the approved price (the App Store fixture does not).
+    const res = await change(fam.token, { kind: 'upgrade', toSlots: 2, channel: 'play_store' });
     expect(res.status).toBe(201);
     const body = capacityChangeResponseSchema.parse(await res.json());
     expect(body).toMatchObject({
@@ -426,7 +442,8 @@ describe('POST /v1/billing/capacity-changes (AC_CAPACITY_04/08/09)', () => {
 
   it('a downgrade validates the keep list against this family and the new tier', async () => {
     const fam = await family({ childCount: 3 });
-    await subscribe(fam, 'pl_family_3');
+    // Managed by Google Play, whose 2-child price is the approved one (the App Store's is not).
+    await subscribe(fam, 'pl_family_3', 'play_store');
     const stranger = await family();
     const [riley, sam, jordan] = fam.children.map((ch) => ch.id) as [string, string, string];
 
@@ -729,7 +746,8 @@ describe('slots the store releases can be assigned again (RV-billing-2, AC_CAPAC
 describe('the parent, never the server, picks who keeps a slot (RV-billing-3)', () => {
   it('an incomplete keep list is refused; an empty list when everyone fits keeps everyone', async () => {
     const fam = await family({ childCount: 3 });
-    await subscribe(fam, 'pl_family_3');
+    // Managed by Google Play, whose 2-child price is the approved one (the App Store's is not).
+    await subscribe(fam, 'pl_family_3', 'play_store');
     const [riley, sam] = fam.children.map((ch) => ch.id) as [string, string, string];
     for (const keepChildIds of [[riley], [riley, riley]]) {
       const res = await change(fam.token, { kind: 'downgrade', toSlots: 2, keepChildIds });
@@ -772,6 +790,121 @@ describe('a store price that is not the approved price is not sold (RV-billing-4
     expect(
       (await change(fam.token, { kind: 'upgrade', toSlots: 3, channel: 'app_store' })).status,
     ).toBe(201);
+  });
+});
+
+describe('the price gate applies whether or not the client names a store (AC_CAPACITY_02)', () => {
+  const APP_STORE_TIER_2 =
+    'The App Store charges $49.99 per month for 2 children, which isn’t PencilLift’s approved price of $49.98. This plan can’t be bought there until the store price matches.';
+
+  async function refusal(res: Response): Promise<{ rule: string; message: string }> {
+    expect(res.status).toBe(422);
+    const { rule, message } = (await json<{ error: { rule: string; message: string } }>(res)).error;
+    return { rule, message };
+  }
+
+  it('with no store named and no managing store, every store offering the tier is checked', async () => {
+    const fam = await family();
+    // Google Play sells 2 children at exactly $49.98, but the App Store offer is $49.99.
+    expect(await refusal(await change(fam.token, { kind: 'upgrade', toSlots: 2 }))).toEqual({
+      rule: 'STORE_PRICE_NOT_APPROVED',
+      message: APP_STORE_TIER_2,
+    });
+    expect(await changeRows(fam)).toEqual([]);
+    // Tiers whose offered prices all match ($39.99), or are not verified yet (checked on the
+    // device), are recorded.
+    expect((await change(fam.token, { kind: 'upgrade', toSlots: 1 })).status).toBe(201);
+    expect((await change(fam.token, { kind: 'upgrade', toSlots: 3 })).status).toBe(201);
+    expect((await changeRows(fam)).map((r) => [r.to_slots, r.status])).toEqual([
+      [1, 'cancelled'],
+      [3, 'pending_purchase'],
+    ]);
+  });
+
+  it('the family’s managing store is always checked, whatever store the client names', async () => {
+    const fam = await family({ childCount: 3 });
+    await subscribe(fam, 'pl_family_3'); // App Store
+    const [riley, sam] = fam.children.map((ch) => ch.id) as [string, string, string];
+    // The App Store applies a downgrade of an App Store subscription, so its $49.99 is what the
+    // parent would pay, even when the client omits the store or names another one.
+    for (const named of [{}, { channel: 'play_store' }]) {
+      const res = await change(fam.token, {
+        kind: 'downgrade',
+        toSlots: 2,
+        keepChildIds: [riley, sam],
+        ...named,
+      });
+      expect(await refusal(res)).toEqual({
+        rule: 'STORE_PRICE_NOT_APPROVED',
+        message: APP_STORE_TIER_2,
+      });
+    }
+    // An upgrade is changed in the managing store too.
+    const small = await family();
+    await subscribe(small, 'pl_family_1');
+    for (const named of [{}, { channel: 'play_store' }]) {
+      const res = await change(small.token, { kind: 'upgrade', toSlots: 2, ...named });
+      expect((await refusal(res)).rule).toBe('STORE_PRICE_NOT_APPROVED');
+    }
+    expect(await changeRows(fam)).toEqual([]);
+    expect(await changeRows(small)).toEqual([]);
+  });
+
+  it('a family managed by a store that charges the approved price is not blocked by another store', async () => {
+    const fam = await family({ childCount: 3 });
+    await subscribe(fam, 'pl_family_3', 'play_store');
+    const [riley, sam] = fam.children.map((ch) => ch.id) as [string, string, string];
+    const res = await change(fam.token, {
+      kind: 'downgrade',
+      toSlots: 2,
+      keepChildIds: [riley, sam],
+    });
+    expect(res.status).toBe(201);
+    expect(capacityChangeResponseSchema.parse(await res.json())).toMatchObject({
+      fromSlots: 3,
+      toSlots: 2,
+      newRecurringCents: 4998,
+      nextStep: 'change_in_store',
+    });
+  });
+
+  it('web billing counts as an offered store only while it is enabled', async () => {
+    for (const enabled of [false, true]) {
+      const web = await createTestApi(
+        enabled ? { OPTIONAL_STRIPE_WEB_BILLING_ENABLED: 'true' } : {},
+      );
+      try {
+        for (const [channel, product, price] of [
+          ['app_store', 'pl_family_2', 4998],
+          ['play_store', 'pl_family_2', 4998],
+          ['stripe', 'price_family_2', 4999],
+        ] as const) {
+          await web.db.sql`
+            insert into public.store_product_mappings (channel, product_id, environment, paid_slots, store_price_cents)
+            values (${channel}, ${product}, 'sandbox', 2, ${price})
+          `;
+        }
+        const fam = await seedFamily(web.db);
+        await grantAdultUnlock(web.db, fam.ownerId, SESSION, 3600);
+        const token = await parentToken(fam.ownerId, { sessionId: SESSION });
+        const res = await web.request('/v1/billing/capacity-changes', {
+          method: 'POST',
+          token,
+          body: { kind: 'upgrade', toSlots: 2 },
+        });
+        if (enabled) {
+          expect(await refusal(res)).toEqual({
+            rule: 'STORE_PRICE_NOT_APPROVED',
+            message:
+              'Web billing charges $49.99 per month for 2 children, which isn’t PencilLift’s approved price of $49.98. This plan can’t be bought there until the store price matches.',
+          });
+        } else {
+          expect(res.status).toBe(201);
+        }
+      } finally {
+        await web.close();
+      }
+    }
   });
 });
 

@@ -37,7 +37,15 @@ export interface ApiConfig {
   /** Fixed program calendar zone for P17 donation months. */
   readonly programTimezone: string;
   readonly providers: {
-    readonly consent: 'development_mock' | 'configured';
+    /**
+     * Verifiable parental consent, selected explicitly (AC_DEPLOY_07):
+     * - `development_mock`: the labeled mock, only ever in development and test;
+     * - `unavailable`: staging/production without an adapter; nothing can be verified;
+     * - `configured`: the implemented adapter named by `consentAdapter`.
+     */
+    readonly consent: 'development_mock' | 'unavailable' | 'configured';
+    /** CONSENT_PROVIDER when `consent` is `configured`, otherwise null. */
+    readonly consentAdapter: string | null;
     readonly billing: 'development_mock' | 'revenuecat';
     readonly ai: 'development_mock' | 'openai';
     readonly storage: 'development_mock' | 'supabase';
@@ -143,7 +151,7 @@ export function loadConfig(
     providers: {
       // No real consent adapter is implemented yet, so nothing can mark consent as configured;
       // naming an unknown provider is a configuration error rather than a silent mock.
-      consent: consentProvider(env.CONSENT_PROVIDER, errors),
+      ...consentProvider(env.CONSENT_PROVIDER, environment, errors),
       billing: env.REVENUECAT_SECRET_API_KEY ? 'revenuecat' : 'development_mock',
       ai: env.OPENAI_API_KEY ? 'openai' : 'development_mock',
       storage: env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY ? 'supabase' : 'development_mock',
@@ -170,17 +178,32 @@ export function loadConfig(
   return errors.length ? { ok: false, errors } : { ok: true, config };
 }
 
-/** Consent adapters implemented in this codebase (none yet: owner action #7 selects the provider). */
-const CONSENT_ADAPTERS: ReadonlySet<string> = new Set<string>();
+/**
+ * Consent adapters implemented in this codebase (none yet: owner action #7 selects the provider).
+ * Each name must also have a factory in the Worker (src/index.ts CONSENT_ADAPTER_FACTORIES);
+ * tests/runtime.test.ts keeps the two lists equal.
+ */
+export const CONSENT_ADAPTERS: ReadonlySet<string> = new Set<string>();
+
+/** Environments where labeled development mocks may be wired (never staging or production). */
+export const MOCK_ENVIRONMENTS: ReadonlySet<Environment> = new Set<Environment>([
+  'development',
+  'test',
+]);
 
 function consentProvider(
   value: string | undefined,
+  environment: Environment,
   errors: ConfigError[],
-): 'development_mock' | 'configured' {
-  if (!value) return 'development_mock';
-  if (CONSENT_ADAPTERS.has(value)) return 'configured';
-  errors.push({ name: 'CONSENT_PROVIDER', problem: `no adapter is implemented for "${value}"` });
-  return 'development_mock';
+): Pick<ApiConfig['providers'], 'consent' | 'consentAdapter'> {
+  if (value) {
+    if (CONSENT_ADAPTERS.has(value)) return { consent: 'configured', consentAdapter: value };
+    errors.push({ name: 'CONSENT_PROVIDER', problem: `no adapter is implemented for "${value}"` });
+    return { consent: 'unavailable', consentAdapter: null };
+  }
+  return MOCK_ENVIRONMENTS.has(environment)
+    ? { consent: 'development_mock', consentAdapter: null }
+    : { consent: 'unavailable', consentAdapter: null };
 }
 
 export interface ReadinessItem {

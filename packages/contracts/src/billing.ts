@@ -129,7 +129,9 @@ export const capacityChangeRequestSchema = z
     keepChildIds: z.array(uuidSchema).max(12).optional(),
     /**
      * The store the parent is about to confirm in. The server refuses a tier whose verified store
-     * price there differs from the approved price, before the store opens.
+     * price differs from the approved price, before the store opens, in this store and in the
+     * family's managing store. Without either, every store that would be offered is checked, so
+     * omitting it never skips the check (AC_CAPACITY_02).
      */
     channel: channelSchema.optional(),
   })

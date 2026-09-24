@@ -13,6 +13,7 @@ import {
 } from '@pencillift/domain';
 import { planDowngrade } from '@pencillift/domain/entitlements';
 import { readJson } from '../app.ts';
+import type { ApiConfig } from '../config.ts';
 import type { Tx } from '../db.ts';
 import { ApiError, businessRule } from '../errors.ts';
 import { assertRecentUnlock, currentFamilyId, requireParent } from '../middleware/auth.ts';
@@ -89,6 +90,59 @@ export function priceCheckFor(
   return approvedCents(paidSlots) === storePriceCents
     ? 'matches_approved'
     : 'differs_from_approved';
+}
+
+/**
+ * The stores a capacity change could be confirmed in (AC_CAPACITY_02). The family's managing store
+ * always counts, because a change to an existing subscription is made there whatever a client
+ * says, and so does the store the client names. When neither is known, the server can't tell where
+ * the parent will buy, so every store that would be offered counts. Web billing is offered only
+ * while it is enabled.
+ */
+export function storesToCheck(
+  named: Channel | undefined,
+  managing: Channel | null,
+  config: Pick<ApiConfig, 'flags'>,
+): ReadonlySet<Channel> {
+  const known = new Set<Channel>();
+  if (named !== undefined) known.add(named);
+  if (managing !== null) known.add(managing);
+  if (known.size > 0) return known;
+  return new Set<Channel>(
+    config.flags.stripeWebBillingEnabled
+      ? ['app_store', 'play_store', 'stripe']
+      : ['app_store', 'play_store'],
+  );
+}
+
+/**
+ * RV-billing-4 (AC_CAPACITY_02): a tier whose verified store price is not the approved price is
+ * never sold (docs/Owner_Actions.md #1). Refused before the store ever opens. A price that is not
+ * verified yet is checked on the device against the store's own catalog.
+ */
+async function assertApprovedStorePrice(
+  tx: Tx,
+  paidSlots: number,
+  stores: ReadonlySet<Channel>,
+  environment: BillingEnvironment,
+): Promise<void> {
+  const approved = approvedCents(paidSlots);
+  if (approved === null) {
+    throw businessRule('INVALID_TARGET_SLOTS', DOWNGRADE_MESSAGES.INVALID_TARGET_SLOTS!);
+  }
+  const differing = await tx<{ channel: Channel; store_price_cents: number }[]>`
+    select channel, store_price_cents from public.store_product_mappings
+     where paid_slots = ${paidSlots} and environment = ${environment} and active
+       and store_price_cents is not null and store_price_cents <> ${approved}
+     order by channel, store_price_cents
+  `;
+  const blocking = differing.find((row) => stores.has(row.channel));
+  if (blocking) {
+    throw businessRule(
+      'STORE_PRICE_NOT_APPROVED',
+      `${STORE_NAME[blocking.channel]} charges ${formatUsd(blocking.store_price_cents)} per month for ${childrenLabel(paidSlots)}, which isn’t PencilLift’s approved price of ${formatUsd(approved)}. This plan can’t be bought there until the store price matches.`,
+    );
+  }
 }
 
 /** The family's billing picture, read with the parent's own role so RLS is a second layer. */
@@ -364,24 +418,12 @@ export function billingRoutes(): Hono<AppEnv> {
         keep = [...plan.value.keepChildIds];
         status = 'scheduled';
       }
-      const approved = approvedCents(body.toSlots);
-      if (body.channel !== undefined && approved !== null) {
-        // RV-billing-4 (AC_CAPACITY_02): a tier whose verified store price is not the approved
-        // price is never sold (docs/Owner_Actions.md #1). Refused before the store ever opens.
-        const [differing] = await tx<{ store_price_cents: number }[]>`
-          select store_price_cents from public.store_product_mappings
-           where channel = ${body.channel} and paid_slots = ${body.toSlots}
-             and environment = ${environment} and active
-             and store_price_cents is not null and store_price_cents <> ${approved}
-           order by store_price_cents limit 1
-        `;
-        if (differing) {
-          throw businessRule(
-            'STORE_PRICE_NOT_APPROVED',
-            `${STORE_NAME[body.channel]} charges ${formatUsd(differing.store_price_cents)} per month for ${childrenLabel(body.toSlots)}, which isn’t PencilLift’s approved price of ${formatUsd(approved)}. This plan can’t be bought there until the store price matches.`,
-          );
-        }
-      }
+      await assertApprovedStorePrice(
+        tx,
+        body.toSlots,
+        storesToCheck(body.channel, capacity?.managing_channel ?? null, deps.config),
+        environment,
+      );
       // At most one open request per family: a new choice supersedes the previous one.
       await tx`
         update public.capacity_changes set status = 'cancelled'

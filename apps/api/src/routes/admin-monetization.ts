@@ -43,6 +43,7 @@ import {
   type RevenueAdjustmentKind,
   type RevenueCategory,
 } from '@pencillift/domain/monetization';
+import { grantsAccess, type EntitlementStatus } from '@pencillift/domain/entitlements';
 import { readJson } from '../app.ts';
 import type { Tx } from '../db.ts';
 import { ApiError, businessRule, isUniqueViolation } from '../errors.ts';
@@ -1286,7 +1287,12 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
     return c.json(body, body.replayed ? 200 : 201);
   });
 
-  async function summaryFor(tx: Tx, month: string, now: Date) {
+  async function summaryFor(
+    tx: Tx,
+    month: string,
+    now: Date,
+    billingEnvironment: 'sandbox' | 'production',
+  ) {
     const entries = await tx<
       {
         id: string;
@@ -1306,6 +1312,27 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
       select a.entry_id, a.kind, a.amount_cents from public.revenue_adjustments a
         join public.revenue_entries e on e.id = a.entry_id where e.period_month = ${month}
     `;
+    // Ad-free families by the serving rule (familyIsAdFree, AC_MON_04): an entitlement in THIS
+    // runtime's billing environment that grants access now and maps to an active ad_free feature.
+    // The same predicate, so the reporting cohort matches who can actually be shown a card.
+    const adFreeRows = await tx<
+      { family_id: string; status: EntitlementStatus; period_end: Date | null }[]
+    >`
+      select e.family_id, e.status, e.period_end
+        from public.family_entitlements e
+        join public.families f on f.id = e.family_id and f.deleted_at is null
+        join public.store_feature_mappings sm
+          on sm.channel = e.channel and sm.product_id = e.product_id and sm.environment = e.environment
+         and sm.feature = 'ad_free' and sm.active
+       where e.environment = ${billingEnvironment}
+    `;
+    const adFreeFamilies = [
+      ...new Set(
+        adFreeRows
+          .filter((row) => grantsAccess(row.status, row.period_end ?? new Date(0), now))
+          .map((row) => row.family_id),
+      ),
+    ];
     // ALL active families (non-buyers, ad-free and hidden-card families included) vs adults who
     // could actually be shown a sponsor placement.
     const [cohorts] = await tx<{ active_families: number; ad_eligible_adults: number }[]>`
@@ -1316,14 +1343,7 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
            join public.families f on f.id = m.family_id and f.deleted_at is null
            left join public.family_monetization_prefs p on p.family_id = f.id
           where m.status = 'active' and coalesce(p.hide_sponsor_cards, false) = false
-            and not exists (
-              select 1 from public.family_entitlements e
-                join public.store_feature_mappings sm
-                  on sm.channel = e.channel and sm.product_id = e.product_id and sm.environment = e.environment
-                 and sm.feature = 'ad_free' and sm.active
-               where e.family_id = f.id
-                 and (e.status in ('active', 'grace_period')
-                      or (e.status = 'cancelled_active' and e.period_end > ${now})))) as ad_eligible_adults
+            and f.id <> all(${adFreeFamilies}::uuid[])) as ad_eligible_adults
     `;
     return revenueSummary(
       entries.map((e) => ({
@@ -1344,8 +1364,11 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
 
   r.get('/monetization/revenue/summary', async (c) => {
     const month = monthQuery(c);
-    const now = c.var.deps.clock();
-    const summary = await c.var.deps.db.asService((tx) => summaryFor(tx, month, now));
+    const { deps } = c.var;
+    const now = deps.clock();
+    const summary = await deps.db.asService((tx) =>
+      summaryFor(tx, month, now, deps.config.billingEnvironment),
+    );
     return c.json({ month, ...summary });
   });
 
@@ -1386,7 +1409,7 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
             suppressed: count === null,
           };
         }),
-        revenue: await summaryFor(tx, month, now),
+        revenue: await summaryFor(tx, month, now, c.var.deps.config.billingEnvironment),
         revenueFromImportsOnly: true as const,
       };
     });

@@ -19,6 +19,7 @@ import {
 } from '@pencillift/db/testing/fixtures';
 import { NON_IDENTIFYING_WORDS, evidenceQuality } from '@pencillift/domain/monetization';
 import { issueChildAccessToken } from '../src/auth/child.ts';
+import { familyIsAdFree } from '../src/services/monetization-data.ts';
 import {
   setLinkCheckFetchForTests,
   type LinkCheckFetch,
@@ -981,6 +982,53 @@ describe('revenue imports, adjustments and reporting (AC_MON_16..18)', () => {
     );
     expect(after.activeFamilies).toBe(families!.n);
     expect(after.adEligibleAdults).toBe(adults!.n - 1);
+  });
+
+  it('the ad-eligible cohort uses the serving ad-free rule: this billing environment, current access only', async () => {
+    const eligible = async () =>
+      (await ok<{ adEligibleAdults: number }>(await admin('/revenue/summary?month=2026-09')))
+        .adEligibleAdults;
+    const productionOnly = await seedFamily(api.db);
+    const sandboxAdFree = await seedFamily(api.db);
+    const lapsed = await seedFamily(api.db);
+    const before = await eligible();
+    await api.db.sql`
+      insert into public.store_feature_mappings (channel, product_id, environment, feature, active) values
+        ('app_store', 'fixture.cohort.adfree', 'sandbox', 'ad_free', true),
+        ('app_store', 'fixture.cohort.adfree', 'production', 'ad_free', true)
+    `;
+    for (const [family, environment, periodEnd] of [
+      // A production purchase never makes a family ad-free in this sandbox runtime.
+      [productionOnly, 'production', '2026-10-10T00:00:00Z'],
+      [sandboxAdFree, 'sandbox', '2026-10-10T00:00:00Z'],
+      // An 'active' row whose period ended months ago (a lost expiry webhook) no longer grants.
+      [lapsed, 'sandbox', '2026-06-01T00:00:00Z'],
+    ] as const) {
+      await api.db.sql`
+        insert into public.family_entitlements (family_id, channel, provider_subscription_id, product_id, paid_slots, status,
+          environment, period_start, period_end, provider_updated_at, fetched_at)
+        values (${family.familyId}, 'app_store', ${`cohort_${family.familyId}`}, 'fixture.cohort.adfree', 0, 'active',
+                ${environment}, '2026-05-01T00:00:00Z', ${periodEnd}, now(), now())
+      `;
+    }
+    const [removed] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.family_memberships
+       where family_id = ${sandboxAdFree.familyId} and status = 'active'`;
+    expect(removed!.n).toBeGreaterThan(0);
+    // Only the family that serving treats as ad-free leaves the reporting cohort, in both reports.
+    expect(await eligible()).toBe(before - removed!.n);
+    const report = await ok<{ revenue: { adEligibleAdults: number } }>(
+      await admin('/report?month=2026-09'),
+    );
+    expect(report.revenue.adEligibleAdults).toBe(before - removed!.n);
+    const served = await api.apiDb.asService(async (tx) =>
+      Promise.all(
+        [productionOnly, sandboxAdFree, lapsed].map((f) =>
+          familyIsAdFree(tx, f.familyId, api.config.billingEnvironment, api.now.value),
+        ),
+      ),
+    );
+    expect(served).toEqual([false, true, false]);
   });
 
   it('aggregate report: totals only, small cells suppressed, no family/user/child ids, clicks are not sales', async () => {

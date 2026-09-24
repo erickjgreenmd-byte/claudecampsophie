@@ -2,7 +2,7 @@ import type { Sql } from 'postgres';
 import { createPostgresClient } from './pg-client.ts';
 import { createApp } from './app.ts';
 import { createParentVerifier } from './auth/parent.ts';
-import { loadConfig } from './config.ts';
+import { loadConfig, MOCK_ENVIRONMENTS, type ApiConfig } from './config.ts';
 import { createDb } from './db.ts';
 import { createOpenAiResponsesClient } from '@pencillift/ai';
 import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/dispatcher.ts';
@@ -16,6 +16,7 @@ import {
   createDevelopmentConsentMock,
   createMemoryStorageMock,
   createOutboxEmailMock,
+  type ConsentProvider,
 } from './providers/index.ts';
 import { cryptoRandom } from '@pencillift/domain';
 import {
@@ -45,21 +46,83 @@ interface Runtime {
   readonly sql: Sql;
 }
 
-type RuntimeResult = { ok: true; runtime: Runtime } | { ok: false; code: string; message: string };
+type RuntimeFailure = { ok: false; code: 'NOT_CONFIGURED' | 'BLOCKED_EXTERNAL'; message: string };
+type RuntimeResult = { ok: true; runtime: Runtime } | RuntimeFailure;
+
+const NOT_CONFIGURED: RuntimeFailure = {
+  ok: false,
+  code: 'NOT_CONFIGURED',
+  message: 'Service is not configured',
+};
+const NOT_READY: RuntimeFailure = {
+  ok: false,
+  code: 'BLOCKED_EXTERNAL',
+  message: 'Service is not ready',
+};
+
+export type ConsentAdapterFactory = (env: WorkerEnv) => ConsentProvider;
+
+/**
+ * Real consent adapters by CONSENT_PROVIDER name (none yet: owner action #7). Every name in
+ * config.ts CONSENT_ADAPTERS must be wired here; tests/runtime.test.ts keeps the lists equal.
+ */
+export const CONSENT_ADAPTER_FACTORIES: Readonly<Record<string, ConsentAdapterFactory>> = {};
+
+/**
+ * Staging/production without a consent adapter: nothing can be started or verified, so the
+ * child-data gates stay closed. It is not a mock and never produces a consent record.
+ */
+function createUnavailableConsentProvider(): ConsentProvider {
+  const refuse = () => Promise.reject(new Error('consent provider not configured'));
+  return { name: 'not_configured', isMock: false, start: refuse, status: refuse };
+}
+
+/**
+ * The consent provider the configuration selects (AC_DEPLOY_07), explicitly and failing closed:
+ * the labeled development mock only in development/test, a configured adapter only when this
+ * Worker implements it, and never a mock outside development/test whatever the configuration says.
+ */
+export function selectConsentProvider(
+  config: ApiConfig,
+  env: WorkerEnv,
+  adapters: Readonly<Record<string, ConsentAdapterFactory>> = CONSENT_ADAPTER_FACTORIES,
+): { ok: true; provider: ConsentProvider } | RuntimeFailure {
+  let provider: ConsentProvider;
+  switch (config.providers.consent) {
+    case 'development_mock':
+      provider = createDevelopmentConsentMock();
+      break;
+    case 'unavailable':
+      provider = createUnavailableConsentProvider();
+      break;
+    case 'configured': {
+      const name = config.providers.consentAdapter;
+      const factory = name !== null && Object.hasOwn(adapters, name) ? adapters[name] : undefined;
+      if (!factory) return NOT_CONFIGURED;
+      provider = factory(env);
+      break;
+    }
+    default:
+      return NOT_CONFIGURED;
+  }
+  if (provider.isMock && !MOCK_ENVIRONMENTS.has(config.environment)) return NOT_READY;
+  return { ok: true, provider };
+}
 
 /** Builds the per-invocation dependencies shared by HTTP requests and Cron Triggers. */
-function buildRuntime(env: WorkerEnv): RuntimeResult {
+export function buildRuntime(env: WorkerEnv): RuntimeResult {
   const loaded = loadConfig(stringEnv(env));
-  if (!loaded.ok)
-    return { ok: false, code: 'NOT_CONFIGURED', message: 'Service is not configured' };
+  if (!loaded.ok) return NOT_CONFIGURED;
   const config = loaded.config;
   if (
     config.environment === 'production' &&
     (config.providers.consent !== 'configured' || config.providers.storage !== 'supabase')
   ) {
     // AC_DEPLOY_07: production never serves with the development consent or storage mocks.
-    return { ok: false, code: 'BLOCKED_EXTERNAL', message: 'Service is not ready' };
+    return NOT_READY;
   }
+  const consent = selectConsentProvider(config, env);
+  if (!consent.ok) return consent;
   // One client configuration for the Worker and the tests (BUG-063: array parameters need types).
   const sql = createPostgresClient(env.HYPERDRIVE.connectionString);
   const db = createDb(sql);
@@ -70,9 +133,9 @@ function buildRuntime(env: WorkerEnv): RuntimeResult {
     random: cryptoRandom,
     verifyParentToken: createParentVerifier(config),
     rateLimiter: createDbRateLimiter(db),
-    // Consent and email adapters do not exist yet (docs/Connections.md); storage uses Supabase when set.
+    // Email adapters do not exist yet (docs/Connections.md); storage uses Supabase when set.
     providers: {
-      consent: createDevelopmentConsentMock(),
+      consent: consent.provider,
       storage:
         config.providers.storage === 'supabase' &&
         typeof env.SUPABASE_URL === 'string' &&
