@@ -214,23 +214,60 @@ export interface AccrualRunResult {
 }
 
 /**
- * Accrues $1 per eligible family/month for periods starting in `month` and the two months before
- * (late settlements are recorded against their original month). Families are processed one per
- * transaction; the (family, month) and billing-period unique keys make reruns harmless. Deleted
+ * How many program months before the run month a period may have started and still accrue when
+ * its payment settles (or reaches us) late. Spec P17: "Record late settlement against the original
+ * period, not as a new donation month."
+ *
+ * Decision: 12 months. Per the providers' documentation (not sandbox-verified), their automatic
+ * recovery windows are about two months at most (App Store billing retry 60 days, Google Play grace
+ * period plus account hold 60 days, Stripe Smart Retries up to 2 months), but a Stripe invoice left
+ * open can still be paid by hand later, and a webhook outage or a stalled job adds our own delay. A
+ * year covers all of that several times over and keeps the scan bounded. The scheduled tick runs
+ * accrual for the previous and the current program month, so in practice a period is picked up for
+ * up to 13 program months after it started; an older one never accrues.
+ */
+export const DONATION_SETTLEMENT_LOOKBACK_MONTHS = 12;
+
+const periodKey = (channel: string, providerPeriodId: string) => `${channel}:${providerPeriodId}`;
+
+/**
+ * Accrues $1 per eligible family/month for periods starting in `month` or in the
+ * DONATION_SETTLEMENT_LOOKBACK_MONTHS program months before it; a late settlement is recorded
+ * against the month its period started in. Families are processed one per transaction; the
+ * (family, month) and billing-period unique keys make reruns and concurrent runs harmless. Deleted
  * families are skipped.
+ *
+ * Only families with work left are evaluated: a settled, unrefunded subscription period in the
+ * window whose program month has no accrual yet and is covered by a school designation. These are
+ * necessary conditions of the donation rule (the domain planner still decides), so the year-long
+ * window stays cheap on every scheduler tick.
  */
 export async function runDonationAccrual(
   db: Db,
   month: string,
   programZone: string,
 ): Promise<AccrualRunResult> {
-  const windowStart = monthBoundsUtc(addMonths(month, -2), programZone).start;
+  const windowStart = monthBoundsUtc(
+    addMonths(month, -DONATION_SETTLEMENT_LOOKBACK_MONTHS),
+    programZone,
+  ).start;
   const windowEnd = monthBoundsUtc(month, programZone).end;
   const families = await db.asService(
     (tx) => tx<{ family_id: string }[]>`
       select distinct p.family_id from public.billing_periods p
         join public.families f on f.id = p.family_id and f.deleted_at is null
        where p.kind = 'subscription_period' and p.period_start >= ${windowStart} and p.period_start < ${windowEnd}
+         and p.settlement = 'settled' and p.settled_at is not null and p.refunded_cents = 0
+         and exists (
+           select 1 from public.family_school_designations d
+            where d.family_id = p.family_id
+              and d.effective_from <= date_trunc('month', p.period_start at time zone ${programZone})::date
+              and (d.effective_to is null
+                   or d.effective_to > date_trunc('month', p.period_start at time zone ${programZone})::date))
+         and not exists (
+           select 1 from public.donation_accruals a
+            where a.family_id = p.family_id
+              and a.donation_month = to_char(p.period_start at time zone ${programZone}, 'YYYY-MM'))
     `,
   );
   let accrued = 0;
@@ -266,10 +303,13 @@ export async function runDonationAccrual(
         },
         existingAccrualMonths: new Set(existing.map((e) => e.donation_month)),
       });
-      const periodIds = new Map(periods.map((p) => [p.provider_period_id, p.id]));
+      // Provider period ids are unique per channel only.
+      const periodIds = new Map(
+        periods.map((p) => [periodKey(p.channel, p.provider_period_id), p.id]),
+      );
       let inserted = 0;
       for (const a of plan.accruals) {
-        const billingPeriodId = periodIds.get(a.providerPeriodId);
+        const billingPeriodId = periodIds.get(periodKey(a.snapshot.channel, a.providerPeriodId));
         if (billingPeriodId === undefined)
           throw new Error('Accrual references a period outside the evaluated window');
         const rows = await tx`

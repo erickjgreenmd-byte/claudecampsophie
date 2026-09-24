@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { seedFamily, seedOwnerAdmin } from '@pencillift/db/testing/fixtures';
+import { applyRefund } from '../src/services/billing-sync.ts';
 import { runDonationAccrual, runGeneration } from '../src/services/p17-jobs.ts';
 import { cryptoRandom } from '@pencillift/domain';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
@@ -191,6 +192,7 @@ describe('templates and monthly generation (AC_PROMO_01)', () => {
 
 describe('donation accrual and payouts (AC_PROMO_11, AC_PROMO_12)', () => {
   let schoolId: string;
+  let fullFamilyId: string;
 
   async function paidPeriod(
     familyId: string,
@@ -215,6 +217,7 @@ describe('donation accrual and payouts (AC_PROMO_11, AC_PROMO_12)', () => {
     await api.db
       .sql`update public.schools set status = 'active', recipient_verified = true where id = ${schoolId}`;
     const full = await seedFamily(api.db);
+    fullFamilyId = full.familyId;
     const discounted = await seedFamily(api.db);
     const noSchool = await seedFamily(api.db);
     for (const f of [full, discounted]) {
@@ -296,6 +299,67 @@ describe('donation accrual and payouts (AC_PROMO_11, AC_PROMO_12)', () => {
       await adminReq('/payouts/prepare', 'POST', { schoolId, throughMonth: '2026-12' }),
     );
     expect(res.status).toBe('carried_forward');
+  });
+
+  it('a refund after payout lowers what is owed at once and what was paid once the next batch is paid (AC_PROMO_10, AC_PROMO_12)', async () => {
+    type Report = {
+      accruedCents: number | null;
+      paidCents: number | null;
+      activeFamilies: string;
+      positivePayingFamilies: string;
+      fullyDiscountedFamilies: string;
+    };
+    const october = async () =>
+      json<Report>(await adminReq(`/schools/${schoolId}/report?month=2026-10`));
+    expect(await october()).toMatchObject({
+      accruedCents: 100,
+      paidCents: 100,
+      activeFamilies: '3',
+      positivePayingFamilies: '2',
+    });
+
+    // The paid October full-price month is refunded in full.
+    await api.apiDb.asService((tx) =>
+      applyRefund(tx, fullFamilyId, 'play_store', `gp_full_${fullFamilyId}`, 'refund', 3999),
+    );
+    // Owed drops at once; the school still holds the dollar until the next payout nets it.
+    // A refunded period is no longer an active or paying family.
+    expect(await october()).toEqual(
+      expect.objectContaining({
+        accruedCents: 0,
+        paidCents: 100,
+        activeFamilies: '2',
+        positivePayingFamilies: '1',
+        fullyDiscountedFamilies: '1',
+      }),
+    );
+
+    // Two full-price November months; the November payout nets October's reversal (+200 - 100).
+    for (const n of [1, 2]) {
+      const fam = await seedFamily(api.db);
+      await api.db
+        .sql`insert into public.family_school_designations (family_id, school_id, effective_from) values (${fam.familyId}, ${schoolId}, '2026-09-01')`;
+      await paidPeriod(fam.familyId, `gp_nov_${n}_${fam.familyId}`, '2026-11-04T00:00:00Z');
+    }
+    expect((await runDonationAccrual(api.apiDb, '2026-11', 'UTC')).accrued).toBe(2);
+    const november = await json<{ status: string; payout: { id: string; totalCents: number } }>(
+      await adminReq('/payouts/prepare', 'POST', { schoolId, throughMonth: '2026-11' }),
+    );
+    expect(november).toMatchObject({ status: 'created', payout: { totalCents: 100 } });
+    expect((await adminReq(`/payouts/${november.payout.id}/approve`, 'POST')).status).toBe(200);
+    expect(await october()).toMatchObject({ accruedCents: 0, paidCents: 100 });
+    expect(
+      (
+        await adminReq(`/payouts/${november.payout.id}/mark-paid`, 'POST', {
+          externalTransferRef: 'ach_456',
+        })
+      ).status,
+    ).toBe(200);
+
+    expect(await october()).toMatchObject({ accruedCents: 0, paidCents: 0 });
+    expect(
+      await json<Report>(await adminReq(`/schools/${schoolId}/report?month=2026-11`)),
+    ).toMatchObject({ accruedCents: 200, paidCents: 200 });
   });
 });
 
