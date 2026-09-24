@@ -10,6 +10,8 @@ import {
   spendTotals,
   type SpendCheckInput,
   type SpendLedger,
+  type SpendOutcome,
+  type SpendReservation,
   type SpendReserveRequest,
 } from './index.ts';
 
@@ -132,6 +134,59 @@ describe('alert thresholds fire once each', () => {
       }),
     );
     expect(denied).toMatchObject({ allowed: false, newlyCrossedThresholds: [100] });
+  });
+
+  it('a denied estimate raises only the ceiling alert plus thresholds real spend has reached', () => {
+    // Counted spend 10%: the denied $95 request reaches 105% only on paper.
+    expect(
+      mustEvaluate(check({ committedMicros: 10_000_000, requestEstimateMicros: 95_000_000 }))
+        .newlyCrossedThresholds,
+    ).toEqual([100]);
+    // Counted spend (committed + in-flight) 60%: 50 is real, 80 is not.
+    expect(
+      mustEvaluate(
+        check({
+          committedMicros: 40_000_000,
+          inFlightReservedMicros: 20_000_000,
+          requestEstimateMicros: 50_000_000,
+        }),
+      ).newlyCrossedThresholds,
+    ).toEqual([50, 100]);
+  });
+
+  it('a denial never raises a configured above-ceiling threshold that real spend has not reached', () => {
+    const thresholds = { alertThresholdsPercent: [50, 80, 120] };
+    expect(
+      mustEvaluate(
+        check({ ...thresholds, committedMicros: 10_000_000, requestEstimateMicros: 120_000_000 }),
+      ),
+    ).toMatchObject({ allowed: false, newlyCrossedThresholds: [] });
+    // Settlements above their estimates can take real spend past the budget; then it is reported.
+    expect(mustEvaluate(check({ ...thresholds, committedMicros: 125_000_000 }))).toMatchObject({
+      allowed: false,
+      newlyCrossedThresholds: [50, 80, 120],
+    });
+  });
+
+  it('property: every reported threshold below 100% was reached by counted spend', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: 1_000_000_000 }),
+        fc.nat({ max: 1_000_000_000 }),
+        fc.nat({ max: 1_000_000_000 }),
+        fc.nat({ max: 2_000_000_000 }),
+        (budgetMicros, committedMicros, inFlightReservedMicros, requestEstimateMicros) => {
+          const result = mustEvaluate(
+            check({ budgetMicros, committedMicros, inFlightReservedMicros, requestEstimateMicros }),
+          );
+          const counted =
+            committedMicros + inFlightReservedMicros + (result.allowed ? requestEstimateMicros : 0);
+          return result.newlyCrossedThresholds
+            .filter((t) => t !== 100)
+            .every((t) => counted * 100 >= t * budgetMicros);
+        },
+      ),
+    );
   });
 
   it('property: along any spending path each configured threshold is reported at most once', () => {
@@ -309,6 +364,55 @@ describe('spend ledger reserves and reconciles concurrent AI spend (AC_FIN_09)',
       counterRandom(),
     );
     expect(!result.ok && result.error.code).toBe('BUDGET_NOT_CONFIGURED');
+  });
+
+  describe('a corrupt persisted ledger fails closed instead of counting low (RV-quotas-5)', () => {
+    const row = (overrides: Partial<SpendReservation>): SpendReservation => ({
+      id: 'r1',
+      idempotencyKey: 'op-r1',
+      stage: 'extraction',
+      estimateMicros: 600_000,
+      status: 'settled',
+      actualMicros: 400_000,
+      outcome: 'succeeded',
+      ...overrides,
+    });
+    it.each<[string, Partial<SpendReservation>]>([
+      ['settled with no recorded cost', { actualMicros: null }],
+      ['settled with a negative cost', { actualMicros: -1 }],
+      ['settled with a fractional cost', { actualMicros: 0.5 }],
+      ['settled with no outcome', { outcome: null }],
+      ['settled with an unknown outcome', { outcome: 'refunded' as SpendOutcome }],
+      ['unbilled but carrying a cost', { outcome: 'cancelled_unbilled', actualMicros: 5 }],
+      ['in flight with a negative hold', { status: 'in_flight', estimateMicros: -600_000 }],
+      ['in flight with a zero hold', { status: 'in_flight', estimateMicros: 0 }],
+      [
+        'in flight but already carrying a settlement',
+        { status: 'in_flight', actualMicros: 0, outcome: 'cancelled_unbilled' },
+      ],
+      ['with an unknown status', { status: 'void' as SpendReservation['status'] }],
+    ])('rejects a row %s', (_label, overrides) => {
+      const ledger: SpendLedger = { reservations: [row({}), row({ id: 'r2', ...overrides })] };
+      expect(() => spendTotals(ledger)).toThrow(RangeError);
+      expect(() =>
+        reserveSpend(ledger, spendRequest({ idempotencyKey: 'op-new' }), counterRandom()),
+      ).toThrow(RangeError);
+    });
+
+    it('still counts well-formed settled and in-flight rows exactly', () => {
+      const ledger: SpendLedger = {
+        reservations: [
+          row({}),
+          row({ id: 'r2', outcome: 'failed_billed', actualMicros: 22_400 }),
+          row({ id: 'r3', outcome: 'cancelled_unbilled', actualMicros: 0 }),
+          row({ id: 'r4', status: 'in_flight', actualMicros: null, outcome: null }),
+        ],
+      };
+      expect(spendTotals(ledger)).toEqual({
+        committedMicros: 422_400,
+        inFlightReservedMicros: 600_000,
+      });
+    });
   });
 
   it('property: committed spend never exceeds the budget while actuals stay within estimates', () => {

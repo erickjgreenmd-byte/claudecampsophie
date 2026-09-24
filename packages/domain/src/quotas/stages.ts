@@ -45,7 +45,10 @@ export interface AttemptUsage {
   readonly attemptsSoFar: number;
   /** Billed micro-USD so far for this stage, INCLUDING failed attempts that cost money (spec F3). */
   readonly spentMicrosSoFar: number;
-  /** Upper-bound estimate for the next attempt (see estimateUpperBoundCostMicros). */
+  /**
+   * Upper-bound estimate for the next attempt (see estimateUpperBoundCostMicros); must be positive
+   * because every provider attempt is billed more than 0 micros.
+   */
   readonly nextEstimateMicros: number;
 }
 
@@ -84,16 +87,18 @@ export function defineStageLimits(table: Readonly<Record<AiStage, StageLimits>>)
  *
  * Decision: corrupt counters (negative, fractional, NaN) throw rather than return a decision,
  * because `NaN` comparisons are always false and would otherwise silently allow unbounded spend.
+ * A zero `nextEstimateMicros` is corrupt too (RV-quotas-4): no billed attempt costs 0, and a 0
+ * upper bound would let an attempt start with no cost headroom left (spent === cap) and push the
+ * stage past its cap. This matches reserveSpend, which also requires a positive estimate.
  */
 export function canAttempt(limits: StageLimits, usage: AttemptUsage): AttemptDecision {
   assertStageLimits(limits, 'limits');
   const { attemptsSoFar, spentMicrosSoFar, nextEstimateMicros } = usage;
-  if (
-    !isNonNegativeSafeInteger(attemptsSoFar) ||
-    !isNonNegativeSafeInteger(spentMicrosSoFar) ||
-    !isNonNegativeSafeInteger(nextEstimateMicros)
-  ) {
+  if (!isNonNegativeSafeInteger(attemptsSoFar) || !isNonNegativeSafeInteger(spentMicrosSoFar)) {
     throw new RangeError('Attempt usage must be non-negative integers');
+  }
+  if (!isPositiveSafeInteger(nextEstimateMicros)) {
+    throw new RangeError('nextEstimateMicros must be a positive integer upper bound');
   }
   if (attemptsSoFar >= limits.maxAttempts) return { allow: false, deny: 'MAX_ATTEMPTS' };
   if (spentMicrosSoFar + nextEstimateMicros > limits.maxCostMicros) {

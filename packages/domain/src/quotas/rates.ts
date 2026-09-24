@@ -1,5 +1,5 @@
 import { err, ok, type Result } from '../shared/result.ts';
-import { isNonNegativeSafeInteger } from './ids.ts';
+import { isNonNegativeSafeInteger, isPositiveSafeInteger } from './ids.ts';
 
 /**
  * Billing rates for one model, in integer micro-USD per 1,000,000 tokens (spec P12: "Keep billing
@@ -84,12 +84,18 @@ function lookupRate(rates: ModelRateTable, modelId: string): ModelRate | undefin
   return rates.models[modelId];
 }
 
+/**
+ * Decision (RV-quotas-3): every known rate must be a POSITIVE integer. The table only holds billed
+ * models, so a 0 rate is a misconfiguration that would price calls at $0 and keep stage caps and
+ * the spend ceiling from ever tripping (AC_FIN_01: unknown rates are explicit, never silently
+ * zero). An unknown cached rate is expressed as `null`, never as 0.
+ */
 function isValidRate(rate: ModelRate): boolean {
   return (
-    isNonNegativeSafeInteger(rate.inputPerMillionMicros) &&
-    isNonNegativeSafeInteger(rate.outputPerMillionMicros) &&
+    isPositiveSafeInteger(rate.inputPerMillionMicros) &&
+    isPositiveSafeInteger(rate.outputPerMillionMicros) &&
     (rate.cachedInputPerMillionMicros === null ||
-      isNonNegativeSafeInteger(rate.cachedInputPerMillionMicros))
+      isPositiveSafeInteger(rate.cachedInputPerMillionMicros))
   );
 }
 
@@ -108,6 +114,17 @@ function isValidRate(rate: ModelRate): boolean {
 export function computeOperationCostMicros(
   rates: ModelRateTable,
   usage: OperationUsage,
+): Result<OperationCost, CostErrorCode> {
+  return priceUsage(rates, usage, 'half_up');
+}
+
+/** `half_up` for billed cost (spec rule); `up` for upper-bound holds, which must never under-hold. */
+type MicroRounding = 'half_up' | 'up';
+
+function priceUsage(
+  rates: ModelRateTable,
+  usage: OperationUsage,
+  rounding: MicroRounding,
 ): Result<OperationCost, CostErrorCode> {
   const rate = lookupRate(rates, usage.modelId);
   if (rate === undefined) {
@@ -145,7 +162,10 @@ export function computeOperationCostMicros(
     BigInt(inputTokens - cachedInputTokens) * BigInt(rate.inputPerMillionMicros) +
     BigInt(cachedInputTokens) * BigInt(cachedRate) +
     BigInt(outputTokens) * BigInt(rate.outputPerMillionMicros);
-  const rounded = (numerator * 2n + TOKENS_PER_RATE_UNIT) / (TOKENS_PER_RATE_UNIT * 2n);
+  const rounded =
+    rounding === 'up'
+      ? (numerator + TOKENS_PER_RATE_UNIT - 1n) / TOKENS_PER_RATE_UNIT
+      : (numerator * 2n + TOKENS_PER_RATE_UNIT) / (TOKENS_PER_RATE_UNIT * 2n);
   if (rounded > BigInt(Number.MAX_SAFE_INTEGER)) {
     return err('COST_OUT_OF_RANGE', 'Operation cost exceeds the representable micro-USD range');
   }
@@ -166,18 +186,25 @@ export interface UpperBoundEstimateInput {
 
 /**
  * Worst-case cost of one attempt, used for in-flight spend reservations and stage cost caps.
- * Decision: no cache discount is assumed (spec P12 base estimate), so the reservation can only
- * over-hold, never under-hold; settlement reconciles to the actual billed usage.
+ * Decision: no cache discount is assumed (spec P12 base estimate) and the exact product is rounded
+ * UP to a whole micro-USD, so the reservation can only over-hold, never under-hold; settlement
+ * reconciles to the actual billed usage. With the positive rates isValidRate requires, a positive
+ * output budget therefore always gives an estimate of at least 1 micro-USD, which canAttempt and
+ * reserveSpend require (RV-quotas-4).
  */
 export function estimateUpperBoundCostMicros(
   rates: ModelRateTable,
   input: UpperBoundEstimateInput,
 ): Result<number, CostErrorCode> {
-  const cost = computeOperationCostMicros(rates, {
-    modelId: input.modelId,
-    inputTokens: input.inputTokens,
-    cachedInputTokens: 0,
-    outputTokens: input.maxOutputTokens,
-  });
+  const cost = priceUsage(
+    rates,
+    {
+      modelId: input.modelId,
+      inputTokens: input.inputTokens,
+      cachedInputTokens: 0,
+      outputTokens: input.maxOutputTokens,
+    },
+    'up',
+  );
   return cost.ok ? ok(cost.value.costMicros) : cost;
 }

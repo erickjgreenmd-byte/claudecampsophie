@@ -42,19 +42,31 @@ export interface SpendEvaluation {
   /** committed + in-flight + this request. */
   readonly projectedMicros: number;
   readonly budgetMicros: number;
-  /** Thresholds reached by `projectedMicros` that were not already alerted, ascending. */
+  /**
+   * Thresholds not already alerted, ascending, that the spend this evaluation leaves counted has
+   * reached: `projectedMicros` when allowed, committed + in-flight only when denied (plus the
+   * 100% ceiling alert on any denial).
+   */
   readonly newlyCrossedThresholds: readonly number[];
 }
+
+/** The threshold that means "the cap is reached and blocking work". */
+const CEILING_THRESHOLD_PERCENT = 100;
 
 /**
  * Application-enforced spend ceiling (spec F4: enforce caps in the application because provider
  * alerts may lag). Denies when committed + in-flight + request > budget; reaching it exactly is
  * allowed.
  *
- * Decision: thresholds are evaluated against the projected spend even when the request is
- * denied. A denial at the ceiling therefore raises the 100% alert (if not already sent) although
- * settled spend stays below it; alerting early is the fail-safe direction, and it guarantees the
- * owner hears about the cap as soon as it starts blocking work.
+ * Alerts are evaluated against the spend that is actually counted after this decision:
+ * - allowed: committed + in-flight + this request (the request becomes an in-flight hold);
+ * - denied: committed + in-flight only, because a denied request is neither spent nor held.
+ *
+ * Decision: a denial additionally raises the 100% ceiling alert (if configured and not already
+ * sent) although counted spend stays below the budget, so the owner hears about the cap as soon as
+ * it starts blocking work. No other threshold is raised by a denied estimate (RV-quotas-2): a
+ * one-off oversized request at 10% spend must not use up the one-time 50%/80% alerts, which would
+ * then stay silent when real spend reaches them.
  */
 export function evaluateSpend(input: SpendCheckInput): Result<SpendEvaluation, SpendErrorCode> {
   const { budgetMicros, committedMicros, inFlightReservedMicros, requestEstimateMicros } = input;
@@ -79,17 +91,23 @@ export function evaluateSpend(input: SpendCheckInput): Result<SpendEvaluation, S
       'Spend amounts must be non-negative integer micro-USD and thresholds positive integers',
     );
   }
-  const projected =
-    BigInt(committedMicros) + BigInt(inFlightReservedMicros) + BigInt(requestEstimateMicros);
+  const current = BigInt(committedMicros) + BigInt(inFlightReservedMicros);
+  const projected = current + BigInt(requestEstimateMicros);
   if (projected > BigInt(Number.MAX_SAFE_INTEGER)) {
     return err('INVALID_SPEND_INPUT', 'Projected spend exceeds the representable range');
   }
   const budget = BigInt(budgetMicros);
+  const allowed = projected <= budget;
+  const counted = allowed ? projected : current;
   const newlyCrossedThresholds = [...new Set(thresholds)]
     .sort((a, b) => a - b)
-    .filter((t) => !input.alreadyAlerted.includes(t) && projected * 100n >= BigInt(t) * budget);
+    .filter(
+      (t) =>
+        !input.alreadyAlerted.includes(t) &&
+        (counted * 100n >= BigInt(t) * budget || (!allowed && t === CEILING_THRESHOLD_PERCENT)),
+    );
   return ok({
-    allowed: projected <= budget,
+    allowed,
     projectedMicros: Number(projected),
     budgetMicros,
     newlyCrossedThresholds,
@@ -138,14 +156,47 @@ export interface SpendTotals {
   readonly inFlightReservedMicros: number;
 }
 
-/** Settled actual spend and outstanding in-flight holds. */
+/**
+ * Checks the invariants reserveSpend/settleSpend guarantee for every row. The ledger is loaded from
+ * persistence, so a row that breaks them (a settled row with no cost, a negative or fractional
+ * amount, an unknown status/outcome) is corrupt data, never a $0 row.
+ */
+function countedMicros(
+  r: SpendReservation,
+  index: number,
+): { readonly settled: boolean; readonly micros: number } {
+  const fail = (why: string): never => {
+    throw new RangeError(`Spend ledger row ${index} is corrupt: ${why}`);
+  };
+  if (!isPositiveSafeInteger(r.estimateMicros)) fail('estimate must be a positive integer');
+  if (r.status === 'in_flight') {
+    if (r.actualMicros !== null || r.outcome !== null) fail('in-flight row has a settlement');
+    return { settled: false, micros: r.estimateMicros };
+  }
+  if (r.status !== 'settled') return fail('unknown status');
+  const actual = r.actualMicros;
+  if (!isNonNegativeSafeInteger(actual)) return fail('settled row needs a recorded cost');
+  if (r.outcome === null || !SPEND_OUTCOMES.includes(r.outcome)) fail('unknown outcome');
+  if (r.outcome === 'cancelled_unbilled' && actual !== 0) fail('unbilled row carries a cost');
+  return { settled: true, micros: actual };
+}
+
+/**
+ * Settled actual spend and outstanding in-flight holds.
+ *
+ * Decision (RV-quotas-5): every row is validated before it is summed and a corrupt row throws
+ * (a data-integrity error, like an out-of-range total). Summing with `actualMicros ?? 0` or
+ * checking only the totals let a settled billed row with no cost, or a negative row offset by a
+ * real one, lower counted spend and open the ceiling (spec F4, AC_FIN_01, AC_FIN_09).
+ */
 export function spendTotals(ledger: SpendLedger): SpendTotals {
   let committedMicros = 0;
   let inFlightReservedMicros = 0;
-  for (const r of ledger.reservations) {
-    if (r.status === 'settled') committedMicros += r.actualMicros ?? 0;
-    else inFlightReservedMicros += r.estimateMicros;
-  }
+  ledger.reservations.forEach((r, index) => {
+    const row = countedMicros(r, index);
+    if (row.settled) committedMicros += row.micros;
+    else inFlightReservedMicros += row.micros;
+  });
   if (!Number.isSafeInteger(committedMicros) || !Number.isSafeInteger(inFlightReservedMicros)) {
     throw new RangeError('Spend ledger totals exceed the representable range');
   }
@@ -178,8 +229,10 @@ export type SpendReserveOutcome =
 
 /**
  * Hold an operation's upper-bound cost against the budget before calling the provider.
- * A denial is a normal outcome (`kind: 'denied'`, ledger unchanged) that still reports any newly
- * crossed alert thresholds; it is not an error.
+ * A denial is a normal outcome (`kind: 'denied'`, ledger unchanged), not an error. It reports the
+ * 100% ceiling alert and any threshold already reached by committed + in-flight spend, never one
+ * reached only by the denied estimate (see evaluateSpend). A corrupt persisted ledger throws
+ * (see spendTotals) instead of being counted low.
  */
 export function reserveSpend(
   ledger: SpendLedger,

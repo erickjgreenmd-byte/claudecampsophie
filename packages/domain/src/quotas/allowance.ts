@@ -60,7 +60,14 @@ export interface ReserveRequest {
   readonly idempotencyKey: string;
   /** Server-verified paid capacity for the period (never client input). */
   readonly paidSlots: number;
-  /** Children currently assigned to paid slots (server-verified). */
+  /**
+   * Children currently holding the family's paid slots (server-verified). At most `paidSlots`
+   * distinct children. When more profiles are assigned than there are paid slots (e.g. a refund,
+   * revocation or lower-tier resubscribe before the parent chose which profiles stay active, spec
+   * P11), pass only the children that still hold a slot (see entitlements `childHasPaidAi`): an
+   * over-assigned list is refused for EVERY child (CHILD_NOT_ENTITLED, reason
+   * PAID_SLOTS_OVERASSIGNED) because it cannot say which child is paid for (AC_CAPACITY_07).
+   */
   readonly activeChildIds: readonly string[];
 }
 
@@ -84,6 +91,9 @@ export type AllowanceErrorCode = (typeof ALLOWANCE_ERROR_CODES)[number];
 
 /** Which ceiling a QUOTA_EXCEEDED hit; reported in `error.details.scope`. */
 export type QuotaScope = 'child' | 'family';
+
+/** Why a reservation was CHILD_NOT_ENTITLED; reported in `error.details.reason`. */
+export type NotEntitledReason = 'NO_PAID_SLOTS' | 'NOT_ASSIGNED' | 'PAID_SLOTS_OVERASSIGNED';
 
 function assertConfig(config: AllowanceConfig): void {
   if (!isPositiveSafeInteger(config.pagesPerPaidChildPerPeriod)) {
@@ -111,7 +121,8 @@ function sumUnits(state: AllowanceState, predicate: (r: AllowanceReservation) =>
  * Order of checks:
  * 1. Idempotent replay: an existing reservation with the same key is returned unchanged, whatever
  *    its status, so a duplicate upload/finalize event is never charged twice.
- * 2. Entitlement: the child must be assigned to a paid slot and the family must have paid capacity.
+ * 2. Entitlement: the family must have paid capacity, the child must be assigned to a paid slot and
+ *    no more distinct children may be assigned than there are paid slots (fail closed otherwise).
  * 3. Ceilings: child usage (reserved + committed) + units <= per-child allowance, AND family usage
  *    for the period across ALL children (including archived/reassigned) + units <=
  *    paidSlots × allowance, so reassigning a slot cannot farm a fresh allowance.
@@ -129,7 +140,8 @@ export function reserve(
     !isNonEmptyString(periodKey) ||
     !isNonEmptyString(idempotencyKey) ||
     !isPositiveSafeInteger(units) ||
-    !Array.isArray(activeChildIds)
+    !Array.isArray(activeChildIds) ||
+    !activeChildIds.every(isNonEmptyString)
   ) {
     return err(
       'INVALID_REQUEST',
@@ -160,8 +172,32 @@ export function reserve(
       `Paid slots must be an integer from 0 to ${config.maxPaidSlots}`,
     );
   }
-  if (paidSlots === 0 || !activeChildIds.includes(childId)) {
-    return err('CHILD_NOT_ENTITLED', 'Child is not assigned to a verified paid slot');
+  if (paidSlots === 0) {
+    return err('CHILD_NOT_ENTITLED', 'Family has no verified paid capacity', {
+      reason: 'NO_PAID_SLOTS' satisfies NotEntitledReason,
+    });
+  }
+  const assigned = new Set(activeChildIds);
+  if (!assigned.has(childId)) {
+    return err('CHILD_NOT_ENTITLED', 'Child is not assigned to a verified paid slot', {
+      reason: 'NOT_ASSIGNED' satisfies NotEntitledReason,
+    });
+  }
+  // Decision (RV-quotas-1): more distinct assigned children than paid slots is an inconsistent
+  // entitlement snapshot (capacity dropped before the parent reselected profiles). Membership alone
+  // would give paid AI to every listed child (AC_CAPACITY_07), so every child is refused until the
+  // caller passes only the children that hold a slot; the family ceiling alone is not enough
+  // because it still lets more children than paid slots consume paid AI.
+  if (assigned.size > paidSlots) {
+    return err(
+      'CHILD_NOT_ENTITLED',
+      'More profiles are assigned than the family has paid slots; the parent must choose which stay active',
+      {
+        reason: 'PAID_SLOTS_OVERASSIGNED' satisfies NotEntitledReason,
+        assignedChildren: assigned.size,
+        paidSlots,
+      },
+    );
   }
 
   const allowance = config.pagesPerPaidChildPerPeriod;

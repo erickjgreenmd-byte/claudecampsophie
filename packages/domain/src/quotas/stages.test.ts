@@ -56,6 +56,12 @@ describe('P12/F4 per-stage attempt and cost limits (AC_FIN_09)', () => {
     ).toEqual({ allow: false, deny: 'STAGE_COST_CAP' });
   });
 
+  it('denies any further attempt once the stage cap is fully spent', () => {
+    expect(
+      canAttempt(LIMITS, { attemptsSoFar: 1, spentMicrosSoFar: 60_000, nextEstimateMicros: 1 }),
+    ).toEqual({ allow: false, deny: 'STAGE_COST_CAP' });
+  });
+
   it('allows spending exactly up to the stage cap', () => {
     expect(
       canAttempt(LIMITS, {
@@ -73,11 +79,14 @@ describe('P12/F4 per-stage attempt and cost limits (AC_FIN_09)', () => {
         fc.nat({ max: 200_000 }),
         fc.nat({ max: 200_000 }),
         (attemptsSoFar, spentMicrosSoFar, nextEstimateMicros) => {
-          const decision = canAttempt(LIMITS, {
-            attemptsSoFar,
-            spentMicrosSoFar,
-            nextEstimateMicros,
-          });
+          const usage = { attemptsSoFar, spentMicrosSoFar, nextEstimateMicros };
+          // RV-quotas-4: a 0 upper bound is corrupt (no billed attempt costs 0) and must fail
+          // closed instead of allowing an attempt with no cost headroom.
+          if (nextEstimateMicros === 0) {
+            expect(() => canAttempt(LIMITS, usage)).toThrow(RangeError);
+            return true;
+          }
+          const decision = canAttempt(LIMITS, usage);
           if (!decision.allow) return true;
           return (
             attemptsSoFar + 1 <= LIMITS.maxAttempts &&
@@ -92,6 +101,8 @@ describe('P12/F4 per-stage attempt and cost limits (AC_FIN_09)', () => {
     { attemptsSoFar: -1, spentMicrosSoFar: 0, nextEstimateMicros: 0 },
     { attemptsSoFar: 0, spentMicrosSoFar: Number.NaN, nextEstimateMicros: 0 },
     { attemptsSoFar: 0, spentMicrosSoFar: 0, nextEstimateMicros: 1.5 },
+    { attemptsSoFar: 0, spentMicrosSoFar: 0, nextEstimateMicros: 0 },
+    { attemptsSoFar: 1, spentMicrosSoFar: 59_999, nextEstimateMicros: 0 },
   ])('fails closed (throws) on corrupt counters %j instead of allowing', (usage) => {
     expect(() => canAttempt(LIMITS, usage)).toThrow(RangeError);
   });

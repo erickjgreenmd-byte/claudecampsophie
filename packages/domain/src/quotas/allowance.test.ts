@@ -158,6 +158,93 @@ describe('entitlement is required (P11: a local boolean never unlocks paid servi
     expect(!result.ok && result.error.code).toBe('CHILD_NOT_ENTITLED');
   });
 
+  it('refuses every child while more profiles are assigned than paid slots (AC_CAPACITY_07)', () => {
+    const random = counterRandom();
+    const four = ['child-riley', 'child-sam', 'child-avery', 'child-jordan'];
+    for (const childId of four) {
+      const result = reserve(
+        EMPTY_ALLOWANCE_STATE,
+        request({ childId, paidSlots: 1, activeChildIds: four, idempotencyKey: `up-${childId}` }),
+        DEFAULT_ALLOWANCE_CONFIG,
+        random,
+      );
+      expect(!result.ok && result.error.code).toBe('CHILD_NOT_ENTITLED');
+      expect(!result.ok && result.error.details).toMatchObject({
+        reason: 'PAID_SLOTS_OVERASSIGNED',
+        assignedChildren: 4,
+        paidSlots: 1,
+      });
+    }
+    // Three profiles on two slots is still over-assigned; two on two is fine.
+    const three = reserve(
+      EMPTY_ALLOWANCE_STATE,
+      request({ paidSlots: 2, activeChildIds: four.slice(0, 3) }),
+      DEFAULT_ALLOWANCE_CONFIG,
+      random,
+    );
+    expect(!three.ok && three.error.code).toBe('CHILD_NOT_ENTITLED');
+    // Once the caller passes only the children holding a slot, that child proceeds.
+    const holder = reserve(
+      EMPTY_ALLOWANCE_STATE,
+      request({ paidSlots: 2, activeChildIds: four.slice(0, 2) }),
+      DEFAULT_ALLOWANCE_CONFIG,
+      random,
+    );
+    expect(holder.ok).toBe(true);
+  });
+
+  it('counts a child listed twice in the assignment as one paid slot', () => {
+    const result = reserve(
+      EMPTY_ALLOWANCE_STATE,
+      request({ paidSlots: 1, activeChildIds: ['child-riley', 'child-riley'] }),
+      DEFAULT_ALLOWANCE_CONFIG,
+      counterRandom(),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('reports why a child is not entitled', () => {
+    const random = counterRandom();
+    const noSlots = reserve(
+      EMPTY_ALLOWANCE_STATE,
+      request({ paidSlots: 0 }),
+      DEFAULT_ALLOWANCE_CONFIG,
+      random,
+    );
+    expect(!noSlots.ok && noSlots.error.details?.['reason']).toBe('NO_PAID_SLOTS');
+    const unassigned = reserve(
+      EMPTY_ALLOWANCE_STATE,
+      request({ childId: 'child-sam' }),
+      DEFAULT_ALLOWANCE_CONFIG,
+      random,
+    );
+    expect(!unassigned.ok && unassigned.error.details?.['reason']).toBe('NOT_ASSIGNED');
+  });
+
+  it('property: children granted paid allowance never outnumber the paid slots', () => {
+    const children = ['child-riley', 'child-sam', 'child-avery', 'child-jordan', 'child-kai'];
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: 4 }),
+        fc.subarray(children, { minLength: 1 }),
+        (paidSlots, activeChildIds) => {
+          const random = counterRandom();
+          let state = EMPTY_ALLOWANCE_STATE;
+          for (const childId of children) {
+            const result = reserve(
+              state,
+              request({ childId, paidSlots, activeChildIds, idempotencyKey: `up-${childId}` }),
+              DEFAULT_ALLOWANCE_CONFIG,
+              random,
+            );
+            if (result.ok) state = result.value.state;
+          }
+          return new Set(state.reservations.map((r) => r.childId)).size <= paidSlots;
+        },
+      ),
+    );
+  });
+
   it.each([-1, 1.5, Number.NaN, 5])('rejects an impossible paid slot count %d', (paidSlots) => {
     const result = reserve(
       EMPTY_ALLOWANCE_STATE,
@@ -176,6 +263,8 @@ describe('entitlement is required (P11: a local boolean never unlocks paid servi
     { childId: '' },
     { periodKey: '' },
     { idempotencyKey: '' },
+    { activeChildIds: ['child-riley', ''] },
+    { activeChildIds: ['child-riley', 7 as unknown as string] },
   ])('rejects a malformed request %j', (overrides) => {
     const result = reserve(
       EMPTY_ALLOWANCE_STATE,

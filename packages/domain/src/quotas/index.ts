@@ -28,6 +28,7 @@ export {
   type AllowanceState,
   type AllowanceUsageQuery,
   type AllowanceUsageReport,
+  type NotEntitledReason,
   type QuotaScope,
   type ReleaseReason,
   type ReservationStatus,

@@ -268,9 +268,82 @@ describe('untrusted usage and model identifiers', () => {
     });
     expect(!result.ok && result.error.code).toBe('INVALID_RATE');
   });
+
+  it.each([
+    ['input', syntheticTable(0, 12_000_000, null)],
+    ['output', syntheticTable(2_000_000, 0, null)],
+    ['cached input (unknown must be null, not 0)', syntheticTable(2_000_000, 12_000_000, 0)],
+  ])('fails closed on a zero %s rate instead of charging nothing (AC_FIN_01)', (_label, table) => {
+    const result = computeOperationCostMicros(table, {
+      modelId: 'test-model',
+      inputTokens: 4000,
+      cachedInputTokens: 1000,
+      outputTokens: 1200,
+    });
+    expect(!result.ok && result.error.code).toBe('INVALID_RATE');
+    const estimate = estimateUpperBoundCostMicros(table, {
+      modelId: 'test-model',
+      inputTokens: 4000,
+      maxOutputTokens: 1200,
+    });
+    expect(!estimate.ok && estimate.error.code).toBe('INVALID_RATE');
+  });
 });
 
 describe('upper-bound attempt estimate for in-flight reservations', () => {
+  it('rounds a fractional micro-USD up so a hold never under-holds', () => {
+    // Luna: 1 input (0.2) + 1 output (1.2) = 1.4 micros: billed cost rounds half up to 1, the
+    // upper-bound hold rounds up to 2.
+    expect(costOf(RATES, 'gpt-5.6-luna', 1, 1)).toBe(1);
+    expect(
+      estimateUpperBoundCostMicros(RATES, {
+        modelId: 'gpt-5.6-luna',
+        inputTokens: 1,
+        maxOutputTokens: 1,
+      }),
+    ).toEqual({ ok: true, value: 2 });
+    // The smallest positive rate still gives a positive estimate for a positive output budget,
+    // which canAttempt and reserveSpend require (RV-quotas-4).
+    expect(
+      estimateUpperBoundCostMicros(syntheticTable(1, 1, null), {
+        modelId: 'test-model',
+        inputTokens: 0,
+        maxOutputTokens: 1,
+      }),
+    ).toEqual({ ok: true, value: 1 });
+  });
+
+  it('property: the estimate is never below the billed cost of any usage within it', () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom('gpt-6-astra', 'gpt-5.6-terra', 'gpt-5.6-luna'),
+        fc
+          .nat({ max: 5_000_000 })
+          .chain((input) =>
+            fc.tuple(
+              fc.constant(input),
+              fc.nat({ max: input }),
+              fc.integer({ min: 1, max: 100_000 }),
+            ),
+          ),
+        fc.nat({ max: 100_000 }),
+        (modelId, [inputTokens, cachedInputTokens, maxOutputTokens], outputShortfall) => {
+          const estimate = estimateUpperBoundCostMicros(RATES, {
+            modelId,
+            inputTokens,
+            maxOutputTokens,
+          });
+          if (!estimate.ok) return false;
+          const outputTokens = Math.max(0, maxOutputTokens - outputShortfall);
+          return (
+            estimate.value >= 1 &&
+            estimate.value >= costOf(RATES, modelId, inputTokens, outputTokens, cachedInputTokens)
+          );
+        },
+      ),
+    );
+  });
+
   it('assumes no cache discount and the full output token budget', () => {
     const result = estimateUpperBoundCostMicros(RATES, {
       modelId: 'gpt-5.6-terra',
