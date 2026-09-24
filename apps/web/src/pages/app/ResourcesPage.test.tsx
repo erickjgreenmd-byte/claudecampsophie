@@ -541,6 +541,16 @@ describe('Sponsor card viewability beacon (spec P16.5; AC_MON_16)', () => {
     const fake = fakeApi();
     renderPage(<ResourcesPage />, { api: fake.api });
     await screen.findByRole('complementary', { name: /Sponsored by/ });
+    // The card is in the DOM before React runs the effect that starts observing it; a real
+    // IntersectionObserver reports the current state on observe(), but this double only reports on
+    // show(). Wait until the card is observed, or a show() under load reaches no observer (BUG-083).
+    if (globalThis.IntersectionObserver === (FakeIntersectionObserver as unknown)) {
+      await waitFor(() =>
+        expect(
+          FakeIntersectionObserver.instances.some((o) => !o.disconnected && o.targets.length > 0),
+        ).toBe(true),
+      );
+    }
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     return fake;
   }
