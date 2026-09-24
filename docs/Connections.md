@@ -1,0 +1,23 @@
+# PencilLift connections (spec E2, AC_CONN_01)
+
+Checked 2026-09-24 from the Claude Code cloud build session. **No provider connection exists yet.**
+Every row is a named blocker, not a passing check. Configuration *names* only — never values.
+
+| Service | Environment | Owner project / ID | Auth method available here | Allowed actions | Config names (no values) | Last harmless check | Status / blocker |
+|---|---|---|---|---|---|---|---|
+| Supabase | staging, production | Unknown — owner says projects exist | None (no CLI login, no MCP, no token) | — | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` (client), `SUPABASE_JWKS_URL`, `SUPABASE_SERVICE_ROLE_KEY` (server), `DATABASE_URL` (server) | Local PostgreSQL 16 stands in for tests only; it **emulates** Supabase roles/defaults and is not the owner's project | **Blocked:** owner must connect the existing staging project (Supabase CLI login or MCP) in an environment the builder can use |
+| RevenueCat | sandbox | Unknown | None | — | `REVENUECAT_PUBLIC_IOS_SDK_KEY`, `REVENUECAT_PUBLIC_ANDROID_SDK_KEY` (client), `REVENUECAT_SECRET_API_KEY`, `REVENUECAT_WEBHOOK_AUTH` (server) | None possible | **Blocked:** project + app IDs, store credentials and product mappings unknown |
+| Stripe (optional, disabled by default) | test mode | Unknown | None | — | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` (server), `OPTIONAL_STRIPE_WEB_BILLING_ENABLED=false` | None possible | **Blocked:** test-mode account access; live use also needs launch-policy decision |
+| Expo / EAS | development, preview, production profiles | Unknown (`EXPO_PROJECT_ID`) | None (no `EXPO_TOKEN`) | — | `EXPO_PROJECT_ID`, `EXPO_TOKEN` (CI only) | None possible | **Blocked:** owner Expo account/project; native builds and installs cannot be produced here |
+| OpenAI (runtime AI) | server project | Unknown (`OPENAI_PROJECT_ID`) | None | — | `OPENAI_API_KEY`, `OPENAI_PROJECT_ID`, `ZDR_APPROVAL_EVIDENCE_REFERENCE` (server) | `curl https://api.openai.com` → proxy 403 (network policy) | **Blocked twice:** no network route from this environment, and ZDR approval for under-13 data must be documented before child-data traffic |
+| Consent provider (VPC) | sandbox | Not selected | None | — | `PARENTAL_CONSENT_PROVIDER`, `PARENTAL_CONSENT_API_KEY`, `PARENTAL_CONSENT_WEBHOOK_SECRET` | — | **Blocked:** no verifiable-parental-consent provider selected/contracted. Development adapter is a labeled mock that production readiness rejects |
+| Cloudflare (API/queues/cron) | staging | Unknown | None | — | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` (CI only) | — | **Blocked:** account access; `wrangler deploy` not possible |
+| Email / push | — | Not selected | None | — | `TRANSACTIONAL_EMAIL_FROM`, `RESEND_API_KEY` (proposed), Expo push | — | **Blocked:** provider selection |
+| DNS PencilLift.com | production | Owner-owned domain | None | — | — | — | **Blocked:** DNS access needed only at deployment |
+| Source control | GitHub `erickjgreenmd-byte/claudecampsophie` | branch `claude/new-session-vil6cz` | Session git proxy | commit/push to the designated branch | — | Push succeeded 2026-09-24 | **Connected** (development only) |
+
+## Rules enforced in code
+
+- Only the Supabase URL/publishable key, API base URL and RevenueCat public SDK keys may ship in client bundles. Everything compiled into an EAS bundle is public.
+- Development MCP/CLI credentials never become runtime credentials.
+- Production readiness (`AC_DEPLOY_07`) refuses to start with mock consent, mock billing, mock AI or missing ZDR evidence.

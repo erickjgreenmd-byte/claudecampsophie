@@ -534,7 +534,9 @@ create policy child_profiles_child_read on public.child_profiles
 -- Postgres grants EXECUTE to PUBLIC by default; helper functions are for signed-in principals only.
 revoke execute on all functions in schema app from public;
 grant execute on all functions in schema app to authenticated, service_role, pl_child;
-alter default privileges in schema app revoke execute on functions from public;
+-- Per-schema default privileges can only ADD to the global defaults, so the PUBLIC revoke must be
+-- global (for functions created by the migration role). Explicit grants below restore access.
+alter default privileges revoke execute on functions from public;
 alter default privileges in schema app grant execute on functions to authenticated, service_role, pl_child;
 
 -- Service role (jobs/webhooks) manages private tables; nobody else has privileges there.

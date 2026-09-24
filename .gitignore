@@ -17,3 +17,5 @@ web-build/
 test-results/
 playwright-report/
 evidence/tmp/
+__pycache__/
+*.pyc

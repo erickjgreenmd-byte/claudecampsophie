@@ -1,0 +1,8 @@
+# PencilLift bug ledger (spec E5.4, AC_ECC_05/06)
+
+States: reported, confirmed, fixing, verifying, closed, blocked_external, deferred_by_owner. Close only with evidence.
+
+| ID | Severity / requirement | State | Revision / environment | Expected vs actual / reproduction | Failed hypotheses | Root cause / fix | Regression evidence | Next |
+|---|---|---|---|---|---|---|---|---|
+| BUG-001 | Low / test infra + migration robustness (AC_DEPLOY_01) | closed | 371519b, local PG16 | Parallel test files: expected isolated DBs; actual `duplicate key value violates unique constraint "pg_authid_rolname_index"` in `schema_invariants.test.ts` | "`if not exists` guard is enough" — rejected: check-then-create races across sessions | Roles are cluster-wide; creation now catches `duplicate_object`/`unique_violation` in shim and `0001` (`pl_child`) | `pnpm test:db` 3 consecutive runs, 32/32 pass | — |
+| BUG-002 | High / AC_SECURITY_04, T1 (anon could execute a SECURITY DEFINER helper) | closed | working tree after 0300, local PG16 | Expected: anon cannot execute `app.*` helpers. Actual: `schema_invariants.test.ts` → `['app.is_school_admin']` executable by anon | "`ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE FROM PUBLIC` covers new functions" — rejected: per-schema defaults can only add to global defaults | 0001 now revokes EXECUTE from PUBLIC globally for the migration role; 0300 also revokes explicitly on `app.is_school_admin` | Invariant test failed before fix, `pnpm test:db` 73/73 after | — |

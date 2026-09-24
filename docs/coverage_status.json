@@ -1,0 +1,68 @@
+{
+  "AC_CAPACITY_01": {
+    "status": "unit_tested",
+    "implementation": "packages/domain/src/pricing/index.ts",
+    "check": "packages/domain/src/pricing/pricing.test.ts",
+    "evidence": "vitest 5/5 pass 2026-09-24"
+  },
+  "AC_ACCESS_01": {
+    "status": "in_progress",
+    "implementation": "supabase/migrations/0001_core_identity.sql create_family (verified email); consent gate pending",
+    "check": "supabase/tests/core_identity.test.ts 'family creation'",
+    "evidence": "db tests pass; consent-start gate not yet built"
+  },
+  "AC_ACCESS_05": {
+    "status": "in_progress",
+    "implementation": "RLS in 0001; later areas pending",
+    "check": "core_identity.test.ts tenant isolation + schema_invariants.test.ts",
+    "evidence": "32/32 db tests pass (core tables only)"
+  },
+  "AC_ACCESS_06": {
+    "status": "in_progress",
+    "implementation": "pl_child role, claims-based helpers, private schema",
+    "check": "core_identity.test.ts child sessions",
+    "evidence": "db tests pass; API token layer pending"
+  },
+  "AC_ACCESS_08": {
+    "status": "in_progress",
+    "implementation": "app.current_child_id() checks session/device/child/family",
+    "check": "core_identity.test.ts revoked device / expired session",
+    "evidence": "db tests pass; PIN rate limits pending"
+  },
+  "AC_ACCESS_09": {
+    "status": "in_progress",
+    "implementation": "membership status in 0001",
+    "check": "core_identity.test.ts revoked membership",
+    "evidence": "db test pass; invitation acceptance flow pending"
+  },
+  "AC_ECC_01": {
+    "status": "verified_by_inspection",
+    "implementation": "docs/ECC_Capabilities.md",
+    "check": "Inventory by inspection of ~/.claude and network policy",
+    "evidence": "ECC not installed and not installable here; fallbacks recorded"
+  },
+  "AC_FIN_01": {
+    "status": "in_progress",
+    "implementation": "docs/Cost_Analysis.md \u00a72, finance/assumptions.json",
+    "check": "finance/cost_model.py --check",
+    "evidence": "Rates carried from 2026-09-18; OpenAI re-check blocked by egress; unknowns explicit"
+  },
+  "AC_PROMO_15": {
+    "status": "unit_tested",
+    "implementation": "finance/promo_school_model.py (owner package)",
+    "check": "python3 finance/promo_school_model.py --check",
+    "evidence": "exit 0 2026-09-24; reports regenerate byte-identical"
+  },
+  "AC_CONN_01": {
+    "status": "blocked_external",
+    "implementation": "docs/Connections.md",
+    "check": "Connection inventory",
+    "evidence": "No provider credentials in environment; see Owner_Actions #3-#8"
+  },
+  "AC_CAPACITY_02": {
+    "status": "blocked_external",
+    "implementation": "docs/Provider_Capability_Matrix.md \u00a71",
+    "check": "Store catalog verification",
+    "evidence": "Apple USD price points cannot represent $49.98/$59.97/$69.96 (secondary source); owner decision #1"
+  }
+}
