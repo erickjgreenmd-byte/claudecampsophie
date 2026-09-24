@@ -4,7 +4,22 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./shared/result": "./src/shared/result.ts",
+    "./shared/random": "./src/shared/random.ts",
+    "./shared/money": "./src/shared/money.ts",
+    "./shared/time": "./src/shared/time.ts",
+    "./shared/billing": "./src/shared/billing.ts",
+    "./pricing": "./src/pricing/index.ts",
+    "./entitlements": "./src/entitlements/index.ts",
+    "./quotas": "./src/quotas/index.ts",
+    "./promotions": "./src/promotions/index.ts",
+    "./donations": "./src/donations/index.ts",
+    "./rewards": "./src/rewards/index.ts",
+    "./grading": "./src/grading/index.ts",
+    "./answer-guard": "./src/answer-guard/index.ts",
+    "./learning": "./src/learning/index.ts",
+    "./scheduling": "./src/scheduling/index.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
