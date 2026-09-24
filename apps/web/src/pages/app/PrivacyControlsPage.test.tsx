@@ -9,6 +9,7 @@ import type {
   SafetyReports,
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
+import { PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
 import { renderPage } from '../../test/render.tsx';
 import PrivacyControlsPage from './PrivacyControlsPage.tsx';
 
@@ -405,6 +406,79 @@ describe('PrivacyControlsPage', () => {
     expect(text(items[1])).toMatch(/reported by a parent/i);
     expect(text(items[1])).toMatch(/resolved/i);
     expect(text(items[1])).toMatch(/did not match the worksheet/i);
+  });
+
+  it('shows a safety-screen flag honestly, with resources and no alert claim (AC_SECURITY_02)', async () => {
+    const QUESTION = 'e29e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2a';
+    const reports: SafetyReports = {
+      reports: [
+        {
+          id: REPORT_A,
+          reporterKind: 'system',
+          category: 'severe_risk',
+          childId: RILEY,
+          questionId: QUESTION,
+          note: null,
+          status: 'escalated',
+          createdAt: '2026-09-23T15:00:00.000Z',
+          triagedAt: null,
+          resolvedAt: null,
+        },
+      ],
+    };
+    const { api } = fakeApi({ reports });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    const [item] = within(list).getAllByRole('listitem');
+    const content = text(item);
+    expect(content).toMatch(/answer flagged for a grown-up/i);
+    expect(content).toMatch(/flagged by pencillift/i);
+    expect(content).toMatch(/riley/i);
+    expect(content).toMatch(/escalated for urgent review/i);
+    expect(content).toMatch(/pencillift flagged an answer for a grown-up to look at/i);
+    expect(content).toMatch(/pencillift sent no automatic alert/i);
+    // It says what the product shows, not what the child saw (opening results is not recorded).
+    expect(content).not.toMatch(/your child saw/i);
+    expect(content).toMatch(/988/);
+    expect(content).toMatch(/1-800-422-4453/);
+    expect(content).toMatch(/911/);
+    // Never claims a delivery, and never names the kind of concern the word match suggested.
+    expect(content.replace(/sent no automatic alert/i, '')).not.toMatch(
+      /alerted|notified|we (?:emailed|texted|sent)/i,
+    );
+    // (The resources line names the hotlines; that is not about this report.)
+    expect(content.replace(PARENT_SAFETY_FLAG_COPY.resources, '')).not.toMatch(
+      /self-harm|suicid|abuse|sexual|violen/i,
+    );
+  });
+
+  it('parents cannot choose the system-only category when sending a report', async () => {
+    const { api } = fakeApi();
+    renderPage(<PrivacyControlsPage />, { api });
+    const section = await screen.findByRole('region', { name: /safety reports/i });
+    const select = within(section).getByLabelText(/what happened/i);
+    const options = within(select)
+      .getAllByRole('option')
+      .map((o) => o.textContent ?? '');
+    expect(options).not.toContain('Answer flagged for a grown-up');
+    expect(options).toHaveLength(6); // "Choose one" + the five parent categories
+    expect(text(section)).toMatch(
+      /pencillift also adds a report here[^.]*flags one of your child’s answers/i,
+    );
+    // Honest about held reports (runbook 5.1) without saying whether one exists.
+    expect(text(section)).toMatch(/some flags appear here only after that review/i);
+    expect(text(section)).toMatch(/pencillift sends no automatic alert/i);
+  });
+
+  it('never loads the safety screen’s rules into the parent bundle (copy comes from contracts)', () => {
+    const sources = import.meta.glob<string>('./PrivacyControlsPage.tsx', {
+      query: '?raw',
+      import: 'default',
+      eager: true,
+    });
+    const source = Object.values(sources)[0]!;
+    expect(source).toContain('PARENT_SAFETY_FLAG_COPY');
+    expect(source).not.toContain('@pencillift/domain/safety');
   });
 
   it('says which child choices save a report and that “Tell a grown-up” sends nothing', async () => {

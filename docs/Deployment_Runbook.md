@@ -173,18 +173,45 @@ allowance released; the parent can resubmit.
 | Consent withdrawal | Parent action | Queued work is cancelled in the same transaction; verify no new `scan_process` jobs start for the family |
 | Deletion request | `deletion_requests` | Purge job runs on the next tick; `purge_report` records counts; storage objects are removed before rows |
 
-### 5.1 Safety reports: moderation and escalation (spec P4, P14; AC_SECURITY_01)
+### 5.1 Safety reports: moderation and escalation (spec P4, P14; AC_SECURITY_01, AC_SECURITY_02)
 
 Reports come from the child's "Tell PencilLift" choices (`POST /v1/child/reports`: `upsetting`,
-`wrong_or_confusing`, `answer_revealed`, `other`) and from parents (`POST /v1/safety-reports`, which also
-offers `unsafe_content`). The child's "Tell a grown-up" card sends nothing, and PencilLift sends no
-automatic parent alert; never tell a family that one was sent.
+`wrong_or_confusing`, `answer_revealed`, `other`), from parents (`POST /v1/safety-reports`, which also
+offers `unsafe_content`) and from PencilLift's safety screen (system reports, below). The child's "Tell a
+grown-up" card sends nothing, and PencilLift sends no automatic parent alert; never tell a family that one
+was sent.
 
-Queue: an owner admin with MFA (aal2) lists `GET /v1/admin/safety-reports?status=open` (oldest first) and
-moves a report with `PATCH /v1/admin/safety-reports/:id`. There is no admin web screen yet; use the API.
-Reviewers see ids, category, status, timestamps and whether a note exists, never homework text, the
-child's nickname or the parent's note. Every change writes an `audit_events` row
-(`safety_report.updated`, from/to status).
+System reports (migration 0760). The scan job screens every extracted answer and printed prompt with the
+deterministic first-layer screen (`@pencillift/domain/safety`; the OpenAI moderation endpoint is not wired).
+On a severe-risk result it makes no coaching call for that question, shows the child the reviewed safety
+template (feedback kind `safety`: talk to a trusted grown-up; 988 for self-harm; Childhelp 1-800-422-4453
+for abuse, secrecy, sexual content or stranger contact; 911 for immediate danger) and files one report per
+question per transcription: `reporter_kind = 'system'`, category `severe_risk`, status `escalated` from the
+start (serious by default; the database keeps it `escalated` or `resolved`). Grading and the scan's status
+are unchanged. The report holds ids and the screen's category codes only, never homework text. The child's
+results screen shows the template as its header and body (hints are hidden for that question). The family
+sees a visible report in its report list as "Answer flagged for a grown-up", "Flagged by PencilLift", with a
+note that PencilLift sent no automatic alert and the same resources; the family never sees the category
+codes. Family hold (proposed default; owner and counsel to approve): a report whose codes include `abuse`,
+`sexual` or `secrecy` starts HELD (`family_visible = false`): the family's list does not show it (RLS) and
+its audit rows carry no `family_id` (family members can read their family's audit log) until the owner
+releases it. The hold only stops PencilLift from drawing the household's attention to the flag; it does not
+hide the child's own answer, which the family can always see in the scan, or the child's feedback rows.
+`self_harm`, `violence` and `personal_contact` reports are visible at once. The child templates and parent
+wording are drafts until the owner and an educator approve them (`SAFETY_TEMPLATES_STATUS`). Blocked model output (coaching, rubric labels, practice intros and stories) is
+logged as a code only (`coaching_blocked_by_safety`, `rubric_label_blocked_by_safety`,
+`practice_ai_blocked_by_safety`) and creates no report: watch the rates as with `coaching_blocked_by_guard`.
+
+Queue: an owner admin with MFA (aal2) lists `GET /v1/admin/safety-reports?status=open` (oldest first; use
+`?status=escalated` for system reports) and moves a report with `PATCH /v1/admin/safety-reports/:id`. There
+is no admin web screen yet; use the API. Reviewers see ids, category, status, timestamps and whether a note
+exists, never homework text, the child's nickname or the parent's note. A system report adds
+`screenCategories` (`self_harm`, `abuse`, `violence`, `sexual`, `secrecy`, `personal_contact`) and
+`familyVisible`, and links the question (`questionId`) and the template shown (`feedbackId`). Every change
+writes an `audit_events` row (`safety_report.updated`, from/to status); a system report's creation writes
+`safety_report.created` with actor `system`. To release a held report to the family's list, send
+`PATCH /v1/admin/safety-reports/:id` with `{"familyVisible": true}` (alone or with a status); it is
+forward only (a report is never hidden again) and writes `safety_report.released_to_family`.
 
 | Status | Meaning | Allowed next |
 |---|---|---|
@@ -201,6 +228,9 @@ Triage. Target: every `open` report reviewed within 1 business day (proposed; ow
 3. `wrong_or_confusing`: check the grading or hint path by ids (`question_results`, `child_feedback`), fix or
    record the defect, then resolve.
 4. `other`: triage by ids and escalate anything that could involve a child's safety.
+5. `severe_risk` (system) arrives `escalated`: go straight to the escalation steps. The screen is a word
+   match and can be wrong (fiction, quotes, a sibling squabble); a false match is resolved with a note
+   naming the screen code that fired so the rule can be tuned, never with the text.
 
 Escalation (serious concerns). Target: owner review within 1 hour of `escalated` (proposed; owner to approve).
 
@@ -211,6 +241,24 @@ Escalation (serious concerns). Target: owner review within 1 hour of `escalated`
    requires, the appropriate authorities, following the owner-approved safety policy. That policy and its
    message templates are an owner action that must be complete before launch (spec P4: "Safety templates
    and human review procedures must exist before launch").
+   For a system report, the screen code decides the first step (proposed; owner and counsel to approve).
+   Precedence when a report carries several codes: `abuse`, `sexual` or `secrecy` first (their step
+   replaces the family contact of the others), then `self_harm`, then `personal_contact`, then `violence`.
+   - `abuse`, `sexual`, `secrecy` (held from the family list): the concern may involve someone in the
+     household, so do not contact the family first; follow the safety policy for the authorities (child
+     protective services, or 911 if the danger is immediate). Release the report to the family only when
+     the policy allows it, and record the decision in the resolution note.
+   - `self_harm`: contact the family owner by email the same day with the 988 Lifeline information; 911 if
+     the danger is immediate. This is a person's message, not an automatic alert, so the family list's
+     "PencilLift sent no automatic alert" stays true; record the contact in the resolution note.
+   - `personal_contact`: the request came from someone outside the household (a stranger or an online
+     contact), so contact the family owner the same day; follow the safety policy for the authorities if
+     the child was asked to meet or to send pictures.
+   - `violence`: contact the family owner; if a specific school or person is named as a target, follow the
+     safety policy for the school or the authorities. A victim's words ("he said if I tell he will hurt my
+     mom") screen as `abuse`, not `violence`.
+   If ids and codes cannot settle it, the owner may read that one question's transcription through the
+   service role; the access is recorded in the resolution note (never the text itself).
 4. Resolve with a note stating the outcome and any product change, without homework text or names.
 
 ## 6. Backup, restore and rollback (not yet rehearsed)

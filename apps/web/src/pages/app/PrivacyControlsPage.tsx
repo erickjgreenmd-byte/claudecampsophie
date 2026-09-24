@@ -7,6 +7,7 @@ import {
   deletionRequestResponseSchema,
   deletionRequestsResponseSchema,
   privacyFamilyViewSchema,
+  PARENT_SAFETY_FLAG_COPY,
   PRIVACY_RETENTION,
   SAFETY_NOTE_MAX_LENGTH,
   SAFETY_REPORT_CATEGORIES,
@@ -17,6 +18,7 @@ import {
   type DeletionRequest,
   type ExportKind,
   type PrivacyFamilyView,
+  type ListedSafetyReportCategory,
   type SafetyReport,
   type SafetyReportCategory,
   type SafetyReportStatus,
@@ -62,12 +64,14 @@ const EXPORT_STATUS_LABELS: Record<DataExport['status'], string> = {
   expired: 'Expired — request a new copy',
 };
 
-const CATEGORY_LABELS: Record<SafetyReportCategory, string> = {
+const CATEGORY_LABELS: Record<ListedSafetyReportCategory, string> = {
   unsafe_content: 'Unsafe or inappropriate content',
   wrong_or_confusing: 'Wrong or confusing',
   upsetting: 'Something upsetting',
   answer_revealed: 'Showed an answer',
   other: 'Something else',
+  // Filed by PencilLift's safety screen only; never offered in the form below.
+  severe_risk: PARENT_SAFETY_FLAG_COPY.category,
 };
 
 const REPORT_STATUS_LABELS: Record<SafetyReportStatus, string> = {
@@ -885,9 +889,14 @@ function DeleteFamilyForm({ onChanged }: { onChanged: () => void }) {
 // ---------------------------------------------------------------------------------------------
 
 function reporterText(family: PrivacyFamilyView, report: SafetyReport): string {
-  return report.reporterKind === 'child'
-    ? `Reported by ${childName(family, report.childId)}`
-    : 'Reported by a parent';
+  switch (report.reporterKind) {
+    case 'child':
+      return `Reported by ${childName(family, report.childId)}`;
+    case 'parent':
+      return 'Reported by a parent';
+    case 'system':
+      return `${PARENT_SAFETY_FLAG_COPY.reporter} · about ${childName(family, report.childId)}`;
+  }
 }
 
 function SafetyReportsSection({
@@ -941,6 +950,13 @@ function SafetyReportsSection({
         “Tell a grown-up” card only encourages your child to talk to someone they trust; it doesn’t
         send anything or alert anyone. Reviewers see the type of report, its status and item
         references — not homework text, your child’s name or your note.
+      </p>
+      <p>
+        PencilLift also adds a report here when its safety check flags one of your child’s answers
+        for a grown-up to look at. For that question, your child’s results show a calm message about
+        talking with a grown-up they trust instead of a hint. PencilLift sends no automatic alert
+        (no email, text or notification). A PencilLift reviewer looks at every flag, and some flags
+        appear here only after that review.
       </p>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <label htmlFor={categoryId}>What happened?</label>
@@ -998,6 +1014,14 @@ function SafetyReportsSection({
               <strong>{CATEGORY_LABELS[r.category]}</strong>
               {` · ${reporterText(family, r)} · ${REPORT_STATUS_LABELS[r.status]} · ${formatDate(r.createdAt)}`}
               {r.note ? <div style={{ color: 'var(--muted)' }}>{`“${r.note}”`}</div> : null}
+              {r.reporterKind === 'system' ? (
+                <div>
+                  <p style={{ margin: '4px 0 0' }}>{PARENT_SAFETY_FLAG_COPY.summary}</p>
+                  <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
+                    {PARENT_SAFETY_FLAG_COPY.resources}
+                  </p>
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>

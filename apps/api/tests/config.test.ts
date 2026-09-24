@@ -58,6 +58,15 @@ describe('provider configuration is honest (AC_DEPLOY_07)', () => {
     });
   });
 
+  it('unapproved child safety messages and missing provider moderation block production (AC_SECURITY_02)', () => {
+    const loaded = loadConfig({ ...TEST_ENV, APP_ENV: 'production' });
+    if (!loaded.ok) throw new Error('config should load');
+    const byCheck = Object.fromEntries(productionReadiness(loaded.config).map((i) => [i.check, i]));
+    expect(byCheck.safety_templates?.status).toBe('blocked');
+    expect(byCheck.safety_templates?.detail).toMatch(/owner, educator and counsel approval/);
+    expect(byCheck.ai_moderation?.status).toBe('blocked');
+  });
+
   it('the billing mocks are selected only in development and test (AC_DEPLOY_07)', () => {
     const selected = (vars: Record<string, string>) => {
       const loaded = loadConfig({ ...TEST_ENV, ...vars });

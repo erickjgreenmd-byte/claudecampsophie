@@ -63,7 +63,11 @@ export const CHILD_REPORT_THANKS =
  * Decision: the admin workflow is forward-only. open → triaged | escalated | resolved;
  * triaged → escalated | resolved; escalated → resolved; resolved is final (a new concern is a new
  * report). Serious safety concerns (`upsetting`, `unsafe_content`) follow the escalation steps in
- * docs/Deployment_Runbook.md, section "Safety reports: moderation and escalation".
+ * docs/Deployment_Runbook.md, section "Safety reports: moderation and escalation". System reports
+ * (`reporter_kind = 'system'`, category `severe_risk`, filed by the scan job's safety screen) start
+ * `escalated`; migration 0760 keeps them `escalated` or `resolved`. A system report whose screen
+ * codes include abuse, sexual or secrecy starts held from the family's list (`family_visible =
+ * false`); the owner admin releases it with `familyVisible: true` (forward only, runbook 5.1).
  */
 const REPORT_TRANSITIONS: Readonly<Record<SafetyReportStatus, readonly SafetyReportStatus[]>> = {
   open: ['triaged', 'escalated', 'resolved'],
@@ -97,7 +101,7 @@ interface ExportRow {
 
 interface ReportRow {
   id: string;
-  reporter_kind: 'child' | 'parent';
+  reporter_kind: SafetyReport['reporterKind'];
   category: SafetyReport['category'];
   child_id: string | null;
   question_id: string | null;
@@ -112,11 +116,13 @@ interface AdminReportRow {
   id: string;
   family_id: string;
   child_id: string | null;
-  reporter_kind: 'child' | 'parent';
+  reporter_kind: SafetyReport['reporterKind'];
   category: SafetyReport['category'];
   question_id: string | null;
   feedback_id: string | null;
   has_note: boolean;
+  screen_categories: AdminSafetyReport['screenCategories'];
+  family_visible: boolean;
   status: SafetyReportStatus;
   created_at: Date;
   triaged_at: Date | null;
@@ -187,6 +193,8 @@ function toAdminReport(row: AdminReportRow): AdminSafetyReport {
     questionId: row.question_id,
     feedbackId: row.feedback_id,
     hasNote: row.has_note,
+    screenCategories: row.screen_categories,
+    familyVisible: row.family_visible,
     status: row.status,
     createdAt: row.created_at.toISOString(),
     triagedAt: iso(row.triaged_at),
@@ -557,6 +565,12 @@ export function privacyRoutes(): Hono<AppEnv> {
     return c.json({ report: toReport(row) }, 201);
   });
 
+  // The family list includes system reports (the safety screen flagged a child's answer). Their
+  // screen category codes are not selected (and not granted to `authenticated`, migration 0760):
+  // the family sees that an answer was flagged for a grown-up, never which kind of concern the word
+  // match suggested. No alert is sent and the response claims none. A held report (abuse, sexual or
+  // secrecy codes) is filtered by RLS until the owner releases it; `family_visible` itself is not
+  // granted to `authenticated`, so this query cannot and does not name it.
   r.get('/safety-reports', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
@@ -602,8 +616,11 @@ export function privacyRoutes(): Hono<AppEnv> {
 
   // ----- Owner admin report queue ---------------------------------------------------------------
 
+  // System reports add the screen's category codes (never text) so the reviewer can follow the
+  // right escalation step (runbook 5.1).
   const ADMIN_COLUMNS = `id, family_id, child_id, reporter_kind, category, question_id, feedback_id,
-    (note is not null) as has_note, status, created_at, triaged_at, resolved_at, resolution_note`;
+    (note is not null) as has_note, screen_categories, family_visible, status, created_at, triaged_at,
+    resolved_at, resolution_note`;
 
   r.get('/admin/safety-reports', requireParent, async (c) => {
     const { deps } = c.var;
@@ -639,10 +656,16 @@ export function privacyRoutes(): Hono<AppEnv> {
     // through the service role on exactly this report id.
     const row = await deps.db.asService(async (tx) => {
       const [current] = await tx<
-        { status: SafetyReportStatus; family_id: string; resolution_note: string | null }[]
-      >`select status, family_id, resolution_note from public.safety_reports where id = ${id.data} for update`;
+        {
+          status: SafetyReportStatus;
+          family_id: string;
+          resolution_note: string | null;
+          family_visible: boolean;
+        }[]
+      >`select status, family_id, resolution_note, family_visible
+          from public.safety_reports where id = ${id.data} for update`;
       if (!current) throw new ApiError('NOT_FOUND', 'Report not found');
-      if (!REPORT_TRANSITIONS[current.status].includes(body.status)) {
+      if (body.status !== undefined && !REPORT_TRANSITIONS[current.status].includes(body.status)) {
         throw businessRule(
           PRIVACY_RULES.invalidTransition,
           `A ${current.status} report cannot move to ${body.status}`,
@@ -655,20 +678,45 @@ export function privacyRoutes(): Hono<AppEnv> {
           'Add a resolution note before resolving',
         );
       }
+      const nextStatus = body.status ?? current.status;
+      // Forward only: a held report can be released to the family list, never hidden again.
+      const released = body.familyVisible === true && !current.family_visible;
+      const visible = current.family_visible || released;
+      if (body.status === undefined && !released) {
+        // Releasing a report that is already visible changes nothing (no triage stamp, no audit).
+        const [same] = await tx.unsafe<AdminReportRow[]>(
+          `select ${ADMIN_COLUMNS} from public.safety_reports where id = $1::uuid`,
+          [id.data],
+        );
+        return same!;
+      }
       const [updated] = await tx.unsafe<AdminReportRow[]>(
         `update public.safety_reports
             set status = $2::text,
                 triaged_at = coalesce(triaged_at, now()),
-                resolved_at = case when $2::text = 'resolved' then now() else resolved_at end,
-                resolution_note = $3::text
+                resolved_at = case when $2::text = 'resolved' and status <> 'resolved' then now()
+                                   else resolved_at end,
+                resolution_note = $3::text,
+                family_visible = $4::boolean
           where id = $1::uuid
           returning ${ADMIN_COLUMNS}`,
-        [id.data, body.status, note],
+        [id.data, nextStatus, note, visible],
       );
-      await tx`
-        insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
-        values (${current.family_id}, ${parent.userId}, 'admin', 'safety_report.updated', 'safety_report', ${id.data},
-                ${JSON.stringify({ from: current.status, to: body.status })}::text::jsonb)`;
+      // A held report's audit rows carry no family_id: family members can read their family's
+      // audit log (0001 audit_member_read), and it must not point them at a held report.
+      const auditFamily = visible ? current.family_id : null;
+      if (body.status !== undefined) {
+        await tx`
+          insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
+          values (${auditFamily}, ${parent.userId}, 'admin', 'safety_report.updated', 'safety_report', ${id.data},
+                  ${JSON.stringify({ from: current.status, to: body.status })}::text::jsonb)`;
+      }
+      if (released) {
+        await tx`
+          insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
+          values (${current.family_id}, ${parent.userId}, 'admin', 'safety_report.released_to_family', 'safety_report',
+                  ${id.data}, ${JSON.stringify({ familyVisible: true })}::text::jsonb)`;
+      }
       return updated!;
     });
     return c.json({ report: toAdminReport(row) });

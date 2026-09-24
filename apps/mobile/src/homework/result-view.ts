@@ -4,6 +4,14 @@
  * "Let's get a clearer picture" or "Ask a grown-up to review this". The child sees their own answer
  * and guarded hints — the response contract has no field that could carry an answer key.
  *
+ * Safety (spec P4; AC_SECURITY_02): when the scan job's safety screen flagged an answer, the question
+ * carries a reviewed 'safety' template instead of coaching. It is shown as its own calm notice
+ * ("Let’s talk with a grown-up"), never as a hint and never next to a "Try again"; the text is the
+ * reviewed template from the server (it names a trusted grown-up and help lines and never claims
+ * that anyone was alerted). When any answer was flagged, the page's status header and body (which
+ * the results screen already renders) become the notice, every distinct template once, and the
+ * score line is hidden: the child sees the help lines even where no per-question card is shown.
+ *
  * Pure logic with no react-native imports so it is unit-testable.
  */
 import {
@@ -62,6 +70,24 @@ export function verdictView(
   const v =
     verdict === 'rubric' && !hasFeedback ? RUBRIC_WITHOUT_FEEDBACK : VERDICTS[verdict ?? 'pending'];
   return { ...v, accessibilityLabel: `Question ${questionNumber}: ${v.title}` };
+}
+
+/** Calm title for a question whose answer the safety screen flagged. */
+export const SAFETY_NOTICE_TITLE = 'Let’s talk with a grown-up';
+
+const SAFETY_VERDICT = {
+  title: SAFETY_NOTICE_TITLE,
+  icon: '♡',
+  tone: 'help',
+} as const satisfies Omit<VerdictView, 'accessibilityLabel'>;
+
+/** The reviewed safety template, rendered as a distinct notice (not a hint). */
+export interface SafetyNoticeView {
+  readonly title: string;
+  readonly body: string;
+  /** The template row, so the help screen can attach it to a report. */
+  readonly feedbackId: string;
+  readonly accessibilityLabel: string;
 }
 
 export interface StatusView {
@@ -146,6 +172,8 @@ export interface QuestionView {
   readonly yourAnswer: string;
   readonly verdict: VerdictView;
   readonly hints: readonly string[];
+  /** Present when the answer was flagged: show this notice instead of hints and the verdict. */
+  readonly safety: SafetyNoticeView | null;
 }
 
 export interface ResultView {
@@ -157,9 +185,26 @@ export interface ResultView {
 
 export function buildResultView(detail: ChildAssignmentDetailResponse): ResultView {
   const status = statusView(detail.assignment.status);
-  const questions = detail.questions.map((q) => {
+  const questions = detail.questions.map((q): QuestionView => {
     const verdict = status.showResults ? q.verdict : null;
-    const hints = status.showResults ? q.feedback.map((f) => f.body) : [];
+    const flagged = status.showResults
+      ? [...q.feedback].reverse().find((f) => f.kind === 'safety')
+      : undefined;
+    // A flagged answer shows only the calm notice: no coaching (even from an earlier
+    // transcription) and no "Try again" next to it. The stored grade is unchanged.
+    const hints =
+      status.showResults && flagged === undefined
+        ? q.feedback.filter((f) => f.kind !== 'safety').map((f) => f.body)
+        : [];
+    const safety: SafetyNoticeView | null =
+      flagged === undefined
+        ? null
+        : {
+            title: SAFETY_NOTICE_TITLE,
+            body: flagged.body,
+            feedbackId: flagged.id,
+            accessibilityLabel: `Question ${q.questionNumber}: ${SAFETY_NOTICE_TITLE}. ${flagged.body}`,
+          };
     return {
       id: q.id,
       label: `Question ${q.questionNumber}`,
@@ -168,10 +213,27 @@ export function buildResultView(detail: ChildAssignmentDetailResponse): ResultVi
         q.studentAnswerText && q.studentAnswerText.trim().length > 0
           ? q.studentAnswerText
           : 'You left this one blank',
-      verdict: verdictView(verdict, q.questionNumber, hints.length > 0),
+      verdict:
+        safety === null
+          ? verdictView(verdict, q.questionNumber, hints.length > 0)
+          : {
+              ...SAFETY_VERDICT,
+              accessibilityLabel: `Question ${q.questionNumber}: ${SAFETY_NOTICE_TITLE}`,
+            },
       hints,
+      safety,
     };
   });
+  const notices = [
+    ...new Set(questions.flatMap((q) => (q.safety === null ? [] : [q.safety.body]))),
+  ];
+  if (notices.length > 0) {
+    return {
+      status: { ...status, title: SAFETY_NOTICE_TITLE, body: notices.join('\n\n') },
+      questions,
+      summary: null,
+    };
+  }
   let summary: string | null = null;
   if (status.showResults && questions.length > 0) {
     const count = (tones: VerdictTone[]) =>

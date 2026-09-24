@@ -189,6 +189,8 @@ export const childFeedbackKindSchema = z.enum([
   'analogous_example',
   'encouragement',
   'template_fallback',
+  // Reviewed safety template shown instead of coaching (spec P4; migration 0760).
+  'safety',
 ]);
 
 /** Stable `rule` codes returned with 422 BUSINESS_RULE by the homework API. */

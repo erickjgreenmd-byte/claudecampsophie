@@ -41,6 +41,8 @@ const CHECK_LABEL: Readonly<Record<string, string>> = {
   storage_provider: 'Homework photo storage (Supabase)',
   email_provider: 'Email provider',
   ai_spend_budget: 'AI spend cap for this month',
+  safety_templates: 'Child safety messages and escalation (approval)',
+  ai_moderation: 'AI moderation (provider)',
 };
 
 function Readiness() {

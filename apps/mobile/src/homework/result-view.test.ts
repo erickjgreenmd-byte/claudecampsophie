@@ -6,10 +6,12 @@ import {
   type ChildAssignmentDetailResponse,
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
+import { childSafetyMessage } from '@pencillift/domain/safety';
 import {
   buildResultView,
   childLoadMessage,
   findForbiddenKeys,
+  SAFETY_NOTICE_TITLE,
   statusView,
   verdictView,
 } from './result-view.ts';
@@ -179,6 +181,127 @@ describe('written work (AC_GRADING_03)', () => {
     expect(q.verdict).toMatchObject({ title: 'Feedback is ready', icon: '★', tone: 'info' });
     expect(q.hints).toEqual(['Add one more reason for your choice.']);
     expect(view.summary).toBe('1 with feedback');
+  });
+});
+
+describe('safety template (spec P4; AC_SECURITY_02)', () => {
+  const SAFETY_ID = '36e35e6f-7a8b-4c9d-8e1f-2a3b4c5d6e7f';
+  const HINT_ID = '47f46f7a-8b9c-4d0e-9f2a-3b4c5d6e7f80';
+  // The body comes from the reviewed template; the screen only renders it.
+  const BODY = childSafetyMessage(['self_harm'], '8-10');
+
+  function flagged(
+    status: ChildAssignmentDetailResponse['assignment']['status'],
+    feedback: { id: string; kind: 'safety' | 'hint'; body: string }[],
+  ) {
+    return childAssignmentDetailResponseSchema.parse({
+      assignment: {
+        id: '8b3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f60',
+        subjectId: null,
+        status,
+        pageCount: 1,
+        createdAt: AT,
+        updatedAt: AT,
+      },
+      questions: [
+        {
+          id: Q1,
+          questionNumber: '1',
+          promptText: 'Why do plants need sunlight?',
+          studentAnswerText: 'synthetic answer',
+          verdict: 'incorrect',
+          feedback,
+        },
+        {
+          id: Q2,
+          questionNumber: '2',
+          promptText: 'What is 2 + 5?',
+          studentAnswerText: '7',
+          verdict: 'correct',
+          feedback: [],
+        },
+      ],
+    });
+  }
+
+  it('renders the safety template as its own calm notice, not as a hint or a “Try again”', () => {
+    const view = buildResultView(flagged('ready', [{ id: SAFETY_ID, kind: 'safety', body: BODY }]));
+    const q = view.questions[0]!;
+    expect(q.safety).toEqual({
+      title: 'Let’s talk with a grown-up',
+      body: BODY,
+      feedbackId: SAFETY_ID,
+      accessibilityLabel: `Question 1: Let’s talk with a grown-up. ${BODY}`,
+    });
+    expect(q.hints).toEqual([]);
+    expect(q.verdict).toMatchObject({ title: 'Let’s talk with a grown-up', tone: 'help' });
+    expect(q.verdict.title).not.toMatch(/try again|wrong|correct/i);
+    expect(view.questions[1]!.safety).toBeNull();
+    // A child in distress does not need a score line next to the notice.
+    expect(view.summary).toBeNull();
+    expect(findForbiddenKeys(view)).toEqual([]);
+  });
+
+  it('puts the template in the header and body the results screen already renders', () => {
+    // results.tsx renders status.title as the page header and status.body under it, so the child
+    // sees the help lines (988 / Childhelp / 911) even before a per-question card is wired.
+    const view = buildResultView(flagged('ready', [{ id: SAFETY_ID, kind: 'safety', body: BODY }]));
+    expect(view.status).toEqual({
+      title: 'Let’s talk with a grown-up',
+      body: BODY,
+      showResults: true,
+      inProgress: false,
+    });
+    expect(view.status.body).toContain('988');
+    expect(view.status.body).toContain('911');
+    const plain = buildResultView(flagged('ready', []));
+    expect(plain.status.title).toBe('Your results are ready');
+  });
+
+  it('shows every distinct template once when several answers were flagged', () => {
+    const abuse = childSafetyMessage(['abuse'], '8-10');
+    const parsed = flagged('needs_parent_review', [{ id: SAFETY_ID, kind: 'safety', body: BODY }]);
+    const detail = {
+      ...parsed,
+      questions: [
+        parsed.questions[0]!,
+        {
+          ...parsed.questions[1]!,
+          feedback: [{ id: HINT_ID, kind: 'safety' as const, body: abuse }],
+        },
+      ],
+    };
+    const view = buildResultView(detail);
+    expect(view.status.title).toBe('Let’s talk with a grown-up');
+    expect(view.status.body).toBe(`${BODY}\n\n${abuse}`);
+    expect(view.status.body).toContain('988');
+    expect(view.status.body).toContain('1-800-422-4453');
+  });
+
+  it('hides coaching from an earlier transcription next to the safety notice', () => {
+    const view = buildResultView(
+      flagged('ready', [
+        { id: HINT_ID, kind: 'hint', body: 'Try again slowly.' },
+        { id: SAFETY_ID, kind: 'safety', body: BODY },
+      ]),
+    );
+    expect(view.questions[0]!.hints).toEqual([]);
+    expect(view.questions[0]!.safety?.body).toBe(BODY);
+  });
+
+  it('shows nothing while the scan is still being checked', () => {
+    const view = buildResultView(
+      flagged('checking', [{ id: SAFETY_ID, kind: 'safety', body: BODY }]),
+    );
+    expect(view.questions[0]!.safety).toBeNull();
+    expect(view.questions[0]!.verdict.title).toBe('Still checking');
+  });
+
+  it('the notice copy never claims an alert and never asks for secrecy', () => {
+    const view = buildResultView(flagged('ready', [{ id: SAFETY_ID, kind: 'safety', body: BODY }]));
+    const text = JSON.stringify(view.questions[0]!.safety);
+    expect(text).not.toMatch(/alerted|notified|we told|told your|secret between/i);
+    expect(SAFETY_NOTICE_TITLE).toBe('Let’s talk with a grown-up');
   });
 });
 

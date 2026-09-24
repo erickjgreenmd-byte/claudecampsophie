@@ -40,6 +40,15 @@ import {
   type ObjectiveQuestion,
 } from '@pencillift/domain/grading';
 import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
+import {
+  childSafetyMessage,
+  heldFromFamily,
+  SAFETY_SCREEN_VERSION,
+  SAFETY_TEMPLATES_VERSION,
+  screenModelOutput,
+  screenQuestion,
+  type SafetyScreen,
+} from '@pencillift/domain/safety';
 import type { Tx } from '../db.ts';
 import type { StorageProvider } from '../providers/index.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
@@ -63,6 +72,22 @@ import { childRubricFeedback } from './rubric-feedback.ts';
  * admitted against the owner's spend ceiling first. Child-facing text is released only after the
  * answer guard passes; otherwise a reviewed template is shown. Nothing here logs homework text,
  * answers or child identifiers.
+ *
+ * Child safety (spec P4; AC_SECURITY_02), moderation before and after generation:
+ * - Before coaching, every extracted question's answer and printed prompt pass the deterministic
+ *   screen (@pencillift/domain/safety). A severe-risk result gets NO further model call for that
+ *   question: the child sees the reviewed safety template (feedback kind 'safety') and an escalated
+ *   SYSTEM safety report is filed (ids and screen codes only; runbook 5.1). One of each per question
+ *   per transcription, so a crash replay or recheck adds nothing.
+ * - After generation, a coaching packet that screens severe (companion persona, diagnosis,
+ *   secrecy, contact, an ungrounded sensitive topic, ...) falls back to the reviewed template, and a
+ *   rubric label that screens severe is dropped. Only codes are logged.
+ * - A report whose screen codes include abuse, sexual or secrecy starts held from the family's list
+ *   (runbook 5.1: the concern may involve someone in the household); the owner releases it.
+ * Decision: grading is unchanged and a severe screen does not move the scan to parent review. The
+ * parent review loop (routes/homework.ts settleParentReview) only settles undecided verdicts, so a
+ * status with no open question could never be cleared; the escalated system report in the family's
+ * report list is the parent-facing signal, and no alert is claimed.
  */
 
 export const GRADER_VERSION = 'scan.v1';
@@ -166,6 +191,29 @@ interface Graded {
 // ---------------------------------------------------------------------------------------------
 // Pure helpers (exported for tests)
 // ---------------------------------------------------------------------------------------------
+
+/** The one child-facing step a graded question gets after grading. */
+export type FeedbackStep = 'safety' | 'coach' | 'rubric' | 'none';
+
+/**
+ * Exactly one step per question. A severe screen always wins (spec P4: moderation before
+ * generation), so nothing is sent to a model for that question and no coaching or rubric rows can
+ * follow the safety template, whatever the verdict or a parent's override. Otherwise a parent's
+ * override is authoritative (no "try again" on an answer a grown-up settled, RV-lead-jobs-ai-19),
+ * incorrect answers are coached and written work gets its rubric rows (AC_GRADING_03).
+ */
+export function feedbackStep(input: {
+  readonly severe: boolean;
+  readonly final: Graded['final'];
+  readonly hasPrivate: boolean;
+  readonly parentOverride: ParentVerdict | null;
+}): FeedbackStep {
+  if (input.severe) return 'safety';
+  if (!input.hasPrivate || input.parentOverride !== null) return 'none';
+  if (input.final === 'incorrect') return 'coach';
+  if (input.final === 'rubric') return 'rubric';
+  return 'none';
+}
 
 /**
  * An answer key computed WITHOUT any model: a printed prompt that is a bare arithmetic expression
@@ -355,6 +403,25 @@ function toBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
   return btoa(binary);
+}
+
+/** Screen categories a system report may carry (child text; mirrors migration 0760). */
+const REPORT_CATEGORIES: ReadonlySet<string> = new Set([
+  'self_harm',
+  'abuse',
+  'violence',
+  'sexual',
+  'secrecy',
+  'personal_contact',
+]);
+
+function isReportCategory(category: string): boolean {
+  return REPORT_CATEGORIES.has(category);
+}
+
+/** A payload-free log code for a severe screen (its first category). */
+function safetyCode(screen: SafetyScreen): string {
+  return `SAFETY_${(screen.categories[0] ?? 'unknown').toUpperCase()}`;
 }
 
 const FEEDBACK_KIND: Readonly<
@@ -1159,13 +1226,22 @@ class ScanRun {
     });
 
     for (const g of graded) {
-      // A parent's override is authoritative: no "try again" coaching on an answer shown as
-      // settled by a grown-up (RV-lead-jobs-ai-19).
-      if (g.final === 'incorrect' && g.private && g.question.parent_override === null)
-        await this.coach(g);
-      // Written work: the child sees the rubric's criteria in fixed wording (AC_GRADING_03).
-      if (g.final === 'rubric' && g.private && g.question.parent_override === null)
-        await this.rubricFeedback(g);
+      // Moderation before generation: a severe-risk answer or prompt is never sent to the tutor.
+      const screen = screenQuestion({
+        prompt: g.question.prompt,
+        answer: g.question.answer,
+        subject: g.question.subject_key,
+        ageBand: this.ctx.ageBand,
+      });
+      const step = feedbackStep({
+        severe: screen.level === 'severe',
+        final: g.final,
+        hasPrivate: g.private !== null,
+        parentOverride: g.question.parent_override,
+      });
+      if (step === 'safety') await this.safetyResponse(g, screen);
+      else if (step === 'coach') await this.coach(g);
+      else if (step === 'rubric') await this.rubricFeedback(g);
     }
 
     const needsReview =
@@ -1280,6 +1356,22 @@ class ScanRun {
             options: { evaluateExpressions: true },
           });
           if (decision.decision === 'release') {
+            // Moderation after generation, grounded in the printed question and its subject.
+            const safety = screenModelOutput(
+              [...packet.steps.map((s) => s.text), packet.retryPrompt],
+              {
+                ageBand: this.ctx.ageBand,
+                context: { prompt: g.question.prompt, subject: g.question.subject_key },
+              },
+            );
+            if (safety.level === 'severe') {
+              this.deps.log({
+                level: 'warn',
+                event: 'coaching_blocked_by_safety',
+                code: safetyCode(safety),
+              });
+              return null;
+            }
             return [
               ...packet.steps.map((s) => ({ kind: FEEDBACK_KIND[s.kind], body: s.text })),
               { kind: 'encouragement', body: packet.retryPrompt },
@@ -1319,7 +1411,12 @@ class ScanRun {
    * asks the child to go over the writing with a grown-up.
    */
   private async rubricFeedback(g: Graded): Promise<void> {
-    const rows = childRubricFeedback(g.private?.rubric ?? null);
+    const rows = childRubricFeedback(g.private?.rubric ?? null, {
+      ageBand: this.ctx.ageBand,
+      context: { prompt: g.question.prompt, subject: g.question.subject_key },
+      onSafetyReject: (code) =>
+        this.deps.log({ level: 'warn', event: 'rubric_label_blocked_by_safety', code }),
+    });
     if (rows.length === 0) return;
     await this.guardedWrite(async (tx) => {
       const [existing] = await tx<{ n: number }[]>`
@@ -1335,6 +1432,67 @@ class ScanRun {
         `;
       }
     });
+  }
+
+  /**
+   * A severe-risk answer (spec P4; AC_SECURITY_02): the reviewed safety template for the child and
+   * an escalated system report for the owner's queue, in one transaction, once per question per
+   * transcription (a replay finds both and adds nothing). No model call is made for the question.
+   * The report holds ids, the screen's category codes and versions: never homework text.
+   */
+  private async safetyResponse(g: Graded, screen: SafetyScreen): Promise<void> {
+    const categories = screen.categories.filter(isReportCategory);
+    // Runbook 5.1: abuse-type codes may involve someone in the household, so the report starts
+    // held from the family's list and its audit row carries no family_id (family members can read
+    // their family's audit log) until the owner releases it.
+    const held = heldFromFamily(screen.categories);
+    const body = childSafetyMessage(screen.categories, this.ctx.ageBand);
+    const filed = await this.guardedWrite(async (tx) => {
+      const [question] = await tx<{ transcription_at: Date; corrected_at: Date | null }[]>`
+        select coalesce(corrected_at, created_at) as transcription_at, corrected_at
+          from public.extracted_questions
+         where id = ${g.question.id} and family_id = ${this.ctx.familyId}`;
+      if (!question) return false;
+      const [existing] = await tx<{ id: string }[]>`
+        select id from public.child_feedback
+         where question_id = ${g.question.id} and kind = 'safety'
+           and created_at >= coalesce(${question.corrected_at}::timestamptz, '-infinity'::timestamptz)
+         order by created_at desc limit 1`;
+      let feedbackId = existing?.id;
+      if (feedbackId === undefined) {
+        const [created] = await tx<{ id: string }[]>`
+          insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
+          values (${g.question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, 'safety', ${body},
+                  ${SAFETY_TEMPLATES_VERSION})
+          returning id`;
+        feedbackId = created!.id;
+      }
+      if (categories.length === 0) return false;
+      const [report] = await tx<{ id: string }[]>`
+        insert into public.safety_reports
+          (family_id, child_id, reporter_kind, category, question_id, feedback_id, status,
+           transcription_at, screen_categories, screen_version, family_visible)
+        values (${this.ctx.familyId}, ${this.ctx.childId}, 'system', 'severe_risk', ${g.question.id},
+                ${feedbackId}, 'escalated', ${question.transcription_at}, ${categories}::text[],
+                ${SAFETY_SCREEN_VERSION}, ${!held})
+        on conflict (question_id, transcription_at) where reporter_kind = 'system' do nothing
+        returning id`;
+      if (!report) return false;
+      await tx`
+        insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+        values (${held ? null : this.ctx.familyId}, 'system', 'safety_report.created', 'safety_report', ${report.id},
+                ${JSON.stringify({ category: 'severe_risk', source: 'safety_screen', screenVersion: SAFETY_SCREEN_VERSION })}::text::jsonb)`;
+      return true;
+    });
+    if (filed) {
+      for (const category of screen.categories) {
+        this.deps.log({
+          level: 'warn',
+          event: 'safety_screen_severe',
+          code: `SAFETY_${category.toUpperCase()}`,
+        });
+      }
+    }
   }
 
   // ---- recheck after a parent correction ------------------------------------------------------

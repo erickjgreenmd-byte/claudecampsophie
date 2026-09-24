@@ -1,5 +1,6 @@
 import { validateZdrEvidence } from '@pencillift/ai';
 import { isValidIanaZone } from '@pencillift/domain';
+import { SAFETY_TEMPLATES_APPROVED, SAFETY_TEMPLATES_STATUS } from '@pencillift/domain/safety';
 import type { Db } from './db.ts';
 
 /**
@@ -355,7 +356,17 @@ export function productionReadiness(
     item(
       'email_provider',
       false,
-      'Transactional email adapter not implemented; guardian invitations use a development outbox',
+      'Transactional email adapter not implemented; outside development/test invitations and notices cannot be sent',
+    ),
+    item(
+      'safety_templates',
+      SAFETY_TEMPLATES_APPROVED,
+      `Child safety messages and parent wording (${SAFETY_TEMPLATES_STATUS}), the family-hold default and the runbook 5.1 escalation steps need owner, educator and counsel approval`,
+    ),
+    item(
+      'ai_moderation',
+      false,
+      'Provider moderation (OpenAI moderation endpoint) before and after generation is not wired; only the deterministic first-layer safety screen runs',
     ),
     item(
       'parent_jwt_keys',

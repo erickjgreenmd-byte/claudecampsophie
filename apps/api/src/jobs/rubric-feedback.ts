@@ -10,7 +10,17 @@
  * quotation marks, links or email addresses. Anything else is dropped, so a label can never carry
  * an example sentence or paragraph to copy. When no label passes, the child gets no rubric rows and
  * the app asks them to go over the writing with a grown-up.
+ *
+ * Moderation after generation (spec P4; AC_SECURITY_02): a label is model output, so each one also
+ * passes the child-safety screen for model output, grounded in the writing prompt and subject. A
+ * label that screens severe (companion persona, secrecy, contact, a sensitive topic the prompt did
+ * not raise, ...) is dropped; the caller is told a code, never the label.
  */
+import {
+  screenModelOutput,
+  type SafetyAgeBand,
+  type ScreenContext,
+} from '@pencillift/domain/safety';
 
 export const MAX_RUBRIC_FEEDBACK_ROWS = 4;
 const MAX_LABEL_CHARS = 80;
@@ -40,11 +50,22 @@ export function childCriterionLabel(raw: unknown): string | null {
   return label;
 }
 
+export interface RubricSafetyOptions {
+  /** The writing prompt and subject the labels must stay grounded in. */
+  readonly context?: ScreenContext;
+  readonly ageBand?: SafetyAgeBand | null;
+  /** Called with a payload-free code for every label the safety screen drops. */
+  readonly onSafetyReject?: (code: string) => void;
+}
+
 /**
  * The rubric rows a child sees for one written answer: unmet criteria first (the next step matters
  * most), at most MAX_RUBRIC_FEEDBACK_ROWS, each label once. Invalid input yields no rows.
  */
-export function childRubricFeedback(rubric: unknown): RubricFeedbackRow[] {
+export function childRubricFeedback(
+  rubric: unknown,
+  options: RubricSafetyOptions = {},
+): RubricFeedbackRow[] {
   if (!Array.isArray(rubric)) return [];
   const next: RubricFeedbackRow[] = [];
   const praise: RubricFeedbackRow[] = [];
@@ -55,6 +76,14 @@ export function childRubricFeedback(rubric: unknown): RubricFeedbackRow[] {
     if (typeof met !== 'boolean') continue;
     const label = childCriterionLabel(criterion);
     if (label === null) continue;
+    const screen = screenModelOutput([label], {
+      ageBand: options.ageBand ?? null,
+      context: options.context ?? {},
+    });
+    if (screen.level === 'severe') {
+      options.onSafetyReject?.(`SAFETY_${screen.categories[0]!.toUpperCase()}`);
+      continue;
+    }
     const key = label.toLocaleLowerCase('en-US');
     if (seen.has(key)) continue;
     seen.add(key);

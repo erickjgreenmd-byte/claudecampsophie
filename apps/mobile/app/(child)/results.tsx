@@ -158,6 +158,20 @@ function ResultDetail({ id }: { id: string }) {
                 </Text>
                 <Text style={styles.chipText}>{q.verdict.title}</Text>
               </View>
+              {/* A flagged answer: the calm message is the page body above; this opens the help
+                  screen with the question and message attached (AC_SECURITY_02). */}
+              {q.safety ? (
+                <Button
+                  label="Get help"
+                  secondary
+                  onPress={() =>
+                    router.push({
+                      pathname: '/help',
+                      params: { questionId: q.id, feedbackId: q.safety!.feedbackId },
+                    })
+                  }
+                />
+              ) : null}
               {q.hints.map((hint, i) => (
                 <Text key={i} style={styles.hint}>
                   <Text style={styles.label}>Hint: </Text>

@@ -18,6 +18,7 @@
     "./rewards": "./src/rewards/index.ts",
     "./grading": "./src/grading/index.ts",
     "./answer-guard": "./src/answer-guard/index.ts",
+    "./safety": "./src/safety/index.ts",
     "./learning": "./src/learning/index.ts",
     "./scheduling": "./src/scheduling/index.ts",
     "./monetization": "./src/monetization/index.ts",

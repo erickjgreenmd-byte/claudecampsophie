@@ -1391,9 +1391,10 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
                 question_id: string;
                 kind: ChildAssignmentDetailResponse['questions'][number]['feedback'][number]['kind'];
                 body: string;
+                created_at: Date;
               }[]
             >`
-              select id, question_id, kind, body from public.child_feedback
+              select id, question_id, kind, body, created_at from public.child_feedback
                where child_id = ${child.childId} and question_id = any(${ids}::uuid[])
                order by created_at`;
       return { assignment, questions, feedback };
@@ -1401,8 +1402,10 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     if (!data) throw new ApiError('NOT_FOUND', 'We couldn’t find that scan.');
     // Decision: pl_child has no column grant for parent overrides or corrected transcriptions, so
     // this one narrowly scoped service read applies them (the child must not be told "Try again"
-    // after a grown-up confirmed the answer). Only these three columns are read, scoped to the
-    // child's own questions; see schemaRequests for the grant that would move it under pl_child.
+    // after a grown-up confirmed the answer). Only these columns are read, scoped to the child's
+    // own questions; see schemaRequests for the grant that would move it under pl_child. The
+    // correction time keeps feedback to the current transcription: a hint or safety notice written
+    // for the answer as first read is not shown after a grown-up corrected it.
     const corrections =
       data.questions.length === 0
         ? []
@@ -1412,10 +1415,12 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
                 id: string;
                 corrected_prompt_text: string | null;
                 corrected_student_answer_text: string | null;
+                corrected_at: Date | null;
                 parent_override_verdict: GradedVerdict | null;
               }[]
             >`
-              select q.id, q.corrected_prompt_text, q.corrected_student_answer_text, r.parent_override_verdict
+              select q.id, q.corrected_prompt_text, q.corrected_student_answer_text, q.corrected_at,
+                     r.parent_override_verdict
                 from public.extracted_questions q
                 left join public.question_results r on r.question_id = q.id
                where q.assignment_id = ${id} and q.child_id = ${child.childId}
@@ -1439,7 +1444,11 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
           verdict: showResults ? (fix?.parent_override_verdict ?? q.verdict) : null,
           feedback: showResults
             ? data.feedback
-                .filter((f) => f.question_id === q.id)
+                .filter(
+                  (f) =>
+                    f.question_id === q.id &&
+                    (!fix?.corrected_at || f.created_at >= fix.corrected_at),
+                )
                 .map((f) => ({ id: f.id, kind: f.kind, body: f.body }))
             : [],
         };

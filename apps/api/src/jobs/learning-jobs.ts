@@ -39,6 +39,7 @@ import {
   type ReviewNote,
 } from '@pencillift/domain/learning';
 import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
+import { screenModelOutput, type SafetyScreen } from '@pencillift/domain/safety';
 import {
   addCalendarDays,
   dailyPracticeState,
@@ -83,6 +84,12 @@ import {
  * (re-rendered by the bank with the same numbers and re-validated) and write one intro line that
  * must pass the leak guard. Anything that fails keeps the bank item unchanged. Every AI attempt is
  * metered. Without a client the bank-only path is the full, honest behavior.
+ *
+ * Moderation after generation (spec P4; AC_SECURITY_02): every re-themed story and the intro also
+ * pass the child-safety screen for model output. A story is grounded in its own bank prompt and an
+ * intro in nothing, so a story or intro that brings in any sensitive topic, a companion persona,
+ * secrecy or contact request is refused and the reviewed bank item (or no intro) is used. Only a
+ * code is logged.
  *
  * Logs carry ids and codes only: never questions, answers, child names or tokens.
  */
@@ -549,6 +556,15 @@ async function recordUsage(
   }
 }
 
+/** Payload-free log line for model output the safety screen refused (never the text). */
+function logSafetyBlock(deps: JobDeps, screen: SafetyScreen): void {
+  deps.log({
+    level: 'warn',
+    event: 'practice_ai_blocked_by_safety',
+    code: `SAFETY_${(screen.categories[0] ?? 'unknown').toUpperCase()}`,
+  });
+}
+
 /**
  * One bounded request that may re-theme word problems and add an intro line. Fails closed to the
  * unchanged bank items on no client, no consent, the ZDR gate, the spend ceiling, any provider or
@@ -660,12 +676,29 @@ export async function personalizeItems(
       rejected += 1;
       continue;
     }
+    const safety = screenModelOutput([themed.prompt.text], {
+      ageBand: ctx.ageBand,
+      context: { prompt: original.prompt.text, subject: original.subject },
+    });
+    if (safety.level === 'severe') {
+      logSafetyBlock(deps, safety);
+      rejected += 1;
+      continue;
+    }
     next[index] = themed;
     rethemed += 1;
   }
   // Content check first (charset + denylist: no credentials, grown-up roles, answers, contact
-  // details or money; review finding RV-learning-api-7), then the answer-leak guard.
+  // details or money; review finding RV-learning-api-7), then the child-safety screen (an intro has
+  // no question, so any sensitive topic is off-task), then the answer-leak guard.
   let intro: string | null = validateIntro(result.intro);
+  if (intro !== null) {
+    const safety = screenModelOutput([intro], { ageBand: ctx.ageBand, context: {} });
+    if (safety.level === 'severe') {
+      logSafetyBlock(deps, safety);
+      intro = null;
+    }
+  }
   // The guard takes at most 32 protected answers per call: check the intro against every batch.
   const answers = items.flatMap((item) => protectedAnswersFor(item.answerSpec));
   const batches: (typeof answers)[] = [];

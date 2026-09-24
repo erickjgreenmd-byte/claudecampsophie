@@ -158,6 +158,58 @@ export const CHILD_REPORT_CATEGORIES = [
 export const childReportCategorySchema = z.enum(CHILD_REPORT_CATEGORIES);
 export type ChildReportCategory = z.infer<typeof childReportCategorySchema>;
 
+/**
+ * Categories only PencilLift's safety screen files (migration 0760: `reporter_kind = 'system'`).
+ * They are never offered to, or accepted from, a parent or child.
+ */
+export const SYSTEM_SAFETY_REPORT_CATEGORIES = ['severe_risk'] as const;
+
+/** Every category a listed report can carry. */
+export const LISTED_SAFETY_REPORT_CATEGORIES = [
+  ...SAFETY_REPORT_CATEGORIES,
+  ...SYSTEM_SAFETY_REPORT_CATEGORIES,
+] as const;
+export const listedSafetyReportCategorySchema = z.enum(LISTED_SAFETY_REPORT_CATEGORIES);
+export type ListedSafetyReportCategory = z.infer<typeof listedSafetyReportCategorySchema>;
+
+/** Who filed a report. `system`: the safety screen flagged a child's answer (never a client). */
+export const safetyReportReporterKindSchema = z.enum(['child', 'parent', 'system']);
+export type SafetyReportReporterKind = z.infer<typeof safetyReportReporterKindSchema>;
+
+/**
+ * Screen category codes a system report may carry (mirrors the 0760 check and the child-text
+ * categories of @pencillift/domain/safety). Shown to the owner admin only, never to the family.
+ */
+export const SAFETY_SCREEN_REPORT_CATEGORIES = [
+  'self_harm',
+  'abuse',
+  'violence',
+  'sexual',
+  'secrecy',
+  'personal_contact',
+] as const;
+export const safetyScreenReportCategorySchema = z.enum(SAFETY_SCREEN_REPORT_CATEGORIES);
+
+/**
+ * Parent-facing wording for a system report in the family's report list (spec P4; AC_SECURITY_02).
+ * DRAFT: the owner and an educator must approve it before launch, with the child templates
+ * (@pencillift/domain/safety SAFETY_TEMPLATES_STATUS). It lives here, not in the domain module, so
+ * the parent web bundle never loads the safety screen's rules.
+ *
+ * Honest by construction (AC_SECURITY_02 "notification claims match actual deliveries"): it states
+ * what the product does, never what the child saw (opening the results is not recorded), and that
+ * PencilLift sent no AUTOMATIC alert (a reviewer may still contact the family by email under
+ * runbook 5.1, which this wording stays true for). It does not name the kind of concern.
+ */
+export const PARENT_SAFETY_FLAG_COPY = {
+  category: 'Answer flagged for a grown-up',
+  reporter: 'Flagged by PencilLift',
+  summary:
+    'PencilLift flagged an answer for a grown-up to look at. For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint. PencilLift sent no automatic alert (no email, text or notification); this list is where the flag appears. Please check in with your child.',
+  resources:
+    'If your child may be in danger, call 911. Support is available any time from the 988 Suicide & Crisis Lifeline (call or text 988) and the Childhelp National Child Abuse Hotline (1-800-422-4453).',
+} as const;
+
 export const safetyReportStatusSchema = z.enum(['open', 'triaged', 'escalated', 'resolved']);
 export type SafetyReportStatus = z.infer<typeof safetyReportStatusSchema>;
 
@@ -172,11 +224,15 @@ export const createSafetyReportRequestSchema = z.strictObject({
 });
 export type CreateSafetyReportRequest = z.infer<typeof createSafetyReportRequestSchema>;
 
-/** A report as the family's guardians see it. */
+/**
+ * A report as the family's guardians see it. A system report (`reporterKind: 'system'`,
+ * `category: 'severe_risk'`) links the flagged question; it never carries a note or homework text,
+ * and which kind of concern the screen matched is not included.
+ */
 export const safetyReportSchema = z.strictObject({
   id: uuidSchema,
-  reporterKind: z.enum(['child', 'parent']),
-  category: safetyReportCategorySchema,
+  reporterKind: safetyReportReporterKindSchema,
+  category: listedSafetyReportCategorySchema,
   childId: uuidSchema.nullable(),
   questionId: uuidSchema.nullable(),
   note: z.string().nullable(),
@@ -210,15 +266,23 @@ export type ChildReportResponse = z.infer<typeof childReportResponseSchema>;
 
 // ---------------------------------------------------------------------------------------------
 // Owner admin report queue: ids, category, status and timestamps only — never homework text,
-// child nicknames or the parent's free-text note (it may quote homework).
+// child nicknames or the parent's free-text note (it may quote homework). System reports add the
+// screen's category codes so reviewers can follow the right escalation step.
 // ---------------------------------------------------------------------------------------------
 
 export const adminSafetyReportSchema = z.strictObject({
   id: uuidSchema,
   familyId: uuidSchema,
   childId: uuidSchema.nullable(),
-  reporterKind: z.enum(['child', 'parent']),
-  category: safetyReportCategorySchema,
+  reporterKind: safetyReportReporterKindSchema,
+  category: listedSafetyReportCategorySchema,
+  /** System reports only: the screen's category codes (never the matched text); else null. */
+  screenCategories: z.array(safetyScreenReportCategorySchema).nullable(),
+  /**
+   * False while a system report is held from the family's list (screen codes abuse, sexual or
+   * secrecy; runbook 5.1). Always true for child and parent reports.
+   */
+  familyVisible: z.boolean(),
   questionId: uuidSchema.nullable(),
   feedbackId: uuidSchema.nullable(),
   hasNote: z.boolean(),
@@ -235,10 +299,19 @@ export const adminSafetyReportsResponseSchema = z.strictObject({
 });
 export const adminSafetyReportResponseSchema = z.strictObject({ report: adminSafetyReportSchema });
 
-export const updateSafetyReportRequestSchema = z.strictObject({
-  status: z.enum(['triaged', 'escalated', 'resolved']),
-  resolutionNote: z.string().trim().min(1).max(RESOLUTION_NOTE_MAX_LENGTH).optional(),
-});
+/**
+ * PATCH /v1/admin/safety-reports/:id. A status move, a release of a held system report to the
+ * family's list (`familyVisible: true`; forward only, a report is never hidden again), or both.
+ */
+export const updateSafetyReportRequestSchema = z
+  .strictObject({
+    status: z.enum(['triaged', 'escalated', 'resolved']).optional(),
+    resolutionNote: z.string().trim().min(1).max(RESOLUTION_NOTE_MAX_LENGTH).optional(),
+    familyVisible: z.literal(true).optional(),
+  })
+  .refine((b) => b.status !== undefined || b.familyVisible !== undefined, {
+    message: 'Provide a status or familyVisible',
+  });
 export type UpdateSafetyReportRequest = z.infer<typeof updateSafetyReportRequestSchema>;
 
 // ---------------------------------------------------------------------------------------------

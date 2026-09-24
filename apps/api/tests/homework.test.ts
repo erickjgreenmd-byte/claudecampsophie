@@ -935,6 +935,28 @@ describe('lists and detail views', () => {
     }
   });
 
+  it('after a correction the child sees only feedback written for the current transcription', async () => {
+    const seeded = await readyScan(fam, token, 0);
+    // The original transcription's hint (and, say, a safety notice) predate the correction; the
+    // recheck writes new feedback for the corrected answer.
+    // (child_feedback is append-only, so time moves forward instead of rows being back-dated.)
+    await api.db.sql`
+      update public.extracted_questions
+         set corrected_student_answer_text = '7/8', corrected_at = now() + interval '1 minute'
+       where id = ${seeded.questionId}`;
+    await api.db.sql`
+      insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version, created_at)
+      values (${seeded.questionId}, ${fam.familyId}, ${fam.children[0]!.id}, 'encouragement',
+              'Nice work checking again!', 'g1', now() + interval '2 minutes')`;
+    const body = childAssignmentDetailResponseSchema.parse(
+      await json(
+        await api.request(`/v1/child/assignments/${seeded.assignmentId}`, { token: riley }),
+      ),
+    );
+    const q1 = body.questions.find((q) => q.id === seeded.questionId)!;
+    expect(q1.feedback.map((f) => f.body)).toEqual(['Nice work checking again!']);
+  });
+
   it('while a scan is still being checked the child sees no verdicts yet', async () => {
     const seeded = await readyScan(fam, token, 0);
     await advance(seeded.assignmentId, ['checking']);
