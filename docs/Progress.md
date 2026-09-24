@@ -4,18 +4,23 @@ Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on 
 Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
 (1–4 paid slots) — unchanged.
 
-## Current state (2026-09-24, after final review round 5)
+## Current state (2026-09-24, after final review round 5; code at `5f02621`, later commits are records only)
 
 Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
 approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
 Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with its gap): integration_tested 33,
-unit_tested 16, db_tested 1, verified_by_inspection 21, mock_only 16, blocked_external 27, in_progress 38,
+unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
 Last local full gate (`scripts/verify.sh`, exit 0) on the round-5 tree: api 845, domain 3,610, db 255, web 406,
 mobile 400, ai 49, contracts 14, ui-tokens 4 (5,583 tests, 0 failed, 0 skipped), gate audit, finance, release-
-artifact scan with negative control. CI: #34 (4a07ac9) and #35 (e123e5c, after 15:00 UTC) green; see
-`docs/Test_Evidence.md` for the run on the latest SHA.
+artifact scan with negative control. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
+there is the source of truth; a records-only commit may still have its run in progress).
+
+Open risks (not hidden by 'closed'): BUG-096 (answers the extraction model inserts into the child's transcription;
+confirmed, mitigated, Owner action #28); BUG-091 and BUG-109 closed with documented residuals (rubric-label
+heuristic limits; the word-list screen misses paraphrases and over-escalates by design); BUG-111 provider
+moderation built but never run live (no key).
 
 ## Done and committed (lead-verified)
 
@@ -34,13 +39,14 @@ artifact scan with negative control. CI: #34 (4a07ac9) and #35 (e123e5c, after 1
 
 ## In flight
 
-- Nothing. Final gate on the latest SHA and the fresh-context resume check (AC_ECC_09) are the remaining steps.
+- Nothing. The fresh-context resume check (AC_ECC_09) ran on 2026-09-24: resumable; its four record fixes are
+  applied.
 
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Fresh-session resume check (AC_ECC_09): a new context reads `CLAUDE.md` and this file and reconciles with Git/CI.
-3. Owner actions in `docs/Owner_Actions.md` (#1–#27) unblock everything else: accounts, consent provider, OpenAI key
+2. Repeat the resume check in the next real session (AC_ECC_09).
+3. Owner actions in `docs/Owner_Actions.md` (#1–#28) unblock everything else: accounts, consent provider, OpenAI key
    and ZDR approval (live moderation and AI), store products and prices, email provider, legal review, spend budget,
    hosted Supabase checks, database production mark, child-safety package approval, moderation-outage rule,
-   reviewer capacity.
+   reviewer capacity, BUG-096 residual.

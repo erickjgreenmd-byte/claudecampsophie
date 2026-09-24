@@ -34,6 +34,7 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 | Provider moderation not live | Built and wired (OpenAI omni-moderation before grading on the child's answers, after generation on coaching, rubric criteria and practice text; fails closed) but exercised only against a labeled mock; readiness keeps `ai_moderation` blocked until a real client is configured. Until then only the deterministic word-list screen reads real text (English plus a few Spanish phrases; misses paraphrases) | OpenAI key + ZDR approval (Owner action #6); confirm the outage rule (Owner action #26) |
 | Database not marked production | The fixture/fake catalog guard activates only once the deployed database is marked; readiness reports `database_environment` blocked | Owner action #21 |
 | Family read access to held safety flags undecided | The child's answer and safety message stay readable to family members through the Data API while a report is held | Owner action #25 (COPPA decision) |
+| Answers can reach the child through the transcription (BUG-096) | Labelled answers in the extraction are withheld; an unlabelled insertion ('(84)', '= 84') in the printed prompt's transcription still shows | Owner action #28 |
 
 ## Gates that are implemented and tested (software level)
 
