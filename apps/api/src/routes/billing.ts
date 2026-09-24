@@ -11,19 +11,20 @@ import {
   monthlyPriceCents,
   priceTable,
 } from '@pencillift/domain';
-import {
-  planDowngrade,
-  type EntitlementStatus,
-  type FamilyCapacity,
-  type ProviderSubscriptionSnapshot,
-} from '@pencillift/domain/entitlements';
+import { planDowngrade } from '@pencillift/domain/entitlements';
 import { readJson } from '../app.ts';
 import type { Tx } from '../db.ts';
 import { ApiError, businessRule } from '../errors.ts';
 import { assertRecentUnlock, currentFamilyId, requireParent } from '../middleware/auth.ts';
-import type { AppDeps, AppEnv } from '../middleware/context.ts';
+import type { AppEnv } from '../middleware/context.ts';
 import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
-import { applySnapshots, resolveUnreachableRedemptions } from '../services/billing-sync.ts';
+import {
+  reconcileFamilyBilling,
+  releaseSlotlessProfiles,
+  reverifyFormerHolders,
+  SubscriptionBoundElsewhere,
+  type FamilyBillingResult,
+} from '../services/billing-sync.ts';
 
 type Ctx = Context<AppEnv>;
 type Channel = 'app_store' | 'play_store' | 'stripe';
@@ -60,16 +61,6 @@ const STORE_NAME: Record<Channel, string> = {
   play_store: 'Google Play',
   stripe: 'Web billing',
 };
-
-/** Provider states after which a subscription can never grant again without a new observation. */
-const TERMINAL_STATUSES: ReadonlySet<EntitlementStatus> = new Set([
-  'expired',
-  'revoked',
-  'refunded',
-]);
-
-/** How many other families one new claim may trigger a re-verification for (RV-billing-1). */
-const MAX_FORMER_HOLDERS = 3;
 
 function childrenLabel(count: number): string {
   return count === 1 ? '1 child' : `${count} children`;
@@ -212,231 +203,6 @@ function statusFor(c: Ctx, familyId: string): Promise<BillingStatus> {
   return deps.db.asParent(parent, (tx) => loadStatus(tx, familyId, deps.config.billingEnvironment));
 }
 
-/**
- * Marks the parent's open requests as applied once verified capacity reflects them. This only
- * updates the request record; paid capacity itself was already computed from provider state.
- */
-export async function settleCapacityChanges(
-  tx: Tx,
-  familyId: string,
-  paidSlots: number,
-): Promise<void> {
-  await tx`
-    update public.capacity_changes set status = 'applied'
-     where family_id = ${familyId}
-       and ((kind = 'upgrade' and status = 'pending_purchase' and to_slots <= ${paidSlots})
-         or (kind = 'downgrade' and status = 'scheduled' and ${paidSlots} > 0 and ${paidSlots} <= to_slots))
-  `;
-}
-
-/**
- * RV-billing-2: `active` means "holds a paid slot" (child_profiles, migration 0001). When verified
- * provider state (expiry, revocation, a store-confirmed downgrade) released a child's slot, the
- * profile goes back to `draft`: paid AI and practice stop for it (spec P11 "stop paid AI for
- * inactive profiles"), its history, exports and rewards are kept, and the parent can later assign an
- * unused paid slot to it again without a new purchase (AC_CAPACITY_03). Profiles that never held a
- * slot and slots the parent released by archiving are left alone. Idempotent; call it inside the
- * transaction that holds the family row lock.
- */
-export async function releaseSlotlessProfiles(tx: Tx, familyId: string): Promise<string[]> {
-  const released = await tx<{ id: string }[]>`
-    update public.child_profiles c set status = 'draft'
-     where c.family_id = ${familyId} and c.status = 'active'
-       and not exists (select 1 from public.child_slot_assignments s
-                        where s.family_id = c.family_id and s.child_id = c.id and s.released_at is null)
-       and (select s.release_reason from public.child_slot_assignments s
-             where s.family_id = c.family_id and s.child_id = c.id
-             order by s.released_at desc limit 1) in ('expired', 'downgrade')
-    returning c.id
-  `;
-  for (const child of released) {
-    await tx`
-      insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
-      values (${familyId}, 'system', 'child.paid_slot_released', 'child', ${child.id})
-    `;
-  }
-  return released.map((child) => child.id);
-}
-
-interface LedgerRow {
-  channel: Channel;
-  provider_subscription_id: string;
-  product_id: string;
-  status: EntitlementStatus;
-  environment: BillingEnvironment;
-  period_start: Date;
-  period_end: Date;
-  provider_updated_at: Date;
-}
-
-function ledgerKey(channel: string, providerSubscriptionId: string): string {
-  return JSON.stringify([channel, providerSubscriptionId]);
-}
-
-/**
- * RV-billing-1: a COMPLETE provider fetch that no longer lists one of the family's subscriptions
- * means the provider moved it to another subscriber (a RevenueCat restore/transfer) or removed it.
- * It must stop granting here, or one store purchase would give two families paid capacity. The row
- * is re-observed as `revoked` with the provider's own last-modified instant unchanged and a new
- * observation time: this observation wins over the stored one, and a later fetch that lists the
- * subscription again (moved back) is newer still and restores it. History is kept.
- */
-function vanishedSnapshots(
-  before: readonly LedgerRow[],
-  fetched: readonly ProviderSubscriptionSnapshot[],
-  environment: BillingEnvironment,
-  now: Date,
-): ProviderSubscriptionSnapshot[] {
-  const listed = new Set(fetched.map((s) => ledgerKey(s.channel, s.providerSubscriptionId)));
-  return before
-    .filter(
-      (r) =>
-        r.environment === environment &&
-        !TERMINAL_STATUSES.has(r.status) &&
-        !listed.has(ledgerKey(r.channel, r.provider_subscription_id)),
-    )
-    .map((r) => ({
-      channel: r.channel,
-      providerSubscriptionId: r.provider_subscription_id,
-      productId: r.product_id,
-      status: 'revoked' as const,
-      periodStart: r.period_start,
-      periodEnd: r.period_end,
-      autoRenew: false,
-      environment: r.environment,
-      providerUpdatedAt: r.provider_updated_at,
-      fetchedAt: now,
-    }));
-}
-
-/** A live subscription this reconciliation newly added to the family's ledger. */
-interface NewClaim {
-  readonly channel: Channel;
-  readonly productId: string;
-  readonly environment: BillingEnvironment;
-  readonly periodStart: Date;
-  readonly periodEnd: Date;
-}
-
-export interface FamilyBillingResult {
-  readonly capacity: FamilyCapacity;
-  readonly newClaims: readonly NewClaim[];
-}
-
-/**
- * Reconciles one family from a COMPLETE provider fetch of its billing ref (never a single event's
- * payload). Must run inside a transaction that already holds the family row lock. Throws the
- * applySnapshots BUG-006 error when a subscription is bound to another family.
- */
-export async function reconcileFamilyBilling(
-  tx: Tx,
-  familyId: string,
-  snapshots: readonly ProviderSubscriptionSnapshot[],
-  environment: BillingEnvironment,
-  now: Date,
-): Promise<FamilyBillingResult> {
-  const before = await tx<LedgerRow[]>`
-    select channel, provider_subscription_id, product_id, status, environment, period_start, period_end,
-           provider_updated_at
-      from public.family_entitlements
-     where family_id = ${familyId} and period_start is not null and period_end is not null
-  `;
-  const vanished = vanishedSnapshots(before, snapshots, environment, now);
-  const capacity = await applySnapshots(
-    tx,
-    familyId,
-    [...snapshots, ...vanished],
-    environment,
-    now,
-  );
-  await releaseSlotlessProfiles(tx, familyId);
-  // A redemption whose target period can no longer happen is resolved now (RV-2).
-  await resolveUnreachableRedemptions(tx, now, familyId);
-  await settleCapacityChanges(tx, familyId, capacity.paidSlots);
-  const known = new Set(before.map((r) => ledgerKey(r.channel, r.provider_subscription_id)));
-  const newClaims = snapshots
-    .filter(
-      (s) =>
-        s.environment === environment &&
-        !TERMINAL_STATUSES.has(s.status) &&
-        !known.has(ledgerKey(s.channel, s.providerSubscriptionId)),
-    )
-    .map((s) => ({
-      channel: s.channel,
-      productId: s.productId,
-      environment: s.environment,
-      periodStart: s.periodStart,
-      periodEnd: s.periodEnd,
-    }));
-  return { capacity, newClaims };
-}
-
-/** Fetches a family's provider state and reconciles it with the family row locked. */
-async function syncFamilyFromProvider(
-  deps: AppDeps,
-  familyId: string,
-  billingRef: string,
-  now: Date,
-): Promise<FamilyBillingResult | null> {
-  const snapshots = await deps.providers.subscriptions.fetchSubscriptions(billingRef, now);
-  return deps.db.asService(async (tx) => {
-    const [live] = await tx<{ deleted_at: Date | null }[]>`
-      select deleted_at from public.families where id = ${familyId} for update
-    `;
-    if (!live || live.deleted_at) return null;
-    return reconcileFamilyBilling(tx, familyId, snapshots, deps.config.billingEnvironment, now);
-  });
-}
-
-/**
- * RV-billing-1: when this family newly holds a live store subscription that another family's ledger
- * also holds for the same store product and exact provider period (a restore or transfer moved it),
- * that family is re-verified with the provider at once, so one purchase never keeps paying for two
- * families while the other parent is away. Only the provider's answer for that family's OWN billing
- * ref decides; nothing from this request is written to it and nothing about it is returned. Best
- * effort after this family's own transaction committed (no nested family locks): a failure is
- * logged, and that family is corrected by its own next sync.
- */
-async function reverifyFormerHolders(
-  deps: AppDeps,
-  familyId: string,
-  claims: readonly NewClaim[],
-  now: Date,
-  requestId: string,
-): Promise<void> {
-  if (claims.length === 0) return;
-  const holders = new Map<string, string>();
-  for (const claim of claims) {
-    if (holders.size >= MAX_FORMER_HOLDERS) break;
-    const rows = await deps.db.asService(
-      (tx) => tx<{ id: string; billing_ref: string }[]>`
-        select distinct f.id, f.billing_ref
-          from public.family_entitlements e
-          join public.families f on f.id = e.family_id and f.deleted_at is null
-         where e.family_id <> ${familyId}
-           and e.channel = ${claim.channel} and e.product_id = ${claim.productId}
-           and e.environment = ${claim.environment}
-           and e.period_start = ${claim.periodStart} and e.period_end = ${claim.periodEnd}
-           and e.status not in ('expired', 'revoked', 'refunded')
-         limit ${MAX_FORMER_HOLDERS}
-      `,
-    );
-    for (const row of rows) {
-      if (holders.size < MAX_FORMER_HOLDERS) holders.set(row.id, row.billing_ref);
-    }
-  }
-  for (const [holderId, billingRef] of holders) {
-    try {
-      await syncFamilyFromProvider(deps, holderId, billingRef, now);
-    } catch {
-      deps.log({ level: 'warn', event: 'billing_former_holder_reverify_failed', requestId });
-    }
-  }
-}
-
-/** Thrown by applySnapshots when a store subscription already belongs to another family (BUG-006). */
-const BOUND_ELSEWHERE = 'Provider subscription is bound to a different family';
-
 export function billingRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
   r.use('/billing/*', requireParent);
@@ -496,7 +262,7 @@ export function billingRoutes(): Hono<AppEnv> {
         return reconcileFamilyBilling(tx, familyId, snapshots, deps.config.billingEnvironment, now);
       });
     } catch (error) {
-      if (error instanceof Error && error.message === BOUND_ELSEWHERE) {
+      if (error instanceof SubscriptionBoundElsewhere) {
         throw businessRule(
           'SUBSCRIPTION_BOUND_ELSEWHERE',
           'This store subscription is linked to a different PencilLift family. Contact support to move it.',

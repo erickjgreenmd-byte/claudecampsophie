@@ -6,14 +6,15 @@ import type { AppEnv } from '../middleware/context.ts';
 import { sha256Hex, timingSafeEqual } from '../security/crypto.ts';
 import {
   applyRefund,
-  applySnapshots,
   isRevenueCatRefund,
   mapRevenueCatEventToPeriod,
   mapStripeInvoiceToPeriod,
   reconcilePromotionsForPeriod,
+  reconcileFamilyBilling,
   recordBillingPeriod,
-  resolveUnreachableRedemptions,
+  reverifyFormerHolders,
   stripeBillingRef,
+  syncFamilyFromProvider,
   verifyStripeSignature,
   type RevenueCatEvent,
   type StripeInvoice,
@@ -40,6 +41,9 @@ const revenueCatBodySchema = z.object({
     cancel_reason: z.string().max(60).optional(),
     event_timestamp_ms: z.number().int().optional(),
     environment: z.string().max(20).optional(),
+    // TRANSFER events name the subscriber identities a purchase moved between.
+    transferred_from: z.array(z.string().max(200)).max(50).optional(),
+    transferred_to: z.array(z.string().max(200)).max(50).optional(),
   }),
 });
 
@@ -115,6 +119,17 @@ async function familyForRefs(c: Ctx, refs: readonly string[]) {
     `,
   );
   return row ?? null;
+}
+
+/** Every live family among the provider's subscriber identities (a TRANSFER names several). */
+async function liveFamiliesForRefs(c: Ctx, refs: readonly string[]) {
+  return c.var.deps.db.asService(
+    (tx) => tx<{ id: string; billing_ref: string }[]>`
+      select id, billing_ref from public.families
+       where billing_ref = any(${[...refs]}) and deleted_at is null
+       order by id
+    `,
+  );
 }
 
 type StripeObject = StripeInvoice & {
@@ -313,6 +328,35 @@ export function webhooksRoutes(): Hono<AppEnv> {
     const refs = [event.app_user_id, event.original_app_user_id, ...(event.aliases ?? [])].filter(
       (x): x is string => typeof x === 'string' && x.length > 0,
     );
+    if (event.type === 'TRANSFER') {
+      // A restore moved a purchase between subscriber identities. Each named family is re-verified
+      // from its OWN complete provider state in its own transaction (no nested family locks), so
+      // the purchase grants exactly where the provider now lists it (RV-billing-1).
+      const named = [...refs, ...(e.transferred_from ?? []), ...(e.transferred_to ?? [])].filter(
+        (x) => x.length > 0,
+      );
+      const families = await liveFamiliesForRefs(c, named);
+      if (families.length === 0) {
+        await finishEvent(c, 'revenuecat', event.id, 'ignored', null, 'UNKNOWN_SUBSCRIBER');
+        return c.json({ status: 'ignored' });
+      }
+      try {
+        const now = deps.clock();
+        for (const f of families) await syncFamilyFromProvider(deps, f.id, f.billing_ref, now);
+      } catch (error) {
+        await finishEvent(
+          c,
+          'revenuecat',
+          event.id,
+          'failed',
+          families[0]!.id,
+          error instanceof Error ? error.name : 'Error',
+        );
+        throw new ApiError('PROVIDER_UNAVAILABLE', 'Temporary failure; retry');
+      }
+      await finishEvent(c, 'revenuecat', event.id, 'processed', families[0]!.id);
+      return c.json({ status: 'processed' });
+    }
     const family = await familyForRefs(c, refs);
     if (!family) {
       await finishEvent(c, 'revenuecat', event.id, 'ignored', null, 'UNKNOWN_SUBSCRIBER');
@@ -330,36 +374,48 @@ export function webhooksRoutes(): Hono<AppEnv> {
         family.billing_ref,
         now,
       );
-      await deps.db.asService(async (tx) => {
+      const result = await deps.db.asService(async (tx) => {
         await lockLiveFamily(tx, family.id);
-        await applySnapshots(tx, family.id, snapshots, deps.config.billingEnvironment, now);
-        const period = mapRevenueCatEventToPeriod(event);
-        if (period) {
-          const recorded = await recordBillingPeriod(
-            tx,
-            family.id,
-            period,
-            deps.config.billingEnvironment,
-          );
-          if (recorded) {
-            await reconcilePromotionsForPeriod(
-              tx,
-              family.id,
-              period,
-              recorded.regularCents,
-              event.type === 'INITIAL_PURCHASE',
-            );
-          }
-        }
-        if (isRevenueCatRefund(event) && event.transaction_id && event.store) {
-          const channel =
-            event.store === 'app_store' || event.store === 'play_store' ? event.store : null;
-          if (channel)
-            await applyRefund(tx, family.id, channel, event.transaction_id, 'refund', null);
-        }
-        // A redemption whose target period can no longer happen is resolved now (RV-2).
-        await resolveUnreachableRedemptions(tx, now, family.id);
+        // The same whole-family reconciliation as POST /v1/billing/sync: a subscription the provider
+        // no longer lists stops granting, released children go back to draft, open capacity
+        // requests settle. The event's own period, promotions and refund are recorded once the
+        // ledger reflects the fetch and before unreachable redemptions are resolved.
+        return reconcileFamilyBilling(
+          tx,
+          family.id,
+          snapshots,
+          deps.config.billingEnvironment,
+          now,
+          async () => {
+            const period = mapRevenueCatEventToPeriod(event);
+            if (period) {
+              const recorded = await recordBillingPeriod(
+                tx,
+                family.id,
+                period,
+                deps.config.billingEnvironment,
+              );
+              if (recorded) {
+                await reconcilePromotionsForPeriod(
+                  tx,
+                  family.id,
+                  period,
+                  recorded.regularCents,
+                  event.type === 'INITIAL_PURCHASE',
+                );
+              }
+            }
+            if (isRevenueCatRefund(event) && event.transaction_id && event.store) {
+              const channel =
+                event.store === 'app_store' || event.store === 'play_store' ? event.store : null;
+              if (channel)
+                await applyRefund(tx, family.id, channel, event.transaction_id, 'refund', null);
+            }
+          },
+        );
       });
+      // A purchase newly listed here may still be granting to the family it came from.
+      await reverifyFormerHolders(deps, family.id, result.newClaims, now, c.var.requestId);
       await finishEvent(c, 'revenuecat', event.id, 'processed', family.id);
       return c.json({ status: 'processed' });
     } catch (error) {
