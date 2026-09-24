@@ -15,3 +15,4 @@ Accepted lessons only; each cites evidence. Project-scoped; never overrides requ
 ## Tentative (not accepted)
 
 - None.
+| L-008 | Committing part of a working tree while other agents (or unfinished work) share it | Tests, typecheck and lint on the working tree prove the combined tree, not the commit: 39ca165 imported `@pencillift/domain/scheduling`, which was still untracked, and passed every check (BUG-034) | The pre-commit hook typechecks the index itself (`scripts/check-staged-tree.sh`: `checkout-index` into a temp dir, workspace links re-pointed at the index copy). Mutation-checked by un-staging the imported module | BUG-034 | Any partial commit; any new workspace package | accepted |
