@@ -117,17 +117,62 @@ describe('AC_LEARNING_07 Thursday review sections', () => {
 
   it('prioritizes weekly weaknesses that are in the teacher test scope', () => {
     const math = unwrap(composeThursdayReview(input())).sections[0]!;
-    expect(math.items.filter((i) => i.part === 'weakness').map((i) => i.skill)).toEqual([
+    // RV-learning-2: this case used to expect [m.c, m.a, m.b, m.d, m.c, m.a], omitting the in-scope
+    // m.x. With four distinct weaknesses, the rest of the test scope now fills before repeats.
+    expect(math.items.filter((i) => i.part === 'weakness').map((i) => [i.skill, i.source])).toEqual(
+      [
+        ['m.c', 'weekly_weakness'],
+        ['m.a', 'weekly_weakness'],
+        ['m.b', 'weekly_weakness'],
+        ['m.d', 'weekly_weakness'],
+        ['m.x', 'test_scope'],
+        ['m.c', 'weekly_weakness'],
+      ],
+    );
+    expect(math.notes).toEqual([
+      { code: 'FEWER_DISTINCT_WEAKNESSES', count: 4 },
+      { code: 'FILLED', part: 'weakness', source: 'test_scope', count: 1 },
+    ]);
+  });
+
+  it('keeps one weakness slot for the test scope even with six or more other weaknesses', () => {
+    const six = ['m.a', 'm.b', 'm.c', 'm.d', 'm.pre', 'm.cur'];
+    const weakness = (overrides: Partial<ThursdayReviewInput>): string[][] =>
+      unwrap(
+        composeThursdayReview(
+          input({
+            enabledSubjects: ['math'],
+            subjectEvidence: new Map([['math', six]]),
+            ...overrides,
+          }),
+        ),
+      )
+        .sections[0]!.items.filter((i) => i.part === 'weakness')
+        .map((i) => [i.skill, i.source]);
+    // No weakness is in the scope: the sixth weakness yields its slot to the upcoming test.
+    expect(weakness({ testScope: new Map([['math', ['m.x']]]) })).toEqual([
+      ...six.slice(0, 5).map((s) => [s, 'weekly_weakness']),
+      ['m.x', 'test_scope'],
+    ]);
+    // An in-scope weakness already covers the scope: six distinct weaknesses, in-scope first.
+    expect(weakness({ testScope: new Map([['math', ['m.c', 'm.x']]]) }).map(([s]) => s)).toEqual([
       'm.c',
       'm.a',
       'm.b',
       'm.d',
-      'm.c',
-      'm.a',
+      'm.pre',
+      'm.cur',
     ]);
+    // A scope skill with no bank item frees the kept slot for the sixth weakness.
     expect(
-      math.items.filter((i) => i.part === 'weakness').every((i) => i.source === 'weekly_weakness'),
-    ).toBe(true);
+      weakness({
+        testScope: new Map([['math', ['m.x']]]),
+        candidateItems: bank(
+          'math',
+          MATH_SKILLS.filter((s) => s !== 'm.x'),
+        ),
+      }),
+    ).toEqual(six.map((s) => [s, 'weekly_weakness']));
   });
 
   it('test scope changes the selection when weekly weaknesses are few', () => {
@@ -154,13 +199,15 @@ describe('AC_LEARNING_07 Thursday review sections', () => {
       ),
     );
     const math = review.sections[0]!;
+    // RV-learning-1: distinct fill (scope, prerequisite, current material) now comes before a
+    // second question on a weak skill; it used to be [m.a, m.a, m.x, m.pre, m.cur, m.a].
     expect(math.items.filter((i) => i.part === 'weakness').map((i) => [i.skill, i.source])).toEqual(
       [
-        ['m.a', 'weekly_weakness'],
         ['m.a', 'weekly_weakness'],
         ['m.x', 'test_scope'],
         ['m.pre', 'prerequisite'],
         ['m.cur', 'current_material'],
+        ['m.a', 'weekly_weakness'],
         ['m.a', 'weekly_weakness'],
       ],
     );

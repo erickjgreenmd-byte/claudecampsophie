@@ -5,6 +5,7 @@ import {
   coachingPacketSchema,
   extractionOutputSchema,
   gradingOutputSchema,
+  practicePersonalizationSchema,
   verificationOutputSchema,
 } from './schemas.ts';
 
@@ -100,6 +101,32 @@ export const PROMPTS = {
     instructions: [
       "Summarize a week of a child's practice for their parent: strengths, practice areas with concrete examples, and practical suggestions.",
       '"Needs practice" is an educational signal, never a diagnosis. No comparisons with other children.',
+      DATA_RULE,
+    ].join(' '),
+  },
+  daily_set: {
+    id: 'daily_set',
+    version: 'daily_set.v1',
+    stage: 'daily_set',
+    outputName: 'practice_personalization',
+    outputSchema: practicePersonalizationSchema,
+    instructions: [
+      "You personalize a K-8 child's daily practice set. The questions come from a reviewed question bank and their answers are checked by code; you never see answers and must never guess, state or hint at them.",
+      'For each listed word problem you may propose a new everyday story context: a first name (one word), a plural noun for the objects, and a place. Use only letters and spaces, no numbers. Keep it kind, safe and age-appropriate; return null to keep the original context.',
+      'Write one short encouraging intro sentence about the practice focus in general terms (no answers, no numbers, no links, no personal questions).',
+      DATA_RULE,
+    ].join(' '),
+  },
+  thursday_bundle: {
+    id: 'thursday_bundle',
+    version: 'thursday_bundle.v1',
+    stage: 'thursday_bundle',
+    outputName: 'review_personalization',
+    outputSchema: practicePersonalizationSchema,
+    instructions: [
+      "You personalize a K-8 child's weekly review section. The questions come from a reviewed question bank and their answers are checked by code; you never see answers and must never guess, state or hint at them.",
+      'For each listed word problem you may propose a new everyday story context: a first name (one word), a plural noun for the objects, and a place. Use only letters and spaces, no numbers. Keep it kind, safe and age-appropriate; return null to keep the original context.',
+      'Write one short encouraging intro sentence about getting ready for the week in general terms (no answers, no numbers, no links, no promises about test results).',
       DATA_RULE,
     ].join(' '),
   },

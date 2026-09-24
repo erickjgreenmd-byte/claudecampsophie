@@ -63,11 +63,15 @@ function accuracyGap(summary: SkillSummary | undefined): number {
 }
 
 /**
- * Ranks the skills a child should practice, most urgent first. Decision: strong skills are never returned
- * (they belong to spaced review and confidence practice). A prerequisite is "unresolved" when it
- * is not strong (including when there is no evidence for it) and it underlies a focus skill: one
- * with repeated independent errors, a needs-practice status, or recent study relevance. Ties are
- * broken by skill id so the result never depends on input order.
+ * Ranks the skills a child should practice, most urgent first. Decision: a skill is "settled" when
+ * it is strong and shows no current repeated independent errors; settled skills are never returned
+ * (they belong to spaced review and confidence practice). A strong skill with repeated recent
+ * independent errors is still ranked for them (P7 puts repeated independent errors first, and
+ * older successes can keep the weighted accuracy of a skill at "strong" while it is slipping).
+ * A prerequisite is "unresolved" when it is not settled (including when there is no evidence for
+ * it) and it underlies a focus skill: one with repeated independent errors, a needs-practice
+ * status, or recent study relevance. Ties are broken by skill id so the result never depends on
+ * input order.
  */
 export function prioritizeSkills(
   summaries: readonly SkillSummary[],
@@ -81,7 +85,10 @@ export function prioritizeSkills(
     }
     bySkill.set(summary.skill, summary);
   }
-  const isStrong = (skill: string): boolean => bySkill.get(skill)?.status === 'strong';
+  const isSettled = (skill: string): boolean => {
+    const summary = bySkill.get(skill);
+    return summary?.status === 'strong' && !hasRepeatedErrors(summary, options.now);
+  };
   const reasons = new Map<string, Set<PriorityReason>>();
   const add = (skill: string, reason: PriorityReason): void => {
     const set = reasons.get(skill) ?? new Set<PriorityReason>();
@@ -91,8 +98,8 @@ export function prioritizeSkills(
 
   const focus = new Set<string>();
   for (const summary of [...bySkill.values()].sort((a, b) => compareIds(a.skill, b.skill))) {
-    if (summary.status === 'strong') continue;
-    add(summary.skill, 'NOT_YET_STRONG');
+    if (isSettled(summary.skill)) continue;
+    if (summary.status !== 'strong') add(summary.skill, 'NOT_YET_STRONG');
     if (hasRepeatedErrors(summary, options.now)) {
       add(summary.skill, 'REPEATED_INDEPENDENT_ERRORS');
       focus.add(summary.skill);
@@ -100,14 +107,14 @@ export function prioritizeSkills(
     if (summary.status === 'needs_practice') focus.add(summary.skill);
   }
   for (const skill of [...options.recentStudySkills].sort(compareIds)) {
-    if (isStrong(skill)) continue;
+    if (isSettled(skill)) continue;
     add(skill, 'RECENT_STUDY');
     if (!bySkill.has(skill)) add(skill, 'NO_EVIDENCE');
     focus.add(skill);
   }
   for (const skill of [...focus].sort(compareIds)) {
     for (const prerequisite of options.prerequisites.get(skill) ?? []) {
-      if (prerequisite === skill || isStrong(prerequisite)) continue;
+      if (prerequisite === skill || isSettled(prerequisite)) continue;
       add(prerequisite, 'UNRESOLVED_PREREQUISITE');
       if (!bySkill.has(prerequisite)) add(prerequisite, 'NO_EVIDENCE');
     }

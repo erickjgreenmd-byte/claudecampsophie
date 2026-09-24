@@ -24,11 +24,12 @@ export type SkillStatus = (typeof SKILL_STATUSES)[number];
  * The published status rules (P7 "transparent initial rule"), evaluated in this order:
  * 1. `not_enough_evidence` when fewer than 5 distinct independent question instances.
  * 2. `needs_practice` when weighted independent accuracy < 0.6 AND independent errors occurred on
- *    at least 2 distinct question instances across at least 2 distinct local days.
+ *    at least 2 distinct question instances across at least 2 distinct days.
  * 3. `strong` when weighted independent accuracy >= 0.85 AND independent correct answers occurred
- *    on at least 2 distinct local days (sessions) AND the latest independent attempt is within 30
- *    days of `now`. Decision: "practiced within 30 days" means independent practice, because
- *    hint-assisted practice is not mastery evidence and normalized weights cannot detect staleness.
+ *    on at least 2 distinct days (sessions; see `ZONELESS_DAY_WINDOW_HOURS`) AND the latest
+ *    independent attempt is within 30 days of `now`. Decision: "practiced within 30 days" means
+ *    independent practice, because hint-assisted practice is not mastery evidence and normalized
+ *    weights cannot detect staleness.
  * 4. otherwise `developing`.
  */
 export const SKILL_STATUS_RULES = Object.freeze({
@@ -48,11 +49,14 @@ export const SKILL_STATUS_RULES = Object.freeze({
 export const DEFAULT_RECENCY_HALF_LIFE_DAYS = 14;
 
 /**
- * Decision: "distinct days" are calendar dates in `timeZone`. Callers should pass the family's
- * IANA zone; the UTC default exists only for zone-less contexts and can split one local evening
- * session across two dates.
+ * Decision: "distinct days" are calendar dates in `timeZone`, the family's IANA zone. Without a
+ * zone no calendar is assumed: a UTC (or any fixed-offset) default would split one evening session
+ * across two dates and let the two-session mastery gate fail open. Instead, answers fall on
+ * different days only when at least this many hours apart, and the day count is the fewest such
+ * windows that cover the answers. That never exceeds the number of local dates the answers span
+ * in any zone (except across a 25-hour daylight-saving fall-back day), so it can only be stricter.
  */
-export const DEFAULT_EVIDENCE_TIME_ZONE = 'UTC';
+export const ZONELESS_DAY_WINDOW_HOURS = 24;
 
 /**
  * Decision: threshold comparisons allow 1e-9 of floating-point slack so that, for example, an
@@ -64,6 +68,7 @@ const DAY_MS = 86_400_000;
 
 export interface SummaryConfig {
   readonly halfLifeDays?: number;
+  /** The family's IANA zone for counting distinct days; see `ZONELESS_DAY_WINDOW_HOURS` if absent. */
   readonly timeZone?: string;
 }
 
@@ -85,6 +90,7 @@ export interface SkillSummary {
   /** Instances eventually answered correctly (after hints/retries) / instances with any graded try. */
   readonly eventualCompletionRate: number | null;
   readonly weightedIndependentAccuracy: number | null;
+  /** Distinct local dates (or zone-less 24-hour windows) of first independent attempts. */
   readonly distinctIndependentDays: number;
   readonly distinctIndependentCorrectDays: number;
   readonly distinctIndependentErrorDays: number;
@@ -96,7 +102,8 @@ export interface SkillSummary {
 
 interface ResolvedConfig {
   readonly halfLifeDays: number;
-  readonly timeZone: string;
+  /** `null` when no zone was supplied: days are counted zone-free (fail closed). */
+  readonly timeZone: string | null;
 }
 
 function resolveConfig(config: SummaryConfig | undefined): ResolvedConfig {
@@ -104,7 +111,8 @@ function resolveConfig(config: SummaryConfig | undefined): ResolvedConfig {
   if (!Number.isFinite(halfLifeDays) || halfLifeDays <= 0) {
     throw new RangeError('halfLifeDays must be a positive finite number');
   }
-  const timeZone = assertIanaZone(config?.timeZone ?? DEFAULT_EVIDENCE_TIME_ZONE);
+  const zone = config?.timeZone;
+  const timeZone = zone === undefined ? null : assertIanaZone(zone);
   return { halfLifeDays, timeZone };
 }
 
@@ -124,6 +132,24 @@ export function recencyWeight(
 
 function localDay(instant: Date, zone: string): string {
   return DateTime.fromJSDate(instant, { zone }).toFormat('yyyy-MM-dd');
+}
+
+/**
+ * Distinct days of `instants`: local calendar dates in `zone`, or without a zone the fewest
+ * `ZONELESS_DAY_WINDOW_HOURS`-long windows covering them (greedy from the earliest is optimal).
+ */
+function distinctDays(instants: readonly Date[], zone: string | null): number {
+  if (zone !== null) return new Set(instants.map((at) => localDay(at, zone))).size;
+  const windowMs = ZONELESS_DAY_WINDOW_HOURS * 3_600_000;
+  let count = 0;
+  let windowStart = Number.NEGATIVE_INFINITY;
+  for (const ms of instants.map((at) => at.getTime()).sort((a, b) => a - b)) {
+    if (ms - windowStart >= windowMs) {
+      count += 1;
+      windowStart = ms;
+    }
+  }
+  return count;
 }
 
 function latest(dates: readonly Date[]): Date | null {
@@ -229,7 +255,10 @@ function summarizeNormalized(
   const independentIncorrect = independent.filter((i) => i.initialCorrectness === 'incorrect');
   const resolved = instances.filter((i) => i.anyResolved);
   const days = (list: readonly (InstanceEvidence & { initial: AttemptEvent })[]): number =>
-    new Set(list.map((i) => localDay(i.initial.occurredAt, config.timeZone))).size;
+    distinctDays(
+      list.map((i) => i.initial.occurredAt),
+      config.timeZone,
+    );
 
   const fields = {
     distinctQuestions: instances.length,

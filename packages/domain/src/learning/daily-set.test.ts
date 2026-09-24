@@ -300,6 +300,64 @@ describe('P7 no repeats of recently used templates', () => {
   });
 });
 
+describe("RV-learning-4 the confidence slot is not starved by other slots' backfill", () => {
+  it('property: an empty confidence slot means no other slot took an item it could have used', () => {
+    const skills = ['w1', 'w2', 's1', 'c1', 'g1', 'p1'] as const;
+    const itemArb = fc.record({
+      templateKey: fc.constantFrom(...Array.from({ length: 16 }, (_, i) => `t${i}`)),
+      skill: fc.constantFrom(...skills),
+      category: fc.constantFrom<ItemCategory>('standard', 'accessible'),
+    });
+    fc.assert(
+      fc.property(
+        fc.array(itemArb, { maxLength: 16 }),
+        fc.uniqueArray(fc.integer({ min: 0, max: 15 }), { maxLength: 16 }),
+        fc.integer({ min: 3, max: 10 }),
+        (items, recentIdx, count) => {
+          const result = composeDailySet(
+            input({
+              count,
+              weakSkills: ['w1', 'w2'],
+              prerequisiteSkills: ['p1'],
+              candidateItems: items,
+              recentlyUsedTemplateKeys: new Set(recentIdx.map((i) => `t${i}`)),
+            }),
+          );
+          if (!result.ok || result.value.mix.confidence > 0) return;
+          // Grade-level and spaced-review items are confidence candidates (its chain is
+          // confidence -> spaced -> grade), so only the slots' own pools may hold them.
+          for (const item of result.value.items) {
+            const ownPool =
+              ['weak', 'prerequisite', 'current_material'].includes(item.source) ||
+              (item.slot === 'spaced' && item.source === 'spaced_review');
+            expect(ownPool).toBe(true);
+          }
+        },
+      ),
+    );
+  });
+
+  it('takes the guaranteed confidence item from the weak slot, preferring an accessible item', () => {
+    // Four questions (2/1/1) but only three items: the weak slot's grade fallback used to take
+    // both grade items, leaving the confidence slot empty.
+    const set = unwrap(
+      composeDailySet(
+        input({
+          count: 4,
+          weakSkills: ['w1'],
+          candidateItems: [...bank('g1', 1), ...bank('g1', 1, 'accessible'), ...bank('s1', 1)],
+        }),
+      ),
+    );
+    expect(set.items.map((i) => [i.slot, i.source, i.category])).toEqual([
+      ['weak', 'grade_fallback', 'standard'],
+      ['spaced', 'spaced_review', 'standard'],
+      ['confidence', 'grade_fallback', 'accessible'],
+    ]);
+    expect(set.notes).toContainEqual({ code: 'INSUFFICIENT_CANDIDATES', count: 1 });
+  });
+});
+
 describe('P7 daily practice is weekend-agnostic', () => {
   it('composes the same set on a Saturday, a Sunday and a Wednesday', () => {
     const saturday = unwrap(composeDailySet(input({ localDate: '2026-09-26' })));

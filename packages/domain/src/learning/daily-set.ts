@@ -28,6 +28,9 @@ export const DAILY_MIX_PERCENT = Object.freeze({ weak: 60, spaced: 20, confidenc
  */
 export const WEAK_SKILL_FIRST_PASS_CAP = 2;
 
+/** Selection tier of backfill stages (see `SelectionStage.tier`); own-pool stages are tier 0. */
+const BACKFILL_TIER = 1;
+
 export const DAILY_SLOTS = ['weak', 'spaced', 'confidence', 'diagnostic'] as const;
 export type DailySlot = (typeof DAILY_SLOTS)[number];
 
@@ -170,6 +173,9 @@ const PRIMARY_SOURCE: Readonly<Record<DailySlot, DailyItemSource>> = {
  *   more weak -> more prerequisites/current -> grade fallback;
  * - spaced review: spaced skills -> weak -> prerequisites -> current material -> grade fallback;
  * - confidence: confidence skills (accessible items preferred) -> spaced skills -> grade fallback.
+ * Decision: the weak and spaced slots' grade fallback and other backfill run only after every
+ * slot's own chain (tier 1), so the guaranteed confidence item (see `dailyMix`) is taken from the
+ * weak slot rather than lost to its backfill whenever an eligible confidence candidate exists.
  * Every backfill is recorded in `notes`. With no history at all (no weak, spaced, confidence,
  * prerequisite or current-material skills) the whole set is a grade-level diagnostic. Decision: those
  * items use a distinct `diagnostic` slot (reported in `mix.diagnostic`) and prefer diagnostic items.
@@ -218,6 +224,11 @@ export function composeDailySet(input: DailySetInput): Result<DailySet, DailySet
     skills,
     cap,
   });
+  /** Backfill beyond a slot's own pools: runs after every slot's own chain. */
+  const backfill = (stage: SelectionStage<DailyItemSource>): SelectionStage<DailyItemSource> => ({
+    ...stage,
+    tier: BACKFILL_TIER,
+  });
 
   let groups: SelectionGroup<DailySlot, DailyItemSource>[];
   if (noHistory) {
@@ -243,9 +254,9 @@ export function composeDailySet(input: DailySetInput): Result<DailySet, DailySet
           all('weak', weak),
           all('prerequisite', prerequisite),
           all('current_material', current),
-          all('grade_fallback', grade),
+          backfill(all('grade_fallback', grade)),
         ],
-        extended: [all('spaced_review', spaced), all('confidence', confidence)],
+        extended: [backfill(all('spaced_review', spaced)), backfill(all('confidence', confidence))],
         categoryPreference: STANDARD_FIRST,
       },
       {
@@ -254,15 +265,17 @@ export function composeDailySet(input: DailySetInput): Result<DailySet, DailySet
         primary: [
           once('spaced_review', spaced),
           all('spaced_review', spaced),
-          all('weak', weak),
-          all('prerequisite', prerequisite),
-          all('current_material', current),
-          all('grade_fallback', grade),
+          backfill(all('weak', weak)),
+          backfill(all('prerequisite', prerequisite)),
+          backfill(all('current_material', current)),
+          backfill(all('grade_fallback', grade)),
         ],
-        extended: [all('confidence', confidence)],
+        extended: [backfill(all('confidence', confidence))],
         categoryPreference: STANDARD_FIRST,
       },
       {
+        // Confidence-building practice: its own skills, then spaced review and grade-level
+        // material (accessible items first), all ahead of the other slots' backfill.
         key: 'confidence',
         need: mix.confidence,
         primary: [
@@ -272,9 +285,9 @@ export function composeDailySet(input: DailySetInput): Result<DailySet, DailySet
           all('grade_fallback', grade),
         ],
         extended: [
-          all('weak', weak),
-          all('prerequisite', prerequisite),
-          all('current_material', current),
+          backfill(all('weak', weak)),
+          backfill(all('prerequisite', prerequisite)),
+          backfill(all('current_material', current)),
         ],
         categoryPreference: ACCESSIBLE_FIRST,
       },

@@ -20,7 +20,6 @@ import {
   type SelectionGroup,
   type SelectionStage,
 } from './selection.ts';
-import { WEAK_SKILL_FIRST_PASS_CAP } from './daily-set.ts';
 
 export const DEFAULT_REVIEW_ITEMS_PER_SUBJECT = 8;
 /** Decision: parent-adjustable review length is bounded to 2..20 questions per subject. */
@@ -28,6 +27,12 @@ export const MIN_REVIEW_ITEMS_PER_SUBJECT = 2;
 export const MAX_REVIEW_ITEMS_PER_SUBJECT = 20;
 /** Decision: the evidence window is at most one week (Monday to the cutoff). */
 export const MAX_EVIDENCE_WINDOW_DAYS = 7;
+/**
+ * Decision: when the teacher supplied a test scope with bank material, at least this many
+ * weakness questions cover it. An in-scope weekly weakness counts; otherwise a slot is kept for a
+ * test-scope question even when the week has six or more other weaknesses (AC_LEARNING_07).
+ */
+export const MIN_TEST_SCOPE_QUESTIONS = 1;
 
 const DAY_MS = 86_400_000;
 
@@ -239,12 +244,14 @@ function without(skills: readonly string[], exclude: ReadonlySet<string>): reado
 /**
  * Composes a Thursday review: one section per enabled subject (every enabled subject gets one).
  *
- * Weakness part, per subject: weekly weak skills that are in the test scope first, then the other
- * weekly weak skills (at most two questions each on the first pass); then, one each, the rest of
- * the test scope, prerequisites of the weak skills and other current material; then repeats of the
- * same lists; then grade-level fallback. Cumulative part: cumulative skills, then the same chain.
- * Decision: test-scope material fills before prerequisites because the scope is the teacher's own
- * statement of what the upcoming test covers.
+ * Weakness part, per subject: one question per distinct weekly weakness, those in the test scope
+ * first, keeping `MIN_TEST_SCOPE_QUESTIONS` slot(s) for the test scope when no in-scope weakness
+ * covers it; then, one each, the rest of the test scope, prerequisites of the weak skills and other
+ * current material (P8: "where six distinct weakness questions are not possible, fill with
+ * prerequisites/current material"); only then second questions on the same lists, weekly
+ * weaknesses first; then grade-level fallback. Cumulative part: cumulative skills, then the same
+ * chain. Decision: test-scope material fills before prerequisites because the scope is the
+ * teacher's own statement of what the upcoming test covers.
  * A subject with no weekly weaknesses and no current material uses the grade-level fallback and is
  * flagged `fallback_no_evidence`. Every fill and shortfall is explained in the section notes; a
  * template is never used twice in one review, and recently used templates only when unavoidable.
@@ -310,10 +317,8 @@ export function composeThursdayReview(
     const scopeList = listFor(input.testScope, subject);
     const scope = new Set(scopeList);
     const weakRanked = listFor(input.subjectEvidence, subject);
-    const weak = [
-      ...weakRanked.filter((s) => scope.has(s)),
-      ...weakRanked.filter((s) => !scope.has(s)),
-    ];
+    const inScopeWeak = weakRanked.filter((s) => scope.has(s));
+    const weak = [...inScopeWeak, ...weakRanked.filter((s) => !scope.has(s))];
     const weakSet = new Set(weak);
     const scopeFill = without(scopeList, weakSet);
     const covered = new Set([...weak, ...scopeFill]);
@@ -338,8 +343,16 @@ export function composeThursdayReview(
         key: 'weakness',
         need: split.weakness,
         primary: [
-          capped('weekly_weakness', weak, WEAK_SKILL_FIRST_PASS_CAP),
+          capped('weekly_weakness', inScopeWeak, 1),
+          {
+            ...capped('weekly_weakness', weak, 1),
+            // Leave room for the test scope; a scope with no usable item frees the slot below.
+            ...(scopeFill.length > 0
+              ? { reserve: { count: MIN_TEST_SCOPE_QUESTIONS, skills: scope } }
+              : {}),
+          },
           capped('test_scope', scopeFill, 1),
+          capped('weekly_weakness', weak, 1),
           capped('prerequisite', prerequisites, 1),
           capped('current_material', current, 1),
           all('weekly_weakness', weak),

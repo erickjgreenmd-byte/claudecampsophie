@@ -10,6 +10,8 @@
 //   D. recently used templates allowed, extended chain.
 // So a recently used template is chosen only when no unused fresh template exists for any skill
 // the composition could legitimately use, and a template is never used twice in one composition.
+// Within a phase, stages run by priority tier (all groups' tier-0 stages, then tier 1, ...), and a
+// stage may reserve slots so a later stage's skills are guaranteed room.
 import { err, ok, type Result } from '../shared/result.ts';
 import { isValidIdentifier } from './evidence.ts';
 
@@ -33,6 +35,19 @@ export interface SelectionStage<S extends string> {
   readonly skills: readonly string[];
   /** A skill is taken in this stage only while its total count in the composition is below this. */
   readonly cap: number;
+  /**
+   * Priority tier (default 0). Within a phase, every group runs its tier-0 stages before any group
+   * runs a tier-1 stage, so one slot's last-resort backfill cannot take the only item another slot
+   * could use. With every stage at tier 0 the groups simply run one after another.
+   */
+  readonly tier?: number;
+  /**
+   * Keeps open slots for other skills: this stage stops while taking another item would leave the
+   * group unable to hold `count` picks of `skills` (e.g. one weakness slot kept for the teacher's
+   * test scope). A later stage without the reservation may use a slot the reserved skills cannot
+   * fill.
+   */
+  readonly reserve?: { readonly count: number; readonly skills: ReadonlySet<string> };
 }
 
 export interface SelectionGroup<G extends string, S extends string> {
@@ -102,6 +117,14 @@ export function normalizeCandidates<I extends CandidateItem>(
   return ok(out);
 }
 
+function stageTier(stage: SelectionStage<string>): number {
+  const tier = stage.tier ?? 0;
+  if (!Number.isInteger(tier) || tier < 0) {
+    throw new RangeError('Selection stage tiers must be non-negative integers');
+  }
+  return tier;
+}
+
 const PHASES = [
   { allowRecent: false, extended: false },
   { allowRecent: false, extended: true },
@@ -157,30 +180,56 @@ export function selectItems<G extends string, S extends string, I extends Candid
     return best?.item;
   };
 
+  const fillFromStage = (
+    group: SelectionGroup<G, S>,
+    list: SelectionPick<G, S, I>[],
+    stage: SelectionStage<S>,
+    allowRecent: boolean,
+  ): void => {
+    // The group's need, less the slots this stage must leave open for its reserved skills.
+    const limit = (): number => {
+      if (stage.reserve === undefined) return group.need;
+      const { count, skills } = stage.reserve;
+      const held = list.filter((p) => skills.has(p.item.skill)).length;
+      return group.need - Math.max(0, count - held);
+    };
+    let progress = true;
+    while (list.length < limit() && progress) {
+      progress = false;
+      for (const skill of stage.skills) {
+        if (list.length >= limit()) break;
+        if ((skillCounts.get(skill) ?? 0) >= stage.cap) continue;
+        const item = pickFor(skill, allowRecent, group.categoryPreference);
+        if (item === undefined) continue;
+        used.add(item.templateKey);
+        skillCounts.set(skill, (skillCounts.get(skill) ?? 0) + 1);
+        list.push({
+          group: group.key,
+          source: stage.source,
+          item,
+          reusedRecentTemplate: recentlyUsed.has(item.templateKey),
+        });
+        progress = true;
+      }
+    }
+  };
+
+  const stagesFor = (
+    group: SelectionGroup<G, S>,
+    extended: boolean,
+  ): readonly SelectionStage<S>[] =>
+    extended ? [...group.primary, ...group.extended] : group.primary;
+  const tiers = [...new Set(groups.flatMap((g) => stagesFor(g, true).map(stageTier)))].sort(
+    (a, b) => a - b,
+  );
+
   for (const phase of PHASES) {
-    for (const group of groups) {
-      const list = picks.get(group.key);
-      if (list === undefined) continue;
-      const stages = phase.extended ? [...group.primary, ...group.extended] : group.primary;
-      for (const stage of stages) {
-        let progress = true;
-        while (list.length < group.need && progress) {
-          progress = false;
-          for (const skill of stage.skills) {
-            if (list.length >= group.need) break;
-            if ((skillCounts.get(skill) ?? 0) >= stage.cap) continue;
-            const item = pickFor(skill, phase.allowRecent, group.categoryPreference);
-            if (item === undefined) continue;
-            used.add(item.templateKey);
-            skillCounts.set(skill, (skillCounts.get(skill) ?? 0) + 1);
-            list.push({
-              group: group.key,
-              source: stage.source,
-              item,
-              reusedRecentTemplate: recentlyUsed.has(item.templateKey),
-            });
-            progress = true;
-          }
+    for (const tier of tiers) {
+      for (const group of groups) {
+        const list = picks.get(group.key);
+        if (list === undefined) continue;
+        for (const stage of stagesFor(group, phase.extended)) {
+          if (stageTier(stage) === tier) fillFromStage(group, list, stage, phase.allowRecent);
         }
       }
     }

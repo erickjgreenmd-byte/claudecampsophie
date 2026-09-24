@@ -118,6 +118,30 @@ export const adultSummarySchema = z.strictObject({
 });
 export type AdultSummary = z.infer<typeof adultSummarySchema>;
 
+/**
+ * Child-facing practice personalization (daily sets and Thursday reviews). The model never sees or
+ * returns an answer: it may only propose a story context for listed word problems (re-rendered by
+ * the bank with the SAME numbers and re-validated) and one short intro line (leak-guarded).
+ */
+export const practicePersonalizationSchema = z.strictObject({
+  intro: z.string().min(1).max(200),
+  items: z
+    .array(
+      z.strictObject({
+        ref: z.string().min(1).max(8),
+        context: z
+          .strictObject({
+            name: z.string().min(1).max(20),
+            things: z.string().min(1).max(40),
+            place: z.string().min(1).max(40),
+          })
+          .nullable(),
+      }),
+    )
+    .max(40),
+});
+export type PracticePersonalization = z.infer<typeof practicePersonalizationSchema>;
+
 type JsonSchema = Record<string, unknown>;
 
 function assertStrict(node: unknown, path: string): void {

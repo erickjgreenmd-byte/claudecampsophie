@@ -5,6 +5,7 @@ import {
   DEFAULT_RECENCY_HALF_LIFE_DAYS,
   SKILL_STATUSES,
   SKILL_STATUS_RULES,
+  ZONELESS_DAY_WINDOW_HOURS,
   summarizeSkill,
   summarizeSkills,
   type AttemptEvent,
@@ -194,7 +195,12 @@ describe('AC_LEARNING_02 not enough evidence and multi-day mastery', () => {
         'late',
       ).map((e, i) => ({ ...e, occurredAt: new Date(`2026-09-23T00:3${i}:00Z`) })),
     ];
-    expect(summarizeSkill(evening, NOW).distinctIndependentDays).toBe(2);
+    // RV-learning-3: without a zone no UTC calendar is assumed (that split this evening in two and
+    // let the mastery gate fail open); zone-less days are 24-hour windows, so this is one day.
+    const zoneless = summarizeSkill(evening, NOW);
+    expect(zoneless.distinctIndependentDays).toBe(1);
+    expect(zoneless.status).toBe('developing');
+    expect(summarizeSkill(evening, NOW, { timeZone: 'UTC' }).distinctIndependentDays).toBe(2);
     const local = summarizeSkill(evening, NOW, { timeZone: 'America/Los_Angeles' });
     expect(local.distinctIndependentDays).toBe(1);
     expect(local.status).toBe('developing');
@@ -400,6 +406,55 @@ describe('P7 weighting and exclusions', () => {
     const snapshot = structuredClone(events);
     summarizeSkill(events, NOW);
     expect(events).toEqual(snapshot);
+  });
+});
+
+describe('RV-learning-3 zone-less day counting fails closed', () => {
+  const at = (iso: string, i: number): AttemptEvent =>
+    attempt({ questionInstanceId: `z-${i}`, occurredAt: new Date(iso) });
+
+  it('without a zone, answers are on different days only when at least 24 hours apart', () => {
+    expect(ZONELESS_DAY_WINDOW_HOURS).toBe(24);
+    // 23 hours apart: two local dates in most zones, but not provably two sessions.
+    const close = ['2026-09-21T20:00:00Z', '2026-09-22T19:00:00Z'].map(at);
+    expect(summarizeSkill(close, NOW).distinctIndependentDays).toBe(1);
+    const apart = ['2026-09-21T20:00:00Z', '2026-09-22T20:00:00Z'].map(at);
+    expect(summarizeSkill(apart, NOW).distinctIndependentDays).toBe(2);
+    // Windows are anchored at the earliest uncovered answer, so a chain of close answers spanning
+    // more than a day still counts as more than one day.
+    const chain = [
+      '2026-09-20T20:00:00Z',
+      '2026-09-21T12:00:00Z',
+      '2026-09-21T21:00:00Z',
+      '2026-09-22T10:00:00Z',
+    ].map(at);
+    expect(summarizeSkill(chain, NOW).distinctIndependentDays).toBe(2);
+  });
+
+  it('property: the zone-less count never exceeds the local-date count in a fixed-offset zone', () => {
+    const zones = ['UTC', 'Asia/Kolkata', 'Pacific/Kiritimati', 'Pacific/Pago_Pago', 'Asia/Tokyo'];
+    fc.assert(
+      fc.property(
+        fc.array(fc.integer({ min: 0, max: 20 * DAY_MS }), { minLength: 1, maxLength: 12 }),
+        (offsets) => {
+          const events = offsets.map((ms, i) =>
+            attempt({ questionInstanceId: `p-${i}`, occurredAt: new Date(NOW.getTime() - ms) }),
+          );
+          const zoneless = summarizeSkill(events, NOW);
+          for (const timeZone of zones) {
+            const zoned = summarizeSkill(events, NOW, { timeZone });
+            expect(zoneless.distinctIndependentDays).toBeLessThanOrEqual(
+              zoned.distinctIndependentDays,
+            );
+            expect(zoneless.distinctIndependentCorrectDays).toBeLessThanOrEqual(
+              zoned.distinctIndependentCorrectDays,
+            );
+          }
+          // Order independent.
+          expect(summarizeSkill([...events].reverse(), NOW)).toEqual(zoneless);
+        },
+      ),
+    );
   });
 });
 

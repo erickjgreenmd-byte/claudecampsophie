@@ -98,6 +98,57 @@ describe('P7 prioritizeSkills', () => {
     expect(skills).not.toContain(MULTIPLICATION);
   });
 
+  it('RV-learning-5: a strong skill that is slipping counts as unresolved, but only while recent', () => {
+    // 20 earlier successes keep MULTIPLICATION "strong" despite errors yesterday and today.
+    const slipping = [
+      ...independentSeries(
+        Array.from({ length: 20 }, (_, i) => [true, 2 + Math.floor(i / 2)] as const),
+        { skill: MULTIPLICATION },
+        'mu',
+      ),
+      ...independentSeries(
+        [
+          [false, 0],
+          [false, 1],
+        ],
+        { skill: MULTIPLICATION },
+        'mu-err',
+      ),
+    ];
+    const summaries = [...fixtureSummaries().filter((s) => s.skill !== MULTIPLICATION)];
+    const [multiplication] = summarizeSkills(slipping, NOW);
+    expect(multiplication!.status).toBe('strong');
+    const ranked = prioritizeSkills([...summaries, multiplication!], OPTIONS);
+    const entry = ranked.find((r) => r.skill === MULTIPLICATION);
+    // Ranked for its own repeated errors and as an unresolved prerequisite of FRACTIONS; never
+    // described as "not yet strong".
+    expect(entry?.reasons).toEqual(['REPEATED_INDEPENDENT_ERRORS', 'UNRESOLVED_PREREQUISITE']);
+    expect(ranked[0]!.skill).toBe(MULTIPLICATION);
+    // Once those errors are older than the recency window and the child has succeeded again on
+    // two days, the strong skill is settled and no longer offered as a weak skill.
+    const later = new Date(NOW.getTime() + 31 * 86_400_000);
+    const recovered = independentSeries(
+      [
+        [true, 0],
+        [true, 0],
+        [true, 1],
+        [true, 1],
+      ],
+      { skill: MULTIPLICATION },
+      'mu-new',
+    ).map((e) => ({ ...e, occurredAt: new Date(e.occurredAt.getTime() + 31 * 86_400_000) }));
+    const [settled] = summarizeSkills([...slipping, ...recovered], later);
+    expect(settled!.status).toBe('strong');
+    expect(settled!.distinctIndependentErrorDays).toBe(2);
+    expect(
+      prioritizeSkills([settled!], {
+        recentStudySkills: new Set(),
+        prerequisites: new Map(),
+        now: later,
+      }),
+    ).toEqual([]);
+  });
+
   it('recent study relevance boosts an otherwise identical skill', () => {
     const events = [
       ...independentSeries(
