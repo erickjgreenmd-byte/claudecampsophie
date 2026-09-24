@@ -100,3 +100,16 @@ select {
     transition: none !important;
   }
 }
+
+.skip-link {
+  position: absolute;
+  left: -999px;
+  top: 0;
+}
+.skip-link:focus {
+  left: 1rem;
+  top: 1rem;
+  z-index: 10;
+  background: var(--surface, #fff);
+  padding: 0.5rem 0.75rem;
+}

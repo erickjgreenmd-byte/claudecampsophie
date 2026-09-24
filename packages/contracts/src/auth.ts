@@ -37,3 +37,7 @@ export const childTokenResponseSchema = z.strictObject({
 export const childRefreshRequestSchema = z.strictObject({
   refreshToken: z.string().min(20).max(200),
 });
+
+/** POST /v1/adult/pin/reset — only right after an account re-authentication (spec P3 recovery). */
+export const pinResetRequestSchema = setParentPinRequestSchema;
+export const okResponseSchema = z.strictObject({ ok: z.literal(true) });

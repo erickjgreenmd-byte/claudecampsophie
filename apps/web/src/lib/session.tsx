@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
+import { Link, useLocation } from 'react-router';
 import { createApiClient, type ApiClient, ApiRequestError } from '@pencillift/contracts/client';
 import { unconfiguredAuth, type AuthAdapter, type ParentSession } from './auth.ts';
 import { readWebConfig, type WebConfig } from './config.ts';
@@ -48,14 +49,29 @@ export function useParentSession(): ParentState {
       setState({ status: 'unconfigured' });
       return;
     }
-    void auth.currentSession().then((session) => {
-      if (active) setState(session ? { status: 'signed_in', session } : { status: 'signed_out' });
-    });
+    const refresh = () => {
+      void auth.currentSession().then((session) => {
+        if (active) setState(session ? { status: 'signed_in', session } : { status: 'signed_out' });
+      });
+    };
+    refresh();
+    const unsubscribe = auth.onChange?.(refresh);
     return () => {
       active = false;
+      unsubscribe?.();
     };
   }, [auth]);
   return state;
+}
+
+function SignInPrompt() {
+  const location = useLocation();
+  const next = encodeURIComponent(`${location.pathname}${location.search}`);
+  return (
+    <Notice>
+      Please <Link to={`/sign-in?next=${next}`}>sign in</Link> to see your family.
+    </Notice>
+  );
 }
 
 /** Gate for parent-portal pages. Never renders protected content without a signed-in parent. */
@@ -70,7 +86,7 @@ export function RequireParent({ children }: { children: ReactNode }) {
       </Notice>
     );
   }
-  if (state.status === 'signed_out') return <Notice>Please sign in to see your family.</Notice>;
+  if (state.status === 'signed_out') return <SignInPrompt />;
   return <>{children}</>;
 }
 

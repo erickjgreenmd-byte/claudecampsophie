@@ -25,7 +25,9 @@ describe('RequireParent (spec P14 honest states)', () => {
         signOut: () => Promise.resolve(),
       },
     });
-    expect(await screen.findByText(/please sign in/i)).toBeTruthy();
+    const link = await screen.findByRole('link', { name: 'sign in' });
+    // The sign-in link carries only a same-origin return path.
+    expect(link.getAttribute('href')).toMatch(/^\/sign-in\?next=%2F/);
     expect(screen.queryByText(/Riley/)).toBeNull();
   });
 

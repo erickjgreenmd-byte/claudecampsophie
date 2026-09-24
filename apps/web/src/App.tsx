@@ -1,11 +1,17 @@
 import { createBrowserRouter, Link, Outlet, RouterProvider } from 'react-router';
 import { Logo } from './components/Logo.tsx';
 import { routes } from './routes.tsx';
+import { unconfiguredAuth } from './lib/auth.ts';
+import { readWebConfig } from './lib/config.ts';
 import { createDefaultSession, SessionProvider } from './lib/session.tsx';
+import { createSupabaseAuth } from './lib/supabase-auth.ts';
 
 function Shell() {
   return (
     <>
+      <a className="skip-link" href="#main">
+        Skip to content
+      </a>
       <header
         className="container"
         style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
@@ -15,7 +21,7 @@ function Shell() {
         </Link>
         <nav aria-label="Main">
           <Link to="/how-it-works">How it works</Link> · <Link to="/pricing">Pricing</Link> ·{' '}
-          <Link to="/support">Support</Link> · <Link to="/app">Parent sign in</Link>
+          <Link to="/support">Support</Link> · <Link to="/app">Parent portal</Link>
         </nav>
       </header>
       <main id="main" className="container">
@@ -29,7 +35,15 @@ function Shell() {
   );
 }
 
-const session = createDefaultSession();
+const config = readWebConfig();
+// Real sign-in only when the owner's Supabase project is configured; otherwise an honest
+// "not configured" state (never a fake login).
+const session = createDefaultSession(
+  config,
+  config.supabaseUrl && config.supabasePublishableKey
+    ? createSupabaseAuth(config)
+    : unconfiguredAuth,
+);
 
 export function App() {
   const router = createBrowserRouter([{ element: <Shell />, children: routes }]);
