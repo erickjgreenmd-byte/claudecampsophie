@@ -1,0 +1,79 @@
+import type { ExpoConfig } from 'expo/config';
+
+/**
+ * Native app configuration (spec P15). `com.pencillift.app` is PROPOSED: the owner must confirm and
+ * reserve bundle/package ownership before any store registration (docs/Owner_Actions.md).
+ * EXPO_PUBLIC_* values are compiled into the bundle and therefore public.
+ */
+const rawApiBaseUrl: unknown = process.env.EXPO_PUBLIC_API_BASE_URL;
+const apiBaseUrl =
+  typeof rawApiBaseUrl === 'string' && rawApiBaseUrl.length > 0
+    ? rawApiBaseUrl
+    : 'http://localhost:8787';
+
+const config: ExpoConfig = {
+  name: 'PencilLift',
+  slug: 'pencillift',
+  scheme: 'pencillift',
+  version: '0.1.0',
+  orientation: 'default',
+  userInterfaceStyle: 'light',
+  platforms: ['ios', 'android', 'web'],
+  ios: {
+    bundleIdentifier: 'com.pencillift.app',
+    supportsTablet: true,
+    buildNumber: '1',
+    infoPlist: {
+      NSCameraUsageDescription:
+        'PencilLift uses the camera so you can take a photo of completed homework to check it.',
+      NSPhotoLibraryUsageDescription:
+        'PencilLift lets you choose a photo of completed homework from your library.',
+      NSFaceIDUsageDescription: 'Face ID lets a parent unlock the parent area quickly.',
+    },
+    privacyManifests: {
+      NSPrivacyTracking: false,
+      NSPrivacyTrackingDomains: [],
+      NSPrivacyCollectedDataTypes: [],
+      NSPrivacyAccessedAPITypes: [],
+    },
+  },
+  android: {
+    package: 'com.pencillift.app',
+    versionCode: 1,
+    permissions: ['CAMERA', 'USE_BIOMETRIC'],
+    blockedPermissions: [
+      'android.permission.ACCESS_FINE_LOCATION',
+      'android.permission.ACCESS_COARSE_LOCATION',
+      'android.permission.RECORD_AUDIO',
+      'com.google.android.gms.permission.AD_ID',
+    ],
+  },
+  plugins: [
+    'expo-router',
+    'expo-secure-store',
+    [
+      'expo-camera',
+      {
+        cameraPermission:
+          'PencilLift uses the camera so you can take a photo of completed homework to check it.',
+        recordAudioAndroid: false,
+      },
+    ],
+    [
+      'expo-image-picker',
+      {
+        photosPermission:
+          'PencilLift lets you choose a photo of completed homework from your library.',
+      },
+    ],
+    [
+      'expo-local-authentication',
+      { faceIDPermission: 'Face ID lets a parent unlock the parent area quickly.' },
+    ],
+    'expo-notifications',
+  ],
+  experiments: { typedRoutes: true },
+  extra: { apiBaseUrl },
+};
+
+export default config;

@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM"],
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "moduleResolution": "Bundler",
+    "noUncheckedIndexedAccess": true
+  },
+  "include": ["app", "src", "app.config.ts", "vitest.config.ts", "expo-env.d.ts"]
+}

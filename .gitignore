@@ -19,3 +19,6 @@ playwright-report/
 evidence/tmp/
 __pycache__/
 *.pyc
+
+# Expo generated
+apps/mobile/expo-env.d.ts
