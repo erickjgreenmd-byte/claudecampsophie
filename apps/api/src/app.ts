@@ -17,6 +17,7 @@ import { adminPromotionsRoutes } from './routes/admin-promotions.ts';
 import { webhooksRoutes } from './routes/webhooks.ts';
 import { monetizationRoutes } from './routes/monetization.ts';
 import { billingRoutes } from './routes/billing.ts';
+import { exportDownloadRoutes } from './routes/export-download.ts';
 import { adminMonetizationRoutes } from './routes/admin-monetization.ts';
 
 /** Max JSON body accepted by any route (uploads use signed storage URLs, never the API body). */
@@ -126,6 +127,7 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   app.route('/v1', promotionsRoutes()); // /v1/schools*, /v1/family/school*, /v1/family/promotions*
   app.route('/v1/admin', adminPromotionsRoutes()); // /v1/admin/promo-*, campaigns, schools, payouts
   app.route('/v1', billingRoutes()); // /v1/billing/*
+  app.route('/v1', exportDownloadRoutes()); // /v1/exports/:id/download
   app.route('/v1', monetizationRoutes()); // /v1/resources*, /v1/placements*, /v1/outbound*
   app.route('/v1/admin', adminMonetizationRoutes()); // /v1/admin/monetization/*
   app.route('/webhooks', webhooksRoutes()); // /webhooks/revenuecat, /webhooks/stripe
