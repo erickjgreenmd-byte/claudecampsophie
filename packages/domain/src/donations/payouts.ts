@@ -5,7 +5,7 @@ import type { Cents } from '../shared/money.ts';
 import { err, ok, assertNever, type Result } from '../shared/result.ts';
 import { parseCalendarMonth, type CalendarMonth } from '../shared/time.ts';
 import { DONATION_CENTS } from './eligibility.ts';
-import { assertId } from './validation.ts';
+import { assertId, containsHiddenCharacters, hasReadableContent } from './validation.ts';
 
 export const PAYOUT_STATUSES = ['accrued', 'approved', 'paid', 'failed', 'adjusted'] as const;
 export type PayoutStatus = (typeof PAYOUT_STATUSES)[number];
@@ -177,8 +177,6 @@ export type PayoutTransition =
   | { readonly status: 'adjusted' };
 
 const MAX_TRANSFER_REFERENCE_LENGTH = 200;
-// eslint-disable-next-line no-control-regex -- rejecting control characters is the point
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 
 /**
  * Payout state machine:
@@ -190,6 +188,11 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
  * ambiguous timeout resubmits the SAME transfer, so it can never become a second transfer.
  * Approving an approved/paid/adjusted batch is INVALID_TRANSITION (no duplicate submission).
  * Marking paid requires the external transfer reference.
+ * Decision: the reference is the audit record of the transfer, so it must be readable as stored.
+ * One with no letter or digit once invisible characters are ignored (e.g. only U+200B) is
+ * MISSING_TRANSFER_REFERENCE; one that contains control or invisible characters anywhere, or is
+ * longer than 200 characters, is INVALID_TRANSFER_REFERENCE (RV-donations-3). Nothing is stripped
+ * silently: only surrounding whitespace is trimmed.
  * Decision: `adjusted --adjust--> adjusted` is allowed so several post-payment adjustments can be
  * recorded against one paid batch; paid history itself is never rewritten.
  */
@@ -217,10 +220,10 @@ export function transitionPayout(
     case 'mark_paid': {
       if (status !== 'approved') return invalid();
       const reference = event.transferReference.trim();
-      if (reference === '') {
+      if (!hasReadableContent(reference)) {
         return err('MISSING_TRANSFER_REFERENCE', 'An external transfer reference is required');
       }
-      if (reference.length > MAX_TRANSFER_REFERENCE_LENGTH || CONTROL_CHARS.test(reference)) {
+      if (reference.length > MAX_TRANSFER_REFERENCE_LENGTH || containsHiddenCharacters(reference)) {
         return err('INVALID_TRANSFER_REFERENCE', 'The transfer reference is malformed');
       }
       return ok({ status: 'paid', transferReference: reference });

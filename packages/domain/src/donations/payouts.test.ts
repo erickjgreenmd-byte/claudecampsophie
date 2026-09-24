@@ -233,6 +233,50 @@ describe('transitionPayout — statuses accrued, approved, paid, failed, adjuste
     }
   });
 
+  it('a reference with no readable letter or digit is missing, however it is padded (RV-donations-3)', () => {
+    for (const transferReference of [
+      '\u200b',
+      '\ufeff',
+      '\u3164', // HANGUL FILLER: a default-ignorable letter
+      '\u2800', // BRAILLE PATTERN BLANK
+      ' \u200b\u00a0',
+      '---',
+    ]) {
+      const result = transitionPayout('approved', { type: 'mark_paid', transferReference });
+      expect(!result.ok && result.error.code, JSON.stringify(transferReference)).toBe(
+        'MISSING_TRANSFER_REFERENCE',
+      );
+    }
+  });
+
+  it('a reference hiding invisible or bidi characters is rejected, not silently cleaned (RV-donations-3)', () => {
+    for (const transferReference of [
+      'tr_\u200b1',
+      'tr_1\u2060',
+      'tr_\u202e1', // right-to-left override
+      'tr_1\u00ad',
+      'tr_\u20281', // line separator inside (trim() only removes it at the ends)
+      'tr_\ue0001', // private use
+    ]) {
+      const result = transitionPayout('approved', { type: 'mark_paid', transferReference });
+      expect(!result.ok && result.error.code, JSON.stringify(transferReference)).toBe(
+        'INVALID_TRANSFER_REFERENCE',
+      );
+    }
+  });
+
+  it('ordinary references, including inner spaces and accented letters, are accepted as trimmed', () => {
+    for (const [input, stored] of [
+      ['ACH 000123', 'ACH 000123'],
+      ['  réf-2026-10  ', 'réf-2026-10'],
+      ['tr_1Abc', 'tr_1Abc'],
+    ] as const) {
+      expect(transitionPayout('approved', { type: 'mark_paid', transferReference: input })).toEqual(
+        { ok: true, value: { status: 'paid', transferReference: stored } },
+      );
+    }
+  });
+
   it('a failed transfer is retried with the same batch idempotency key, so it can never become a second transfer', () => {
     const first = transitionPayout('accrued', approve);
     const failed = transitionPayout('approved', { type: 'mark_failed' });

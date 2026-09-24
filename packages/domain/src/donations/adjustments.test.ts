@@ -41,6 +41,20 @@ function apply(
 const net = (adjustments: readonly DonationAdjustment[]): number =>
   100 + adjustments.reduce((sum, a) => sum + a.amountCents, 0);
 
+/** Re-fetched provider state after each event, for a period whose disputes are won in full. */
+const providerAfter = (event: AdjustmentEvent): ProviderPeriodState => {
+  switch (event) {
+    case 'refund':
+      return { settlement: 'refunded', refundedCents: 4998 };
+    case 'partial_refund':
+      return { settlement: 'partially_refunded', refundedCents: 1000 };
+    case 'chargeback':
+      return { settlement: 'chargeback', refundedCents: 4998 };
+    case 'chargeback_reversed':
+      return { settlement: 'settled', refundedCents: 0 };
+  }
+};
+
 describe('planAdjustment — refunds and chargebacks never delete ledger rows (AC_PROMO_12)', () => {
   it.each(['refund', 'partial_refund', 'chargeback'] as const)(
     'a %s reverses an unpaid accrual by exactly -100',
@@ -77,7 +91,13 @@ describe('planAdjustment — refunds and chargebacks never delete ledger rows (A
   });
 
   it('a chargeback reversal after a chargeback reinstates +100 exactly once', () => {
-    const made = apply(PAID, ['chargeback', 'chargeback_reversed', 'chargeback_reversed']);
+    // RV-donations-2: a reinstatement is decided on the re-fetched provider state (settled, $0
+    // refunded after the won dispute), never on the event order alone.
+    const made = apply(
+      PAID,
+      ['chargeback', 'chargeback_reversed', 'chargeback_reversed'],
+      providerAfter,
+    );
     expect(made.map((a) => [a.idempotencyKey, a.amountCents])).toEqual([
       ['acc_riley_2026_09:reversal', -100],
       ['acc_riley_2026_09:reinstatement', 100],
@@ -96,6 +116,43 @@ describe('planAdjustment — refunds and chargebacks never delete ledger rows (A
     ).toBeNull();
   });
 
+  it('without re-fetched provider state a won dispute never reinstates (fail closed, RV-donations-2)', () => {
+    // The keys only record that the accrual was reversed, not whether a permanent refund or a
+    // reversible dispute caused it, so the event order alone cannot justify paying the $1 again.
+    for (const cause of ['chargeback', 'refund', 'partial_refund'] as const) {
+      const made = apply(PAID, [cause, 'chargeback_reversed']);
+      expect(
+        made.map((a) => a.kind),
+        cause,
+      ).toEqual(['reversal']);
+      expect(net(made)).toBe(0);
+    }
+    const unrecognized = planAdjustment({
+      accrual: PAID,
+      event: 'chargeback_reversed',
+      existingAdjustmentKeys: new Set(['acc_riley_2026_09:reversal']),
+      providerState: {
+        settlement: 'SETTLED' as ProviderPeriodState['settlement'],
+        refundedCents: 0,
+      },
+    });
+    expect(unrecognized).toBeNull();
+  });
+
+  it('partial refund, then a chargeback, then a won dispute nets 0 with provider state', () => {
+    const made = apply(
+      PAID,
+      ['partial_refund', 'chargeback', 'chargeback_reversed'],
+      // The partial refund still stands after the dispute is won.
+      (event) =>
+        event === 'partial_refund' || event === 'chargeback_reversed'
+          ? { settlement: 'partially_refunded', refundedCents: 1000 }
+          : { settlement: 'chargeback', refundedCents: 4998 },
+    );
+    expect(made.map((a) => a.kind)).toEqual(['reversal']);
+    expect(net(made)).toBe(0);
+  });
+
   it('a won dispute does not reinstate while the provider still shows a refund on the period', () => {
     const adjustment = planAdjustment({
       accrual: PAID,
@@ -107,13 +164,13 @@ describe('planAdjustment — refunds and chargebacks never delete ledger rows (A
   });
 
   it('a refund after a reinstatement reverses one final time, then nothing further', () => {
-    const made = apply(PAID, [
-      'chargeback',
-      'chargeback_reversed',
-      'refund',
-      'chargeback_reversed',
-      'refund',
-    ]);
+    // providerAfter reports the second won dispute as settled in full too, so this also shows the
+    // final reversal is terminal whatever the provider says afterwards.
+    const made = apply(
+      PAID,
+      ['chargeback', 'chargeback_reversed', 'refund', 'chargeback_reversed', 'refund'],
+      providerAfter,
+    );
     expect(made.map((a) => a.kind)).toEqual(['reversal', 'reinstatement', 'final_reversal']);
     expect(net(made)).toBe(0);
   });

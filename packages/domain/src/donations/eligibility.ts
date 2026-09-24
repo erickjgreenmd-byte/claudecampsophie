@@ -31,7 +31,8 @@ export const DONATION_RULES_VERSION = 'p17-f7-full-price-only-v1';
 /**
  * Ineligibility reasons in evaluation order; the first failing rule is the reported reason.
  * NOT_SUBSCRIPTION_PERIOD: proration, add-on and tax invoices never qualify on their own.
- * NOT_SETTLED: pending or failed payment (or no settlement time recorded).
+ * NOT_SETTLED: pending or failed payment, an unrecognized settlement status, or no settlement
+ *   time recorded.
  * REFUNDED_OR_CHARGED_BACK: refunded, partially refunded, charged back, or any refunded cents.
  * DISCOUNTED: ANY discount (1%..100%, promo code, promotional credit, intro offer) or a charge
  *   below the regular price disqualifies the whole period, even when a positive payment remains.
@@ -72,6 +73,30 @@ const RULE_FAILURE: Readonly<Record<DonationRule, DonationIneligibleReason>> = {
   school_designated: 'NO_SCHOOL_DESIGNATION',
   school_active: 'SCHOOL_INACTIVE',
 };
+
+/**
+ * What each known settlement status means for the `settled` and `not_refunded` rules.
+ * collected: the payment was taken and stands. reversed: it was taken, then refunded (in part) or
+ * charged back. uncollected: no payment was taken.
+ * Decision: both rules are allow-lists over this table (RV-donations-1). A status that is not in
+ * it (a new provider state, a casing slip in a normalizer) fails `settled` and reports NOT_SETTLED,
+ * so it can never earn a donation; that fails closed like the `kind` rule and `unknown` schools.
+ * The Record type forces a decision here whenever SettlementStatus gains a member.
+ */
+const SETTLEMENT_OUTCOME: Readonly<
+  Record<SettlementStatus, 'collected' | 'reversed' | 'uncollected'>
+> = {
+  settled: 'collected',
+  refunded: 'reversed',
+  partially_refunded: 'reversed',
+  chargeback: 'reversed',
+  pending: 'uncollected',
+  failed: 'uncollected',
+};
+/** Map lookup, so inherited object keys such as "constructor" are never mistaken for a status. */
+const SETTLEMENT_OUTCOMES: ReadonlyMap<string, 'collected' | 'reversed' | 'uncollected'> = new Map(
+  Object.entries(SETTLEMENT_OUTCOME),
+);
 
 export interface EvaluatedRule {
   readonly rule: DonationRule;
@@ -144,6 +169,8 @@ export interface EvaluateDonationEligibilityInput {
  * There is no input that relaxes the rule: extra properties are ignored by construction.
  * Decision: an `unknown` school status is treated like `inactive` (fail closed).
  * Decision: a `settled` period without `settledAt` is treated as not settled (fail closed).
+ * Decision: an unrecognized settlement status is treated as not settled (fail closed); see
+ * SETTLEMENT_OUTCOME.
  */
 export function evaluateDonationEligibility(
   input: EvaluateDonationEligibilityInput,
@@ -157,22 +184,17 @@ export function evaluateDonationEligibility(
   const schoolId = designationForMonth(input.designations, donationMonth);
   const schoolStatus = schoolId === null ? null : input.schoolStatus(schoolId);
 
+  const settlement = SETTLEMENT_OUTCOMES.get(period.settlement) ?? 'unrecognized';
   const rules: EvaluatedRule[] = [
     { rule: 'subscription_period', passed: period.kind === 'subscription_period' },
     {
       rule: 'settled',
       passed:
-        period.settlement !== 'pending' &&
-        period.settlement !== 'failed' &&
-        period.settledAt !== null,
+        (settlement === 'collected' || settlement === 'reversed') && period.settledAt !== null,
     },
     {
       rule: 'not_refunded',
-      passed:
-        period.settlement !== 'refunded' &&
-        period.settlement !== 'partially_refunded' &&
-        period.settlement !== 'chargeback' &&
-        period.refundedCents === 0,
+      passed: settlement === 'collected' && period.refundedCents === 0,
     },
     {
       rule: 'undiscounted',

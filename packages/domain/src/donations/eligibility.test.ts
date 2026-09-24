@@ -103,6 +103,31 @@ describe('evaluateDonationEligibility — F7 approved donation rule (AC_PROMO_11
     expect(reasonOf(evaluate(period({ settlement, settledAt: null })))).toBe('NOT_SETTLED');
   });
 
+  it('an unrecognized settlement status fails closed as not settled (RV-donations-1)', () => {
+    // Values the SettlementStatus union excludes but a normalizer slip could produce, including
+    // inherited object keys that a plain-object lookup would wrongly find.
+    for (const settlement of [
+      'disputed',
+      'void',
+      'in_grace_period',
+      'SETTLED',
+      ' settled',
+      '',
+      'constructor',
+      '__proto__',
+      'toString',
+    ]) {
+      const result = evaluate(
+        period({ settlement: settlement as BillingPeriodFact['settlement'] }),
+      );
+      expect(reasonOf(result), settlement).toBe('NOT_SETTLED');
+      const rules = Object.fromEntries(
+        result.snapshot.evaluatedRules.map((r) => [r.rule, r.passed]),
+      );
+      expect(rules, settlement).toMatchObject({ settled: false, not_refunded: false });
+    }
+  });
+
   it('a "settled" status without a settlement time fails closed as not settled', () => {
     expect(reasonOf(evaluate(period({ settledAt: null })))).toBe('NOT_SETTLED');
   });

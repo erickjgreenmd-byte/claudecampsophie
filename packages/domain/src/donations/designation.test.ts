@@ -140,7 +140,20 @@ describe('planSchoolDesignation — one school per family, changes from the next
     expect(result.designations).toEqual(pendingOak);
   });
 
-  it.each(['', '   ', ' sch_maple', 'sch\nmaple'])('rejects a malformed school id %j', (id) => {
+  it.each([
+    '',
+    '   ',
+    ' sch_maple',
+    'sch\nmaple',
+    // Invisible-only or invisible-padded ids (RV-donations-3): zero width space, word joiner, soft
+    // hyphen + zero width joiner, byte order mark, hangul filler.
+    '\u200b',
+    '\u2060',
+    '\u00ad\u200d',
+    'sch_maple\ufeff',
+    'sch_\u200bmaple',
+    '\u3164',
+  ])('rejects a malformed school id %j', (id) => {
     const result = planSchoolDesignation({
       designations: MAPLE_SINCE_JANUARY,
       newSchoolId: id,

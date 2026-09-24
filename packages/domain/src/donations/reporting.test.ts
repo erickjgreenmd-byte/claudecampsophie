@@ -222,6 +222,157 @@ describe('toSchoolFacingReport — schools see only suppressed aggregates (AC_PR
     expect(summarize([FULL_PRICE]).activeFamilies).toBe(1);
   });
 
+  it('withholds a figure that would reveal a small group by subtraction (RV-donations-4)', () => {
+    // 6 active families, 5 of them donating: publishing both reveals the one that did not pay
+    // full price. The donation figures keep priority; the others are withheld as "5+".
+    const report = toSchoolFacingReport({
+      ...base,
+      attributedSignups: 6,
+      activeFamilies: 6,
+      donationEligibleFamilies: 5,
+      accruedCents: 500,
+      paidCents: 0,
+    });
+    expect(report).toMatchObject({
+      attributedSignups: '5+',
+      activeFamilies: '5+',
+      donationEligibleFamilies: 5,
+      contributionAccruedCents: 500,
+      contributionPaidCents: 0,
+    });
+  });
+
+  it('treats amounts as $1-per-family counts, so an amount cannot be subtracted either', () => {
+    // Accrued $6.00 but paid $5.00: the $1 gap is one family's reversed donation.
+    const report = toSchoolFacingReport({
+      ...base,
+      attributedSignups: 6,
+      activeFamilies: 6,
+      donationEligibleFamilies: 6,
+      accruedCents: 600,
+      paidCents: 500,
+    });
+    expect(report).toMatchObject({
+      attributedSignups: 6,
+      activeFamilies: 6,
+      donationEligibleFamilies: 6,
+      contributionAccruedCents: 600,
+      contributionPaidCents: '$5.00+',
+    });
+    // A published family count next to a published amount is checked too.
+    const fromAmount = toSchoolFacingReport({
+      ...base,
+      attributedSignups: 0,
+      activeFamilies: 7,
+      donationEligibleFamilies: 0,
+      accruedCents: 500,
+      paidCents: 500,
+    });
+    expect(fromAmount.contributionAccruedCents).toBe(500);
+    expect(fromAmount.activeFamilies).toBe('5+');
+  });
+
+  it('refuses a negative amount instead of publishing an exact reversal (programmer error)', () => {
+    // summarizeSchoolMonth never produces one; a hand-built summary with −$1 would expose one reversal.
+    expect(() => toSchoolFacingReport({ ...base, paidCents: -100 })).toThrow(RangeError);
+    expect(() => toSchoolFacingReport({ ...base, activeFamilies: 2.5 })).toThrow(RangeError);
+  });
+
+  it('publishes every figure when they are equal or far apart', () => {
+    const report = toSchoolFacingReport({
+      ...base,
+      attributedSignups: 20,
+      activeFamilies: 12,
+      donationEligibleFamilies: 12,
+      accruedCents: 1200,
+      paidCents: 0,
+    });
+    expect(report).toMatchObject({
+      attributedSignups: 20,
+      activeFamilies: 12,
+      donationEligibleFamilies: 12,
+      contributionAccruedCents: 1200,
+      contributionPaidCents: 0,
+    });
+  });
+
+  it('end to end: a discounted family among six cannot be recovered from the school view', () => {
+    const facts = [
+      ...['fam_riley', 'fam_sam', 'fam_avery', 'fam_jordan', 'fam_casey'].map((id) => fact(id)),
+      fact('fam_morgan', { chargedCents: 2499, discounted: true, donationEligible: false }),
+    ];
+    const summary = summarizeSchoolMonth({
+      schoolId: MAPLE,
+      month: '2026-09',
+      familyFacts: facts,
+      accruedCents: 500,
+      paidCents: 500,
+    });
+    expect(summary).toMatchObject({ activeFamilies: 6, donationEligibleFamilies: 5 });
+    const report = toSchoolFacingReport(summary);
+    expect(report.activeFamilies).toBe('5+');
+    expect(report.donationEligibleFamilies).toBe(5);
+  });
+
+  it('property: published figures never differ by 1..minCohort−1 families; every label is truthful', () => {
+    const count = fc.integer({ min: 0, max: 30 });
+    const cents = fc.oneof(
+      fc.integer({ min: 0, max: 30 }).map((n) => n * 100),
+      fc.integer({ min: 0, max: 3000 }),
+    );
+    fc.assert(
+      fc.property(
+        count,
+        count,
+        count,
+        cents,
+        cents,
+        fc.constantFrom(5, 6, 10),
+        (signups, active, eligible, accrued, paid, minCohort) => {
+          const summary: SchoolMonthSummary = {
+            ...base,
+            attributedSignups: signups,
+            activeFamilies: active,
+            donationEligibleFamilies: eligible,
+            accruedCents: accrued,
+            paidCents: paid,
+          };
+          const report = toSchoolFacingReport(summary, minCohort);
+          const threshold = minCohort * 100;
+          const figures = [
+            [report.attributedSignups, signups * 100, 'count'],
+            [report.activeFamilies, active * 100, 'count'],
+            [report.donationEligibleFamilies, eligible * 100, 'count'],
+            [report.contributionAccruedCents, accrued, 'amount'],
+            [report.contributionPaidCents, paid, 'amount'],
+          ] as const;
+          const published: number[] = [];
+          for (const [shown, exactCents, kind] of figures) {
+            const small = exactCents > 0 && exactCents < threshold;
+            if (typeof shown === 'number') {
+              // Published figures are exact and never small.
+              expect(kind === 'count' ? shown * 100 : shown).toBe(exactCents);
+              expect(small).toBe(false);
+              published.push(exactCents);
+            } else if (shown.startsWith('<')) {
+              expect(small).toBe(true);
+            } else {
+              // Withheld as "N+" / "$N.00+": true only for figures of at least minCohort.
+              expect(shown.endsWith('+')).toBe(true);
+              expect(exactCents).toBeGreaterThanOrEqual(threshold);
+            }
+          }
+          for (const a of published) {
+            for (const b of published) {
+              const gap = Math.abs(a - b);
+              expect(gap === 0 || gap >= threshold).toBe(true);
+            }
+          }
+        },
+      ),
+    );
+  });
+
   it('property: no school-facing count is ever an exact value between 1 and 4', () => {
     const count = fc.integer({ min: 0, max: 30 });
     fc.assert(

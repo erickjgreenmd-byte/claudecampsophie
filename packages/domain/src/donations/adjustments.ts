@@ -39,8 +39,9 @@ export interface PlanAdjustmentInput {
   /** Idempotency keys of adjustments already recorded (any accrual; only this one's matter). */
   readonly existingAdjustmentKeys: ReadonlySet<string>;
   /**
-   * Recommended. When present, a chargeback reversal reinstates only if the provider shows the
-   * period settled with nothing refunded, so a won dispute cannot resurrect a refunded period.
+   * Required for a reinstatement. A chargeback reversal reinstates only when this re-fetched
+   * provider state shows the period settled with nothing refunded; without it, or with any other
+   * state, it plans nothing. Refund and chargeback events do not need it.
    */
   readonly providerState?: ProviderPeriodState;
 }
@@ -68,13 +69,18 @@ export function adjustmentKey(accrualId: string, kind: AdjustmentKind): string {
  *
  * - refund / partial_refund / chargeback: -100 once (`reversal`). Any partial refund removes the
  *   whole $1 because a refunded period is not a full-price period.
- * - chargeback_reversed after a reversal: +100 once (`reinstatement`).
+ * - chargeback_reversed after a reversal: +100 once (`reinstatement`), only when the re-fetched
+ *   provider state shows the period settled in full (see below).
  * Decision: a refund or chargeback AFTER a reinstatement reverses once more (`final_reversal`,
  * terminal) rather than being ignored, so PencilLift never keeps paying $1 for a refunded period.
  * A second won dispute after that does not reinstate again (under-paying $1 in that rare case is
  * the safe direction). The accrual net is therefore always 0 or 100.
- * Decision: without `providerState`, a chargeback reversal after a reversal reinstates (contract
- * default); callers should pass the re-fetched provider state to guard refund-then-dispute cases.
+ * Decision: a reinstatement requires the re-fetched `providerState` to show the period settled
+ * with nothing refunded; without providerState a chargeback reversal plans nothing (fail closed,
+ * RV-donations-2). The recorded keys only say THAT the accrual was reversed, not whether a
+ * permanent refund or a reversible dispute caused it, so the event order alone cannot tell that a
+ * won dispute left the period at full price (e.g. partial refund → chargeback → dispute won).
+ * docs/Architecture.md §5: reconciliation uses fetched provider state, not event order.
  */
 export function planAdjustment(input: PlanAdjustmentInput): DonationAdjustment | null {
   const { accrual, event, existingAdjustmentKeys: keys } = input;
@@ -113,10 +119,9 @@ export function planAdjustment(input: PlanAdjustmentInput): DonationAdjustment |
     case 'chargeback_reversed': {
       if (!reversed || reinstated) return null;
       const state = input.providerState;
-      if (state !== undefined && !(state.settlement === 'settled' && state.refundedCents === 0)) {
-        return null;
-      }
-      return make('reinstatement', 100);
+      const settledInFull =
+        state !== undefined && state.settlement === 'settled' && state.refundedCents === 0;
+      return settledInFull ? make('reinstatement', 100) : null;
     }
     default:
       return assertNever(event, 'adjustment event');

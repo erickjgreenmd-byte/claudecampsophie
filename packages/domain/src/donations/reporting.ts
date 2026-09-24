@@ -1,6 +1,6 @@
 // School reporting (spec P17): distinct family counts for administrators, and a suppressed,
 // aggregate-only view for schools. No family, guardian, child or payment identifiers leave here.
-import { assertCents, formatUsd, type Cents } from '../shared/money.ts';
+import { formatUsd, type Cents } from '../shared/money.ts';
 import { parseCalendarMonth, type CalendarMonth } from '../shared/time.ts';
 import { DONATION_CENTS } from './eligibility.ts';
 import { assertId, assertNonNegativeCents } from './validation.ts';
@@ -105,8 +105,14 @@ export function summarizeSchoolMonth(input: SummarizeSchoolMonthInput): SchoolMo
 /** Minimum cohort below which school-facing figures are suppressed. */
 export const DEFAULT_MIN_COHORT = 5;
 
-export type SuppressedCount = number | `<${number}`;
-export type SuppressedAmount = Cents | `<${string}`;
+/**
+ * A school-facing count: the exact value, `<5` for a small count (1..minCohort−1), or `5+` for a
+ * count of at least minCohort that is withheld because publishing it next to another figure would
+ * reveal a small group by subtraction (with minCohort 5).
+ */
+export type SuppressedCount = number | `<${number}` | `${number}+`;
+/** A school-facing amount: exact cents, e.g. `<$5.00` when small, or e.g. `$5.00+` when withheld. */
+export type SuppressedAmount = Cents | `<${string}` | `${string}+`;
 
 /** What a school administrator may see: suppressed aggregates only. */
 export interface SchoolFacingReport {
@@ -120,15 +126,40 @@ export interface SchoolFacingReport {
   readonly contributionPaidCents: SuppressedAmount;
 }
 
+type FigureKey =
+  | 'attributedSignups'
+  | 'activeFamilies'
+  | 'donationEligibleFamilies'
+  | 'contributionAccruedCents'
+  | 'contributionPaidCents';
+
+/**
+ * Order in which figures claim publication when two of them conflict: the contribution and the
+ * donation count first (what the report is for), then signups, and active families last.
+ */
+const PUBLICATION_PRIORITY: readonly FigureKey[] = [
+  'contributionAccruedCents',
+  'donationEligibleFamilies',
+  'contributionPaidCents',
+  'attributedSignups',
+  'activeFamilies',
+];
+
 /**
  * Builds the school-facing view: any count in 1..minCohort−1 becomes `<minCohort` (e.g. "<5").
  *
  * Decision: internal fields are omitted — owedCents and the payment-status breakdown
  * (positivePayingFamilies, fullyDiscountedFamilies) — because payment status is family financial
- * data, and publishing it next to activeFamilies would let a school subtract its way to a
- * suppressed small group.
+ * data.
  * Decision: a contribution amount in 1..(minCohort × $1 − 1¢) is shown as e.g. "<$5.00", since each
  * family contributes exactly $1 and the exact amount would reveal a suppressed count.
+ * Decision (complementary suppression, RV-donations-4): no two published figures may differ by
+ * 1..minCohort−1 families, because the difference is itself a group of families (e.g. 6 active and
+ * 5 donation-eligible families reveal the one family that did not pay full price). Amounts count
+ * as families at $1 each. Figures are considered in PUBLICATION_PRIORITY order and each one is
+ * published only if it is equal to, or at least minCohort families away from, every figure already
+ * published; otherwise it is withheld as `minCohort+` (counts) or e.g. `$5.00+` (amounts). The
+ * label is truthful: only figures of at least minCohort can reach this step.
  * Decision: minCohort below the default of 5 is refused (privacy can be tightened, not weakened).
  */
 export function toSchoolFacingReport(
@@ -138,25 +169,49 @@ export function toSchoolFacingReport(
   if (!Number.isSafeInteger(minCohort) || minCohort < DEFAULT_MIN_COHORT) {
     throw new RangeError(`minCohort must be an integer of at least ${DEFAULT_MIN_COHORT}`);
   }
-  const count = (value: number): SuppressedCount => {
+  const countCents = (value: number): Cents => {
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new RangeError('Report counts must be non-negative integers');
     }
-    return value > 0 && value < minCohort ? `<${minCohort}` : value;
+    return value * DONATION_CENTS;
   };
-  const moneyThreshold = minCohort * DONATION_CENTS;
-  const amount = (value: Cents): SuppressedAmount => {
-    assertCents(value, 'contribution amount');
-    return value > 0 && value < moneyThreshold ? `<${formatUsd(moneyThreshold)}` : value;
+  const amountCents = (value: Cents): Cents => assertNonNegativeCents(value, 'contribution amount');
+  // Every figure in family-equivalent cents (a family is $1), so counts and amounts compare.
+  const cents: Readonly<Record<FigureKey, Cents>> = {
+    attributedSignups: countCents(summary.attributedSignups),
+    activeFamilies: countCents(summary.activeFamilies),
+    donationEligibleFamilies: countCents(summary.donationEligibleFamilies),
+    contributionAccruedCents: amountCents(summary.accruedCents),
+    contributionPaidCents: amountCents(summary.paidCents),
+  };
+  const threshold = minCohort * DONATION_CENTS;
+  const isSmall = (value: Cents) => value > 0 && value < threshold;
+
+  const published: Cents[] = [];
+  const withheld = new Set<FigureKey>();
+  for (const key of PUBLICATION_PRIORITY) {
+    const value = cents[key];
+    if (isSmall(value)) continue; // primary suppression, labelled below
+    if (published.some((other) => isSmall(Math.abs(value - other)))) withheld.add(key);
+    else published.push(value);
+  }
+
+  const count = (key: FigureKey, value: number): SuppressedCount => {
+    if (isSmall(cents[key])) return `<${minCohort}`;
+    return withheld.has(key) ? `${minCohort}+` : value;
+  };
+  const amount = (key: FigureKey, value: Cents): SuppressedAmount => {
+    if (isSmall(value)) return `<${formatUsd(threshold)}`;
+    return withheld.has(key) ? `${formatUsd(threshold)}+` : value;
   };
   return {
     schoolId: summary.schoolId,
     month: summary.month,
-    attributedSignups: count(summary.attributedSignups),
-    activeFamilies: count(summary.activeFamilies),
-    donationEligibleFamilies: count(summary.donationEligibleFamilies),
-    contributionAccruedCents: amount(summary.accruedCents),
-    contributionPaidCents: amount(summary.paidCents),
+    attributedSignups: count('attributedSignups', summary.attributedSignups),
+    activeFamilies: count('activeFamilies', summary.activeFamilies),
+    donationEligibleFamilies: count('donationEligibleFamilies', summary.donationEligibleFamilies),
+    contributionAccruedCents: amount('contributionAccruedCents', summary.accruedCents),
+    contributionPaidCents: amount('contributionPaidCents', summary.paidCents),
   };
 }
 
