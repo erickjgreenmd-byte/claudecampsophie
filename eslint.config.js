@@ -48,6 +48,19 @@ export default tseslint.config(
     },
   },
   {
+    // Worker source must be type-checked with Workers types, not the tests' Node/DOM environment that
+    // the project service would otherwise reuse for files the tests import.
+    files: ['apps/api/src/**/*.ts'],
+    ignores: ['apps/api/src/**/*.test.ts'],
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+        project: ['./apps/api/tsconfig.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+  {
     files: ['**/*.test.ts', '**/*.test.tsx', '**/tests/**/*.ts'],
     rules: {
       '@typescript-eslint/no-unsafe-assignment': 'off',

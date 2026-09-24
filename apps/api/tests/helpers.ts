@@ -3,6 +3,7 @@ import { createTestDb, type TestDb } from '@pencillift/db/testing';
 import { cryptoRandom } from '@pencillift/domain';
 import { createApp } from '../src/app.ts';
 import { createParentVerifier } from '../src/auth/parent.ts';
+import { createStripeClientMock, createSubscriberStateMock } from '../src/providers/billing.ts';
 import { loadConfig, type ApiConfig } from '../src/config.ts';
 import { createDb, type Db } from '../src/db.ts';
 import type { LogEvent } from '../src/middleware/context.ts';
@@ -36,6 +37,8 @@ export interface TestApi {
     consent: ReturnType<typeof createDevelopmentConsentMock>;
     storage: ReturnType<typeof createMemoryStorageMock>;
     email: ReturnType<typeof createOutboxEmailMock>;
+    subscriptions: ReturnType<typeof createSubscriberStateMock>;
+    stripe: ReturnType<typeof createStripeClientMock>;
   };
   request(
     path: string,
@@ -56,6 +59,8 @@ export async function createTestApi(overrides: Record<string, string> = {}): Pro
     consent: createDevelopmentConsentMock(),
     storage: createMemoryStorageMock(),
     email: createOutboxEmailMock(),
+    subscriptions: createSubscriberStateMock(),
+    stripe: createStripeClientMock(),
   };
   const app = createApp({
     config,

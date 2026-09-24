@@ -47,6 +47,14 @@ export interface ApiConfig {
   };
   readonly zdrEvidence: ZdrEvidence | null;
   readonly corsOrigins: readonly string[];
+  readonly webhooks: {
+    /** RevenueCat sends this exact Authorization header value (configured in its dashboard). */
+    readonly revenuecatAuthorization: string | null;
+    /** Stripe endpoint signing secret (whsec_…). */
+    readonly stripeSigningSecret: string | null;
+  };
+  /** Store environment whose purchases grant capacity here (sandbox purchases never grant production access). */
+  readonly billingEnvironment: 'sandbox' | 'production';
 }
 
 export type ConfigError = { readonly name: string; readonly problem: string };
@@ -135,6 +143,11 @@ export function loadConfig(
       .split(',')
       .map((o) => o.trim())
       .filter(Boolean),
+    webhooks: {
+      revenuecatAuthorization: env.REVENUECAT_WEBHOOK_AUTH ?? null,
+      stripeSigningSecret: env.STRIPE_WEBHOOK_SECRET ?? null,
+    },
+    billingEnvironment: environment === 'production' ? 'production' : 'sandbox',
   };
   return errors.length ? { ok: false, errors } : { ok: true, config };
 }

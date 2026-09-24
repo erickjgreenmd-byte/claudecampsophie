@@ -1,3 +1,5 @@
+import type { StripeBillingClient, SubscriberStateProvider } from './billing.ts';
+
 /**
  * External provider boundaries. Every implementation declares `isMock`; production readiness
  * (config.productionReadiness) and these adapters refuse mocks outside development/test.
@@ -60,6 +62,8 @@ export interface Providers {
   readonly consent: ConsentProvider;
   readonly storage: StorageProvider;
   readonly email: EmailProvider;
+  readonly subscriptions: SubscriberStateProvider;
+  readonly stripe: StripeBillingClient;
 }
 
 /**

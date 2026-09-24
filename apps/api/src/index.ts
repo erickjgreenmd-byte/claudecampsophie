@@ -10,6 +10,12 @@ import {
   createOutboxEmailMock,
 } from './providers/index.ts';
 import { cryptoRandom } from '@pencillift/domain';
+import {
+  createRevenueCatProvider,
+  createStripeClient,
+  createStripeClientMock,
+  createSubscriberStateMock,
+} from './providers/billing.ts';
 
 /**
  * Cloudflare Worker entry. Secrets/vars arrive in `env`; the database connection comes from the
@@ -77,6 +83,14 @@ export default {
         consent: createDevelopmentConsentMock(),
         storage: createMemoryStorageMock(),
         email: createOutboxEmailMock(),
+        subscriptions:
+          typeof env.REVENUECAT_SECRET_API_KEY === 'string'
+            ? createRevenueCatProvider(env.REVENUECAT_SECRET_API_KEY)
+            : createSubscriberStateMock(),
+        stripe:
+          typeof env.STRIPE_SECRET_KEY === 'string'
+            ? createStripeClient(env.STRIPE_SECRET_KEY)
+            : createStripeClientMock(),
       },
       log: (event) => console.log(JSON.stringify(event)),
     });
