@@ -541,4 +541,32 @@ describe('homework history of an archived child stays readable', () => {
     expect(solutions.status).toBe(200);
     expect(assignmentSolutionsResponseSchema.parse(solutions.body).solutions).toHaveLength(1);
   });
+  it('a transcription correction queues no paid recheck for an archived or downgraded child', async () => {
+    const samScanId = await readyScan(fam, SAM()); // Sam's profile is draft (slot released)
+    for (const [childId, scanId] of [
+      [RILEY(), rileyScanId],
+      [SAM(), samScanId],
+    ] as const) {
+      const [question] = await api.db.sql<{ id: string }[]>`
+        select id from public.extracted_questions where assignment_id = ${scanId}`;
+      const res = await api.request(`/v1/questions/${question!.id}/correction`, {
+        method: 'POST',
+        token,
+        body: { studentAnswerText: '41' },
+      });
+      expect(res.status, childId).toBe(422);
+      const [state] = await api.db.sql<{ status: string }[]>`
+        select status from public.assignments where id = ${scanId}`;
+      expect(state!.status).toBe('ready');
+      const [row] = await api.db.sql<{ corrected: string | null }[]>`
+        select corrected_student_answer_text as corrected from public.extracted_questions
+         where id = ${question!.id}`;
+      expect(row!.corrected).toBeNull();
+      const jobs = await api.db.sql`
+        select 1 from public.jobs
+         where kind = 'scan_process' and payload->>'assignmentId' = ${scanId}
+           and payload->>'mode' = 'recheck'`;
+      expect(jobs).toHaveLength(0);
+    }
+  });
 });

@@ -1249,6 +1249,10 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
             'This scan is still being checked. Try again when it is ready.',
           );
         }
+        // A correction queues a paid AI recheck of child data, so it needs the same gate as a new
+        // scan: verified consent and a child who holds a paid slot. History of an archived or
+        // downgraded child stays readable but is not re-graded (AC_CAPACITY_08, spec P11).
+        await assertCanCollect(c, tx, caller, assignment.child_id);
         const hasPrompt = body.promptText !== undefined;
         const hasAnswer = body.studentAnswerText !== undefined;
         await tx`
