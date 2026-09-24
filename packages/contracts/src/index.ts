@@ -8,3 +8,4 @@ export * from './homework.ts';
 export * from './learning.ts';
 export * from './privacy.ts';
 export * from './monetization.ts';
+export * from './billing.ts';

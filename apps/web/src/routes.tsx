@@ -35,6 +35,7 @@ export const routes: RouteObject[] = [
   { path: '/app/learning', lazy: page(() => import('./pages/app/LearningPlannerPage.tsx')) },
   { path: '/app/school', lazy: page(() => import('./pages/app/SchoolAndPromotionsPage.tsx')) },
   { path: '/app/resources', lazy: page(() => import('./pages/app/ResourcesPage.tsx')) },
+  { path: '/app/subscription', lazy: page(() => import('./pages/app/SubscriptionPage.tsx')) },
   { path: '/admin', lazy: page(() => import('./pages/admin/AdminHomePage.tsx')) },
   { path: '/admin/mfa', lazy: page(() => import('./pages/admin/MfaPage.tsx')) },
   { path: '/admin/promotions', lazy: page(() => import('./pages/admin/PromotionsAdminPage.tsx')) },
