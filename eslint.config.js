@@ -61,6 +61,18 @@ export default tseslint.config(
     },
   },
   {
+    // Plain Node scripts are outside every tsconfig: lint them without type information (the
+    // pre-commit hook lints staged scripts too).
+    files: ['scripts/**/*.mjs'],
+    ...tseslint.configs.disableTypeChecked,
+  },
+  {
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { process: 'readonly', console: 'readonly', Buffer: 'readonly', URL: 'readonly' },
+    },
+  },
+  {
     files: ['**/*.test.ts', '**/*.test.tsx', '**/tests/**/*.ts'],
     rules: {
       '@typescript-eslint/no-unsafe-assignment': 'off',

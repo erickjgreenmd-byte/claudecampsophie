@@ -19,4 +19,4 @@ if [ "${#lintable[@]}" -gt 0 ]; then npx eslint --max-warnings=0 --no-warn-ignor
 # Typecheck the staged tree itself, not the working tree (BUG-034): catches commits that import
 # untracked files or depend on unstaged edits while other work is in progress.
 if [ "${#lintable[@]}" -gt 0 ]; then scripts/check-staged-tree.sh; fi
-node scripts/scan-secrets.mjs
+node scripts/scan-secrets.mjs --staged
