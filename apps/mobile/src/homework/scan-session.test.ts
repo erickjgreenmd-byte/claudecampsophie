@@ -37,8 +37,9 @@ function pagesOf(n: number): ScanPage[] {
 
 describe('limits are shown before anything is uploaded (spec P5)', () => {
   it('summarizes the configured limits in plain words', () => {
+    // Only what the scan job can read today; PDF import waits for the isolated converter.
     expect(limitsSummary(limits)).toBe(
-      'Up to 10 pages per scan. Each page can be up to 15 MB. Photos (JPEG, PNG or HEIC) or a PDF.',
+      'Up to 10 pages per scan. Each page can be up to 15 MB. Photos (JPEG or PNG). PDF files can’t be added yet, so take a photo of each page instead.',
     );
     expect(
       limitsSummary({
@@ -112,7 +113,7 @@ describe('validation before upload (AC_CAPTURE_02)', () => {
     ]);
     expect(canSend(session, limits)).toBe(false);
     expect(problems.map((p) => problemCopy(p, limits))).toEqual([
-      'Page 2 is a kind of file PencilLift can’t read. Try a photo or a PDF instead.',
+      'Page 2 is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
       'Page 3 is too big (over 15 MB). Try taking the photo again.',
     ]);
   });
@@ -135,5 +136,38 @@ describe('validation before upload (AC_CAPTURE_02)', () => {
     expect(problemCopy({ kind: 'too_many_pages', max: 3 }, tighter)).toBe(
       'Only 3 pages fit in one scan. Remove a page or two.',
     );
+  });
+});
+
+describe('PDF import is not offered until the file converter ships (AC_CAPTURE_01, AC_UX_02)', () => {
+  // The scan job ends PDF (and HEIC) scans as failed_final FORMAT_NEEDS_CONVERSION because the
+  // isolated converter is not deployed, so the app must not send them or promise they work.
+  it('never lists PDF as something to add, and says plainly that it isn’t available yet', () => {
+    const summary = limitsSummary(limits);
+    expect(summary).not.toMatch(/or a PDF/);
+    expect(summary).toMatch(/PDF files can’t be added yet/);
+    expect(summary).not.toMatch(/HEIC/);
+  });
+
+  it('flags a PDF, or a photo that stayed HEIC, before anything is sent', () => {
+    const pdf = toScanPage(
+      { uri: 'file:///cache/guide.pdf', mimeType: 'application/pdf', fileSize: 1000 },
+      'library',
+      newId,
+    );
+    const heic = toScanPage(
+      { uri: 'file:///cache/photo.heic', mimeType: 'image/heic', fileSize: 1000 },
+      'library',
+      newId,
+    );
+    const ok = toScanPage(photo(), 'camera', newId);
+    const session = addPages(EMPTY_SESSION, [ok, pdf, heic], limits).session;
+    const problems = validateSession(session, limits);
+    expect(problems).toEqual([
+      { kind: 'page', localId: pdf.localId, pageNumber: 2, problem: 'unsupported_type' },
+      { kind: 'page', localId: heic.localId, pageNumber: 3, problem: 'unsupported_type' },
+    ]);
+    expect(canSend(session, limits)).toBe(false);
+    for (const p of problems) expect(problemCopy(p, limits)).not.toMatch(/PDF/);
   });
 });

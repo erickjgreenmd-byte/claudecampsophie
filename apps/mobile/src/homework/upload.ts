@@ -230,7 +230,7 @@ const RULE_COPY: Record<string, string> = {
   TOO_MANY_PAGES: 'That’s more pages than fit in one scan. Remove a page or two.',
   PAGE_TOO_LARGE: 'One page is too big. Try taking that photo again.',
   UNSUPPORTED_FILE_TYPE:
-    'One page is a kind of file PencilLift can’t read. Try a photo or a PDF instead.',
+    'One page is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
   UPLOAD_INCOMPLETE: 'Some pages didn’t finish sending. Let’s try again.',
 };
 
@@ -243,7 +243,7 @@ export function childUploadMessage(error: unknown): string {
   if (error instanceof PageLimitError) {
     return error.problem === 'too_large'
       ? `Page ${error.pageNumber} is too big or empty. Try taking that photo again.`
-      : `Page ${error.pageNumber} is a kind of file PencilLift can’t read. Try a photo or a PDF instead.`;
+      : `Page ${error.pageNumber} is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.`;
   }
   if (error instanceof UploadTransferError) {
     return 'A page didn’t finish sending. Your pages are still here — let’s try again.';

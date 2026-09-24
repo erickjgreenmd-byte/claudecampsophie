@@ -39,8 +39,28 @@ const VERDICTS: Record<
   pending: { title: 'Still checking', icon: '…', tone: 'pending' },
 };
 
-export function verdictView(verdict: GradedVerdict | null, questionNumber: string): VerdictView {
-  const v = VERDICTS[verdict ?? 'pending'];
+/**
+ * Written work with no guarded feedback sent to the child. The rubric itself is parent-only (never in
+ * a child DTO), so the child is not promised feedback it can't see (AC_GRADING_03); the parent sees
+ * the rubric feedback with the solutions.
+ */
+const RUBRIC_WITHOUT_FEEDBACK = {
+  title: 'Ask a grown-up to go over your writing',
+  icon: '★',
+  tone: 'help',
+} as const satisfies Omit<VerdictView, 'accessibilityLabel'>;
+
+/**
+ * `hasFeedback` says whether guarded feedback was sent for this question; it only changes the copy
+ * for written work, which says "Feedback is ready" only when there is feedback to read.
+ */
+export function verdictView(
+  verdict: GradedVerdict | null,
+  questionNumber: string,
+  hasFeedback = true,
+): VerdictView {
+  const v =
+    verdict === 'rubric' && !hasFeedback ? RUBRIC_WITHOUT_FEEDBACK : VERDICTS[verdict ?? 'pending'];
   return { ...v, accessibilityLabel: `Question ${questionNumber}: ${v.title}` };
 }
 
@@ -139,6 +159,7 @@ export function buildResultView(detail: ChildAssignmentDetailResponse): ResultVi
   const status = statusView(detail.assignment.status);
   const questions = detail.questions.map((q) => {
     const verdict = status.showResults ? q.verdict : null;
+    const hints = status.showResults ? q.feedback.map((f) => f.body) : [];
     return {
       id: q.id,
       label: `Question ${q.questionNumber}`,
@@ -147,8 +168,8 @@ export function buildResultView(detail: ChildAssignmentDetailResponse): ResultVi
         q.studentAnswerText && q.studentAnswerText.trim().length > 0
           ? q.studentAnswerText
           : 'You left this one blank',
-      verdict: verdictView(verdict, q.questionNumber),
-      hints: status.showResults ? q.feedback.map((f) => f.body) : [],
+      verdict: verdictView(verdict, q.questionNumber, hints.length > 0),
+      hints,
     };
   });
   let summary: string | null = null;

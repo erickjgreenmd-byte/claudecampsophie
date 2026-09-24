@@ -3,6 +3,7 @@ import { DEFAULT_HOMEWORK_UPLOAD_LIMITS } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { toScanPage, type ScanPage } from './scan-session.ts';
 import {
+  PageLimitError,
   ScanCancelledError,
   ScanStoppedError,
   UploadTransferError,
@@ -94,8 +95,8 @@ function twoPages(): ScanPage[] {
   return [
     toScanPage({ uri: 'file:///p1.jpg', mimeType: 'image/jpeg' }, 'camera', () => 'a'),
     toScanPage(
-      { uri: 'file:///p2.pdf', mimeType: 'application/pdf', fileSize: 1000 },
-      'pdf',
+      { uri: 'file:///p2.png', mimeType: 'image/png', fileSize: 1000 },
+      'library',
       () => 'b',
     ),
   ];
@@ -128,11 +129,11 @@ describe('uploading a scan (spec P5, AC_CAPTURE_01, AC_CAPTURE_06)', () => {
     const registered = (calls[1]!.body as { pages: Record<string, unknown>[] }).pages;
     expect(registered.map((p) => [p.pageNumber, p.mimeType])).toEqual([
       [1, 'image/jpeg'],
-      [2, 'application/pdf'],
+      [2, 'image/png'],
     ]);
     expect(registered.every((p) => /^[0-9a-f]{64}$/.test(p.sha256 as string))).toBe(true);
     expect(calls[2]!.body).toEqual({ idempotencyKey: attempt.finalizeKey });
-    expect(puts.map((p) => p.mimeType)).toEqual(['image/jpeg', 'application/pdf']);
+    expect(puts.map((p) => p.mimeType)).toEqual(['image/jpeg', 'image/png']);
     expect(progress.at(-1)).toEqual({ phase: 'done', pagesDone: 2, pagesTotal: 2 });
     expect(progress.some((p) => p.phase === 'uploading' && p.pagesDone === 1)).toBe(true);
   });
@@ -170,6 +171,38 @@ describe('uploading a scan (spec P5, AC_CAPTURE_01, AC_CAPTURE_06)', () => {
     }).catch((e: unknown) => e);
     expect(childUploadMessage(error)).toMatch(/too big/);
     expect(calls).toHaveLength(0);
+  });
+
+  it('never sends a PDF or HEIC page: the scan job can’t read them until the converter ships', async () => {
+    // Server-side they would end failed_final FORMAT_NEEDS_CONVERSION (AC_CAPTURE_01, AC_UX_02).
+    for (const [uri, mimeType] of [
+      ['file:///guide.pdf', 'application/pdf'],
+      ['file:///photo.heic', 'image/heic'],
+    ] as const) {
+      const { api, calls } = fakeApi();
+      const { io, puts } = fakeIo();
+      const error = await uploadScan({
+        api,
+        io,
+        pages: [
+          toScanPage({ uri: 'file:///p1.jpg', mimeType: 'image/jpeg' }, 'camera', () => 'a'),
+          toScanPage({ uri, mimeType, fileSize: 1000 }, 'library', () => 'b'),
+        ],
+        limits,
+        attempt: newAttempt(newKey),
+        signal: new AbortController().signal,
+        onProgress: () => undefined,
+      }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(PageLimitError);
+      expect(error).toMatchObject({ pageNumber: 2, problem: 'unsupported_type' });
+      expect(childUploadMessage(error)).toBe(
+        'Page 2 is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
+      );
+      expect(calls).toHaveLength(0);
+      expect(puts).toHaveLength(0);
+    }
+    const rule = new ApiRequestError('BUSINESS_RULE', 'raw', 422, 'UNSUPPORTED_FILE_TYPE');
+    expect(childUploadMessage(rule)).not.toMatch(/PDF/);
   });
 
   it('stops when cancelled and cancelling tells the server', async () => {

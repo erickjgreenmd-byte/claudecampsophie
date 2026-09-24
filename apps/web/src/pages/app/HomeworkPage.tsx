@@ -23,6 +23,7 @@ import {
   assignmentSolutionsResponseSchema,
   assignmentStateResponseSchema,
   correctTranscriptionResponseSchema,
+  homeworkRubricSchema,
   overrideResultResponseSchema,
   uploadLimitsResponseSchema,
   uploadPagesResponseSchema,
@@ -43,9 +44,11 @@ import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 
 /**
  * Parent homework (spec P5 "Parent selects child", P6, P14 "scan uploader / assignment review /
- * solutions"; AC_UX_02, AC_GRADING_05, AC_GRADING_10). Parents can scan homework for the selected
- * child by uploading page photos, see every processing state explained honestly, the child's answers
- * and verdicts, and — only after a server-verified PIN step-up — solutions.
+ * solutions"; AC_UX_02, AC_GRADING_03, AC_GRADING_05, AC_GRADING_10). Parents can scan homework for
+ * the selected child by uploading page photos (PDF and HEIC are shown as not available yet: the scan
+ * job cannot read them until the file converter ships), see every processing state explained
+ * honestly, the child's answers and verdicts, and — only after a server-verified PIN step-up —
+ * solutions, including rubric feedback for written work.
  */
 export default function HomeworkPage() {
   return (
@@ -1060,6 +1063,7 @@ function AssignmentDetail({
                   key={q.id}
                   question={q}
                   solution={solutions?.get(q.id) ?? null}
+                  solutionsShown={solutions !== null}
                   correctable={CORRECTABLE_ASSIGNMENT_STATUSES.includes(
                     query.data.assignment.status,
                   )}
@@ -1086,11 +1090,14 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 function QuestionCard({
   question: q,
   solution,
+  solutionsShown = false,
   correctable,
   onChanged,
 }: {
   question: ParentQuestion;
   solution: QuestionSolution | null;
+  /** True once the parent unlocked and loaded the solutions for this scan. */
+  solutionsShown?: boolean;
   correctable: boolean;
   onChanged: () => void;
 }) {
@@ -1142,10 +1149,26 @@ function QuestionCard({
       ) : (
         <Field label="Result">Not checked yet</Field>
       )}
+      {!solution && result?.gradedVerdict === 'rubric' ? (
+        <p style={{ margin: '4px 0' }}>
+          {solutionsShown
+            ? 'No rubric feedback was recorded for this answer.'
+            : 'Rubric feedback is shown with the solutions (it needs your parent PIN).'}
+        </p>
+      ) : null}
       {solution ? (
         <div className="notice" style={{ margin: '8px 0' }}>
-          <Field label="Answer">{solution.correctAnswer}</Field>
-          <Field label="Worked solution">{solution.workedSolution}</Field>
+          {/* Written work has no single right answer, so empty answer lines are left out. */}
+          {solution.correctAnswer.trim() ? (
+            <Field label="Answer">{solution.correctAnswer}</Field>
+          ) : null}
+          {solution.workedSolution.trim() ? (
+            <Field label="Worked solution">{solution.workedSolution}</Field>
+          ) : null}
+          <RubricFeedback
+            rubric={solution.rubric}
+            written={q.answerKind === 'writing' || result?.gradedVerdict === 'rubric'}
+          />
           {solution.misconception ? (
             <Field label="Likely mix-up">{solution.misconception}</Field>
           ) : null}
@@ -1202,6 +1225,69 @@ function QuestionCard({
       <ActionFeedback feedback={action.feedback} what="Changing a result" />
     </article>
   );
+}
+
+/**
+ * Rubric feedback for written work (AC_GRADING_03): each criterion, whether it was met and the
+ * grader's note, in words and symbols (never colour alone). Parent-only — it arrives only with the
+ * step-up solutions. A rubric stored in any other JSON shape is still shown as plain text.
+ */
+function RubricFeedback({ rubric, written }: { rubric: unknown; written: boolean }) {
+  const known = homeworkRubricSchema.safeParse(rubric);
+  const empty = rubric === null || (known.success && known.data.length === 0);
+  if (empty) {
+    return written ? (
+      <p style={{ margin: '4px 0' }}>No rubric feedback was recorded for this answer.</p>
+    ) : null;
+  }
+  return (
+    <section aria-label="Rubric feedback" style={{ margin: '4px 0' }}>
+      <span style={{ fontWeight: 700 }}>Rubric feedback:</span>
+      {known.success ? (
+        <ul style={{ margin: '4px 0', paddingLeft: 20 }}>
+          {known.data.map((c, i) => (
+            <li key={i}>
+              <strong>{c.met ? '✓ Met' : '○ Not yet'}</strong> — {c.criterion}
+              {c.note ? `: ${c.note}` : ''}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <RubricText value={rubric} />
+      )}
+    </section>
+  );
+}
+
+/** Plain-text rendering of JSON (lists and “key: value” lines); never raw JSON or [object Object]. */
+function RubricText({ value }: { value: unknown }): ReactNode {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'yes' : 'no';
+  if (Array.isArray(value)) {
+    const items: readonly unknown[] = value;
+    return (
+      <ul style={{ margin: '4px 0', paddingLeft: 20 }}>
+        {items.map((item, i) => (
+          <li key={i}>
+            <RubricText value={item} />
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  if (typeof value === 'object' && value !== null) {
+    return (
+      <ul style={{ margin: '4px 0', paddingLeft: 20 }}>
+        {Object.entries(value as Record<string, unknown>).map(([key, item]) => (
+          <li key={key}>
+            {key}: <RubricText value={item} />
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return null;
 }
 
 type Action = ReturnType<typeof useAction>;

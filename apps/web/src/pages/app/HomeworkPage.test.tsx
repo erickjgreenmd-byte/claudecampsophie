@@ -533,6 +533,9 @@ describe('parent scan uploader (spec P5, P14; RV-homework-9)', () => {
     );
     const input = within(card).getByLabelText<HTMLInputElement>('Choose page photos');
     expect(input.accept).toBe('image/jpeg,image/png');
+    // PDF import is not offered until the converter ships (AC_CAPTURE_01, AC_UX_02).
+    expect(within(card).queryByRole('button', { name: /pdf/i })).toBeNull();
+    expect(within(card).queryByLabelText(/pdf/i)).toBeNull();
     await userEvent.upload(input, [
       file('first.jpg', 'image/jpeg', 'first page'),
       file('second.png', 'image/png', 'second page'),
@@ -754,5 +757,128 @@ describe('honest follow-up states (RV-homework-6, 7, 8)', () => {
     );
     await waitFor(() => expect(screen.queryByText(/Loading/)).toBeNull());
     expect(screen.getByText(/re-checking this question/)).toBeTruthy();
+  });
+});
+
+describe('rubric feedback for written work (AC_GRADING_03)', () => {
+  const WRITING = '36e35e6f-7a8b-4c9d-8e0f-2a3b4c5d6e7f';
+  const writingQuestion = question({
+    id: WRITING,
+    questionNumber: '3',
+    promptText: 'Write two sentences about your favourite season.',
+    studentAnswerText: 'I like autumn. The leaves turn orange.',
+    answerKind: 'writing',
+    subjectKey: 'writing',
+    skill: 'opinion_writing',
+    uncertainty: 'low',
+    result: {
+      verdict: 'rubric',
+      gradedVerdict: 'rubric',
+      route: 'deterministic',
+      disagreement: false,
+      gradedAt: AT,
+      override: null,
+    },
+  });
+  // The shape the grader stores for writing (packages/ai gradingOutputSchema `rubric`).
+  const writingSolution = {
+    questionId: WRITING,
+    questionNumber: '3',
+    correctAnswer: '',
+    workedSolution: '',
+    rubric: [
+      { criterion: 'Uses complete sentences', met: true, note: 'Both sentences are complete.' },
+      { criterion: 'Gives a reason', met: false, note: 'Add one more reason for the choice.' },
+    ],
+    misconception: null,
+  };
+  function withWriting(rubric: unknown = writingSolution.rubric) {
+    return fakeApi({
+      get: (path) => {
+        if (path === `/v1/assignments/${READY}`) return detail([question(), writingQuestion]);
+        if (path.endsWith('/solutions')) {
+          return {
+            ...solutions,
+            solutions: [...solutions.solutions, { ...writingSolution, rubric }],
+          };
+        }
+        return undefined;
+      },
+    });
+  }
+
+  it('shows each rubric criterion with its feedback once solutions are unlocked, never before', async () => {
+    const { api } = withWriting();
+    renderPage(<HomeworkPage />, { api });
+    const panel = await openReadyScan();
+    const article = await within(panel).findByRole('article', { name: 'Question 3' });
+    expect(within(article).getByText(/Written response/)).toBeTruthy();
+    // Before the PIN step-up: say where the feedback is, show none of it.
+    expect(within(article).getByText(/Rubric feedback is shown with the solutions/)).toBeTruthy();
+    expect(within(article).queryByText(/Uses complete sentences/)).toBeNull();
+
+    await userEvent.click(within(panel).getByRole('button', { name: 'Show solutions' }));
+    const rubric = await within(article).findByRole('region', { name: 'Rubric feedback' });
+    const items = within(rubric)
+      .getAllByRole('listitem')
+      .map((li) => li.textContent);
+    expect(items).toEqual([
+      expect.stringMatching(/✓ Met.*Uses complete sentences.*Both sentences are complete\./),
+      expect.stringMatching(/○ Not yet.*Gives a reason.*Add one more reason for the choice\./),
+    ]);
+    expect(within(article).queryByText(/Rubric feedback is shown with the solutions/)).toBeNull();
+    // Writing has no right answer: no empty "Answer" or "Worked solution" lines.
+    expect(within(article).queryByText(/^Answer:/)).toBeNull();
+    expect(within(article).queryByText(/^Worked solution:/)).toBeNull();
+    // Objective items keep their answer and no rubric section.
+    const q1 = within(panel).getByRole('article', { name: 'Question 1' });
+    expect(within(q1).getByText('7/8')).toBeTruthy();
+    expect(within(q1).queryByRole('region', { name: 'Rubric feedback' })).toBeNull();
+
+    await userEvent.click(within(panel).getByRole('button', { name: 'Hide solutions' }));
+    expect(within(article).queryByText(/Uses complete sentences/)).toBeNull();
+  });
+
+  it('a rubric stored in another JSON shape is still shown as readable text', async () => {
+    const { api } = withWriting({ criterion: 'Clear topic sentence', score: 3, strong: true });
+    renderPage(<HomeworkPage />, { api });
+    const panel = await openReadyScan();
+    await userEvent.click(within(panel).getByRole('button', { name: 'Show solutions' }));
+    const article = within(panel).getByRole('article', { name: 'Question 3' });
+    const rubric = await within(article).findByRole('region', { name: 'Rubric feedback' });
+    expect(rubric.textContent).toMatch(/criterion: Clear topic sentence/);
+    expect(rubric.textContent).toMatch(/score: 3/);
+    expect(rubric.textContent).toMatch(/strong: yes/);
+    expect(rubric.textContent).not.toMatch(/\[object Object\]|[{}]/);
+  });
+
+  it('after unlocking, a written answer with no stored solution says none was recorded (no PIN prompt)', async () => {
+    const { api } = fakeApi({
+      get: (path) => {
+        if (path === `/v1/assignments/${READY}`) return detail([question(), writingQuestion]);
+        if (path.endsWith('/solutions')) return solutions; // no row for the written item
+        return undefined;
+      },
+    });
+    renderPage(<HomeworkPage />, { api });
+    const panel = await openReadyScan();
+    await userEvent.click(within(panel).getByRole('button', { name: 'Show solutions' }));
+    const article = within(panel).getByRole('article', { name: 'Question 3' });
+    expect(
+      await within(article).findByText(/No rubric feedback was recorded for this answer/),
+    ).toBeTruthy();
+    expect(within(article).queryByText(/it needs your parent PIN/)).toBeNull();
+  });
+
+  it('says so when no rubric feedback was recorded for a written answer', async () => {
+    const { api } = withWriting(null);
+    renderPage(<HomeworkPage />, { api });
+    const panel = await openReadyScan();
+    await userEvent.click(within(panel).getByRole('button', { name: 'Show solutions' }));
+    const article = within(panel).getByRole('article', { name: 'Question 3' });
+    expect(
+      await within(article).findByText(/No rubric feedback was recorded for this answer/),
+    ).toBeTruthy();
+    expect(within(article).queryByRole('region', { name: 'Rubric feedback' })).toBeNull();
   });
 });

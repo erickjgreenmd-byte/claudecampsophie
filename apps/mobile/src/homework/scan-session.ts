@@ -2,12 +2,19 @@
  * Child scan session (spec P5 capture; AC_CAPTURE_01/02): the pages a child has picked, their order,
  * and validation against the upload limits, which are shown before anything is sent.
  *
- * Pure logic with no react-native imports so it is unit-testable; the scan screen wires the camera,
- * photo library and document picker to it.
+ * Pure logic with no react-native imports so it is unit-testable; the scan screen wires the camera
+ * and photo library to it. PDF import is not offered: the scan job cannot read PDF (or HEIC) until
+ * the isolated converter ships, and such a scan would always end failed_final
+ * FORMAT_NEEDS_CONVERSION. Photos are re-encoded to JPEG on the device, so a HEIC photo is sent as
+ * JPEG; one that could not be re-encoded is flagged here instead of being sent.
  */
-import type { HomeworkMimeType, HomeworkUploadLimits } from '@pencillift/contracts';
+import {
+  HOMEWORK_READABLE_MIME_TYPES,
+  type HomeworkMimeType,
+  type HomeworkUploadLimits,
+} from '@pencillift/contracts';
 
-export type PageSource = 'camera' | 'library' | 'pdf';
+export type PageSource = 'camera' | 'library';
 
 export interface ScanPage {
   readonly localId: string;
@@ -19,7 +26,7 @@ export interface ScanPage {
   readonly source: PageSource;
 }
 
-/** What the camera, image picker and document picker hand back (subset). */
+/** What the camera and image picker hand back (subset). */
 export interface PickedAsset {
   readonly uri: string;
   readonly mimeType?: string | null;
@@ -122,8 +129,13 @@ export type SessionProblem =
       readonly problem: PageProblem;
     };
 
+/** Types the app sends: allowed by the server's limits and readable by the scan job today. */
+export function readableTypes(limits: HomeworkUploadLimits): HomeworkMimeType[] {
+  return limits.allowedMimeTypes.filter((t) => HOMEWORK_READABLE_MIME_TYPES.includes(t));
+}
+
 export function isAllowedType(mimeType: string, limits: HomeworkUploadLimits): boolean {
-  return (limits.allowedMimeTypes as readonly string[]).includes(mimeType);
+  return (readableTypes(limits) as readonly string[]).includes(mimeType);
 }
 
 export function validateSession(
@@ -168,17 +180,21 @@ function joinOr(items: readonly string[]): string {
   return `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]!}`;
 }
 
-/** Plain-language limits shown on the scan screen before anything is picked or sent. */
+/**
+ * Plain-language limits shown on the scan screen before anything is picked or sent. Lists only the
+ * photo types the scan job reads today, and says honestly when PDF import isn't available yet.
+ */
 export function limitsSummary(limits: HomeworkUploadLimits): string {
-  const photos = limits.allowedMimeTypes.filter((t) => t !== 'application/pdf');
-  const kinds: string[] = [];
-  if (photos.length > 0) kinds.push(`Photos (${joinOr(photos.map((t) => TYPE_NAMES[t]))})`);
-  if (limits.allowedMimeTypes.includes('application/pdf')) kinds.push('a PDF');
-  return (
-    `Up to ${limits.maxPages} pages per scan. ` +
-    `Each page can be up to ${describeSize(limits.maxPageBytes)}. ` +
-    `${joinOr(kinds)}.`
-  );
+  const photos = readableTypes(limits);
+  const parts = [
+    `Up to ${limits.maxPages} pages per scan.`,
+    `Each page can be up to ${describeSize(limits.maxPageBytes)}.`,
+  ];
+  if (photos.length > 0) parts.push(`Photos (${joinOr(photos.map((t) => TYPE_NAMES[t]))}).`);
+  if (limits.allowedMimeTypes.includes('application/pdf') && !photos.includes('application/pdf')) {
+    parts.push('PDF files can’t be added yet, so take a photo of each page instead.');
+  }
+  return parts.join(' ');
 }
 
 /** Calm, blame-free copy for the child (spec P6/P14). */
@@ -190,7 +206,7 @@ export function problemCopy(problem: SessionProblem, limits: HomeworkUploadLimit
       return `Only ${problem.max} pages fit in one scan. Remove a page or two.`;
     case 'page':
       return problem.problem === 'unsupported_type'
-        ? `Page ${problem.pageNumber} is a kind of file PencilLift can’t read. Try a photo or a PDF instead.`
+        ? `Page ${problem.pageNumber} is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.`
         : `Page ${problem.pageNumber} is too big (over ${describeSize(limits.maxPageBytes)}). Try taking the photo again.`;
   }
 }

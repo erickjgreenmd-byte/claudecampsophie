@@ -3,7 +3,6 @@ import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-nati
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { randomUUID } from 'expo-crypto';
-import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { openSettings } from 'expo-linking';
 import { router } from 'expo-router';
@@ -44,10 +43,14 @@ import {
 } from '../../src/homework/upload.ts';
 
 /**
- * Child scan screen (spec P5, P14 child "scan"; AC_CAPTURE_01/02, AC_UX_02). Camera, photo library
- * and PDF import, with a permission-denied fallback for each; page list with reorder, turn and
- * remove; limits shown before anything is sent; upload progress with a working stop button.
- * Child-facing copy is calm and never commercial.
+ * Child scan screen (spec P5, P14 child "scan"; AC_CAPTURE_01/02, AC_UX_02). Camera and photo
+ * library, with a permission-denied fallback for each; page list with reorder, turn and remove;
+ * limits shown before anything is sent; upload progress with a working stop button. Child-facing
+ * copy is calm and never commercial.
+ *
+ * PDF import is not offered yet: the scan job cannot read PDFs until the isolated converter ships
+ * (such a scan would always end failed_final FORMAT_NEEDS_CONVERSION), and the limits card says so.
+ * Photos are re-encoded to JPEG on the device, which also turns HEIC photos into readable JPEGs.
  */
 
 type UploadState =
@@ -116,10 +119,6 @@ export default function ScanScreen() {
     async (assets: PickedAsset[], source: PageSource) => {
       const prepared: PickedAsset[] = [];
       for (const asset of assets) {
-        if (source === 'pdf') {
-          prepared.push(asset);
-          continue;
-        }
         try {
           // Re-encode photos on the device: drops location/EXIF metadata (spec P4).
           prepared.push({ uri: await normalizePhoto(asset.uri), mimeType: 'image/jpeg' });
@@ -192,25 +191,6 @@ export default function ScanScreen() {
     } finally {
       setBusy(false);
     }
-  };
-
-  const choosePdf = async () => {
-    setPermissionHelp(null);
-    const result = await DocumentPicker.getDocumentAsync({
-      type: 'application/pdf',
-      copyToCacheDirectory: true,
-      multiple: false,
-    });
-    if (result.canceled) return;
-    await add(
-      result.assets.map((a) => ({
-        uri: a.uri,
-        mimeType: a.mimeType ?? 'application/pdf',
-        fileName: a.name,
-        fileSize: a.size ?? null,
-      })),
-      'pdf',
-    );
   };
 
   const turnPage = async (localId: string, uri: string) => {
@@ -352,12 +332,6 @@ export default function ScanScreen() {
               onPress={() => void choosePhotos()}
               disabled={busy || remainingSlots(session, limits) === 0}
             />
-            <Button
-              label="Add a PDF"
-              secondary
-              onPress={() => void choosePdf()}
-              disabled={busy || remainingSlots(session, limits) === 0}
-            />
           </View>
         ) : null}
 
@@ -395,20 +369,11 @@ export default function ScanScreen() {
               const problem = pageProblems.get(page.localId);
               return (
                 <View key={page.localId} style={styles.page}>
-                  {page.mimeType === 'application/pdf' ? (
-                    <View
-                      style={[styles.thumb, styles.pdfThumb]}
-                      accessibilityLabel={`Page ${n} is a PDF`}
-                    >
-                      <Text style={styles.cardTitle}>PDF</Text>
-                    </View>
-                  ) : (
-                    <Image
-                      source={{ uri: page.uri }}
-                      style={styles.thumb}
-                      accessibilityLabel={`Photo of page ${n}`}
-                    />
-                  )}
+                  <Image
+                    source={{ uri: page.uri }}
+                    style={styles.thumb}
+                    accessibilityLabel={`Photo of page ${n}`}
+                  />
                   <View style={styles.pageInfo}>
                     <Text style={styles.cardTitle}>Page {n}</Text>
                     {page.byteSize !== null ? (
@@ -433,14 +398,12 @@ export default function ScanScreen() {
                           disabled={index === session.pages.length - 1}
                           onPress={() => changePages(movePage(session, page.localId, 1))}
                         />
-                        {page.mimeType !== 'application/pdf' ? (
-                          <SmallButton
-                            label="Turn"
-                            a11y={`Turn page ${n}`}
-                            disabled={busy}
-                            onPress={() => void turnPage(page.localId, page.uri)}
-                          />
-                        ) : null}
+                        <SmallButton
+                          label="Turn"
+                          a11y={`Turn page ${n}`}
+                          disabled={busy}
+                          onPress={() => void turnPage(page.localId, page.uri)}
+                        />
                         <SmallButton
                           label="Remove"
                           a11y={`Remove page ${n}`}
@@ -603,12 +566,6 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   thumb: { width: 72, height: 96, borderRadius: radii.sm, backgroundColor: colors.offWhite },
-  pdfThumb: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: colors.muted,
-  },
   pageInfo: { flex: 1, gap: spacing.xs },
   button: {
     minHeight: minTouchTarget,

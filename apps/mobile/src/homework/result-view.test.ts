@@ -134,6 +134,54 @@ describe('result view (AC_GRADING_06)', () => {
   });
 });
 
+describe('written work (AC_GRADING_03)', () => {
+  const F2 = '25d24d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e';
+  function writing(feedback: { id: string; kind: 'hint'; body: string }[]) {
+    return childAssignmentDetailResponseSchema.parse({
+      assignment: {
+        id: '8b3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f60',
+        subjectId: null,
+        status: 'ready',
+        pageCount: 1,
+        createdAt: AT,
+        updatedAt: AT,
+      },
+      questions: [
+        {
+          id: Q1,
+          questionNumber: '1',
+          promptText: 'Write two sentences about your favourite season.',
+          studentAnswerText: 'I like autumn. The leaves turn orange.',
+          verdict: 'rubric',
+          feedback,
+        },
+      ],
+    });
+  }
+
+  it('never promises feedback the child can’t see: with none sent, a grown-up goes over it', () => {
+    // The rubric itself is parent-only (never in a child DTO); the child only gets guarded hints.
+    const view = buildResultView(writing([]));
+    const q = view.questions[0]!;
+    expect(q.hints).toEqual([]);
+    expect(q.verdict.title).not.toMatch(/feedback/i);
+    expect(q.verdict).toMatchObject({ title: 'Ask a grown-up to go over your writing', icon: '★' });
+    expect(q.verdict.title).not.toMatch(/correct|wrong|try again/i);
+    expect(view.summary).not.toMatch(/feedback/);
+    expect(findForbiddenKeys(view)).toEqual([]);
+  });
+
+  it('says feedback is ready only when guarded feedback was actually sent', () => {
+    const view = buildResultView(
+      writing([{ id: F2, kind: 'hint', body: 'Add one more reason for your choice.' }]),
+    );
+    const q = view.questions[0]!;
+    expect(q.verdict).toMatchObject({ title: 'Feedback is ready', icon: '★', tone: 'info' });
+    expect(q.hints).toEqual(['Add one more reason for your choice.']);
+    expect(view.summary).toBe('1 with feedback');
+  });
+});
+
 describe('load errors', () => {
   it('explains offline, unpaired and missing states calmly', () => {
     expect(childLoadMessage(new ApiRequestError('NETWORK', 'raw', 0))).toMatch(/offline/);

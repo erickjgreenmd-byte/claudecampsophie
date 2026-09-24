@@ -375,6 +375,22 @@ export const assignmentDetailResponseSchema = z.strictObject({
 });
 export type AssignmentDetailResponse = z.infer<typeof assignmentDetailResponseSchema>;
 
+/**
+ * The rubric the grader stores for written work (packages/ai gradingOutputSchema): one entry per
+ * criterion with whether it was met and a short feedback note (AC_GRADING_03). Writing gets this
+ * feedback instead of a right/wrong grade. `questionSolutionSchema.rubric` stays JSON so rows in any
+ * other shape still parse; clients narrow with this schema and show anything else as plain text.
+ * Parent-only: `rubric` is a CHILD_FORBIDDEN_HOMEWORK_KEYS key.
+ */
+export const homeworkRubricSchema = z.array(
+  z.strictObject({
+    criterion: z.string(),
+    met: z.boolean(),
+    note: z.string(),
+  }),
+);
+export type HomeworkRubric = z.infer<typeof homeworkRubricSchema>;
+
 /** Parent-only, after a server-verified recent step-up (AC_GRADING_05). */
 export const questionSolutionSchema = z.strictObject({
   questionId: uuidSchema,
