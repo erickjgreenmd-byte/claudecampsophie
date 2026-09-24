@@ -46,8 +46,16 @@ def main() -> int:
             return 1
         counts[st] += 1
         short = text if len(text) <= 140 else text[:137] + "..."
-        cells = [ac, short, st, entry.get("implementation", "—"), entry.get("check", "—"), entry.get("evidence", "—")]
-        lines.append("| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |")
+        cells = [
+            ac,
+            short,
+            st,
+            entry.get("implementation", "—"),
+            entry.get("check", "—"),
+            entry.get("evidence", "—"),
+            entry.get("gap", "—") or "—",
+        ]
+        lines.append("| " + " | ".join(" ".join(c.split()).replace("|", "\\|") for c in cells) + " |")
     header = [
         "# Requirement coverage (spec E1, AC_DEPLOY_08)",
         "",
@@ -58,8 +66,10 @@ def main() -> int:
         "",
         f"**{len(rows)} acceptance checks.** " + ", ".join(f"{s}: {counts[s]}" for s in ALLOWED if counts[s]),
         "",
-        "| ID | Required outcome | Status | Implementation | Check | Evidence |",
-        "|---|---|---|---|---|---|",
+        "Gap names the weakest clause that keeps a row from a stronger status (what is missing and why).",
+        "",
+        "| ID | Required outcome | Status | Implementation | Check | Evidence | Gap |",
+        "|---|---|---|---|---|---|---|",
     ]
     OUT.write_text("\n".join(header + lines) + "\n", encoding="utf-8")
     print(f"Wrote {OUT.relative_to(ROOT)}: {len(rows)} checks; " + ", ".join(f"{k}={v}" for k, v in counts.items()))
