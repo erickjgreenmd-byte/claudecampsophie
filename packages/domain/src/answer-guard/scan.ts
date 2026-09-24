@@ -2,9 +2,14 @@
 //
 // Known limitations (this is ONE defense-in-depth layer; spec E4: "Do not treat a simple
 // substring filter or a second model's approval as proof that answers cannot leak"):
-// - Semantic paraphrase ("the number of legs on a spider" for 8), riddles, rhymes, hints that let
-//   the child infer the value, and arithmetic expressions that evaluate to it ("6 x 7") are NOT
-//   detected; expressions are never evaluated (numbers are data, never code).
+// - Semantic paraphrase ("the number of legs on a spider" for 8), riddles, rhymes and hints that
+//   let the child infer the value are NOT detected. Arithmetic expressions ("6 x 7", "six times
+//   seven", "(3 + 4) × 2", "2^3", "6²", "$6\times7$", "$20 − $8", "6 cm × 7 cm", "3(14)",
+//   vertical "40 / + 2") are read as their value unless `evaluateExpressions` is false (expressions.ts:
+//   a safe exact-rational parser, never eval; unboundable expressions fail closed). Not read as
+//   operators: ":", "by", "and", "of", "into", "less", "groups of", "sevens"; operands carrying
+//   a unit outside UNIT_WORDS ("3 apples + 2 apples"), intermediate values other than bracketed
+//   groups ("6 × 7 + 1" is 43 only) and scientific notation ("6e0") are not read.
 // - Translation beyond English/Spanish number words (e.g. French, CJK numerals, "aprender" for
 //   "learn") is not detected; Spanish number words above 100 other than "ciento"/"mil" are not
 //   read. Decimal digits of every script are read (canonicalize maps them to ASCII).
@@ -37,6 +42,7 @@ import {
   rot13View,
   type DecodedCandidate,
 } from './encodings.ts';
+import { createExpressionCache, type ExpressionCache } from './expressions.ts';
 import type { MarkerState } from './numbers.ts';
 import type {
   EncodingKind,
@@ -64,6 +70,8 @@ export interface ScanContext {
   readonly compiled: CompiledTargets;
   readonly maxTextLength: number;
   readonly maxEncodingDepth: number;
+  /** Set unless ScanOptions.evaluateExpressions is false: parser results shared by the scan's texts. */
+  readonly expressions: ExpressionCache | null;
 }
 
 export interface TextScanOptions {
@@ -103,6 +111,7 @@ export function createScanContext(
       depth !== undefined && Number.isInteger(depth) && depth >= 0 && depth <= MAX_ENCODING_DEPTH
         ? depth
         : MAX_ENCODING_DEPTH,
+    expressions: options.evaluateExpressions !== false ? createExpressionCache() : null,
   };
 }
 
@@ -126,7 +135,9 @@ function directFindings(
 ): RawFinding[] {
   if (opts.urlsOnly === true) return detectUrls(view);
   return [
-    ...(opts.skipNumeric === true ? [] : detectNumeric(view, ctx.answers, markerState)),
+    ...(opts.skipNumeric === true
+      ? []
+      : detectNumeric(view, ctx.answers, markerState, ctx.expressions)),
     ...detectChoice(view, ctx.answers),
     ...detectTargets(view, ctx.compiled),
     ...detectUrls(view),

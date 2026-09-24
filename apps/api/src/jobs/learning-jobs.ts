@@ -673,7 +673,12 @@ export async function personalizeItems(
   if (
     intro === null ||
     batches.some(
-      (batch) => guardChildContent({ packet: { intro }, answers: batch }).decision !== 'release',
+      (batch) =>
+        guardChildContent({
+          packet: { intro },
+          answers: batch,
+          options: { evaluateExpressions: true },
+        }).decision !== 'release',
     )
   ) {
     intro = null;

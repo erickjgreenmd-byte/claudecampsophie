@@ -53,6 +53,21 @@ export interface ScanOptions {
   readonly maxTextLength?: number;
   /** Maximum decode depth for nested encodings (0..2). Default and maximum 2. */
   readonly maxEncodingDepth?: number;
+  /**
+   * Read arithmetic expressions as the value they disclose: "6 × 7" is a mention of 42 (spec P6
+   * "No original problem's final numeric value ... in hints"). Expressions are evaluated by a safe
+   * exact-rational parser, never eval; one that cannot be bounded fails closed
+   * (`expression_unbounded`) and one with two readings is not guessed (`expression_unevaluable`).
+   *
+   * Decision (lead, at integration): ON unless explicitly false, so every child-facing caller,
+   * present and future, fails closed. Pass false only when the text IS the problem statement
+   * ("What is 6 × 7?", the bank's prompt self-check in bank/validate.ts): a problem necessarily
+   * contains an expression equal to its own key. With it on, a hint that restates the problem
+   * ("look again at 6 × 7") is blocked when, and only when, its value equals a protected answer
+   * (fail closed; the caller shows a safe template). apps/api/tests/guard-call-sites.test.ts keeps
+   * the opt-out confined to problem statements.
+   */
+  readonly evaluateExpressions?: boolean;
 }
 
 export interface PacketScanOptions extends ScanOptions {

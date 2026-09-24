@@ -1273,7 +1273,12 @@ class ScanRun {
             ],
             900,
           );
-          const decision = guardChildContent({ packet, answers: key.answers });
+          // Expressions are read as their value ("6 × 7" discloses 42), explicitly (L-012).
+          const decision = guardChildContent({
+            packet,
+            answers: key.answers,
+            options: { evaluateExpressions: true },
+          });
           if (decision.decision === 'release') {
             return [
               ...packet.steps.map((s) => ({ kind: FEEDBACK_KIND[s.kind], body: s.text })),

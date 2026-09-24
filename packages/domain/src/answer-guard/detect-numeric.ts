@@ -1,6 +1,7 @@
 // Numeric detector: flags any representation equal to a protected numeric value (spec P6).
 
 import type { NormalizedAnswer, NumericTarget } from './answers.ts';
+import type { ExpressionCache } from './expressions.ts';
 import { extractNumericMentionsDetailed, type MarkerState } from './numbers.ts';
 import { abs, equals, withinRounding } from './rational.ts';
 import type { RawFinding, TextView } from './view.ts';
@@ -36,17 +37,26 @@ function matchTechnique(
   return null;
 }
 
-const DIGIT_SEPARATOR = String.raw`(?:[ \t]*[-_.*|\u2022\u00B7][ \t]*|[ \t\n]+)`;
+/**
+ * Decision: "^" separates digits like "*" and "-" do. canonicalize writes a superscript exponent
+ * as "^n" ("4²" -> "4^2"), and a child who does not know exponents may still read "4²" as 42.
+ */
+const DIGIT_SEPARATOR = String.raw`(?:[ \t]*[-_.*|^\u2022\u00B7][ \t]*|[ \t\n]+)`;
 
 export function detectNumeric(
   view: TextView,
   answers: readonly NormalizedAnswer[],
   markerState: MarkerState,
+  /** Evaluate arithmetic expressions (ScanOptions.evaluateExpressions), sharing this cache. */
+  expressions: ExpressionCache | null = null,
 ): RawFinding[] {
   if (!answers.some((a) => a.numeric.length > 0)) return [];
-  const { mentions, masked, overlong } = extractNumericMentionsDetailed(view.lower, {
-    markerState,
-  });
+  const { mentions, masked, overlong, expressionFailures } = extractNumericMentionsDetailed(
+    view.lower,
+    expressions === null
+      ? { markerState }
+      : { markerState, evaluateExpressions: true, expressionCache: expressions },
+  );
   // Decision (regression RV-answer-guard-1): a numeral too long to compare exactly is a
   // fail-closed finding, never a silent pass.
   const findings: RawFinding[] = overlong.map((span) => ({
@@ -56,6 +66,17 @@ export function detectNumeric(
     start: span.start,
     end: span.end,
   }));
+  // Decision ([capture-grading] expression note): an expression that cannot be bounded or
+  // evaluated unambiguously is likewise a fail-closed finding (see expressions.ts).
+  for (const failure of expressionFailures) {
+    findings.push({
+      detector: 'fail_closed',
+      answerIndex: null,
+      technique: failure.technique,
+      start: failure.start,
+      end: failure.end,
+    });
+  }
   for (const answer of answers) {
     for (const target of answer.numeric) {
       for (const mention of mentions) {

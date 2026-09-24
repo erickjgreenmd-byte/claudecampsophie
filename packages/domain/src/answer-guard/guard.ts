@@ -23,6 +23,7 @@ const LIMIT_TECHNIQUES = new Set([
   'encoding_depth_exceeded',
   'findings_limit',
   'numeral_too_long',
+  'expression_unbounded',
 ]);
 const UNSUPPORTED_TECHNIQUES = new Set([
   'cycle',
@@ -94,8 +95,9 @@ export function guardChildContent(input: GuardInput): GuardDecision {
 
 /**
  * True only when an analogous worked example (spec P6: "different numbers/context whose solution
- * does not reveal the target answer") passes the same scan. Fails closed: non-string input, an
- * empty or invalid answer list, or any exception returns false.
+ * does not reveal the target answer") passes the same scan, with arithmetic expressions evaluated
+ * (an example "6 × 7" whose solution is the protected 42 reveals it). Fails closed: non-string
+ * input, an empty or invalid answer list, or any exception returns false.
  */
 export function analogousExampleIsSafe(input: {
   readonly exampleText: string;
@@ -104,7 +106,7 @@ export function analogousExampleIsSafe(input: {
   try {
     if (typeof input.exampleText !== 'string') return false;
     if (!Array.isArray(input.answers) || input.answers.length === 0) return false;
-    return scanForLeaks(input.exampleText, input.answers).safe;
+    return scanForLeaks(input.exampleText, input.answers, { evaluateExpressions: true }).safe;
   } catch {
     return false;
   }

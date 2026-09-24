@@ -105,7 +105,14 @@ export function validateBankItem(item: BankItem): Result<BankItem, BankValidatio
     return err('DISTRACTOR_NOT_INCORRECT', 'The distractor does not grade as incorrect');
   }
 
-  const decision = guardChildContent({ packet: item.prompt, answers: protectedAnswersFor(spec) });
+  // The prompt IS the problem statement, so it necessarily contains an expression equal to its own
+  // key ("What is 6 × 7?"): expression reading is switched off here, and only here. Everything
+  // child-facing that is not a problem statement (hints, intros, examples) keeps the default (on).
+  const decision = guardChildContent({
+    packet: item.prompt,
+    answers: protectedAnswersFor(spec),
+    options: { evaluateExpressions: false },
+  });
   if (decision.decision !== 'release') {
     return err('KEY_LEAKED', 'The child prompt reveals or may reveal its own answer', {
       reasons: decision.reasons.map((r) => r.code),

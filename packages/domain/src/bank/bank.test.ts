@@ -55,7 +55,12 @@ function assertSelfValid(item: BankItem): void {
     expect(spec.validLetters).toContain(spec.letters[0]);
     expect(item.prompt.choices).toHaveLength(spec.validLetters.length);
   }
-  const decision = guardChildContent({ packet: item.prompt, answers: protectedAnswersFor(spec) });
+  // Same rule as the validator: a problem statement is scanned without expression reading.
+  const decision = guardChildContent({
+    packet: item.prompt,
+    answers: protectedAnswersFor(spec),
+    options: { evaluateExpressions: false },
+  });
   expect(decision.decision).toBe('release');
   // The child prompt carries no key-like field names at all.
   expect(findForbiddenFields(item.prompt)).toEqual([]);

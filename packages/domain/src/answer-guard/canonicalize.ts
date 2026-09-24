@@ -37,6 +37,22 @@ function scriptDigits(value: string, alphabet: string): string {
 }
 
 /**
+ * Superscript digits glued to a base ("6\u00B2", "10\u207B\u00B2", "x\u00B2", "cm\u00B2") are an
+ * exponent: NFKC alone would fold "6\u00B2 + 6" into "62 + 6". They are written "^2" first, so the
+ * literal digits are still read ("6", "2"), an evaluated expression reads the power (36), and the
+ * digit-separator rule still reads "4\u00B2" as a possible 42. A superscript run with no base
+ * ("the answer is \u2074\u00B2") is plain digits, as before.
+ */
+const SUPERSCRIPT_EXPONENT_RE = new RegExp(
+  `(?<=[\\p{L}\\p{N})\\]}])(?<![${SUPERSCRIPT_DIGITS}\u207A\u207B])([\u207A\u207B]?)([${SUPERSCRIPT_DIGITS}]+)`,
+  'gu',
+);
+
+function exponentOf(_match: string, sign: string, digits: string): string {
+  return `^${sign === '\u207B' ? '-' : sign === '\u207A' ? '+' : ''}${scriptDigits(digits, SUPERSCRIPT_DIGITS)}`;
+}
+
+/**
  * Homoglyphs that render like Latin letters in common fonts. Applied after NFKC, before
  * lowercasing, so both cases are listed. Not exhaustive (documented limitation).
  */
@@ -201,6 +217,7 @@ function singlePass(input: string): string {
   let s = input.replace(SCRIPT_FRACTION_RE, (_m, n: string, d: string) => {
     return ` ${scriptDigits(n, SUPERSCRIPT_DIGITS)}/${scriptDigits(d, SUBSCRIPT_DIGITS)} `;
   });
+  s = s.replace(SUPERSCRIPT_EXPONENT_RE, exponentOf);
   s = s.replace(
     VULGAR_RE,
     (c) => ` ${Object.hasOwn(VULGAR_FRACTIONS, c) ? VULGAR_FRACTIONS[c] : c} `,

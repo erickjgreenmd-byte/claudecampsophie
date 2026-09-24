@@ -163,8 +163,19 @@ describe('extractNumericMentions reads exact rationals', () => {
     expect(values('ninety-nine thousand nine hundred')).toContain('99900');
   });
 
-  it('never evaluates arithmetic expressions (numbers are data, not code)', () => {
+  it('reads an expression value only when asked, through the safe parser (numbers stay data)', () => {
+    // Default (answer keys, scan-process key parsing): component numbers only.
     expect(values('6 x 7')).not.toContain('42');
     expect(values('6 x 7')).toEqual(expect.arrayContaining(['6', '7']));
+    // Opt-in (hints, examples): the value too, read by parseMathAnswer, never eval.
+    const opted = extractNumericMentions(canonicalize('6 x 7'), { evaluateExpressions: true });
+    expect(opted.map((m) => `${m.value.num}/${m.value.den}:${m.reading}`)).toEqual(
+      expect.arrayContaining(['6/1:integer', '7/1:integer', '42/1:expression']),
+    );
+    expect(() =>
+      extractNumericMentions(canonicalize('process.exit(1) + constructor(2)'), {
+        evaluateExpressions: true,
+      }),
+    ).not.toThrow();
   });
 });

@@ -1,5 +1,8 @@
 // Minimal exact rational arithmetic on BigInt, local to the guard by design (the guard reuses no
 // parsing or arithmetic from other modules so a defect elsewhere cannot silently weaken it).
+// One deliberate exception: expressions.ts evaluates arithmetic expressions with the grading
+// module's bounded parser. That only ADDS readings; every literal is still read here, and every
+// parser failure other than division by zero fails closed.
 
 export interface Rational {
   /** Numerator; carries the sign. */

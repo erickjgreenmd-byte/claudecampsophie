@@ -62,7 +62,9 @@ interface ScriptedQuestion {
   key: string;
   primary: { verdict: string; confidence: 'low' | 'medium' | 'high' };
   verifier: { verdict: string; confidence: 'low' | 'medium' | 'high' };
-  coaching?: 'safe' | 'leaky';
+  coaching?: 'safe' | 'leaky' | 'expression';
+  /** For coaching 'expression': the hint discloses the key as this unevaluated expression. */
+  leakExpression?: string;
   rubric?: { criterion: string; met: boolean; note: string }[];
 }
 
@@ -210,7 +212,9 @@ function scriptedModel(script: Script): ResponsesClient & { requests: ResponsesR
                 kind: 'hint',
                 text: leaky
                   ? `Almost! The answer is ${s.key}.`
-                  : 'Say the word slowly and listen for the sound in the middle.',
+                  : s.coaching === 'expression'
+                    ? `Almost! The answer is ${s.leakExpression}.`
+                    : 'Say the word slowly and listen for the sound in the middle.',
               },
             ],
             retryPrompt: 'Give it another try!',
@@ -552,6 +556,28 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
     expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'needs_parent_review' });
     expect(await feedback(scan.assignmentId)).toEqual([]);
     expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+  });
+
+  it('a hint that discloses the key as an expression ("6 × 7" for 42) falls back to the template (AC_GRADING_07/08)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '9',
+      prompt: '6 × 7 =',
+      answer: '48',
+      kind: 'numeric',
+      key: '42',
+      primary: { verdict: 'incorrect', confidence: 'high' },
+      verifier: { verdict: 'incorrect', confidence: 'high' },
+      coaching: 'expression',
+      leakExpression: '$6\\times7$',
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [q] })));
+    expect(await results(scan.assignmentId)).toMatchObject([{ verdict: 'incorrect' }]);
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => r.kind)).toEqual(['template_fallback']);
+    expect(rows.map((r) => r.body).join(' ')).not.toMatch(/times|×|42/);
+    expect(api.logs.some((l) => l.event === 'coaching_blocked_by_guard')).toBe(true);
   });
 
   it('written work gets rubric feedback in fixed wording; the model’s notes never reach the child (AC_GRADING_03)', async () => {

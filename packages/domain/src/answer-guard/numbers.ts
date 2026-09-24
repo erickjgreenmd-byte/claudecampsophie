@@ -6,6 +6,11 @@
 // are read too ("3/4" -> 3/4, 3 and 4). A false match blocks a packet (safe template fallback); a
 // missed match leaks an answer.
 
+import {
+  extractExpressionReadings,
+  type ExpressionCache,
+  type ExpressionFailure,
+} from './expressions.ts';
 import { add, divide, multiply, pow10, rational, type Rational } from './rational.ts';
 
 export type NumericReading =
@@ -21,7 +26,8 @@ export type NumericReading =
   | 'over'
   | 'scaled'
   | 'words'
-  | 'place_value';
+  | 'place_value'
+  | 'expression';
 
 export interface NumericMention {
   readonly value: Rational;
@@ -40,6 +46,13 @@ export interface ExtractOptions {
   readonly markerState?: MarkerState;
   /** Mask structural list markers first (default true). Off for parsing an answer value. */
   readonly maskMarkers?: boolean;
+  /**
+   * Also read the value of arithmetic expressions ("6 x 7" -> 42, reading 'expression'), through
+   * the safe parser in expressions.ts (default false). Off for parsing an answer value.
+   */
+  readonly evaluateExpressions?: boolean;
+  /** Parser results shared across the texts of one scan (see expressions.ts). */
+  readonly expressionCache?: ExpressionCache;
 }
 
 export interface ExtractResult {
@@ -51,6 +64,8 @@ export interface ExtractResult {
    * exactly within the arithmetic bound, so the numeric detector fails closed on them.
    */
   readonly overlong: readonly Span[];
+  /** Expressions that could not be bounded or evaluated (fail closed); empty unless requested. */
+  readonly expressionFailures: readonly ExpressionFailure[];
 }
 
 interface Span {
@@ -1175,7 +1190,16 @@ export function extractNumericMentionsDetailed(
   const overlong: Span[] = [];
   extractDigitNotations(masked, out, overlong);
   extractWordNumbers(masked, out);
-  return { mentions: out, masked, overlong };
+  if (options.evaluateExpressions !== true) {
+    return { mentions: out, masked, overlong, expressionFailures: [] };
+  }
+  const expressions = extractExpressionReadings(masked, out, options.expressionCache);
+  return {
+    mentions: [...out, ...expressions.mentions],
+    masked,
+    overlong,
+    expressionFailures: expressions.failures,
+  };
 }
 
 /** Every numeric mention in canonical lowercase text, as exact rationals. */
