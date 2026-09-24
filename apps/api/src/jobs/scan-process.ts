@@ -16,7 +16,15 @@ import {
   type ResponsesClient,
   type VerificationOutput,
 } from '@pencillift/ai';
-import { guardChildContent, type ProtectedAnswer } from '@pencillift/domain/answer-guard';
+import {
+  canonicalize,
+  extractNumericMentions,
+  guardChildContent,
+  MAX_PROTECTED_ANSWERS,
+  validateProtectedAnswers,
+  type NumericMention,
+  type ProtectedAnswer,
+} from '@pencillift/domain/answer-guard';
 import {
   formatRational,
   gradeObjectiveQuestion,
@@ -36,7 +44,8 @@ import type { Tx } from '../db.ts';
 import type { StorageProvider } from '../providers/index.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 import { ImageFormatError, stripImageMetadata } from '../services/image-metadata.ts';
-import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
+import type { DeadLetterReason, JobDeferral, JobDeps, JobHandler, JobRow } from './dispatcher.ts';
+import { acquireSpendHold, releaseSpendHold, SpendCeilingReached } from './spend-ceiling.ts';
 
 /**
  * Homework scan processing (spec P5, P6, P12; AC_CAPTURE_*, AC_GRADING_*). One durable job per
@@ -46,9 +55,13 @@ import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
  *   → independent verification → resolution → leak-guarded child coaching → usage commit.
  *
  * Every write is idempotent (upserts keyed by assignment/page/question, unique attempt keys), so a
- * crash at any point is repaired by the job retry. AI calls never run inside a DB transaction.
- * Child-facing text is released only after the answer guard passes; otherwise a reviewed template
- * is shown. Nothing here logs homework text, answers or child identifiers.
+ * crash at any point is repaired by the job retry; a retry never re-extracts a scan whose questions
+ * are already stored. AI calls never run inside a DB transaction. Before every AI stage and inside
+ * every write batch the run re-checks that it may still process this child's data (no deletion, not
+ * archived, consent still verified), so a deletion stops it immediately (spec P4). Every stage is
+ * admitted against the owner's spend ceiling first. Child-facing text is released only after the
+ * answer guard passes; otherwise a reviewed template is shown. Nothing here logs homework text,
+ * answers or child identifiers.
  */
 
 export const GRADER_VERSION = 'scan.v1';
@@ -64,6 +77,9 @@ const CONFIDENCE: Readonly<Record<'low' | 'medium' | 'high', number>> = {
 /** Page issues that mean "take the picture again" rather than guessing (spec P5). */
 const RESCAN_PAGE_ISSUES = new Set(['blurry', 'glare', 'rotated', 'cut_off', 'not_homework']);
 
+/** A scan paused by the spend ceiling is retried after this long (no attempt is spent). */
+const SPEND_CEILING_RETRY_MS = 60 * 60_000;
+
 /** Reviewed fallback when a coaching packet fails validation (spec P6: never show unchecked output). */
 export const TEMPLATE_FALLBACK =
   "Let's look at this one again. Read the question slowly, check each step, and try once more. If you're stuck, ask a grown-up to help.";
@@ -76,6 +92,7 @@ const payloadSchema = z.object({
 });
 
 type RateTable = typeof DEFAULT_RATE_TABLE_2026_09_18;
+type ParentVerdict = 'correct' | 'incorrect' | 'unresolved';
 
 export interface ScanProcessOptions {
   readonly ai: ResponsesClient;
@@ -129,6 +146,8 @@ interface QuestionRow {
   readonly skill: string;
   readonly uncertainty: 'low' | 'medium' | 'high' | null;
   readonly corrected_by: string | null;
+  /** A parent's override stays authoritative over any regrade (spec P5). */
+  readonly parent_override: ParentVerdict | null;
 }
 
 interface Graded {
@@ -138,6 +157,8 @@ interface Graded {
   readonly route: 'deterministic' | 'agreement' | 'escalated' | 'parent_review';
   readonly disagreement: boolean;
   readonly private: GradingOutput['results'][number] | null;
+  /** The model-free key computed from the printed prompt, when there is one. */
+  readonly promptKey: string | null;
   readonly provenance: Record<string, unknown>;
 }
 
@@ -212,27 +233,111 @@ function modelVerdict(verdict: string): ModelVerdict {
   return decisive(verdict) ? verdict : 'unresolved';
 }
 
-/** Protected answers for the leak guard; always at least the literal key as text. */
+const NUMERIC_KINDS: ReadonlySet<AnswerKind> = new Set([
+  'numeric',
+  'quantity',
+  'division_remainder',
+]);
+const CHOICE_PREFIX = /^(?:option|choice|letter|answer)\s*[:.]?\s*/i;
+/** "B", "(B)", "B)", "B.", "B:", "B) 3/6", "(B) 3/6", "B. 3/6", "Choice B" … */
+const CHOICE_LETTER = /^\(?([A-Za-z])(?:[).:]|\s|$)/;
+/** A single letter standing alone ("and C", "(C)", "C)"); not a letter of a word or "it's". */
+const STANDALONE_LETTER = /(?<![\p{L}\p{N}'\u2019])([A-Za-z])(?![\p{L}\p{N}])/gu;
+
+/**
+ * Letters a multiple-choice key names after its leading letter ("A and C", "(A) or (C)",
+ * "C. 10 or A. 4"). The English article "a" in option text ("B) a right angle") is not an option
+ * when the key's own letter is a capital. Any other standalone letter counts, so an ambiguous key
+ * fails closed rather than leaving a second correct letter unprotected (RV-lead-jobs-ai-8).
+ */
+function otherChoiceLetters(rest: string, first: string): string[] {
+  const capitalKey = first !== first.toLowerCase();
+  return [...rest.matchAll(STANDALONE_LETTER)]
+    .map((m) => m[1]!)
+    .filter((letter) => !(capitalKey && letter === 'a'));
+}
+
+/** Mentions not strictly contained in a longer mention (the guard's own reading of a key). */
+function maximalMentions(mentions: readonly NumericMention[]): NumericMention[] {
+  return mentions.filter(
+    (m) =>
+      !mentions.some(
+        (o) => o.start <= m.start && o.end >= m.end && o.end - o.start > m.end - m.start,
+      ),
+  );
+}
+
+/** Every number a key states ("x = 4", "The answer is 84.", "B) 3/6"), as guard values. */
+function keyNumbers(key: string, includeWordNumbers: boolean): string[] {
+  const canon = canonicalize(key);
+  const mentions = maximalMentions(extractNumericMentions(canon, { maskMarkers: false }));
+  const values = new Set<string>();
+  for (const m of mentions) {
+    if (!includeWordNumbers && !/[0-9]/.test(canon.slice(m.start, m.end))) continue;
+    values.add(m.value.den === 1n ? m.value.num.toString() : `${m.value.num}/${m.value.den}`);
+  }
+  return [...values];
+}
+
+/**
+ * Protected answers for the leak guard, derived from a free-text key (RV-lead-jobs-ai-8): the literal
+ * key as text, every number it states (a leading option letter, "<var> =" and sentences included),
+ * a multiple-choice letter written with or without its option text, and a spelling word.
+ *
+ * Fails closed: returns [] when the key cannot be turned into a protectable form (a multiple-choice
+ * key without a readable letter or naming more than one letter, a numeric key without a readable
+ * number, or more forms than the guard accepts). The caller then shows the reviewed template instead
+ * of calling the tutor.
+ */
 export function protectedAnswers(kind: AnswerKind, key: string): ProtectedAnswer[] {
   const trimmed = key.trim();
   if (trimmed.length === 0) return [];
   const answers: ProtectedAnswer[] = [{ kind: 'text', value: trimmed.slice(0, 200) }];
-  const numeric = parseMathAnswer(trimmed);
-  const quantity = numeric.ok ? null : parseQuantity(trimmed);
-  const value = numeric.ok ? numeric.value : quantity?.ok ? quantity.value.value : null;
-  if (value !== null) answers.push({ kind: 'numeric', value: formatRational(value) });
-  if (kind === 'division_remainder') {
-    const quotient = /^\s*(\d+)/.exec(trimmed)?.[1];
-    if (quotient !== undefined) answers.push({ kind: 'numeric', value: quotient });
-  }
+  const numbers = keyNumbers(trimmed, NUMERIC_KINDS.has(kind));
+  if (NUMERIC_KINDS.has(kind) && numbers.length === 0) return [];
+  for (const value of numbers) answers.push({ kind: 'numeric', value });
   if (kind === 'multiple_choice') {
-    const letter = trimmed.replace(/^\(?([A-Za-z])[).:]?$/, '$1');
-    if (/^[A-Za-z]$/.test(letter))
-      answers.push({ kind: 'multiple_choice', value: letter.toUpperCase() });
+    const choice = trimmed.replace(CHOICE_PREFIX, '');
+    const match = CHOICE_LETTER.exec(choice);
+    const letter = match?.[1];
+    if (match === null || letter === undefined) return [];
+    // A select-all key ("A and C") names more letters than the guard can withhold as one answer.
+    if (otherChoiceLetters(choice.slice(match[0].length), letter).length > 0) return [];
+    answers.push({ kind: 'multiple_choice', value: letter.toUpperCase() });
   }
   if (kind === 'spelling' && /^[\p{L}'-]+$/u.test(trimmed))
     answers.push({ kind: 'spelling', value: trimmed });
+  if (answers.length > MAX_PROTECTED_ANSWERS || !validateProtectedAnswers(answers).ok) return [];
   return answers;
+}
+
+/**
+ * True when the model's free-text key states exactly the model-free prompt key: "84", "84.0",
+ * "x = 84", "12 × 7 = 84" (the value after the last "="). Anything else — another value, several
+ * candidate values, no readable value — is a disagreement.
+ */
+export function keysAgree(promptKey: string, modelKey: string): boolean {
+  const trimmed = modelKey.trim();
+  const direct = parseMathAnswer(trimmed);
+  if (direct.ok) return formatRational(direct.value) === promptKey;
+  const expected = parseMathAnswer(promptKey);
+  if (!expected.ok || expected.value.num < 0n) return false; // signs are not compared below
+  const target =
+    expected.value.den === 1n
+      ? expected.value.num.toString()
+      : `${expected.value.num}/${expected.value.den}`;
+  const stated = keyNumbers(trimmed.slice(trimmed.lastIndexOf('=') + 1), true);
+  return stated.length === 1 && stated[0] === target;
+}
+
+function uniqueAnswers(answers: readonly ProtectedAnswer[]): ProtectedAnswer[] {
+  const seen = new Set<string>();
+  return answers.filter((a) => {
+    const id = `${a.kind}:${a.value}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -278,7 +383,7 @@ export function storageReader(
 export function createScanProcessHandler(options: ScanProcessOptions): JobHandler {
   const rates = options.rates ?? DEFAULT_RATE_TABLE_2026_09_18;
 
-  return async (deps, job) => {
+  const handler = async (deps: JobDeps, job: JobRow): Promise<void | JobDeferral> => {
     const parsed = payloadSchema.safeParse(job.payload);
     if (!parsed.success || !job.family_id) {
       deps.log({ level: 'error', event: 'scan_invalid_job', code: 'INVALID_JOB' });
@@ -286,7 +391,7 @@ export function createScanProcessHandler(options: ScanProcessOptions): JobHandle
     }
     const payload = parsed.data;
     const ctx = await loadAssignment(deps, job.family_id, payload.assignmentId);
-    if (!ctx) return; // deleted/purged family or assignment: nothing to do
+    if (!ctx) return; // deleted/purged family, child being deleted, or assignment gone
 
     const run = new ScanRun(
       deps,
@@ -302,11 +407,61 @@ export function createScanProcessHandler(options: ScanProcessOptions): JobHandle
       else await run.initial();
     } catch (error) {
       if (error instanceof Superseded) return;
+      if (error instanceof SpendCeilingReached) return await run.pause();
       await run.fail(error);
     } finally {
       await run.recordUsage();
     }
   };
+  return Object.assign(handler, {
+    onDeadLetter: (deps: JobDeps, job: JobRow, reason: DeadLetterReason) =>
+      settleDeadLetteredScan(deps, job, reason),
+  });
+}
+
+/**
+ * Compensation for a scan job that was dead-lettered without its handler settling it (the worker
+ * died on the final attempt): the scan ends failed_final and its allowance is released, instead of
+ * sitting in "checking" forever (RV-lead-jobs-ai-2). A dead recheck keeps the earlier results and
+ * goes to a grown-up. Idempotent; a deleted or already settled scan is left alone.
+ */
+export async function settleDeadLetteredScan(
+  deps: JobDeps,
+  job: JobRow,
+  reason: DeadLetterReason,
+): Promise<void> {
+  const parsed = payloadSchema.safeParse(job.payload);
+  if (!parsed.success || !job.family_id) return;
+  const familyId = job.family_id;
+  const { assignmentId, mode, reservationId } = parsed.data;
+  const code = reason === 'LOCK_EXPIRED' ? 'PROCESSING_TIMEOUT' : 'PROCESSING_ERROR';
+  await deps.db.asService(async (tx) => {
+    const [row] = await tx<{ status: string }[]>`
+      select status from public.assignments where id = ${assignmentId} and family_id = ${familyId}
+       for update`;
+    if (!row) return;
+    const move = (to: string) => tx`
+      update public.assignments set status = ${to}, error_code = ${code}
+       where id = ${assignmentId} and family_id = ${familyId}`;
+    if (mode === 'recheck') {
+      if (row.status === 'checking' || row.status === 'verifying') {
+        await move('needs_parent_review');
+      }
+      return;
+    }
+    let status = row.status;
+    if (status === 'queued') {
+      await move('extracting');
+      status = 'extracting';
+    }
+    if (!['extracting', 'checking', 'verifying', 'failed_retryable'].includes(status)) return;
+    await move('failed_final');
+    await tx`
+      update public.usage_reservations set status = 'released', release_reason = 'failed_final'
+       where family_id = ${familyId} and status = 'reserved'
+         and ${reservationId ? tx`id = ${reservationId}` : tx`idempotency_key like ${`scan-usage:${assignmentId}:v%`}`}`;
+  });
+  deps.log({ level: 'error', event: 'scan_failed_final', code });
 }
 
 async function loadAssignment(
@@ -330,6 +485,10 @@ async function loadAssignment(
         join public.child_profiles c on c.id = a.child_id and c.family_id = a.family_id
         join public.families f on f.id = a.family_id and f.deleted_at is null
        where a.id = ${assignmentId} and a.family_id = ${familyId}
+         and not exists (
+           select 1 from public.deletion_requests d
+            where d.family_id = a.family_id and d.status in ('requested', 'processing')
+              and (d.scope = 'family' or d.target_child_id = a.child_id))
     `,
   );
   return row
@@ -430,6 +589,28 @@ class ScanRun {
     throw error instanceof Error ? error : new Error(code);
   }
 
+  /**
+   * The owner's spend ceiling is reached: keep every result written so far and run again later
+   * without spending an attempt. A retried initial run skips extraction (its questions are stored).
+   */
+  async pause(): Promise<JobDeferral> {
+    try {
+      if (
+        this.mode === 'initial' &&
+        ['extracting', 'checking', 'verifying'].includes(this.ctx.status)
+      )
+        await this.transition('failed_retryable', 'SPEND_CEILING');
+    } catch (error) {
+      if (!(error instanceof Superseded)) throw error;
+    }
+    this.deps.log({ level: 'warn', event: 'scan_paused', code: 'SPEND_CEILING' });
+    return {
+      kind: 'defer',
+      runAfter: new Date(this.deps.clock().getTime() + SPEND_CEILING_RETRY_MS),
+      code: 'SPEND_CEILING',
+    };
+  }
+
   async recordUsage(): Promise<void> {
     if (this.usage.length === 0) return;
     const rows = this.usage.map((a) => ({
@@ -458,14 +639,53 @@ class ScanRun {
 
   // ---- gates ---------------------------------------------------------------------------------
 
-  private async assertMayProcess(): Promise<void> {
-    const { config } = this.deps;
-    const consent = await this.deps.db.asService((tx) =>
-      hasVerifiedConsent(tx, this.ctx.familyId, {
-        allowTestProvider: config.environment !== 'production',
-      }),
-    );
+  /**
+   * May this run still touch this child's data? The assignment must still be in the state this run
+   * put it in, the family live, no deletion open for the family or child, the child not archived and
+   * consent still verified. `lock` holds the assignment row for the rest of a write transaction, so a
+   * concurrent deletion (which moves the assignment to 'deleted') serialises with the write.
+   */
+  private async assertActive(tx: Tx, lock: boolean): Promise<void> {
+    const [row] = await tx<
+      { status: string; family_deleted: boolean; child_status: string | null; deleting: boolean }[]
+    >`
+      select a.status, f.deleted_at is not null as family_deleted, c.status as child_status,
+             exists (select 1 from public.deletion_requests d
+                      where d.family_id = a.family_id and d.status in ('requested', 'processing')
+                        and (d.scope = 'family' or d.target_child_id = a.child_id)) as deleting
+        from public.assignments a
+        join public.families f on f.id = a.family_id
+        left join public.child_profiles c on c.id = a.child_id and c.family_id = a.family_id
+       where a.id = ${this.ctx.id} and a.family_id = ${this.ctx.familyId}
+       ${lock ? tx`for share of a` : tx``}
+    `;
+    if (
+      !row ||
+      row.status !== this.ctx.status ||
+      row.family_deleted ||
+      row.deleting ||
+      row.child_status === null
+    ) {
+      throw new Superseded();
+    }
+    if (row.child_status === 'archived') throw new PermanentFailure('CHILD_ARCHIVED');
+    const consent = await hasVerifiedConsent(tx, this.ctx.familyId, {
+      allowTestProvider: this.deps.config.environment !== 'production',
+    });
     if (!consent) throw new PermanentFailure('CONSENT_REQUIRED');
+  }
+
+  /** Runs a batch of child-data writes only while processing is still allowed (spec P4). */
+  private guardedWrite<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    return this.deps.db.asService(async (tx) => {
+      await this.assertActive(tx, true);
+      return fn(tx);
+    });
+  }
+
+  private async assertMayProcess(): Promise<void> {
+    await this.deps.db.asService((tx) => this.assertActive(tx, false));
+    const { config } = this.deps;
     const gate = checkChildDataGate({
       containsChildPersonalData: true,
       ageBand: this.ctx.ageBand,
@@ -475,18 +695,23 @@ class ScanRun {
       now: this.deps.clock(),
     });
     if (!gate.ok) throw new PermanentFailure('AI_NOT_AVAILABLE');
-    const month = this.deps.clock().toISOString().slice(0, 7);
-    const [budget] = await this.deps.db.asService(
-      (tx) => tx<{ budget_micros: string; spent: string }[]>`
-        select b.budget_micros::text,
-               coalesce((select sum(cost_micros) from public.ai_usage_events
-                          where created_at >= date_trunc('month', ${this.deps.clock()}::timestamptz)), 0)::text as spent
-          from public.spend_budgets b where b.scope = 'global' and b.period_key = ${month}
-      `,
-    );
-    // Application-enforced ceiling (spec F4): provider alerts lag, so stop before spending.
-    if (budget && BigInt(budget.spent) >= BigInt(budget.budget_micros)) {
-      throw new RetryableFailure('SPEND_CEILING');
+  }
+
+  /**
+   * Admits a group of AI stages against the owner's spend ceiling with their upper-bound cost, runs
+   * them, then records their actual cost before the hold is released (RV-lead-jobs-ai-10).
+   */
+  private async spending<T>(
+    stages: readonly (keyof typeof PROPOSED_STAGE_LIMITS)[],
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const micros = stages.reduce((n, s) => n + PROPOSED_STAGE_LIMITS[s].maxCostMicros, 0);
+    const hold = await acquireSpendHold(this.deps, micros);
+    try {
+      return await fn();
+    } finally {
+      await this.recordUsage();
+      await releaseSpendHold(this.deps, hold);
     }
   }
 
@@ -495,6 +720,9 @@ class ScanRun {
     input: readonly InputPart[],
     estimatedInputTokens: number,
   ): Promise<z.infer<S>> {
+    // Deletion, archiving or a consent withdrawal since the last step stops the run before any
+    // more child data goes to the provider (spec P4; RV-lead-jobs-ai-3).
+    await this.deps.db.asService((tx) => this.assertActive(tx, false));
     const out = await runStage<S>({
       prompt,
       input,
@@ -513,6 +741,8 @@ class ScanRun {
       ...(this.options.sleep ? { sleep: this.options.sleep } : {}),
     });
     this.usage.push(...out.attempts);
+    // Recorded right away so the spend ceiling sees this stage before the next one is admitted.
+    await this.recordUsage();
     if (out.result.ok) return out.result.value;
     const code = out.result.error.code;
     if (code === 'CHILD_DATA_GATE') throw new PermanentFailure('AI_NOT_AVAILABLE');
@@ -526,6 +756,39 @@ class ScanRun {
     if (!(await this.enterExtracting())) return;
     await this.assertMayProcess();
 
+    let missingPassage: ReadonlySet<number> = new Set();
+    // Extract once (spec P12): a retry grades the stored questions instead of re-transcribing, so
+    // it can neither pay for vision again nor leave the first run's questions behind as
+    // duplicates of differently labelled ones (RV-lead-jobs-ai-9).
+    if (!(await this.hasQuestions())) {
+      const extracted = await this.extract();
+      if (extracted === null) return;
+      missingPassage = extracted;
+    }
+    const questions = await this.loadQuestions();
+    if (questions.length === 0) {
+      await this.transition('needs_parent_review', 'NO_QUESTIONS_FOUND');
+      await this.settleReservation('committed');
+      return;
+    }
+    await this.transition('checking');
+    const graded = await this.grade(questions, missingPassage);
+    await this.finish(graded);
+    await this.settleReservation('committed');
+  }
+
+  private async hasQuestions(): Promise<boolean> {
+    const [row] = await this.deps.db.asService(
+      (tx) => tx<{ n: number }[]>`
+        select count(*)::int as n from public.extracted_questions
+         where assignment_id = ${this.ctx.id} and family_id = ${this.ctx.familyId}
+      `,
+    );
+    return (row?.n ?? 0) > 0;
+  }
+
+  /** Extraction; returns the pages missing their source passage, or null when the scan ended. */
+  private async extract(): Promise<ReadonlySet<number> | null> {
     const pages = await this.deps.db.asService(
       (tx) => tx<{ id: string; page_number: number; storage_path: string; mime_type: string }[]>`
         select id, page_number, storage_path, mime_type from public.source_pages
@@ -555,44 +818,37 @@ class ScanRun {
         if (!(error instanceof ImageFormatError)) throw error;
         await this.transition('needs_rescan', 'IMAGE_UNREADABLE');
         await this.settleReservation('unreadable');
-        return;
+        return null;
       }
       images.push(imagePart(page.mime_type as 'image/jpeg' | 'image/png', toBase64(clean)));
     }
 
-    const extraction = await this.stage<typeof PROMPTS.extraction.outputSchema>(
-      PROMPTS.extraction,
-      [
-        dataEnvelope({
-          pageNumbers: pages.map((p) => p.page_number),
-          gradeLevel: this.ctx.gradeLevel,
-        }),
-        ...images,
-      ],
-      1_500 * pages.length + 800,
+    const extraction = await this.spending(['extraction'], () =>
+      this.stage<typeof PROMPTS.extraction.outputSchema>(
+        PROMPTS.extraction,
+        [
+          dataEnvelope({
+            pageNumbers: pages.map((p) => p.page_number),
+            gradeLevel: this.ctx.gradeLevel,
+          }),
+          ...images,
+        ],
+        1_500 * pages.length + 800,
+      ),
     );
 
     if (this.needsRescan(extraction, pages.length)) {
       await this.transition('needs_rescan', 'RETAKE_REQUESTED');
       // An unreadable scan never permanently consumes allowance (spec P11).
       await this.settleReservation('unreadable');
-      return;
+      return null;
     }
     const pageIds = new Map(pages.map((p) => [p.page_number, p.id]));
     const missingPassage = new Set(
       extraction.pages.filter((p) => p.issues.includes('missing_passage')).map((p) => p.pageNumber),
     );
-    await this.storeQuestions(extraction, pageIds);
-    const questions = await this.loadQuestions();
-    if (questions.length === 0) {
-      await this.transition('needs_parent_review', 'NO_QUESTIONS_FOUND');
-      await this.settleReservation('committed');
-      return;
-    }
-    await this.transition('checking');
-    const graded = await this.grade(questions, missingPassage);
-    await this.finish(graded);
-    await this.settleReservation('committed');
+    await this.guardedWrite((tx) => this.storeQuestions(tx, extraction, pageIds, missingPassage));
+    return missingPassage;
   }
 
   private needsRescan(extraction: ExtractionOutput, pageCount: number): boolean {
@@ -604,33 +860,36 @@ class ScanRun {
   }
 
   private async storeQuestions(
+    tx: Tx,
     extraction: ExtractionOutput,
     pageIds: ReadonlyMap<number, string>,
+    missingPassage: ReadonlySet<number>,
   ): Promise<void> {
     const seen = new Set<string>();
-    await this.deps.db.asService(async (tx) => {
-      for (const q of extraction.questions) {
-        const pageId = pageIds.get(q.pageNumber);
-        const key = `${q.pageNumber}:${q.questionNumber}`;
-        if (!pageId || seen.has(key)) continue; // unknown page or duplicate label: keep the first
-        seen.add(key);
-        await tx`
-          insert into public.extracted_questions
-            (assignment_id, family_id, child_id, page_id, question_number, bounding_box, prompt_text,
-             student_answer_text, answer_kind, subject_key, skill, grade_estimate, uncertainty)
-          values (${this.ctx.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${pageId}, ${q.questionNumber},
-                  ${q.boundingBox ? JSON.stringify(q.boundingBox) : null}::text::jsonb, ${q.promptText},
-                  ${q.studentAnswerText}, ${q.answerKind}, ${q.subject}, ${q.skill}, ${q.gradeEstimate},
-                  ${q.uncertainty})
-          on conflict (assignment_id, page_id, question_number) do update
-            set prompt_text = excluded.prompt_text, student_answer_text = excluded.student_answer_text,
-                answer_kind = excluded.answer_kind, subject_key = excluded.subject_key,
-                skill = excluded.skill, grade_estimate = excluded.grade_estimate,
-                uncertainty = excluded.uncertainty, bounding_box = excluded.bounding_box
-            where public.extracted_questions.corrected_at is null
-        `;
-      }
-    });
+    for (const q of extraction.questions) {
+      const pageId = pageIds.get(q.pageNumber);
+      const key = `${q.pageNumber}:${q.questionNumber}`;
+      if (!pageId || seen.has(key)) continue; // unknown page or duplicate label: keep the first
+      seen.add(key);
+      // A missing source passage is stored as high uncertainty, so a retry that grades the stored
+      // questions (without re-extracting) still refuses to decide them.
+      const uncertainty = missingPassage.has(q.pageNumber) ? 'high' : q.uncertainty;
+      await tx`
+        insert into public.extracted_questions
+          (assignment_id, family_id, child_id, page_id, question_number, bounding_box, prompt_text,
+           student_answer_text, answer_kind, subject_key, skill, grade_estimate, uncertainty)
+        values (${this.ctx.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${pageId}, ${q.questionNumber},
+                ${q.boundingBox ? JSON.stringify(q.boundingBox) : null}::text::jsonb, ${q.promptText},
+                ${q.studentAnswerText}, ${q.answerKind}, ${q.subject}, ${q.skill}, ${q.gradeEstimate},
+                ${uncertainty})
+        on conflict (assignment_id, page_id, question_number) do update
+          set prompt_text = excluded.prompt_text, student_answer_text = excluded.student_answer_text,
+              answer_kind = excluded.answer_kind, subject_key = excluded.subject_key,
+              skill = excluded.skill, grade_estimate = excluded.grade_estimate,
+              uncertainty = excluded.uncertainty, bounding_box = excluded.bounding_box
+          where public.extracted_questions.corrected_at is null
+      `;
+    }
   }
 
   private async loadQuestions(ids?: readonly string[]): Promise<QuestionRow[]> {
@@ -639,9 +898,11 @@ class ScanRun {
         select q.id, p.page_number, q.question_number,
                coalesce(q.corrected_prompt_text, q.prompt_text) as prompt,
                coalesce(q.corrected_student_answer_text, q.student_answer_text) as answer,
-               q.answer_kind, q.subject_key, q.skill, q.uncertainty, q.corrected_by
+               q.answer_kind, q.subject_key, q.skill, q.uncertainty, q.corrected_by,
+               r.parent_override_verdict as parent_override
           from public.extracted_questions q
           join public.source_pages p on p.id = q.page_id
+          left join public.question_results r on r.question_id = q.id and r.family_id = q.family_id
          where q.assignment_id = ${this.ctx.id} and q.family_id = ${this.ctx.familyId}
            and (${ids === undefined}::boolean or q.id = any(${ids ? [...ids] : []}::uuid[]))
          order by p.page_number, q.created_at, q.question_number
@@ -657,78 +918,91 @@ class ScanRun {
   ): Promise<Graded[]> {
     // Synthetic refs: printed numbers repeat across pages, so the model never keys on them.
     const refs = questions.map((q, i) => ({ ref: `q${i + 1}`, q }));
-    const grading = await this.stage<typeof PROMPTS.grading.outputSchema>(
-      PROMPTS.grading,
-      [
-        dataEnvelope({
-          gradeLevel: this.ctx.gradeLevel,
-          pagesMissingSourcePassage: [...missingPassage],
-          questions: refs.map(({ ref, q }) => ({
-            questionNumber: ref,
-            prompt: q.prompt,
-            studentAnswer: q.answer,
-            answerKind: q.answer_kind,
-            subject: q.subject_key,
-          })),
-        }),
-      ],
-      300 * questions.length + 600,
-    );
-    const primaryByRef = new Map(grading.results.map((r) => [r.questionNumber, r]));
-    if (this.ctx.status === 'checking') await this.transition('verifying');
-
-    const pending: { ref: string; q: QuestionRow; primary: GradingOutput['results'][number] }[] =
-      [];
-    const early: Graded[] = [];
-    for (const { ref, q } of refs) {
-      const primary = primaryByRef.get(ref) ?? null;
-      if (isBlank(q.answer)) {
-        early.push(
-          this.graded(q, 'unanswered', 'deterministic', false, primary, { reason: 'BLANK' }),
-        );
-      } else if (q.answer_kind === 'writing') {
-        // Writing gets rubric feedback only; it is never forced into right/wrong (spec P5).
-        early.push(
-          this.graded(q, 'rubric', 'deterministic', false, primary, {
-            reason: 'RUBRIC_FEEDBACK_ONLY',
-          }),
-        );
-      } else if (primary === null) {
-        early.push(
-          this.graded(q, 'needs_parent_review', 'parent_review', false, null, {
-            reason: 'NO_MODEL_RESULT',
-          }),
-        );
-      } else {
-        pending.push({ ref, q, primary });
-      }
-    }
-
-    let verification: VerificationOutput | null = null;
-    if (pending.length > 0) {
-      try {
-        verification = await this.stage<typeof PROMPTS.verification.outputSchema>(
-          PROMPTS.verification,
+    // Grading and its independent verification are admitted together: once grading is paid for,
+    // the check that makes it usable is not refused halfway.
+    const { verification, pending, early } = await this.spending(
+      ['grading', 'verification'],
+      async () => {
+        const grading = await this.stage<typeof PROMPTS.grading.outputSchema>(
+          PROMPTS.grading,
           [
             dataEnvelope({
               gradeLevel: this.ctx.gradeLevel,
-              questions: pending.map(({ ref, q, primary }) => ({
+              pagesMissingSourcePassage: [...missingPassage],
+              questions: refs.map(({ ref, q }) => ({
                 questionNumber: ref,
                 prompt: q.prompt,
                 studentAnswer: q.answer,
                 answerKind: q.answer_kind,
-                proposedVerdict: primary.verdict,
+                subject: q.subject_key,
               })),
             }),
           ],
-          250 * pending.length + 500,
+          300 * questions.length + 600,
         );
-      } catch (error) {
-        // Without an independent check nothing is accepted: those items go to a grown-up.
-        if (!(error instanceof RetryableFailure)) throw error;
-        verification = null;
-      }
-    }
+        const primaryByRef = new Map(grading.results.map((r) => [r.questionNumber, r]));
+        if (this.ctx.status === 'checking') await this.transition('verifying');
+
+        const pending: {
+          ref: string;
+          q: QuestionRow;
+          primary: GradingOutput['results'][number];
+        }[] = [];
+        const early: Graded[] = [];
+        for (const { ref, q } of refs) {
+          const primary = primaryByRef.get(ref) ?? null;
+          if (isBlank(q.answer)) {
+            early.push(
+              this.graded(q, 'unanswered', 'deterministic', false, primary, null, {
+                reason: 'BLANK',
+              }),
+            );
+          } else if (q.answer_kind === 'writing') {
+            // Writing gets rubric feedback only; it is never forced into right/wrong (spec P5).
+            early.push(
+              this.graded(q, 'rubric', 'deterministic', false, primary, null, {
+                reason: 'RUBRIC_FEEDBACK_ONLY',
+              }),
+            );
+          } else if (primary === null) {
+            early.push(
+              this.graded(q, 'needs_parent_review', 'parent_review', false, null, null, {
+                reason: 'NO_MODEL_RESULT',
+              }),
+            );
+          } else {
+            pending.push({ ref, q, primary });
+          }
+        }
+
+        let verification: VerificationOutput | null = null;
+        if (pending.length > 0) {
+          try {
+            verification = await this.stage<typeof PROMPTS.verification.outputSchema>(
+              PROMPTS.verification,
+              [
+                dataEnvelope({
+                  gradeLevel: this.ctx.gradeLevel,
+                  questions: pending.map(({ ref, q, primary }) => ({
+                    questionNumber: ref,
+                    prompt: q.prompt,
+                    studentAnswer: q.answer,
+                    answerKind: q.answer_kind,
+                    proposedVerdict: primary.verdict,
+                  })),
+                }),
+              ],
+              250 * pending.length + 500,
+            );
+          } catch (error) {
+            // Without an independent check nothing is accepted: those items go to a grown-up.
+            if (!(error instanceof RetryableFailure)) throw error;
+            verification = null;
+          }
+        }
+        return { verification, pending, early };
+      },
+    );
     const verifierByRef = new Map((verification?.results ?? []).map((r) => [r.questionNumber, r]));
 
     const resolved = pending.map(({ ref, q, primary }) => {
@@ -782,17 +1056,25 @@ class ScanRun {
         // Escalation to a stronger model is not wired yet; unsettled items go to parent review.
         escalationBudgetRemaining: 0,
       });
-      return this.graded(q, resolution.final, resolution.route, resolution.disagreement, primary, {
-        deterministic: deterministic ?? null,
-        deterministicReason,
-        modelKeyCheck: keyedOutcome?.reason ?? null,
-        // The model's own verdict is kept for audit; exact comparison against its key replaces it.
-        modelVerdict: primary.verdict,
-        primary: primaryJudgment.verdict,
-        verifier: verifier?.verdict ?? null,
-        verifierAvailable: verification !== null,
-        capture,
-      });
+      return this.graded(
+        q,
+        resolution.final,
+        resolution.route,
+        resolution.disagreement,
+        primary,
+        promptKey,
+        {
+          deterministic: deterministic ?? null,
+          deterministicReason,
+          modelKeyCheck: keyedOutcome?.reason ?? null,
+          // The model's own verdict is kept for audit; exact comparison against its key replaces it.
+          modelVerdict: primary.verdict,
+          primary: primaryJudgment.verdict,
+          verifier: verifier?.verdict ?? null,
+          verifierAvailable: verification !== null,
+          capture,
+        },
+      );
     });
     return [...early, ...resolved];
   }
@@ -803,6 +1085,7 @@ class ScanRun {
     route: Graded['route'],
     disagreement: boolean,
     primary: GradingOutput['results'][number] | null,
+    promptKey: string | null,
     detail: Record<string, unknown>,
   ): Graded {
     return {
@@ -811,6 +1094,7 @@ class ScanRun {
       route,
       disagreement,
       private: primary,
+      promptKey,
       provenance: {
         graderVersion: GRADER_VERSION,
         prompts: [
@@ -826,7 +1110,7 @@ class ScanRun {
   // ---- results, feedback, evidence ------------------------------------------------------------
 
   private async finish(graded: readonly Graded[], unsettledElsewhere = false): Promise<void> {
-    await this.deps.db.asService(async (tx) => {
+    await this.guardedWrite(async (tx) => {
       for (const g of graded) {
         if (g.private) {
           await tx`
@@ -856,17 +1140,26 @@ class ScanRun {
     });
 
     for (const g of graded) {
-      if (g.final === 'incorrect' && g.private) await this.coach(g);
+      // A parent's override is authoritative: no "try again" coaching on an answer shown as
+      // settled by a grown-up (RV-lead-jobs-ai-19).
+      if (g.final === 'incorrect' && g.private && g.question.parent_override === null)
+        await this.coach(g);
     }
 
     const needsReview =
       unsettledElsewhere ||
-      graded.some((g) => g.final === 'needs_parent_review' || g.final === 'unresolved');
+      graded.some((g) => {
+        const shown = g.question.parent_override ?? g.final;
+        return shown === 'needs_parent_review' || shown === 'unresolved';
+      });
     await this.transition(needsReview ? 'needs_parent_review' : 'ready');
   }
 
   /** First-attempt evidence (spec P7); a regrade after a correction is an override, never a rewrite. */
   private async recordAttempt(tx: Tx, g: Graded): Promise<void> {
+    // The parent's override already corrected this question's evidence; a machine regrade never
+    // overrules it, so the verdict shown and the evidence learned from stay the same.
+    if (g.question.parent_override !== null) return;
     const correctness =
       g.final === 'correct' || g.final === 'incorrect'
         ? g.final
@@ -902,9 +1195,32 @@ class ScanRun {
     }
   }
 
+  /**
+   * The key the tutor may see and every form of it the guard must withhold, or null when coaching
+   * must fall back to the reviewed template. When the model-free prompt key decided the question,
+   * that key is the one protected and given to the tutor; a model key that disagrees with it means
+   * the model's solution and misconception are unreliable, so no tutor call is made (RV-7).
+   */
+  private coachingKey(g: Graded): { tutorKey: string; answers: ProtectedAnswer[] } | null {
+    const kind = g.question.answer_kind;
+    const modelKey = g.private?.correctAnswer ?? '';
+    if (g.promptKey !== null) {
+      if (!keysAgree(g.promptKey, modelKey)) {
+        this.deps.log({ level: 'warn', event: 'coaching_key_mismatch', code: 'TEMPLATE' });
+        return null;
+      }
+      const fromPrompt = protectedAnswers(kind, g.promptKey);
+      const fromModel = protectedAnswers(kind, modelKey);
+      if (fromPrompt.length === 0 || fromModel.length === 0) return null;
+      const answers = uniqueAnswers([...fromPrompt, ...fromModel]);
+      if (answers.length > MAX_PROTECTED_ANSWERS) return null;
+      return { tutorKey: g.promptKey, answers };
+    }
+    const answers = protectedAnswers(kind, modelKey);
+    return answers.length > 0 ? { tutorKey: modelKey, answers } : null;
+  }
+
   private async coach(g: Graded): Promise<void> {
-    const key = g.private?.correctAnswer ?? '';
-    const answers = protectedAnswers(g.question.answer_kind, key);
     const [existing] = await this.deps.db.asService(
       (tx) => tx<{ n: number }[]>`
         select count(*)::int as n from public.child_feedback f
@@ -915,46 +1231,53 @@ class ScanRun {
     if ((existing?.n ?? 0) > 0) return; // already coached for this transcription (crash replay)
 
     let rows: { kind: string; body: string }[] | null = null;
-    if (answers.length > 0) {
+    const key = this.coachingKey(g);
+    if (key !== null) {
       try {
-        const packet = await this.stage<typeof PROMPTS.coaching.outputSchema>(
-          PROMPTS.coaching,
-          [
-            dataEnvelope({
-              gradeLevel: this.ctx.gradeLevel,
-              ageBand: this.ctx.ageBand,
-              skill: g.question.skill,
-              question: g.question.prompt,
-              studentAnswer: g.question.answer,
-              likelyMisconception: g.private?.misconception ?? null,
-              // Given so hints are accurate; the guard below blocks any leak of it.
-              answerForTutorOnly: key,
-            }),
-          ],
-          900,
-        );
-        const decision = guardChildContent({ packet, answers });
-        if (decision.decision === 'release') {
-          rows = [
-            ...packet.steps.map((s) => ({ kind: FEEDBACK_KIND[s.kind], body: s.text })),
-            { kind: 'encouragement', body: packet.retryPrompt },
-          ];
-        } else {
+        rows = await this.spending(['coaching'], async () => {
+          const packet = await this.stage<typeof PROMPTS.coaching.outputSchema>(
+            PROMPTS.coaching,
+            [
+              dataEnvelope({
+                gradeLevel: this.ctx.gradeLevel,
+                ageBand: this.ctx.ageBand,
+                skill: g.question.skill,
+                question: g.question.prompt,
+                studentAnswer: g.question.answer,
+                likelyMisconception: g.private?.misconception ?? null,
+                // Given so hints are accurate; the guard below blocks any leak of it.
+                answerForTutorOnly: key.tutorKey,
+              }),
+            ],
+            900,
+          );
+          const decision = guardChildContent({ packet, answers: key.answers });
+          if (decision.decision === 'release') {
+            return [
+              ...packet.steps.map((s) => ({ kind: FEEDBACK_KIND[s.kind], body: s.text })),
+              { kind: 'encouragement', body: packet.retryPrompt },
+            ];
+          }
           this.deps.log({
             level: 'warn',
             event: 'coaching_blocked_by_guard',
             code: decision.reasons[0]?.code ?? 'BLOCKED',
           });
-        }
+          return null;
+        });
       } catch (error) {
-        if (!(error instanceof RetryableFailure) && !(error instanceof PermanentFailure))
+        if (error instanceof SpendCeilingReached) {
+          // Coaching is optional: past the ceiling the child gets the reviewed template instead.
+          this.deps.log({ level: 'warn', event: 'coaching_skipped', code: 'SPEND_CEILING' });
+        } else if (!(error instanceof RetryableFailure) && !(error instanceof PermanentFailure)) {
           throw error;
+        }
       }
     }
     // Never unchecked output: a blocked, failed or unguardable packet becomes the reviewed template.
-    rows ??= [{ kind: 'template_fallback', body: TEMPLATE_FALLBACK }];
-    await this.deps.db.asService(async (tx) => {
-      for (const row of rows) {
+    const feedback = rows ?? [{ kind: 'template_fallback', body: TEMPLATE_FALLBACK }];
+    await this.guardedWrite(async (tx) => {
+      for (const row of feedback) {
         await tx`
           insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
           values (${g.question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${row.kind}, ${row.body}, ${GUARD_VERSION})

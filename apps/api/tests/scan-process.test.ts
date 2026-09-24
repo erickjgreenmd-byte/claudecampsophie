@@ -7,11 +7,17 @@ import {
   type ResponsesResult,
 } from '@pencillift/ai';
 import { cryptoRandom } from '@pencillift/domain';
-import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
+import {
+  grantAdultUnlock,
+  seedFamily,
+  seedOwnerAdmin,
+  type SeededFamily,
+} from '@pencillift/db/testing/fixtures';
 import { runJobs, type JobDeps, type JobHandler } from '../src/jobs/dispatcher.ts';
 import {
   computePromptKey,
   createScanProcessHandler,
+  keysAgree,
   protectedAnswers,
   TEMPLATE_FALLBACK,
 } from '../src/jobs/scan-process.ts';
@@ -654,5 +660,420 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
       select o.correctness from public.attempt_overrides o join public.attempts a on a.id = o.attempt_id
        where a.question_instance_id = ${q!.id}`;
     expect(overrides).toEqual([{ correctness: 'correct' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Hardening from the lead jobs/AI review (RV-lead-jobs-ai-2/3/7/8/9/10/19)
+// ---------------------------------------------------------------------------------------------
+
+/** Runs `hook` before the scripted model answers (e.g. a parent acting while a call is in flight). */
+function hooked(
+  inner: ResponsesClient & { requests: ResponsesRequest[] },
+  hook: (request: ResponsesRequest) => Promise<void>,
+): ResponsesClient & { requests: ResponsesRequest[] } {
+  return {
+    name: inner.name,
+    isMock: true,
+    requests: inner.requests,
+    async create(request) {
+      await hook(request);
+      return inner.create(request);
+    },
+  };
+}
+
+async function jobRow(id: string) {
+  const [row] = await api.db.sql<
+    {
+      id: string;
+      kind: string;
+      family_id: string;
+      child_id: string;
+      payload: Record<string, unknown>;
+      attempts: number;
+      max_attempts: number;
+    }[]
+  >`select id, kind, family_id, child_id, payload, attempts, max_attempts from public.jobs where id = ${id}`;
+  return row!;
+}
+
+describe('free-text keys and the model-free key (RV-lead-jobs-ai-7, -8)', () => {
+  const forms = (kind: Parameters<typeof protectedAnswers>[0], key: string) =>
+    protectedAnswers(kind, key).map((a) => [a.kind, a.value]);
+
+  it('protects a choice letter written with its option text, and every number a key states', () => {
+    for (const key of ['B) 3/6', 'B. 3/6', '(B) 3/6', 'B: 3/6', 'Choice B', 'b']) {
+      expect(forms('multiple_choice', key), key).toContainEqual(['multiple_choice', 'B']);
+    }
+    expect(forms('multiple_choice', 'B) 3/6')).toContainEqual(['numeric', '1/2']);
+    expect(forms('numeric', 'x = 4')).toContainEqual(['numeric', '4']);
+    expect(forms('numeric', 'The answer is 84.')).toContainEqual(['numeric', '84']);
+    expect(forms('numeric', 'four')).toContainEqual(['numeric', '4']);
+    expect(forms('quantity', '12 cm')).toContainEqual(['numeric', '12']);
+    expect(forms('division_remainder', '4 R 2')).toEqual(
+      expect.arrayContaining([
+        ['numeric', '4'],
+        ['numeric', '2'],
+      ]),
+    );
+    expect(forms('open_response', 'It has 3 sides.')).toContainEqual(['numeric', '3']);
+  });
+
+  it('fails closed when a key has no protectable form', () => {
+    expect(protectedAnswers('multiple_choice', 'the second one')).toEqual([]);
+    expect(protectedAnswers('numeric', 'unknown')).toEqual([]);
+    expect(protectedAnswers('quantity', 'several')).toEqual([]);
+  });
+
+  it('keys agree only when the model states exactly the prompt-computed value', () => {
+    expect(keysAgree('84', '84')).toBe(true);
+    expect(keysAgree('84', '84.0')).toBe(true);
+    expect(keysAgree('84', 'x = 84')).toBe(true);
+    expect(keysAgree('84', '12 × 7 = 84')).toBe(true);
+    expect(keysAgree('7/8', '14/16')).toBe(true);
+    expect(keysAgree('84', '82')).toBe(false);
+    expect(keysAgree('84', '84 or 85')).toBe(false);
+    expect(keysAgree('84', 'eighty')).toBe(false);
+  });
+
+  it('a model key that contradicts the prompt-computed key gets the template, with no tutor call', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '4',
+      prompt: '12 × 7 =',
+      answer: '74',
+      kind: 'numeric',
+      key: '82', // wrong model key; the prompt-computed 84 decides
+      primary: { verdict: 'incorrect', confidence: 'high' },
+      verifier: { verdict: 'incorrect', confidence: 'high' },
+      coaching: 'safe',
+    };
+    const client = scriptedModel({ questions: [q] });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests.map((r) => r.outputName)).not.toContain('child_coaching_packet');
+    expect((await feedback(scan.assignmentId)).map((f) => f.kind)).toEqual(['template_fallback']);
+    expect(api.logs.some((l) => l.event === 'coaching_key_mismatch')).toBe(true);
+  });
+
+  it('when the keys agree, the tutor is primed with the prompt-computed key', async () => {
+    await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '4',
+      prompt: '12 × 7 =',
+      answer: '74',
+      kind: 'numeric',
+      key: 'x = 84',
+      primary: { verdict: 'incorrect', confidence: 'high' },
+      verifier: { verdict: 'incorrect', confidence: 'high' },
+      coaching: 'safe',
+    };
+    const client = scriptedModel({ questions: [q] });
+    await runJobs(deps, handlerFor(client));
+    const coaching = client.requests.find((r) => r.outputName === 'child_coaching_packet')!;
+    expect(envelope(coaching).data.answerForTutorOnly).toBe('84');
+  });
+});
+
+/** The misspelled word (graded incorrect) on a one-page scan. */
+const SPELLING_ON_PAGE_1: ScriptedQuestion = { ...WORKSHEET[2]!, page: 1 };
+
+describe('scan hardening (RV-lead-jobs-ai-2, -3, -9, -10, -19)', () => {
+  it('consent withdrawn mid-run: no further AI stage, nothing written, allowance released', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = hooked(scriptedModel({ questions: WORKSHEET.slice(0, 2) }), async (r) => {
+      if (r.outputName !== 'homework_extraction') return;
+      await api.db.sql`
+        insert into public.consent_records (family_id, adult_user_id, provider, method, purpose, policy_version, status, is_test_provider, withdrawn_at, created_at)
+        values (${scan.fam.familyId}, ${scan.fam.ownerId}, 'mock', 'mock', 'child_learning_data', 'v1', 'withdrawn', true, now(), now() + interval '1 second')`;
+    });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+    expect(await results(scan.assignmentId)).toEqual([]);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'CONSENT_REQUIRED',
+    });
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+  });
+
+  it('a child archived mid-run: the scan stops, ends failed_final and releases the allowance', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = hooked(scriptedModel({ questions: WORKSHEET.slice(0, 2) }), async (r) => {
+      if (r.outputName !== 'homework_extraction') return;
+      await api.db.sql`
+        update public.child_profiles set status = 'archived', archived_at = now()
+         where id = ${scan.fam.children[0]!.id}`;
+    });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+    const [written] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.extracted_questions where assignment_id = ${scan.assignmentId}`;
+    expect(written!.n).toBe(0);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'CHILD_ARCHIVED',
+    });
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'released' });
+  });
+
+  it('the spend ceiling pauses a scan without spending an attempt; the rerun grades the stored questions', async () => {
+    const scan = await queuedScan({ pages: 1, maxAttempts: 1 });
+    const adminId = await seedOwnerAdmin(api.db);
+    const [spent] = await api.db.sql<{ micros: string }[]>`
+      select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${(BigInt(spent!.micros) + 1n).toString()}::bigint, ${adminId})`;
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 2) });
+    try {
+      const first = await runJobs(deps, handlerFor(client));
+      expect(first).toEqual({ succeeded: 0, retried: 1, deadLettered: 0 });
+      expect(client.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+      expect(await assignment(scan.assignmentId)).toEqual({
+        status: 'failed_retryable',
+        error_code: 'SPEND_CEILING',
+      });
+      expect(await reservation(scan.reservationId)).toMatchObject({ status: 'reserved' });
+      const [job] = await api.db.sql<{ status: string; attempts: number }[]>`
+        select status, attempts from public.jobs where id = ${scan.jobId}`;
+      expect(job).toEqual({ status: 'failed_retryable', attempts: 0 }); // the only attempt is kept
+
+      // The owner raises the cap; an hour later the scan continues where it stopped.
+      await api.db
+        .sql`update public.spend_budgets set budget_micros = 1000000000000 where period_key = '2026-09'`;
+      api.now.value = new Date(api.now.value.getTime() + 61 * 60_000);
+      await runJobs(deps, handlerFor(client));
+    } finally {
+      api.now.value = new Date('2026-09-24T15:00:00Z');
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
+    // Extract once: the paid transcription is reused, never repeated.
+    expect(client.requests.filter((r) => r.outputName === 'homework_extraction').length).toBe(1);
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+    const [holds] = await api.db.sql<
+      { n: number }[]
+    >`select count(*)::int as n from private.ai_spend_holds`;
+    expect(holds!.n).toBe(0); // every hold was released after its stage was metered
+  });
+
+  it('past the ceiling, coaching falls back to the reviewed template without a call', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const adminId = await seedOwnerAdmin(api.db);
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', 1000000000000, ${adminId})`;
+    const client = hooked(
+      scriptedModel({ questions: [SPELLING_ON_PAGE_1] }), // the misspelled word: incorrect
+      async (r) => {
+        if (r.outputName === 'independent_verification') {
+          await api.db
+            .sql`update public.spend_budgets set budget_micros = 1 where period_key = '2026-09'`;
+        }
+      },
+    );
+    try {
+      await runJobs(deps, handlerFor(client));
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
+    expect(client.requests.map((r) => r.outputName)).toEqual([
+      'homework_extraction',
+      'private_grading',
+      'independent_verification',
+    ]);
+    expect((await feedback(scan.assignmentId)).map((f) => f.kind)).toEqual(['template_fallback']);
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+  });
+
+  it('a retry after a stored extraction grades the same questions, whatever the new labels would be', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = scriptedModel({
+      questions: WORKSHEET.slice(0, 1),
+      failStages: new Set(['private_grading']),
+    });
+    const handler = handlerFor(client).scan_process!;
+    const job = await jobRow(scan.jobId);
+    await expect(handler(deps, { ...job, attempts: 1 })).rejects.toThrow();
+    const healthy = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    await handlerFor(healthy).scan_process!(deps, { ...job, attempts: 2 });
+    expect(healthy.requests.map((r) => r.outputName)).not.toContain('homework_extraction');
+    const [counts] = await api.db.sql<{ questions: number; attempts: number }[]>`
+      select (select count(*)::int from public.extracted_questions where assignment_id = ${scan.assignmentId}) as questions,
+             (select count(*)::int from public.attempts a join public.extracted_questions q on q.id = a.question_instance_id
+               where q.assignment_id = ${scan.assignmentId}) as attempts`;
+    expect(counts).toEqual({ questions: 1, attempts: 1 });
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+  });
+
+  it('a regrade never overrules a parent override: no evidence override, no new coaching', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [SPELLING_ON_PAGE_1] })));
+    const [q] = await api.db.sql<{ id: string }[]>`
+      select id from public.extracted_questions where assignment_id = ${scan.assignmentId}`;
+    const before = await feedback(scan.assignmentId);
+    await api.db.sql`
+      update public.question_results set parent_override_verdict = 'correct', overridden_by = ${scan.fam.ownerId},
+             overridden_at = now(), override_reason = 'Teacher accepted it'
+       where question_id = ${q!.id}`;
+    await api.db.sql`
+      insert into public.attempt_overrides (attempt_id, family_id, correctness, reason, overridden_by)
+      select id, family_id, 'correct', 'Teacher accepted it', ${scan.fam.ownerId}
+        from public.attempts where question_instance_id = ${q!.id}`;
+    await api.db.sql`
+      update public.extracted_questions
+         set corrected_student_answer_text = 'kiten.', corrected_by = ${scan.fam.ownerId}, corrected_at = now()
+       where id = ${q!.id}`;
+    await api.db
+      .sql`update public.assignments set status = 'checking' where id = ${scan.assignmentId}`;
+    await api.db.sql`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+      values ('scan_process', ${`scan:${scan.assignmentId}:v2`}, ${scan.fam.familyId}, ${scan.fam.children[0]!.id},
+              ${JSON.stringify({ assignmentId: scan.assignmentId, mode: 'recheck', questionIds: [q!.id] })}::text::jsonb,
+              ${new Date(api.now.value.getTime() - 1000)})`;
+    const client = scriptedModel({ questions: [SPELLING_ON_PAGE_1] });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests.map((r) => r.outputName)).not.toContain('child_coaching_packet');
+    const overrides = await api.db.sql<{ correctness: string }[]>`
+      select o.correctness from public.attempt_overrides o join public.attempts a on a.id = o.attempt_id
+       where a.question_instance_id = ${q!.id} order by o.created_at`;
+    expect(overrides).toEqual([{ correctness: 'correct' }]);
+    expect(await feedback(scan.assignmentId)).toEqual(before);
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+  });
+
+  it('a recheck whose final attempt is lost to an expired lock goes to a grown-up, keeping results', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    await runJobs(deps, handlerFor(scriptedModel({ questions: WORKSHEET.slice(0, 1) })));
+    await api.db
+      .sql`update public.assignments set status = 'checking' where id = ${scan.assignmentId}`;
+    await api.db.sql`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, status, attempts, max_attempts, locked_until)
+      values ('scan_process', ${`scan:${scan.assignmentId}:v2`}, ${scan.fam.familyId}, ${scan.fam.children[0]!.id},
+              ${JSON.stringify({ assignmentId: scan.assignmentId, mode: 'recheck', questionIds: [] })}::text::jsonb,
+              'running', 1, 1, ${new Date(api.now.value.getTime() - 60_000)})`;
+    const report = await runJobs(deps, handlerFor(scriptedModel({ questions: [] })));
+    expect(report.deadLettered).toBe(1);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'needs_parent_review',
+      error_code: 'PROCESSING_TIMEOUT',
+    });
+    expect(await results(scan.assignmentId)).toHaveLength(1); // earlier results are kept
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Checker follow-up (RV-lead-jobs-ai-8, -18)
+// ---------------------------------------------------------------------------------------------
+
+/** The scripted model, except that the tutor returns `hint` as its hint step. */
+function tutorSays(
+  inner: ResponsesClient & { requests: ResponsesRequest[] },
+  hint: string,
+): ResponsesClient & { requests: ResponsesRequest[] } {
+  return {
+    name: inner.name,
+    isMock: true,
+    requests: inner.requests,
+    async create(request) {
+      if (request.outputName !== 'child_coaching_packet') return inner.create(request);
+      inner.requests.push(request);
+      return ok(
+        {
+          steps: [
+            { kind: 'concept', text: 'Let us look at what the question asks for.' },
+            { kind: 'hint', text: hint },
+          ],
+          retryPrompt: 'Give it another try!',
+        },
+        'gpt-6-astra',
+      );
+    },
+  };
+}
+
+describe('multi-letter choice keys (RV-lead-jobs-ai-8 follow-up)', () => {
+  it('a multiple-choice key naming more than one letter fails closed', () => {
+    for (const key of [
+      'A and C',
+      'A or C',
+      '(A) and (C)',
+      'A & C',
+      'A, C',
+      'a and c',
+      'A/C',
+      'A) 4 and C) 10',
+      'C. 10 or A. 4',
+      'Choice A and choice C',
+      'B, D',
+      'Both A and C',
+    ]) {
+      expect(protectedAnswers('multiple_choice', key), key).toEqual([]);
+    }
+  });
+
+  it('one letter with its option text still protects that letter', () => {
+    for (const key of ['B) a right angle', 'B) 3/6', 'Choice B', '(b) 3/6', "B) it's 3/6"]) {
+      expect(
+        protectedAnswers('multiple_choice', key).map((a) => [a.kind, a.value]),
+        key,
+      ).toContainEqual(['multiple_choice', 'B']);
+    }
+  });
+
+  it('a select-all key gets the reviewed template: the other correct letter is never hinted', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '5',
+      prompt: 'Circle every even number. (A) 4 (B) 7 (C) 10',
+      answer: 'A',
+      kind: 'multiple_choice',
+      key: 'A and C',
+      primary: { verdict: 'incorrect', confidence: 'high' },
+      verifier: { verdict: 'incorrect', confidence: 'high' },
+    };
+    const client = tutorSays(
+      scriptedModel({ questions: [q] }),
+      'You found one. Now look closely at choice C too.',
+    );
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests.map((r) => r.outputName)).not.toContain('child_coaching_packet');
+    const bodies = await feedback(scan.assignmentId);
+    expect(bodies.map((f) => f.kind)).toEqual(['template_fallback']);
+    for (const f of bodies) expect(f.body).not.toMatch(/\bchoice C\b/i);
+  });
+});
+
+describe('usage metered after a concurrent purge (RV-lead-jobs-ai-18 follow-up)', () => {
+  it('a stage that returns after another worker purged the family records its cost without the child', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const childId = scan.fam.children[0]!.id;
+    await grantAdultUnlock(api.db, scan.fam.ownerId);
+    const client = hooked(scriptedModel({ questions: [SPELLING_ON_PAGE_1] }), async (r) => {
+      if (r.outputName !== 'private_grading') return;
+      await api.db.asParent(
+        scan.fam.ownerId,
+        (tx) => tx`select public.request_deletion(${scan.fam.familyId}, null)`,
+      );
+      await runJobs(deps); // another tick's worker runs the purge while grading is in flight
+    });
+    await handlerFor(client).scan_process!(deps, await jobRow(scan.jobId)).catch(() => undefined);
+    const [request] = await api.db.sql<{ status: string }[]>`
+      select status from public.deletion_requests where family_id = ${scan.fam.familyId}`;
+    expect(request!.status).toBe('completed');
+    const [usage] = await api.db.sql<{ keyed: number; kept: number }[]>`
+      select count(*) filter (where child_id = ${childId})::int as keyed,
+             count(*) filter (where child_id is null)::int as kept
+        from public.ai_usage_events where family_id = ${scan.fam.familyId}`;
+    expect(usage!.keyed).toBe(0); // nothing points at the purged child ...
+    expect(usage!.kept).toBeGreaterThanOrEqual(2); // ... but the owner's cost records stay
   });
 });

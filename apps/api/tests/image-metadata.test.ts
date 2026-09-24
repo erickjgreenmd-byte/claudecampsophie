@@ -111,6 +111,96 @@ describe('image metadata stripping (spec P4, AC_CAPTURE_02)', () => {
     expect(hasBytes(out, 'IEND')).toBe(true);
   });
 
+  it('PNG is an allow-list: rendering chunks survive, every other chunk is dropped (RV-lead-jobs-ai-16)', () => {
+    const rendering = ['PLTE', 'tRNS', 'gAMA', 'cHRM', 'sRGB', 'iCCP', 'sBIT', 'pHYs', 'bKGD'];
+    // Metadata carriers a deny-list misses: pre-standard Exif, C2PA/JUMBF, time, APNG control,
+    // vendor/private chunks and an unknown future ancillary chunk.
+    const dropped = ['exIf', 'caBX', 'tIME', 'acTL', 'fcTL', 'vpAg', 'prVt', 'zzZz'];
+    const input = new Uint8Array([
+      0x89,
+      0x50,
+      0x4e,
+      0x47,
+      0x0d,
+      0x0a,
+      0x1a,
+      0x0a,
+      ...chunk('IHDR', [0, 0, 0, 1, 0, 0, 0, 1, 8, 3, 0, 0, 0]),
+      ...rendering.flatMap((type) => chunk(type, ascii(`keep-${type}`))),
+      ...dropped.flatMap((type) => chunk(type, ascii(`GPSLatitude-${type}`))),
+      ...chunk('IDAT', [1, 2, 3]),
+      ...chunk('IEND', []),
+    ]);
+    const out = stripImageMetadata(input, 'image/png');
+    for (const type of ['IHDR', 'IDAT', 'IEND', ...rendering]) {
+      expect(hasBytes(out, type), type).toBe(true);
+    }
+    for (const type of rendering) expect(hasBytes(out, `keep-${type}`), type).toBe(true);
+    expect(hasBytes(out, 'GPSLatitude')).toBe(false);
+    for (const type of dropped) expect(hasBytes(out, type), type).toBe(false);
+    // Idempotent, and the output is still a well-formed PNG.
+    expect(stripImageMetadata(out, 'image/png')).toEqual(out);
+  });
+
+  it('JPEG is an allow-list too: only decoding segments, a bare JFIF header and ICC profiles survive (RV-lead-jobs-ai-16)', () => {
+    const jfif = [
+      ...ascii('JFIF\0'),
+      1,
+      2, // version 1.02
+      1, // units: dots per inch
+      0,
+      72,
+      0,
+      72, // density
+      2,
+      1, // a 2x1 RGB thumbnail follows ...
+      ...ascii('THUMB!'),
+      ...ascii('GPSThumbTrailer'), // ... and bytes no decoder reads
+    ];
+    const input = new Uint8Array([
+      0xff,
+      0xd8,
+      ...segment(0xe0, jfif),
+      ...segment(0xe0, [...ascii('JFIF\0'), 1, 1, 0, 0, 1, 0, 1, 0, 0, ...ascii('GPSDup')]), // 2nd
+      ...segment(0xe0, ascii('JFXX\0\x10GPSLongitude=-122.4')), // JFIF extension thumbnail
+      ...segment(0xe2, ascii('FPXR\0GPSLatitude=37.7749')), // FlashPix, not a colour profile
+      ...segment(0xe2, ascii('MPF\0MM\0*GPSSecondImage')), // multi-picture index
+      ...segment(0xe2, ascii('ICC_PROFILE\0\x01\x01profile-bytes')),
+      ...segment(0xee, ascii('Adobe\0GPSAdobe')), // APP14
+      ...segment(0xf7, ascii('GPSAltitude=12')), // reserved JPGn marker
+      ...segment(0xc8, ascii('GPSReservedJPG')), // reserved JPG marker
+      ...segment(0x4f, ascii('GPSReservedLow')), // reserved low marker
+      ...segment(0xdb, [0x00, ...new Array<number>(64).fill(1)]),
+      ...segment(0xc4, [0x00, ...new Array<number>(16).fill(0)]), // DHT
+      ...segment(0xdd, [0x00, 0x04]), // DRI
+      ...segment(0xc0, [8, 0, 1, 0, 1, 1, 1, 0x11, 0]),
+      ...segment(0xda, [1, 1, 0, 0, 0x3f, 0]),
+      0x12,
+      0xff,
+      0x00,
+      0x34,
+      0xff,
+      0xd9,
+      ...ascii('GPSAfterEOI'),
+    ]);
+    const out = stripImageMetadata(input, 'image/jpeg');
+    expect(hasBytes(out, 'GPS')).toBe(false);
+    for (const gone of ['JFXX', 'FPXR', 'MPF', 'Adobe', 'THUMB!']) {
+      expect(hasBytes(out, gone), gone).toBe(false);
+    }
+    expect(hasBytes(out, 'ICC_PROFILE\0\x01\x01profile-bytes')).toBe(true);
+    // The JFIF header keeps its version, units and density; the thumbnail is removed.
+    expect(hasBytes(out, '\xff\xe0\x00\x10JFIF\0\x01\x02\x01\x00\x48\x00\x48\x00\x00')).toBe(true);
+    expect(out.filter((b, k) => b === 0xff && out[k + 1] === 0xe0)).toHaveLength(1); // one header
+    // Tables, frame and scan survive byte for byte.
+    for (const marker of [0xdb, 0xc4, 0xdd, 0xc0, 0xda]) {
+      expect(hasBytes(out, String.fromCharCode(0xff, marker)), marker.toString(16)).toBe(true);
+    }
+    expect(hasBytes(out, '\x12\xff\x00\x34\xff\xd9')).toBe(true);
+    expect(Array.from(out.slice(-2))).toEqual([0xff, 0xd9]);
+    expect(stripImageMetadata(out, 'image/jpeg')).toEqual(out); // idempotent
+  });
+
   it('rejects content that is not what it claims to be, or is truncated', () => {
     const bad = (bytes: Uint8Array, mime: string) => () => stripImageMetadata(bytes, mime);
     expect(bad(png(), 'image/jpeg')).toThrow(ImageFormatError);
