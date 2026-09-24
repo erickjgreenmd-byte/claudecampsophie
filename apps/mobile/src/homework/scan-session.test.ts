@@ -6,6 +6,7 @@ import {
   canSend,
   describeSize,
   inferMimeType,
+  isOversizedPicture,
   limitsSummary,
   movePage,
   problemCopy,
@@ -37,9 +38,10 @@ function pagesOf(n: number): ScanPage[] {
 
 describe('limits are shown before anything is uploaded (spec P5)', () => {
   it('summarizes the configured limits in plain words', () => {
-    // Only what the scan job can read today; PDF import waits for the isolated converter.
+    // Only what the scan job can read today; PDF import waits for the isolated converter. The
+    // picture size limit (HOMEWORK_IMAGE_LIMITS, AC_CAPTURE_02) is shown too, as on the web.
     expect(limitsSummary(limits)).toBe(
-      'Up to 10 pages per scan. Each page can be up to 15 MB. Photos (JPEG or PNG). PDF files can’t be added yet, so take a photo of each page instead.',
+      'Up to 10 pages per scan. Each page can be up to 15 MB. Photos (JPEG or PNG) of up to 60 megapixels. PDF files can’t be added yet, so take a photo of each page instead.',
     );
     expect(
       limitsSummary({
@@ -47,7 +49,9 @@ describe('limits are shown before anything is uploaded (spec P5)', () => {
         maxPageBytes: 5 * 1024 * 1024,
         allowedMimeTypes: ['image/png'],
       }),
-    ).toBe('Up to 3 pages per scan. Each page can be up to 5 MB. Photos (PNG).');
+    ).toBe(
+      'Up to 3 pages per scan. Each page can be up to 5 MB. Photos (PNG) of up to 60 megapixels.',
+    );
   });
 
   it('formats sizes for people', () => {
@@ -169,5 +173,48 @@ describe('PDF import is not offered until the file converter ships (AC_CAPTURE_0
     ]);
     expect(canSend(session, limits)).toBe(false);
     for (const p of problems) expect(problemCopy(p, limits)).not.toMatch(/PDF/);
+  });
+});
+
+describe('picture size limits (AC_CAPTURE_02 image dimensions)', () => {
+  // The same limits the scan job applies (HOMEWORK_IMAGE_LIMITS): 10,000 px per side, 60 MP.
+  it('carries the picker’s width and height onto the page', () => {
+    const page = toScanPage(photo({ width: 4032, height: 3024 }), 'library', newId);
+    expect(page).toMatchObject({ width: 4032, height: 3024 });
+    const unknown = toScanPage(photo({ width: 0, height: null }), 'library', newId);
+    expect(unknown).toMatchObject({ width: null, height: null });
+  });
+
+  it('flags a picture over the limits with calm copy; unknown or ordinary sizes pass', () => {
+    const huge = toScanPage(photo({ width: 12_000, height: 9_000 }), 'library', newId); // 108 MP
+    const strip = toScanPage(photo({ width: 10_001, height: 100 }), 'library', newId);
+    const edge = toScanPage(photo({ width: 10_000, height: 6_000 }), 'library', newId); // 60 MP
+    const unknown = toScanPage(photo(), 'camera', newId);
+    const session = addPages(EMPTY_SESSION, [edge, huge, unknown, strip], limits).session;
+    const problems = validateSession(session, limits);
+    expect(problems).toEqual([
+      { kind: 'page', localId: huge.localId, pageNumber: 2, problem: 'too_many_pixels' },
+      { kind: 'page', localId: strip.localId, pageNumber: 4, problem: 'too_many_pixels' },
+    ]);
+    expect(canSend(session, limits)).toBe(false);
+    expect(problemCopy(problems[0]!, limits)).toBe(
+      'Page 2 is too big a picture for PencilLift to read. Try taking a new photo of the page.',
+    );
+  });
+
+  it('tells the screen which picked photos must not be re-encoded on the device', () => {
+    expect(isOversizedPicture(photo({ width: 20_000, height: 20_000 }))).toBe(true);
+    expect(isOversizedPicture(photo({ width: 4032, height: 3024 }))).toBe(false);
+    expect(isOversizedPicture(photo())).toBe(false); // unknown: the server still checks
+  });
+
+  it('a turned page keeps its size (the limits do not depend on orientation)', () => {
+    const page = toScanPage(photo({ width: 9_000, height: 7_000 }), 'library', newId);
+    let session = addPages(EMPTY_SESSION, [page], limits).session;
+    session = replacePage(session, page.localId, { uri: 'file:///turned.jpg', byteSize: null });
+    expect(session.pages[0]).toMatchObject({ width: 9_000, height: 7_000 });
+    expect(validateSession(session, limits)).toEqual([
+      { kind: 'page', localId: page.localId, pageNumber: 1, problem: 'too_many_pixels' },
+    ]);
   });
 });

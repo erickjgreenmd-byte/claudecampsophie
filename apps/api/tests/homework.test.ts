@@ -542,7 +542,7 @@ describe('page uploads (AC_CAPTURE_02)', () => {
     const res = await upload(token, id, {
       pages: [
         { pageNumber: 1, mimeType: 'image/jpeg', byteSize: 1000, sha256: sha('a') },
-        { pageNumber: 2, mimeType: 'application/pdf', byteSize: 2000, sha256: sha('b') },
+        { pageNumber: 2, mimeType: 'image/png', byteSize: 2000, sha256: sha('b') },
       ],
     });
     expect(res.status).toBe(200);
@@ -555,7 +555,7 @@ describe('page uploads (AC_CAPTURE_02)', () => {
        where assignment_id = ${id} order by page_number`;
     expect(rows.map((r) => r.storage_path)).toEqual([
       `${fam.familyId}/${fam.children[0]!.id}/${id}/${rows[0]!.id}.jpg`,
-      `${fam.familyId}/${fam.children[0]!.id}/${id}/${rows[1]!.id}.pdf`,
+      `${fam.familyId}/${fam.children[0]!.id}/${id}/${rows[1]!.id}.png`,
     ]);
     expect(body.uploads.map((u) => u.pageId)).toEqual(rows.map((r) => r.id));
   });

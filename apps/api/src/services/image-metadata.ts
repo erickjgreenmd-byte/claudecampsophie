@@ -4,11 +4,11 @@
  * walks the container structure and copies only the segments/chunks needed to render the image.
  *
  * JPEG: an ALLOW-list too: keeps SOI, the segments a decoder needs (frame headers SOFn, DHT, DAC,
- *       DQT, DRI, DNL, DHP, EXP, SOS with its scan data, RSTn, TEM, EOI), one JFIF header rewritten
+ *       DQT, DRI, DHP, EXP, SOS with its scan data, RSTn, TEM, EOI), one JFIF header rewritten
  *       to its fixed 14 bytes (version, units, density; no thumbnail, no trailing bytes) and APP2
  *       segments that are ICC colour profiles. Everything else is dropped: APP1 (Exif, GPS, XMP),
  *       APP0 JFXX thumbnails and non-JFIF APP0, APP2 FlashPix/MPF, APP3–APP15, COM, the reserved
- *       JPG/JPGn and low markers, and any bytes after EOI (RV-lead-jobs-ai-16).
+ *       JPG/JPGn and low markers, DNL (see below) and any bytes after EOI (RV-lead-jobs-ai-16).
  * PNG:  an ALLOW-list: keeps only the critical chunks (IHDR, PLTE, IDAT, IEND) and the rendering
  *       chunks that change how pixels look (tRNS, gAMA, cHRM, sRGB, iCCP, sBIT, pHYs, bKGD). Every
  *       other chunk is dropped — text (tEXt/zTXt/iTXt), Exif (eXIf and the pre-standard exIf), time,
@@ -17,13 +17,39 @@
  *       APNG animation chunks are dropped too; the first frame (IDAT) still renders.
  *
  * Anything that does not parse as the declared type is rejected (never passed through "as is").
+ *
+ * Declared dimensions (AC_CAPTURE_02 decompression bombs): the size an image declares is checked
+ * against HOMEWORK_IMAGE_LIMITS (contracts) as soon as the walk reaches it — the PNG IHDR, which
+ * must be the first chunk, and the JPEG frame header (SOFn, plus DHP), which must come before any
+ * scan — so an over-limit page is refused with DIMENSIONS_TOO_LARGE before any image data is looked
+ * at, decoded or sent anywhere. Zero or missing dimensions, a second IHDR or frame header, and an
+ * image with no image data (no IDAT with data, or no SOS) are MALFORMED.
+ *
+ * Decoder work besides the pixel count (TOO_COMPLEX): a JPEG frame may declare at most 4 colour
+ * components (photos use 1, 3 or 4; the format allows 255) and at most 100 scans (libjpeg's standard
+ * progression writes 10, or 18 for four components), because a decoder re-walks the whole image for
+ * every progressive scan. DNL is never forwarded: a height of 0, which needs it, is refused, so the
+ * checked frame header alone says how tall the image is. Not bounded here: bit depth (a 60 MP 16-bit
+ * RGBA PNG decodes to about 480 MB against 240 MB at 8 bits); the shared pixel limits stay the one
+ * rule the apps can also check before upload.
  */
+import { homeworkImageSizeProblem } from '@pencillift/contracts';
+
+export type ImageFormatErrorCode =
+  'SIGNATURE_MISMATCH' | 'MALFORMED' | 'UNSUPPORTED_TYPE' | 'DIMENSIONS_TOO_LARGE' | 'TOO_COMPLEX';
 
 export class ImageFormatError extends Error {
-  constructor(readonly code: 'SIGNATURE_MISMATCH' | 'MALFORMED' | 'UNSUPPORTED_TYPE') {
+  constructor(readonly code: ImageFormatErrorCode) {
     super(code);
     this.name = 'ImageFormatError';
   }
+}
+
+/** Refuses declared dimensions that are missing (MALFORMED) or over the shared limits. */
+function assertDimensions(width: number, height: number): void {
+  const problem = homeworkImageSizeProblem(width, height);
+  if (problem === 'missing') throw new ImageFormatError('MALFORMED');
+  if (problem === 'too_large') throw new ImageFormatError('DIMENSIONS_TOO_LARGE');
 }
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -48,8 +74,13 @@ export function stripImageMetadata(bytes: Uint8Array, mimeType: string): Uint8Ar
   throw new ImageFormatError('UNSUPPORTED_TYPE');
 }
 
-/** Segments a decoder needs besides SOS: DHT, DAC, DQT, DNL, DRI, DHP, EXP. */
-const JPEG_TABLES: ReadonlySet<number> = new Set([0xc4, 0xcc, 0xdb, 0xdc, 0xdd, 0xde, 0xdf]);
+/** Segments a decoder needs besides SOS: DHT, DAC, DQT, DRI, DHP, EXP (not DNL, see above). */
+const JPEG_TABLES: ReadonlySet<number> = new Set([0xc4, 0xcc, 0xdb, 0xdd, 0xde, 0xdf]);
+const JPEG_DHP = 0xde;
+/** Colour components per frame: grey 1, YCbCr/RGB 3, CMYK/YCCK 4. */
+const JPEG_MAX_COMPONENTS = 4;
+/** Scans per image: 10x libjpeg's standard progression (18 for four components is the most seen). */
+const JPEG_MAX_SCANS = 100;
 const JFIF_ID = [0x4a, 0x46, 0x49, 0x46, 0x00]; // "JFIF\0"
 const ICC_ID = Array.from('ICC_PROFILE\0', (c) => c.charCodeAt(0));
 
@@ -58,6 +89,21 @@ function isFrameHeader(marker: number): boolean {
   return (
     marker >= 0xc0 && marker <= 0xcf && !(marker === 0xc4 || marker === 0xc8 || marker === 0xcc)
   );
+}
+
+/**
+ * Frame header (and DHP) payload: precision, height (Y), width (X), component count Nf, then three
+ * bytes per component. The length must match Nf exactly; Y = 0 (height deferred to a DNL marker,
+ * which common decoders do not support) and X = 0 are malformed; more than 4 components is refused.
+ */
+function assertJpegFrame(payload: Uint8Array): void {
+  if (payload.length < 6) throw new ImageFormatError('MALFORMED');
+  const components = payload[5]!;
+  if (components === 0 || payload.length !== 6 + 3 * components) {
+    throw new ImageFormatError('MALFORMED');
+  }
+  if (components > JPEG_MAX_COMPONENTS) throw new ImageFormatError('TOO_COMPLEX');
+  assertDimensions((payload[3]! << 8) | payload[4]!, (payload[1]! << 8) | payload[2]!);
 }
 
 function startsWith(bytes: Uint8Array, prefix: readonly number[]): boolean {
@@ -97,6 +143,8 @@ function stripJpeg(bytes: Uint8Array): Uint8Array {
   }
   const kept: Uint8Array[] = [bytes.subarray(0, 2)];
   let sawJfif = false;
+  let frames = 0;
+  let scans = 0;
   let i = 2;
   while (i < bytes.length) {
     if (bytes[i] !== 0xff) throw new ImageFormatError('MALFORMED');
@@ -106,6 +154,8 @@ function stripJpeg(bytes: Uint8Array): Uint8Array {
     if (m >= bytes.length) throw new ImageFormatError('MALFORMED');
     const marker = bytes[m]!;
     if (marker === 0xd9) {
+      // One frame with its size, and image data: anything else is not a picture we can read.
+      if (frames !== 1 || scans === 0) throw new ImageFormatError('MALFORMED');
       kept.push(bytes.subarray(m - 1, m + 1)); // EOI; anything after it is dropped
       return concat(kept);
     }
@@ -120,6 +170,10 @@ function stripJpeg(bytes: Uint8Array): Uint8Array {
     const segmentEnd = m + 1 + length;
     const payload = bytes.subarray(m + 3, segmentEnd);
     if (marker === 0xda) {
+      // A scan is only read once the frame header has said (and passed) how big the image is.
+      if (frames !== 1) throw new ImageFormatError('MALFORMED');
+      scans += 1;
+      if (scans > JPEG_MAX_SCANS) throw new ImageFormatError('TOO_COMPLEX');
       // Start of scan: header, then entropy-coded data up to the next non-RST marker (usually EOI).
       let end = segmentEnd;
       while (end + 1 < bytes.length) {
@@ -132,6 +186,14 @@ function stripJpeg(bytes: Uint8Array): Uint8Array {
       kept.push(bytes.subarray(m - 1, end));
       i = end;
       continue;
+    }
+    if (isFrameHeader(marker)) {
+      // Exactly one frame: a second one (small first, huge later, or vice versa) is refused.
+      frames += 1;
+      if (frames > 1) throw new ImageFormatError('MALFORMED');
+      assertJpegFrame(payload);
+    } else if (marker === JPEG_DHP) {
+      assertJpegFrame(payload); // hierarchical: DHP declares the full image size
     }
     if (isFrameHeader(marker) || JPEG_TABLES.has(marker)) {
       kept.push(bytes.subarray(m - 1, segmentEnd));
@@ -154,6 +216,7 @@ function stripPng(bytes: Uint8Array): Uint8Array {
   const kept: Uint8Array[] = [bytes.subarray(0, 8)];
   let i = 8;
   let sawEnd = false;
+  let sawData = false;
   while (i < bytes.length) {
     if (i + 12 > bytes.length) throw new ImageFormatError('MALFORMED');
     const length =
@@ -162,6 +225,15 @@ function stripPng(bytes: Uint8Array): Uint8Array {
     if (end > bytes.length) throw new ImageFormatError('MALFORMED');
     const type = String.fromCharCode(bytes[i + 4]!, bytes[i + 5]!, bytes[i + 6]!, bytes[i + 7]!);
     if (!/^[A-Za-z]{4}$/.test(type)) throw new ImageFormatError('MALFORMED');
+    // IHDR is first and only once (PNG spec); its size is checked before any later chunk is read.
+    if ((i === 8) !== (type === 'IHDR')) throw new ImageFormatError('MALFORMED');
+    if (type === 'IHDR') {
+      if (length !== 13) throw new ImageFormatError('MALFORMED');
+      const u32 = (k: number) =>
+        ((bytes[k]! << 24) >>> 0) + (bytes[k + 1]! << 16) + (bytes[k + 2]! << 8) + bytes[k + 3]!;
+      assertDimensions(u32(i + 8), u32(i + 12));
+    }
+    if (type === 'IDAT' && length > 0) sawData = true; // an empty zlib stream is not image data
     if (PNG_KEEP.has(type)) kept.push(bytes.subarray(i, end));
     i = end;
     if (type === 'IEND') {
@@ -169,7 +241,7 @@ function stripPng(bytes: Uint8Array): Uint8Array {
       break;
     }
   }
-  if (!sawEnd) throw new ImageFormatError('MALFORMED');
+  if (!sawEnd || !sawData) throw new ImageFormatError('MALFORMED');
   return concat(kept);
 }
 

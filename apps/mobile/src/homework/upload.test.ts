@@ -320,3 +320,50 @@ describe('child-facing error copy (spec P6, P14)', () => {
     expect(toHex(new Uint8Array([0, 15, 255]))).toBe('000fff');
   });
 });
+
+describe('picture size and server capture rules (AC_CAPTURE_02)', () => {
+  it('refuses a picture over the size limits before reading bytes or contacting the API', async () => {
+    const { api, calls } = fakeApi();
+    const read: string[] = [];
+    const { io, puts } = fakeIo({
+      readBytes: (uri) => {
+        read.push(uri);
+        return Promise.resolve(new TextEncoder().encode(`bytes of ${uri}`));
+      },
+    });
+    const error = await uploadScan({
+      api,
+      io,
+      pages: [
+        toScanPage({ uri: 'file:///p1.jpg', mimeType: 'image/jpeg' }, 'camera', () => 'a'),
+        toScanPage(
+          { uri: 'file:///big.jpg', mimeType: 'image/jpeg', width: 16_320, height: 12_240 },
+          'library',
+          () => 'b',
+        ),
+      ],
+      limits,
+      attempt: newAttempt(newKey),
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(PageLimitError);
+    expect(error).toMatchObject({ pageNumber: 2, problem: 'too_many_pixels' });
+    expect(childUploadMessage(error)).toBe(
+      'Page 2 is too big a picture for PencilLift to read. Try taking a new photo of the page.',
+    );
+    expect(read).toEqual(['file:///p1.jpg']);
+    expect(calls).toHaveLength(0);
+    expect(puts).toHaveLength(0);
+  });
+
+  it('explains the server’s capture rules calmly, never with raw server text', () => {
+    const rule = (r: string) => new ApiRequestError('BUSINESS_RULE', 'raw server text', 422, r);
+    expect(childUploadMessage(rule('FORMAT_NOT_SUPPORTED_YET'))).toBe(
+      'One page is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
+    );
+    expect(childUploadMessage(rule('UPLOAD_MISMATCH'))).toBe(
+      'Some pages got mixed up on the way. Let’s try sending them again.',
+    );
+  });
+});

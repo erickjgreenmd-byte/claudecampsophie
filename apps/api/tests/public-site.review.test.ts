@@ -53,6 +53,9 @@ function jpegWithExifGps(): Uint8Array {
       Buffer.from('ffd8', 'hex'), // SOI
       Buffer.from([0xff, 0xe1, (length >> 8) & 0xff, length & 0xff]), // APP1 marker + length
       exifPayload,
+      Buffer.from([0xff, 0xdb, 0x00, 0x43, 0x00, ...new Array<number>(64).fill(1)]), // DQT
+      Buffer.from([0xff, 0xc0, 0x00, 0x0b, 8, 0, 1, 0, 1, 1, 1, 0x11, 0]), // SOF0: 1 x 1 pixel
+      Buffer.from([0xff, 0xda, 0x00, 0x08, 1, 1, 0, 0, 0x3f, 0, 0x12, 0x34]), // SOS + scan data
       Buffer.from('ffd9', 'hex'), // EOI
     ]),
   );

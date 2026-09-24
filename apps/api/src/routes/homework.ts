@@ -5,6 +5,7 @@ import {
   DEFAULT_HOMEWORK_PAGE_ALLOWANCE_PER_CHILD,
   DEFAULT_HOMEWORK_UPLOAD_LIMITS,
   FINALIZED_ASSIGNMENT_STATUSES,
+  HOMEWORK_READABLE_MIME_TYPES,
   correctTranscriptionRequestSchema,
   createAssignmentRequestSchema,
   finalizeAssignmentRequestSchema,
@@ -47,6 +48,7 @@ import {
 } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
 import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
+import type { StoredObjectInfo } from '../providers/index.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 
 /**
@@ -119,6 +121,14 @@ const EXTENSIONS: Record<HomeworkMimeType, string> = {
   'image/png': 'png',
   'image/heic': 'heic',
   'application/pdf': 'pdf',
+};
+
+/** Names used in capture error copy. */
+const TYPE_NAMES: Record<HomeworkMimeType, string> = {
+  'image/jpeg': 'JPEG',
+  'image/png': 'PNG',
+  'image/heic': 'HEIC',
+  'application/pdf': 'PDF',
 };
 
 /** Child verdicts are shown only once checking has finished (no interim results). */
@@ -586,8 +596,22 @@ function validatePages(pages: readonly UploadPage[], config: HomeworkConfig): vo
     throw businessRule('TOO_MANY_PAGES', `A scan can have at most ${limits.maxPages} pages`);
   }
   const allowed: readonly string[] = limits.allowedMimeTypes;
+  const readable = limits.allowedMimeTypes.filter((t) => HOMEWORK_READABLE_MIME_TYPES.includes(t));
+  const readableNames = readable.map((t) => TYPE_NAMES[t]).join(' or ');
   if (pages.some((p) => !allowed.includes(p.mimeType))) {
-    throw businessRule('UNSUPPORTED_FILE_TYPE', 'Only JPEG, PNG, HEIC photos and PDF files work');
+    throw businessRule('UNSUPPORTED_FILE_TYPE', `Only ${readableNames} photos work`);
+  }
+  // Decision (AC_CAPTURE_02): HEIC and PDF stay in the configured list (spec P5; clients show them
+  // as "not available yet") but the scan job cannot read them until the isolated converter ships.
+  // Refusing them here, before pages are registered or signed, keeps a scan from starting, using
+  // allowance and then failing as FORMAT_NEEDS_CONVERSION.
+  const unreadable = pages.find((p) => !(readable as readonly string[]).includes(p.mimeType));
+  if (unreadable) {
+    const name = TYPE_NAMES[unreadable.mimeType as HomeworkMimeType];
+    throw businessRule(
+      'FORMAT_NOT_SUPPORTED_YET',
+      `${name} files can’t be read yet. Please add ${readableNames} photos of the pages instead.`,
+    );
   }
   if (pages.some((p) => p.byteSize > limits.maxPageBytes)) {
     const mb = Math.floor(limits.maxPageBytes / (1024 * 1024));
@@ -804,6 +828,7 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
             deps.providers.storage.createSignedUploadUrl(
               page.storage_path,
               config.uploadUrlTtlSeconds,
+              { byteSize: page.byte_size, contentType: page.mime_type },
             ),
             deps.providers.storage.exists(page.storage_path),
           ]);
@@ -857,21 +882,50 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     if (!pre) throw new ApiError('NOT_FOUND', 'Scan not found');
     let verified = false;
     if (pre.status === 'uploading') {
-      let present: boolean[];
+      // AC_CAPTURE_02: byte size and hash were declared by the device at registration, so finalize
+      // compares them with what storage measured (never trusting mere existence). Only the size can
+      // be checked cheaply: Supabase reports no content hash besides an MD5/multipart ETag, and
+      // hashing would mean downloading every page here (see providers/supabase-storage.ts).
+      let stored: (StoredObjectInfo | null)[];
       try {
-        present = await Promise.all(
-          pre.pages.map((p) => deps.providers.storage.exists(p.storage_path)),
+        stored = await Promise.all(
+          pre.pages.map((p) => deps.providers.storage.stat(p.storage_path)),
         );
       } catch {
         throw new ApiError('PROVIDER_UNAVAILABLE', 'Homework storage is not reachable right now');
       }
-      if (pre.pages.length === 0 || present.includes(false)) {
+      if (pre.pages.length === 0 || stored.includes(null)) {
         throw businessRule(
           'UPLOAD_INCOMPLETE',
           say(
             caller,
             'Some pages have not finished uploading. Resume the upload, then send the scan.',
             'Some pages didn’t finish sending. Let’s try sending them again.',
+          ),
+        );
+      }
+      const mismatched = pre.pages.filter((p, i) => {
+        const size = stored[i]!.byteSize;
+        return size !== p.byte_size || size > config.limits.maxPageBytes;
+      });
+      if (mismatched.length > 0) {
+        // Unverified bytes are removed so a resume signs fresh URLs and sends those pages again
+        // (uploads never overwrite). Best effort: a failed removal still refuses, and the pages
+        // stay unfinalized either way.
+        deps.log({ level: 'warn', event: 'homework_upload_mismatch', requestId: c.var.requestId });
+        await deps.providers.storage.remove(mismatched.map((p) => p.storage_path)).catch(() => {
+          deps.log({
+            level: 'warn',
+            event: 'homework_storage_remove_failed',
+            requestId: c.var.requestId,
+          });
+        });
+        throw businessRule(
+          'UPLOAD_MISMATCH',
+          say(
+            caller,
+            'Some pages didn’t arrive the way they were sent. Try again to send those pages again.',
+            'Some pages got mixed up on the way. Let’s try sending them again.',
           ),
         );
       }

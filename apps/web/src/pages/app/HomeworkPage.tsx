@@ -15,6 +15,7 @@ import {
   CORRECTABLE_ASSIGNMENT_STATUSES,
   DEFAULT_HOMEWORK_UPLOAD_LIMITS,
   FINALIZED_ASSIGNMENT_STATUSES,
+  HOMEWORK_IMAGE_LIMITS,
   HOMEWORK_READABLE_MIME_TYPES,
   OVERRIDE_REASON_MAX_LENGTH,
   TRANSCRIPTION_TEXT_MAX_LENGTH,
@@ -23,6 +24,7 @@ import {
   assignmentSolutionsResponseSchema,
   assignmentStateResponseSchema,
   correctTranscriptionResponseSchema,
+  homeworkImageSizeProblem,
   homeworkRubricSchema,
   overrideResultResponseSchema,
   uploadLimitsResponseSchema,
@@ -458,9 +460,18 @@ function AllowanceCard({ allowance, name }: { allowance: PageAllowance; name: st
 // Parent scan uploader (spec P5 "Parent selects child", P14 parent "scan uploader"; RV-homework-9)
 // ---------------------------------------------------------------------------------------------
 
+interface ImageSize {
+  readonly width: number;
+  readonly height: number;
+}
+
 interface PickedPage {
   readonly key: string;
   readonly file: File;
+  /** The browser's reading of the photo's pixel size; null when it could not tell. */
+  readonly measured: Promise<ImageSize | null>;
+  /** `measured` once it settles (undefined while measuring). */
+  readonly size?: ImageSize | null;
 }
 
 /** Idempotency keys kept across retries so a retry resumes the same scan (AC_CAPTURE_01/06). */
@@ -482,6 +493,8 @@ type SendState =
 class UploadStoppedError extends Error {}
 /** The scan was cancelled or deleted on the server; its pages can only be sent as a new scan. */
 class ScanStoppedError extends Error {}
+/** A page's photo is over the picture size limits (found when its measurement finished late). */
+class PictureTooBigError extends Error {}
 /** A PUT to a signed storage URL failed (page number and status only; never the signed URL). */
 class PageTransferError extends Error {
   readonly pageNumber: number;
@@ -521,15 +534,63 @@ function readableTypes(limits: HomeworkUploadLimits): HomeworkMimeType[] {
   return limits.allowedMimeTypes.filter((t) => HOMEWORK_READABLE_MIME_TYPES.includes(t));
 }
 
+const MEGAPIXELS = HOMEWORK_IMAGE_LIMITS.maxPixels / 1_000_000;
+const MEASURE_TIMEOUT_MS = 10_000;
+
+/**
+ * Asks the browser for a picked photo's natural pixel size without putting it on the page
+ * (AC_CAPTURE_02). Resolves null when the browser can't tell (not an image it opens, or no answer in
+ * time): the scan job measures every page's header anyway, so an unknown size is not refused here.
+ */
+function measureImage(file: File): Promise<ImageSize | null> {
+  return new Promise((resolve) => {
+    let url: string;
+    try {
+      url = URL.createObjectURL(file);
+    } catch {
+      resolve(null);
+      return;
+    }
+    const image = new Image();
+    let settled = false;
+    const done = (size: ImageSize | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      image.onload = null;
+      image.onerror = null;
+      URL.revokeObjectURL(url);
+      resolve(size);
+    };
+    const timer = setTimeout(() => done(null), MEASURE_TIMEOUT_MS);
+    image.onload = () =>
+      done(
+        image.naturalWidth > 0 && image.naturalHeight > 0
+          ? { width: image.naturalWidth, height: image.naturalHeight }
+          : null,
+      );
+    image.onerror = () => done(null);
+    image.src = url;
+  });
+}
+
+/** The same picture size limits the scan job applies (HOMEWORK_IMAGE_LIMITS). */
+function pictureSizeProblem(name: string, size: ImageSize | null | undefined): string | null {
+  if (!size || homeworkImageSizeProblem(size.width, size.height) !== 'too_large') return null;
+  const n = (value: number) => value.toLocaleString('en-US');
+  return `${name} is too big a picture (${n(size.width)} × ${n(size.height)} pixels). Photos can be up to ${n(HOMEWORK_IMAGE_LIMITS.maxSidePx)} pixels on each side and ${MEGAPIXELS} megapixels; a photo at your camera’s usual size works.`;
+}
+
 /** Checked before anything is sent; the server enforces the same limits either way. */
-function pageProblem(file: File, limits: HomeworkUploadLimits): string | null {
+function pageProblem(page: PickedPage, limits: HomeworkUploadLimits): string | null {
+  const { file } = page;
   const readable: readonly string[] = readableTypes(limits);
   if (!readable.includes(file.type)) return `${file.name} isn’t a JPEG or PNG photo.`;
   if (file.size === 0) return `${file.name} is empty.`;
   if (file.size > limits.maxPageBytes) {
     return `${file.name} is larger than ${Math.floor(limits.maxPageBytes / (1024 * 1024))} MB.`;
   }
-  return null;
+  return pictureSizeProblem(file.name, page.size);
 }
 
 /**
@@ -560,6 +621,11 @@ async function sendParentScan(args: {
   for (const [i, page] of pages.entries()) {
     stopIfAborted();
     args.onProgress('preparing', i);
+    // A measurement still running when Send was pressed is waited for, so an over-limit photo is
+    // refused before the scan is created.
+    const tooBig = pictureSizeProblem(page.file.name, await page.measured);
+    if (tooBig) throw new PictureTooBigError(tooBig);
+    stopIfAborted();
     const bytes = new Uint8Array(await page.file.arrayBuffer());
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
     prepared.push({ pageNumber: i + 1, mimeType: page.file.type, bytes, sha256: toHex(digest) });
@@ -632,6 +698,9 @@ function parentUploadMessage(error: unknown): string {
   }
   if (error instanceof ScanStoppedError) {
     return 'That scan was cancelled. Your pages are still selected — send them again to start a new scan.';
+  }
+  if (error instanceof PictureTooBigError) {
+    return `${error.message} Your pages are still selected — remove that page to send the rest.`;
   }
   if (error instanceof PageTransferError) {
     return `Page ${error.pageNumber} didn’t finish uploading. Your pages are still selected — try again to send the rest.`;
@@ -760,7 +829,7 @@ function UploadPanel({
   const running = state.kind === 'running';
   const readable = readableTypes(limits);
   const notYet = limits.allowedMimeTypes.filter((t) => !readable.includes(t));
-  const problems = pages.map((p) => pageProblem(p.file, limits));
+  const problems = pages.map((p) => pageProblem(p, limits));
   const canSend =
     pages.length > 0 && pages.length <= limits.maxPages && problems.every((p) => p === null);
 
@@ -796,9 +865,17 @@ function UploadPanel({
     event.target.value = '';
     if (files.length === 0) return;
     const room = Math.max(0, limits.maxPages - pages.length);
-    const added = files.slice(0, room).map((file) => ({ key: newKey(), file }));
+    const added: PickedPage[] = files
+      .slice(0, room)
+      .map((file) => ({ key: newKey(), file, measured: measureImage(file) }));
     const dropped = files.length - added.length;
     changePages([...pages, ...added]);
+    // Sizes arrive as each photo is measured; a page over the limits then shows its problem.
+    for (const page of added) {
+      void page.measured.then((size) =>
+        setPages((current) => current.map((p) => (p.key === page.key ? { ...p, size } : p))),
+      );
+    }
     setNotice(
       dropped > 0
         ? `Only ${limits.maxPages} pages fit in one scan, so ${dropped} ${dropped === 1 ? 'file was' : 'files were'} left out.`
@@ -867,8 +944,8 @@ function UploadPanel({
     <div style={{ marginTop: 12 }}>
       <p id={limitsId} style={{ margin: '0 0 8px' }}>
         Up to {limits.maxPages} pages per scan, each{' '}
-        {Math.floor(limits.maxPageBytes / (1024 * 1024))} MB or smaller, as {typeNames} photos. Lay
-        each page flat in good light so every word shows.
+        {Math.floor(limits.maxPageBytes / (1024 * 1024))} MB or smaller, as {typeNames} photos of up
+        to {MEGAPIXELS} megapixels. Lay each page flat in good light so every word shows.
       </p>
       {notYet.length > 0 ? (
         <p style={{ margin: '0 0 8px' }}>

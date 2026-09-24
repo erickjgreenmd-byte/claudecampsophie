@@ -16,7 +16,13 @@ import {
   type HomeworkUploadLimits,
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
-import { isAllowedType, type ScanPage } from './scan-session.ts';
+import {
+  isAllowedType,
+  isPictureTooBig,
+  pictureTooBigCopy,
+  type PageProblem,
+  type ScanPage,
+} from './scan-session.ts';
 
 /** Page bytes backed by a plain ArrayBuffer (what fetch bodies and digests accept). */
 export type PageBytes = Uint8Array<ArrayBuffer>;
@@ -71,11 +77,11 @@ export class ScanStoppedError extends Error {
   }
 }
 
-/** A page failed a limit once its real bytes were measured. */
+/** A page failed a limit before upload (type or picture size), or once its bytes were measured. */
 export class PageLimitError extends Error {
   readonly pageNumber: number;
-  readonly problem: 'too_large' | 'unsupported_type';
-  constructor(pageNumber: number, problem: 'too_large' | 'unsupported_type') {
+  readonly problem: PageProblem;
+  constructor(pageNumber: number, problem: PageProblem) {
     super(problem);
     this.name = 'PageLimitError';
     this.pageNumber = pageNumber;
@@ -117,6 +123,8 @@ export async function uploadScan(args: {
     checkCancelled(signal);
     onProgress({ phase: 'preparing', pagesDone: i, pagesTotal: total });
     if (!isAllowedType(page.mimeType, limits)) throw new PageLimitError(i + 1, 'unsupported_type');
+    // Over the picture size limits (AC_CAPTURE_02): refused before its bytes are even read.
+    if (isPictureTooBig(page)) throw new PageLimitError(i + 1, 'too_many_pixels');
     const bytes = await io.readBytes(page.uri);
     if (bytes.length === 0 || bytes.length > limits.maxPageBytes) {
       throw new PageLimitError(i + 1, 'too_large');
@@ -232,6 +240,11 @@ const RULE_COPY: Record<string, string> = {
   UNSUPPORTED_FILE_TYPE:
     'One page is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
   UPLOAD_INCOMPLETE: 'Some pages didn’t finish sending. Let’s try again.',
+  // HEIC/PDF are refused at registration until the converter ships (the app never sends them).
+  FORMAT_NOT_SUPPORTED_YET:
+    'One page is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
+  // The server removed pages that arrived different from what was registered; a retry re-sends them.
+  UPLOAD_MISMATCH: 'Some pages got mixed up on the way. Let’s try sending them again.',
 };
 
 /** Calm, blame-free words for every failure; raw server text is never shown to a child. */
@@ -241,9 +254,14 @@ export function childUploadMessage(error: unknown): string {
     return 'That scan was stopped. Your pages are still here — tap “Try again” to send them as a new scan.';
   }
   if (error instanceof PageLimitError) {
-    return error.problem === 'too_large'
-      ? `Page ${error.pageNumber} is too big or empty. Try taking that photo again.`
-      : `Page ${error.pageNumber} is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.`;
+    switch (error.problem) {
+      case 'too_large':
+        return `Page ${error.pageNumber} is too big or empty. Try taking that photo again.`;
+      case 'too_many_pixels':
+        return pictureTooBigCopy(error.pageNumber);
+      case 'unsupported_type':
+        return `Page ${error.pageNumber} is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.`;
+    }
   }
   if (error instanceof UploadTransferError) {
     return 'A page didn’t finish sending. Your pages are still here — let’s try again.';

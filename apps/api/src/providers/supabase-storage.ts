@@ -13,7 +13,16 @@ import type { StorageProvider } from './index.ts';
  * - POST   /object/upload/sign/{bucket}/{path}  → `{ url }` (relative, contains the upload token)
  * - POST   /object/sign/{bucket}/{path}         `{ expiresIn }` → `{ signedURL }` (relative)
  * - HEAD   /object/{bucket}/{path}              200 when present, 400/404 when absent
+ * - GET    /object/info/{bucket}/{path}         `{ size, content_type, etag, ... }` (storage-api
+ *                                               InfoRenderer); absent only when the error body
+ *                                               names a missing object (ERRORS.NoSuchKey: 400 or
+ *                                               404 with statusCode "404" and code "NoSuchKey", or
+ *                                               no code and error "not_found")
  * - DELETE /object/{bucket}                     `{ prefixes: [...] }`
+ *
+ * Content hashes: the info response carries only the S3 ETag, which is an MD5 for single-part
+ * uploads and not a content digest at all for multipart ones. There is no SHA-256, so `stat` reports
+ * the measured size only; checking the registered sha256 would mean downloading every page.
  */
 
 export interface SupabaseStorageOptions {
@@ -86,6 +95,7 @@ export function createSupabaseStorage(options: SupabaseStorageOptions): StorageP
     url: string,
     body?: unknown,
     extraHeaders: Record<string, string> = {},
+    absentIsAnswer = method === 'HEAD',
   ): Promise<Response> {
     const headers: Record<string, string> = { ...auth, ...extraHeaders };
     if (body !== undefined) headers['content-type'] = 'application/json';
@@ -95,13 +105,26 @@ export function createSupabaseStorage(options: SupabaseStorageOptions): StorageP
       signal: AbortSignal.timeout(timeoutMs),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    if (
-      !response.ok &&
-      !(method === 'HEAD' && (response.status === 400 || response.status === 404))
-    ) {
+    if (!response.ok && !(absentIsAnswer && (response.status === 400 || response.status === 404))) {
       throw new StorageRequestError(operation, response.status);
     }
     return response;
+  }
+
+  /**
+   * True only when the error body names a missing object (storage-api ERRORS.NoSuchKey, rendered
+   * as HTTP 400 with statusCode "404"; older versions omit `code`). Any other 400/404 is not an
+   * answer about the object: a storage version without the route (Fastify's `error: "Not Found"`),
+   * a missing bucket (NoSuchBucket) or a bare 404 from something in between is an error, so a
+   * caller never reads "not uploaded" from a misconfiguration.
+   */
+  async function isAbsent(response: Response): Promise<boolean> {
+    if (response.status !== 400 && response.status !== 404) return false;
+    const payload: unknown = await response.json().catch(() => null);
+    if (typeof payload !== 'object' || payload === null) return false;
+    const body = payload as Record<string, unknown>;
+    if (String(body.statusCode) !== '404') return false;
+    return body.code === 'NoSuchKey' || (body.code === undefined && body.error === 'not_found');
   }
 
   async function relativeUrl(response: Response, field: 'url' | 'signedURL'): Promise<string> {
@@ -154,6 +177,31 @@ export function createSupabaseStorage(options: SupabaseStorageOptions): StorageP
         `${base}/object/${bucket}/${encodeObjectPath(path)}`,
       );
       return response.ok;
+    },
+
+    async stat(path) {
+      const response = await call(
+        'stat',
+        'GET',
+        `${base}/object/info/${bucket}/${encodeObjectPath(path)}`,
+        undefined,
+        {},
+        true,
+      );
+      if (!response.ok) {
+        if (await isAbsent(response)) return null;
+        throw new StorageRequestError('stat', response.status);
+      }
+      const payload: unknown = await response.json().catch(() => null);
+      const size =
+        typeof payload === 'object' && payload !== null
+          ? (payload as Record<string, unknown>).size
+          : undefined;
+      // A size storage did not report is never guessed (finalize then refuses as unavailable).
+      if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+        throw new StorageRequestError('stat (unexpected response)', response.status);
+      }
+      return { byteSize: size };
     },
 
     async remove(paths) {

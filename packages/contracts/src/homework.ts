@@ -34,15 +34,56 @@ export const DEFAULT_HOMEWORK_UPLOAD_LIMITS: HomeworkUploadLimits = {
 };
 
 /**
- * Types the scan job can read today. HEIC and PDF are accepted for upload (spec P5) but need the
- * isolated converter, which is not deployed yet: the scan job ends such scans as `failed_final` with
- * error code `FORMAT_NEEDS_CONVERSION` (and gives the pages back). Clients offer only these types for
- * new scans and show HEIC/PDF as "not available yet" until the converter ships.
+ * Types the scan job can read today. HEIC and PDF stay in the configured list above (spec P5 names
+ * them; the limits endpoint reports them and clients show them as "not available yet") but need the
+ * isolated converter, which is not deployed yet. Page registration therefore refuses them with the
+ * business rule `FORMAT_NOT_SUPPORTED_YET` before any upload or allowance is used (AC_CAPTURE_02).
+ * The scan job's `FORMAT_NEEDS_CONVERSION` (failed_final, pages given back) remains only for scans
+ * registered before that check existed. Clients offer only these types for new scans.
  */
 export const HOMEWORK_READABLE_MIME_TYPES: readonly HomeworkMimeType[] = [
   'image/jpeg',
   'image/png',
 ];
+
+/**
+ * Fixed ceilings on the pixel size a homework photo may declare (AC_CAPTURE_02 "image dimensions";
+ * decompression bombs). A PNG IHDR or JPEG SOFn header can declare billions of pixels in a file of a
+ * few hundred bytes, and a decoder then allocates width × height × channels. The scan job refuses a
+ * page over these limits from its header, before anything is decoded or sent to AI; the apps refuse
+ * it before upload. Not configurable, and not part of the limits endpoint response: a deliberate
+ * deviation from spec P5 ("make limits configurable"), because they bound decoder work on our side
+ * and in every viewer rather than express product policy. They are still visible before upload:
+ * both apps import them from here (web limits line, mobile `limitsSummary`).
+ * - `maxSidePx` 10,000: above the longest side of every phone camera's normal and full-resolution
+ *   modes (12–24 MP defaults, 48 MP 8064 × 6048, 50 MP 8160 × 6120 or 8192 × 6144), and it stops
+ *   extreme strips (e.g. 60,000 × 1,000) that stay under the pixel cap.
+ * - `maxPixels` 60,000,000 (60 MP): those 48–50 MP full-resolution photos still fit with headroom,
+ *   and a decoded page stays at or under 240 MB of 8-bit RGBA. 64/108/200 MP camera modes are refused
+ *   (their files are usually over the 15 MB page limit anyway). Homework legibility needs far less:
+ *   the AI provider downsizes large images before reading them.
+ */
+export const HOMEWORK_IMAGE_LIMITS = {
+  maxSidePx: 10_000,
+  maxPixels: 60_000_000,
+} as const;
+
+/** `missing`: zero, negative or non-integer dimensions (malformed). `too_large`: over the limits. */
+export type HomeworkImageSizeProblem = 'missing' | 'too_large';
+
+/** Checks declared image dimensions against HOMEWORK_IMAGE_LIMITS; null when they are fine. */
+export function homeworkImageSizeProblem(
+  width: number,
+  height: number,
+): HomeworkImageSizeProblem | null {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
+    return 'missing';
+  }
+  const { maxSidePx, maxPixels } = HOMEWORK_IMAGE_LIMITS;
+  // Sides first, so the product is only formed from values of at most 10,000.
+  if (width > maxSidePx || height > maxSidePx) return 'too_large';
+  return width * height > maxPixels ? 'too_large' : null;
+}
 
 /**
  * Spec P11 prototype allowance: 40 homework pages per paid child per billing period. A configurable
@@ -158,8 +199,12 @@ export const HOMEWORK_BUSINESS_RULES = [
   'TOO_MANY_PAGES',
   'PAGE_TOO_LARGE',
   'UNSUPPORTED_FILE_TYPE',
+  /** HEIC/PDF: configured as allowed, but unreadable until the converter ships (see above). */
+  'FORMAT_NOT_SUPPORTED_YET',
   'PAGE_COUNT_MISMATCH',
   'UPLOAD_INCOMPLETE',
+  /** A stored page's measured size differs from what was registered; it is removed for a resend. */
+  'UPLOAD_MISMATCH',
   'NO_PAGES',
   'INVALID_TRANSITION',
   'START_NEW_SCAN',

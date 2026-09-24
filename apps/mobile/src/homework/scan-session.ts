@@ -7,9 +7,19 @@
  * the isolated converter ships, and such a scan would always end failed_final
  * FORMAT_NEEDS_CONVERSION. Photos are re-encoded to JPEG on the device, so a HEIC photo is sent as
  * JPEG; one that could not be re-encoded is flagged here instead of being sent.
+ *
+ * Picture size (AC_CAPTURE_02): the camera and picker report width and height, which are checked
+ * against the same HOMEWORK_IMAGE_LIMITS the scan job applies, and shown in `limitsSummary`. An
+ * over-limit picture is flagged so it cannot be sent, and the app skips its own re-encode of it
+ * (`isOversizedPicture`). That saves a second decode only: the image picker has usually decoded it
+ * already (expo-image-picker re-compresses when quality < 1), so this is a courtesy to the user, not
+ * a defence. The defence is the scan job, which refuses any page whose header is over the limits
+ * before anything is decoded or sent to AI; an unknown size therefore passes here.
  */
 import {
+  HOMEWORK_IMAGE_LIMITS,
   HOMEWORK_READABLE_MIME_TYPES,
+  homeworkImageSizeProblem,
   type HomeworkMimeType,
   type HomeworkUploadLimits,
 } from '@pencillift/contracts';
@@ -24,6 +34,9 @@ export interface ScanPage {
   /** Null when the picker did not report a size (it is measured when the bytes are read). */
   readonly byteSize: number | null;
   readonly source: PageSource;
+  /** Pixel size as the camera or picker reported it; null (or absent) when unknown. */
+  readonly width?: number | null;
+  readonly height?: number | null;
 }
 
 /** What the camera and image picker hand back (subset). */
@@ -32,6 +45,8 @@ export interface PickedAsset {
   readonly mimeType?: string | null;
   readonly fileName?: string | null;
   readonly fileSize?: number | null;
+  readonly width?: number | null;
+  readonly height?: number | null;
 }
 
 export interface ScanSession {
@@ -65,15 +80,34 @@ export function inferMimeType(asset: PickedAsset): string {
   return (ext && EXTENSION_TYPES[ext]) ?? 'application/octet-stream';
 }
 
+const positive = (n: number | null | undefined): number | null =>
+  typeof n === 'number' && n > 0 ? n : null;
+
 export function toScanPage(asset: PickedAsset, source: PageSource, newId: () => string): ScanPage {
-  const size = asset.fileSize;
   return {
     localId: newId(),
     uri: asset.uri,
     mimeType: inferMimeType(asset),
-    byteSize: typeof size === 'number' && size > 0 ? size : null,
+    byteSize: positive(asset.fileSize),
     source,
+    width: positive(asset.width),
+    height: positive(asset.height),
   };
+}
+
+/** True when a reported pixel size is over the limits; false when it is fine or unknown. */
+function overPictureLimits(width: number | null | undefined, height: number | null | undefined) {
+  const w = positive(width);
+  const h = positive(height);
+  return w !== null && h !== null && homeworkImageSizeProblem(w, h) === 'too_large';
+}
+
+/**
+ * The screen asks this before re-encoding a picked photo: a picture over the size limits is added
+ * as is (no second decode on the device), so its page shows the problem and cannot be sent.
+ */
+export function isOversizedPicture(asset: PickedAsset): boolean {
+  return overPictureLimits(asset.width, asset.height);
 }
 
 export function remainingSlots(session: ScanSession, limits: HomeworkUploadLimits): number {
@@ -112,12 +146,13 @@ export function movePage(session: ScanSession, localId: string, direction: -1 | 
 export function replacePage(
   session: ScanSession,
   localId: string,
-  change: Partial<Pick<ScanPage, 'uri' | 'mimeType' | 'byteSize'>>,
+  change: Partial<Pick<ScanPage, 'uri' | 'mimeType' | 'byteSize' | 'width' | 'height'>>,
 ): ScanSession {
   return { pages: session.pages.map((p) => (p.localId === localId ? { ...p, ...change } : p)) };
 }
 
-export type PageProblem = 'unsupported_type' | 'too_large';
+/** `too_large`: bytes over the page limit. `too_many_pixels`: picture over the size limits. */
+export type PageProblem = 'unsupported_type' | 'too_large' | 'too_many_pixels';
 
 export type SessionProblem =
   | { readonly kind: 'no_pages' }
@@ -153,9 +188,16 @@ export function validateSession(
       problems.push({ ...base, problem: 'unsupported_type' });
     } else if (page.byteSize !== null && page.byteSize > limits.maxPageBytes) {
       problems.push({ ...base, problem: 'too_large' });
+    } else if (isPictureTooBig(page)) {
+      problems.push({ ...base, problem: 'too_many_pixels' });
     }
   });
   return problems;
+}
+
+/** A page whose reported pixel size is over HOMEWORK_IMAGE_LIMITS (unknown sizes pass). */
+export function isPictureTooBig(page: ScanPage): boolean {
+  return overPictureLimits(page.width, page.height);
 }
 
 export function canSend(session: ScanSession, limits: HomeworkUploadLimits): boolean {
@@ -190,11 +232,21 @@ export function limitsSummary(limits: HomeworkUploadLimits): string {
     `Up to ${limits.maxPages} pages per scan.`,
     `Each page can be up to ${describeSize(limits.maxPageBytes)}.`,
   ];
-  if (photos.length > 0) parts.push(`Photos (${joinOr(photos.map((t) => TYPE_NAMES[t]))}).`);
+  if (photos.length > 0) {
+    const megapixels = HOMEWORK_IMAGE_LIMITS.maxPixels / 1_000_000;
+    parts.push(
+      `Photos (${joinOr(photos.map((t) => TYPE_NAMES[t]))}) of up to ${megapixels} megapixels.`,
+    );
+  }
   if (limits.allowedMimeTypes.includes('application/pdf') && !photos.includes('application/pdf')) {
     parts.push('PDF files can’t be added yet, so take a photo of each page instead.');
   }
   return parts.join(' ');
+}
+
+/** Shared with upload.ts so the same problem always reads the same way. */
+export function pictureTooBigCopy(pageNumber: number): string {
+  return `Page ${pageNumber} is too big a picture for PencilLift to read. Try taking a new photo of the page.`;
 }
 
 /** Calm, blame-free copy for the child (spec P6/P14). */
@@ -205,8 +257,13 @@ export function problemCopy(problem: SessionProblem, limits: HomeworkUploadLimit
     case 'too_many_pages':
       return `Only ${problem.max} pages fit in one scan. Remove a page or two.`;
     case 'page':
-      return problem.problem === 'unsupported_type'
-        ? `Page ${problem.pageNumber} is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.`
-        : `Page ${problem.pageNumber} is too big (over ${describeSize(limits.maxPageBytes)}). Try taking the photo again.`;
+      switch (problem.problem) {
+        case 'unsupported_type':
+          return `Page ${problem.pageNumber} is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.`;
+        case 'too_large':
+          return `Page ${problem.pageNumber} is too big (over ${describeSize(limits.maxPageBytes)}). Try taking the photo again.`;
+        case 'too_many_pixels':
+          return pictureTooBigCopy(problem.pageNumber);
+      }
   }
 }

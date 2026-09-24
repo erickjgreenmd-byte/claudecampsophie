@@ -710,6 +710,116 @@ describe('parent scan uploader (spec P5, P14; RV-homework-9)', () => {
   });
 });
 
+/**
+ * Stands in for the browser measuring a picked photo's natural size (jsdom never loads images).
+ * `hold` keeps every measurement pending until `release()`.
+ */
+function stubImageSizes(
+  sizes: Record<string, { width: number; height: number }>,
+  options: { hold?: boolean } = {},
+) {
+  const pending: (() => void)[] = [];
+  vi.spyOn(URL, 'createObjectURL').mockImplementation((blob) => `blob:test/${(blob as File).name}`);
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+  class FakeImage {
+    naturalWidth = 0;
+    naturalHeight = 0;
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    set src(url: string) {
+      const size = sizes[url.slice('blob:test/'.length)];
+      const fire = () => {
+        if (!size) {
+          this.onerror?.();
+          return;
+        }
+        this.naturalWidth = size.width;
+        this.naturalHeight = size.height;
+        this.onload?.();
+      };
+      if (options.hold) pending.push(fire);
+      else queueMicrotask(fire);
+    }
+  }
+  vi.stubGlobal('Image', FakeImage);
+  return { release: () => pending.splice(0).forEach((fire) => fire()) };
+}
+
+describe('picture size limits in the parent uploader (AC_CAPTURE_02)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows the picture size limit and refuses an over-limit photo before sending anything', async () => {
+    stubStorage();
+    stubImageSizes({
+      'huge.jpg': { width: 12_000, height: 9_000 },
+      'page.png': { width: 4032, height: 3024 },
+    });
+    const { api, sends } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    expect(within(card).getByText(/photos of up to 60 megapixels/)).toBeTruthy();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      file('huge.jpg', 'image/jpeg', 'huge'),
+      file('page.png', 'image/png', 'page'),
+    ]);
+    expect(
+      await within(card).findByText(
+        'huge.jpg is too big a picture (12,000 × 9,000 pixels). Photos can be up to 10,000 pixels on each side and 60 megapixels; a photo at your camera’s usual size works.',
+        { exact: false },
+      ),
+    ).toBeTruthy();
+    const list = within(card).getByRole('list', { name: 'Pages to send' });
+    expect(within(list).getAllByText(/too big a picture/)).toHaveLength(1);
+    const sendButton = within(card).getByRole<HTMLButtonElement>('button', {
+      name: 'Send 2 pages',
+    });
+    expect(sendButton.disabled).toBe(true);
+    await userEvent.click(within(card).getByRole('button', { name: 'Remove page 1' }));
+    expect(
+      within(card).getByRole<HTMLButtonElement>('button', { name: 'Send 1 page' }).disabled,
+    ).toBe(false);
+    expect(sends).toHaveLength(0);
+  });
+
+  it('a photo still being measured when Send is pressed is checked before the scan is created', async () => {
+    const puts = stubStorage();
+    const images = stubImageSizes(
+      { 'bomb.png': { width: 50_000, height: 50_000 } },
+      { hold: true },
+    );
+    const { api, sends } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      file('bomb.png', 'image/png', 'tiny file, huge header'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 1 page' }));
+    images.release();
+    expect((await within(card).findByRole('alert')).textContent).toMatch(
+      /bomb\.png is too big a picture \(50,000 × 50,000 pixels\)/,
+    );
+    expect(sends).toHaveLength(0);
+    expect(puts).toHaveLength(0);
+  });
+
+  it('a photo the browser can’t measure is left to the server’s check', async () => {
+    const puts = stubStorage();
+    stubImageSizes({}); // every measurement fails
+    const { api, sends } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      file('page.jpg', 'image/jpeg', 'only page'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 1 page' }));
+    expect(await within(card).findByText(/Sent!/)).toBeTruthy();
+    expect(sends).toHaveLength(3);
+    expect(puts).toHaveLength(1);
+  });
+});
+
 describe('honest follow-up states (RV-homework-6, 7, 8)', () => {
   it('a scan that needs the file converter says so instead of asking for clearer photos', async () => {
     const { api } = fakeApi({

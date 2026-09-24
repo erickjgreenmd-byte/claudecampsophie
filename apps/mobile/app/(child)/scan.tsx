@@ -19,6 +19,7 @@ import {
   addPages,
   canSend,
   describeSize,
+  isOversizedPicture,
   limitsSummary,
   movePage,
   problemCopy,
@@ -119,9 +120,21 @@ export default function ScanScreen() {
     async (assets: PickedAsset[], source: PageSource) => {
       const prepared: PickedAsset[] = [];
       for (const asset of assets) {
+        // A picture over the size limits (AC_CAPTURE_02) is added as is, without a second decode
+        // here: its page shows the problem and the scan cannot be sent.
+        if (isOversizedPicture(asset)) {
+          prepared.push(asset);
+          continue;
+        }
         try {
-          // Re-encode photos on the device: drops location/EXIF metadata (spec P4).
-          prepared.push({ uri: await normalizePhoto(asset.uri), mimeType: 'image/jpeg' });
+          // Re-encode photos on the device: drops location/EXIF metadata (spec P4). Re-encoding
+          // keeps the pixel size (a turn only swaps the sides), so the picker's size still applies.
+          prepared.push({
+            uri: await normalizePhoto(asset.uri),
+            mimeType: 'image/jpeg',
+            width: asset.width ?? null,
+            height: asset.height ?? null,
+          });
         } catch {
           prepared.push(asset);
         }
@@ -152,7 +165,19 @@ export default function ScanScreen() {
     setBusy(true);
     try {
       const picture = await cameraRef.current?.takePictureAsync({ quality: 0.85, exif: false });
-      if (picture) await add([{ uri: picture.uri, mimeType: 'image/jpeg' }], 'camera');
+      if (picture) {
+        await add(
+          [
+            {
+              uri: picture.uri,
+              mimeType: 'image/jpeg',
+              width: picture.width,
+              height: picture.height,
+            },
+          ],
+          'camera',
+        );
+      }
     } catch {
       setNotice('The camera didn’t take that photo. Let’s try again.');
     } finally {
@@ -185,6 +210,8 @@ export default function ScanScreen() {
           mimeType: a.mimeType ?? null,
           fileName: a.fileName ?? null,
           fileSize: a.fileSize ?? null,
+          width: a.width,
+          height: a.height,
         })),
         'library',
       );
