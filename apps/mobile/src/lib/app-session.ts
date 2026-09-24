@@ -1,6 +1,7 @@
 import { AppState } from 'react-native';
 import { childSession, modeEffects } from '../family/runtime.ts';
 import { clearAdultCaches, registerParentTokenSource } from '../family/parent-session.ts';
+import { registerPrivacyTokenSources } from '../privacy/session.ts';
 import { registerRewardsTokenSources } from '../rewards/session.ts';
 import { currentMode } from './mode.ts';
 import { parentAuth } from './parent-auth.ts';
@@ -15,11 +16,13 @@ import { secureStorage } from './secure-storage.ts';
  */
 export function initAppSession(): () => void {
   registerRewardsTokenSources({ child: childSession.accessToken });
+  registerPrivacyTokenSources({ child: childSession.accessToken });
 
   const unwatch = parentAuth.watch((signedIn) => {
     const source = signedIn ? parentAuth.tokenSource : null;
     registerParentTokenSource(source);
     registerRewardsTokenSources({ parent: source });
+    registerPrivacyTokenSources({ parent: source });
     if (!signedIn) clearAdultCaches();
   });
 
