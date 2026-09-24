@@ -65,6 +65,26 @@ export const createChildProfileResponseSchema = z.strictObject({
   status: z.literal('draft'),
 });
 
+/**
+ * POST /v1/children/:id/activate (parent + step-up). Assigns one of the family's verified, unused
+ * paid slots to a draft child (spec P11: "If an existing paid slot is unused, assigning it requires
+ * no new purchase"). It never buys capacity: with no unused slot the API answers BUSINESS_RULE
+ * NEEDS_PAID_SLOT, and without verified consent CONSENT_REQUIRED.
+ */
+export const childActivationResponseSchema = z.strictObject({
+  childId: uuidSchema,
+  status: z.literal('active'),
+  paidSlots: z.number().int().min(0),
+  assignedSlots: z.number().int().min(0),
+});
+export type ChildActivationResponse = z.infer<typeof childActivationResponseSchema>;
+
+/** Stable BUSINESS_RULE codes from child activation that the parent screens branch on. */
+export const CHILD_ACTIVATION_RULES = {
+  needsPaidSlot: 'NEEDS_PAID_SLOT',
+  consentRequired: 'CONSENT_REQUIRED',
+} as const;
+
 /** GET /v1/child/me — the paired child's own safe fields only. */
 export const childMeResponseSchema = z.strictObject({
   id: uuidSchema,

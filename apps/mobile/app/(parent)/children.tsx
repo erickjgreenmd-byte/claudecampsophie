@@ -3,6 +3,7 @@ import { Text, TextInput } from 'react-native';
 import { router } from 'expo-router';
 import {
   AGE_BANDS,
+  childActivationResponseSchema,
   createChildProfileResponseSchema,
   familyOverviewResponseSchema,
   type AgeBand,
@@ -10,10 +11,13 @@ import {
 import type { ApiClient } from '@pencillift/contracts/client';
 import { colors } from '@pencillift/ui-tokens';
 import {
+  activationError,
+  activationMessage,
   childRows,
   gradeText,
   parentActionError,
   slotSummary,
+  type ChildRow,
 } from '../../src/family/family-view.ts';
 import {
   Body,
@@ -32,8 +36,10 @@ import {
 } from '../../src/family/ui.tsx';
 
 /**
- * Children (spec P3, P14 child list + add-child; AC_ACCESS_04). New children are free drafts;
- * only an active child (holding a paid slot) can be paired with a device.
+ * Children (spec P3, P11, P14 child list + add-child/paid-slot management; AC_ACCESS_04,
+ * AC_CAPACITY_03). New children are free drafts; a draft takes one of the family's unused paid
+ * slots without a new purchase, and only an active child (holding a paid slot) can be paired.
+ * Buying another slot happens on the Plan and child slots screen, never here.
  */
 export default function ChildrenScreen() {
   const access = useParentAccess();
@@ -67,37 +73,99 @@ function ChildrenContent({ api }: { api: ApiClient }) {
     <>
       <Card>
         <Body>{slotSummary(family)}</Body>
-        <Body muted>
-          Assigning a paid slot to a draft happens in subscription management, which isn’t available
-          on this screen yet.
-        </Body>
+        <Button
+          label="Plan and child slots"
+          secondary
+          onPress={() => router.push('/(parent)/plan')}
+        />
       </Card>
       {family.children.length === 0 ? (
         <Body>No children yet. Add your first child below.</Body>
       ) : null}
       {childRows(family).map((row) => (
-        <Card key={row.id}>
-          <Heading>{row.nickname}</Heading>
-          <Body>{row.detail}</Body>
-          <Body muted>Status: {row.statusText}</Body>
-          {row.canPair ? (
-            <Button
-              label="Pair a device"
-              accessibilityLabel={`Pair a device for ${row.nickname}`}
-              onPress={() =>
-                router.push({
-                  pathname: '/(parent)/pair-device',
-                  params: { childId: row.id, nickname: row.nickname },
-                })
-              }
-            />
-          ) : row.pairingNote ? (
-            <Body muted>{row.pairingNote}</Body>
-          ) : null}
-        </Card>
+        <ChildCard key={row.id} api={api} row={row} onChanged={() => void reload()} />
       ))}
       <AddChild api={api} onAdded={() => void reload()} />
     </>
+  );
+}
+
+/**
+ * One child. A draft with an unused paid slot available can take it here (no purchase; the server
+ * re-checks slots, consent and the PIN unlock). The outcome stays visible after the list reloads.
+ */
+function ChildCard({
+  api,
+  row,
+  onChanged,
+}: {
+  api: ApiClient;
+  row: ChildRow;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; needsPin: boolean; text: string } | null>(
+    null,
+  );
+
+  const activate = async () => {
+    if (busy) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const activated = await api.send(
+        'POST',
+        `/v1/children/${row.id}/activate`,
+        undefined,
+        childActivationResponseSchema,
+      );
+      setResult({ ok: true, needsPin: false, text: activationMessage(row.nickname, activated) });
+      onChanged();
+    } catch (error) {
+      const mapped = activationError(error);
+      setResult({ ok: false, needsPin: mapped.needsPin, text: mapped.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <Heading>{row.nickname}</Heading>
+      <Body>{row.detail}</Body>
+      <Body muted>Status: {row.statusText}</Body>
+      {row.canPair ? (
+        <Button
+          label="Pair a device"
+          accessibilityLabel={`Pair a device for ${row.nickname}`}
+          onPress={() =>
+            router.push({
+              pathname: '/(parent)/pair-device',
+              params: { childId: row.id, nickname: row.nickname },
+            })
+          }
+        />
+      ) : row.pairingNote ? (
+        <Body muted>{row.pairingNote}</Body>
+      ) : null}
+      {row.canActivate ? (
+        <Button
+          label={busy ? 'Assigning…' : 'Assign an unused paid slot'}
+          accessibilityLabel={`Assign an unused paid slot to ${row.nickname}`}
+          busy={busy}
+          onPress={() => void activate()}
+        />
+      ) : row.activationNote ? (
+        <Body muted>{row.activationNote}</Body>
+      ) : null}
+      {result ? (
+        result.ok ? (
+          <Body>{result.text}</Body>
+        ) : (
+          <ErrorBox message={result.text} needsPin={result.needsPin} />
+        )
+      ) : null}
+    </Card>
   );
 }
 

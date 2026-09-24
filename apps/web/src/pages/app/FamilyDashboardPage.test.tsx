@@ -157,6 +157,42 @@ describe('FamilyDashboardPage', () => {
     ]);
   });
 
+  it('restarts a pending consent (e.g. the provider changed) and offers no withdrawal for it', async () => {
+    const user = userEvent.setup();
+    const NEW_CONSENT = 'be6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d';
+    const { api, sends } = fakeApi({
+      consent: () =>
+        consent({ state: 'pending', consentId: CONSENT, configuredProviderIsTest: false }),
+      send: (call) =>
+        call.path === '/v1/consent/start'
+          ? {
+              consentId: NEW_CONSENT,
+              state: 'pending',
+              redirectUrl: 'https://consent.example.test/again',
+              isTestProvider: false,
+            }
+          : new ApiRequestError(
+              'CONFLICT',
+              'Start consent again with the current provider',
+              409,
+              'CONSENT_PROVIDER_CHANGED',
+            ),
+    });
+    renderPage(<FamilyDashboardPage />, { api });
+    expect(await screen.findByText('Consent is waiting for verification.')).toBeTruthy();
+    // A consent that was never given is not "withdrawn" behind a PIN; it is restarted.
+    expect(screen.queryByRole('button', { name: 'Withdraw consent' })).toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Check status' }));
+    expect(await screen.findByText('Start consent again with the current provider')).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Start consent again' }));
+    const link = await screen.findByRole('link', { name: /Continue with the consent provider/ });
+    expect(link.getAttribute('href')).toBe('https://consent.example.test/again');
+    expect(sends.map((c) => c.path)).toEqual([
+      `/v1/consent/${CONSENT}/refresh`,
+      '/v1/consent/start',
+    ]);
+  });
+
   it('shows verified consent from a test provider with an honest note, and withdraws it', async () => {
     const user = userEvent.setup();
     let withdrawn = false;

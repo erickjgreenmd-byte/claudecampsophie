@@ -9,6 +9,7 @@ import {
 import {
   lockParentArea,
   pinEntryError,
+  pinResetGuidance,
   unlockWithBiometrics,
   unlockWithPin,
   type BiometricPinStore,
@@ -119,6 +120,19 @@ describe('parent unlock', () => {
     expect(outcome.kind).toBe('pin_changed');
     expect(store.cleared).toBe(true);
     expect(await store.isEnabled()).toBe(false);
+  });
+
+  it('points a parent who forgot the PIN to the working portal reset (RV-family-4)', () => {
+    expect(pinResetGuidance('https://portal.example.test/')).toEqual({
+      text: 'Forgot your PIN? Reset it in the parent portal after confirming your account password.',
+      url: 'https://portal.example.test/app/security/reset-pin',
+    });
+    for (const origin of [null, '', 'http://portal.example.test', 'javascript:alert(1)']) {
+      const guidance = pinResetGuidance(origin);
+      expect(guidance.url, String(origin)).toBeNull();
+      expect(guidance.text).toMatch(/Reset your parent PIN/);
+      expect(guidance.text).not.toMatch(/isn’t available|needs account recovery/);
+    }
   });
 
   it('relocks on the server and reports failure without throwing', async () => {

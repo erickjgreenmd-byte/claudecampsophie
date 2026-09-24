@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Switch, Text, TextInput, View } from 'react-native';
+import { Linking, Switch, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
 import { colors } from '@pencillift/ui-tokens';
 import { enterParentMode } from '../../src/lib/mode.ts';
+import { portalUrl } from '../../src/lib/parent-auth.ts';
 import { secureStorage } from '../../src/lib/secure-storage.ts';
 import {
   biometricPinStore,
@@ -24,6 +25,7 @@ import {
 } from '../../src/family/ui.tsx';
 import {
   lockParentArea,
+  pinResetGuidance,
   unlockWithBiometrics,
   unlockWithPin,
   type UnlockOutcome,
@@ -182,7 +184,25 @@ export default function UnlockScreen() {
           )
         }
       />
-      <Body muted>Forgot your PIN? Resetting it needs account recovery in the parent portal.</Body>
+      <PinResetHelp />
     </Screen>
+  );
+}
+
+/** A forgotten PIN is reset in the portal after re-authentication; link there when we can. */
+function PinResetHelp() {
+  const guidance = pinResetGuidance(portalUrl);
+  const url = guidance.url;
+  return (
+    <>
+      <Body muted>{guidance.text}</Body>
+      {url ? (
+        <Button
+          label="Reset PIN in the parent portal"
+          secondary
+          onPress={() => void Linking.openURL(url).catch(() => undefined)}
+        />
+      ) : null}
+    </>
   );
 }

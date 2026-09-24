@@ -199,8 +199,11 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
     if (ok) onChanged();
   };
 
-  const canStart =
-    status.state === 'none' || status.state === 'failed' || status.state === 'withdrawn';
+  // Starting is allowed in every state but verified, including pending (the API accepts it): a
+  // parent who closed the provider's page, or whom the API tells to "Start consent again with the
+  // current provider", needs a real way to restart, not only "Check status" (RV-family-5).
+  const canStart = status.state !== 'verified';
+  const restarting = status.state === 'pending';
   const pendingId = status.state === 'pending' ? status.consentId : null;
   const blocked = status.state !== 'verified';
 
@@ -213,10 +216,16 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
           {status.policyVersion ?? 'unknown'}). You can withdraw consent at any time.
         </p>
       ) : status.state === 'pending' ? (
-        <p style={{ margin: '4px 0' }}>
-          Finish the steps with the consent provider, then check the status. Homework checking stays
-          off until consent is verified.
-        </p>
+        <>
+          <p style={{ margin: '4px 0' }}>
+            Finish the steps with the consent provider, then check the status. Homework checking
+            stays off until consent is verified.
+          </p>
+          <p style={{ margin: '4px 0' }}>
+            Closed the provider’s page, or asked to start again? Start consent again: it replaces
+            this waiting request.
+          </p>
+        </>
       ) : status.state === 'withdrawn' ? (
         <p style={{ margin: '4px 0' }}>
           {status.withdrawnAt ? `Withdrawn on ${formatDate(status.withdrawnAt)}. ` : ''}PencilLift
@@ -250,16 +259,6 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
       ) : null}
 
       <div style={buttonRow}>
-        {canStart ? (
-          <button
-            type="button"
-            className="btn"
-            disabled={busy !== null}
-            onClick={() => void start()}
-          >
-            {busy === 'start' ? 'Starting…' : 'Start consent'}
-          </button>
-        ) : null}
         {pendingId ? (
           <button
             type="button"
@@ -270,7 +269,18 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
             {busy === 'refresh' ? 'Checking…' : 'Check status'}
           </button>
         ) : null}
-        {(status.state === 'verified' || status.state === 'pending') && !confirmWithdraw ? (
+        {canStart ? (
+          <button
+            type="button"
+            className={restarting ? 'btn secondary' : 'btn'}
+            disabled={busy !== null}
+            onClick={() => void start()}
+          >
+            {busy === 'start' ? 'Starting…' : restarting ? 'Start consent again' : 'Start consent'}
+          </button>
+        ) : null}
+        {/* Only a verified consent can be withdrawn here; a pending request is simply restarted. */}
+        {status.state === 'verified' && !confirmWithdraw ? (
           <button
             type="button"
             className="btn secondary"

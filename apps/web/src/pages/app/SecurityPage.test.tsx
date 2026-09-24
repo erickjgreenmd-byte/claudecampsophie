@@ -50,7 +50,12 @@ describe('SecurityPage', () => {
     renderPage(<SecurityPage />, { api: fakeApi(() => ({})).api });
     expect(await screen.findByText(/What the parent PIN protects/)).toBeTruthy();
     expect(screen.getByText(/not proof of parental consent/)).toBeTruthy();
-    expect(screen.getByText(/isn’t available in the portal yet/)).toBeTruthy();
+    // A forgotten PIN has a working, verified reset path (RV-family-4), not a dead end.
+    expect(screen.queryByText(/isn’t available in the portal yet/)).toBeNull();
+    expect(screen.getByRole('link', { name: 'Reset your parent PIN' }).getAttribute('href')).toBe(
+      '/app/security/reset-pin',
+    );
+    expect(screen.getByText(/confirming it’s you with your account password/)).toBeTruthy();
   });
 
   it('unlocks with the PIN, shows when the unlock ends and clears the field', async () => {
@@ -84,6 +89,10 @@ describe('SecurityPage', () => {
     await user.type(input, '482914');
     await user.click(screen.getByRole('button', { name: 'Unlock' }));
     expect(await screen.findByText(/Too many incorrect PINs/)).toBeTruthy();
+    // A locked-out parent is pointed at the verified reset, as the API message suggests.
+    expect(screen.getByRole('link', { name: 'Reset it' }).getAttribute('href')).toBe(
+      '/app/security/reset-pin',
+    );
   });
 
   it('does not send an incomplete PIN', async () => {

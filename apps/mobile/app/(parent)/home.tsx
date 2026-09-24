@@ -9,7 +9,7 @@ import {
   type ConsentStatus,
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
-import { consentBanner } from '../../src/family/consent.ts';
+import { consentBanner, type ConsentAction } from '../../src/family/consent.ts';
 import { childRows, parentActionError, slotSummary } from '../../src/family/family-view.ts';
 import { guardianSummary } from '../../src/family/guardians.ts';
 import {
@@ -103,6 +103,22 @@ function FamilyHome({ api }: { api: ApiClient }) {
         onPress={() => router.push('/(parent)/devices')}
       />
 
+      <Heading>Family tools</Heading>
+      <Button label="Reward requests" onPress={() => router.push('/(parent)/rewards')} />
+      <Button label="Learning planner" secondary onPress={() => router.push('/(parent)/planner')} />
+      <Button label="Plan and billing" secondary onPress={() => router.push('/(parent)/plan')} />
+      <Button
+        label="School and promo codes"
+        secondary
+        onPress={() => router.push('/(parent)/school')}
+      />
+      <Button
+        label="Parent resources"
+        secondary
+        onPress={() => router.push('/(parent)/resources')}
+      />
+      <Button label="Privacy and data" secondary onPress={() => router.push('/(parent)/privacy')} />
+
       {guardianView ? (
         <>
           <Heading>Adults</Heading>
@@ -136,16 +152,16 @@ function ConsentCard({
   onChanged: () => void;
 }) {
   const banner = consentBanner(status);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<ConsentAction | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [redirectUrl, setRedirectUrl] = useState<string | null>(null);
 
-  const act = async () => {
-    if (!status || busy) return;
-    setBusy(true);
+  const act = async (action: ConsentAction) => {
+    if (!status || busy !== null || action === 'none') return;
+    setBusy(action);
     setMessage(null);
     try {
-      if (banner.action === 'start') {
+      if (action === 'start') {
         const started = await api.send('POST', '/v1/consent/start', {}, consentStartResponseSchema);
         setRedirectUrl(started.redirectUrl);
         setMessage(
@@ -153,7 +169,7 @@ function ConsentCard({
             ? 'Consent started. Continue with the consent provider, then check the status here.'
             : 'Consent started. Check the status to see the provider’s result.',
         );
-      } else if (banner.action === 'refresh' && status.consentId) {
+      } else if (status.consentId) {
         await api.send(
           'POST',
           `/v1/consent/${status.consentId}/refresh`,
@@ -165,7 +181,7 @@ function ConsentCard({
     } catch (error) {
       setMessage(parentActionError(error).message);
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
@@ -176,7 +192,21 @@ function ConsentCard({
       <Body>{banner.body}</Body>
       {banner.testNote ? <Body muted>{banner.testNote}</Body> : null}
       {banner.actionLabel ? (
-        <Button label={banner.actionLabel} busy={busy} onPress={() => void act()} />
+        <Button
+          label={banner.actionLabel}
+          busy={busy === banner.action}
+          disabled={busy !== null}
+          onPress={() => void act(banner.action)}
+        />
+      ) : null}
+      {banner.secondaryLabel ? (
+        <Button
+          label={banner.secondaryLabel}
+          secondary
+          busy={busy === banner.secondaryAction}
+          disabled={busy !== null}
+          onPress={() => void act(banner.secondaryAction)}
+        />
       ) : null}
       {redirectUrl && status?.state === 'pending' ? (
         <Button

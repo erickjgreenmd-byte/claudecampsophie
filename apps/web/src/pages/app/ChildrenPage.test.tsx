@@ -73,11 +73,110 @@ describe('ChildrenPage', () => {
     expect(screen.getByText('Status: Active: uses a paid slot')).toBeTruthy();
     expect(screen.getByText('Status: Draft: not active yet, no charge')).toBeTruthy();
     expect(screen.getByText('Kindergarten · ages 5-7')).toBeTruthy();
-    expect(screen.getByText(/Assigning a slot from this portal isn’t available yet/)).toBeTruthy();
+    // The one paid slot is Riley's: Sam cannot be activated without buying, and the page says so
+    // instead of pointing at a screen that does not exist (RV-family-3).
+    expect(screen.queryByText(/isn’t available yet/)).toBeNull();
+    expect(screen.getByRole('link', { name: 'subscription' }).getAttribute('href')).toBe(
+      '/app/subscription',
+    );
     // Draft children cannot be paired and say why (no dead button).
     const sam = screen.getByRole('heading', { name: 'Sam' }).closest('li')!;
     expect(within(sam).queryByRole('button')).toBeNull();
     expect(within(sam).getByText(/once Sam has a paid slot/)).toBeTruthy();
+    expect(
+      within(sam).getByText(
+        'All 1 paid slot is in use. To activate Sam, add a child slot to your plan in the PencilLift app.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('says honestly that a family without a subscription has no slot to assign', async () => {
+    renderPage(<ChildrenPage />, {
+      api: fakeApi({
+        get: () =>
+          family({
+            paidSlots: 0,
+            children: [
+              { id: SAM, nickname: 'Sam', gradeLevel: 0, ageBand: '5-7', status: 'draft' },
+            ],
+          }),
+      }).api,
+    });
+    const sam = (await screen.findByRole('heading', { name: 'Sam' })).closest('li')!;
+    expect(within(sam).queryByRole('button')).toBeNull();
+    expect(within(sam).getByText(/no paid child slots yet/)).toBeTruthy();
+  });
+
+  it('assigns an unused paid slot to a draft child and reloads the list', async () => {
+    const user = userEvent.setup();
+    let activated = false;
+    const { api, sends, gets } = fakeApi({
+      get: () =>
+        family({
+          paidSlots: 2,
+          children: [
+            { id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' },
+            {
+              id: SAM,
+              nickname: 'Sam',
+              gradeLevel: 0,
+              ageBand: '5-7',
+              status: activated ? 'active' : 'draft',
+            },
+          ],
+        }),
+      send: () => {
+        activated = true;
+        return { childId: SAM, status: 'active', paidSlots: 2, assignedSlots: 2 };
+      },
+    });
+    renderPage(<ChildrenPage />, { api });
+    const sam = (await screen.findByRole('heading', { name: 'Sam' })).closest('li')!;
+    // Riley already holds a slot, so Riley has no assign control.
+    const riley = screen.getByRole('heading', { name: 'Riley' }).closest('li')!;
+    expect(within(riley).queryByRole('button', { name: /paid slot/ })).toBeNull();
+    await user.click(
+      within(sam).getByRole('button', { name: 'Assign an unused paid slot to Sam' }),
+    );
+    expect(
+      await within(sam).findByText(
+        'Sam is active and uses one of your paid slots (2 of 2 in use). You can now create a pairing code.',
+      ),
+    ).toBeTruthy();
+    expect(sends).toEqual([
+      { method: 'POST', path: `/v1/children/${SAM}/activate`, body: undefined },
+    ]);
+    await waitFor(() => expect(gets.length).toBe(2));
+    expect(await within(sam).findByRole('button', { name: 'Create pairing code' })).toBeTruthy();
+  });
+
+  it('explains step-up and missing consent when assigning a slot is refused', async () => {
+    const user = userEvent.setup();
+    const errors = [
+      new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN to continue', 403),
+      new ApiRequestError(
+        'BUSINESS_RULE',
+        'Parental consent is needed before a child can start',
+        422,
+        'CONSENT_REQUIRED',
+      ),
+    ];
+    const { api } = fakeApi({
+      get: () => family({ paidSlots: 2 }),
+      send: () => errors.shift(),
+    });
+    renderPage(<ChildrenPage />, { api });
+    const sam = (await screen.findByRole('heading', { name: 'Sam' })).closest('li')!;
+    const assign = within(sam).getByRole('button', { name: 'Assign an unused paid slot to Sam' });
+    await user.click(assign);
+    expect(
+      await within(sam).findByText(/Assigning a paid slot needs a recent PIN unlock/),
+    ).toBeTruthy();
+    await user.click(assign);
+    expect(await within(sam).findByText('Parental consent comes first.')).toBeTruthy();
+    expect(
+      within(sam).getByRole('link', { name: 'Give consent on the family dashboard' }),
+    ).toBeTruthy();
   });
 
   it('creates a pairing code, shows it once with expiry and instructions, then hides it', async () => {

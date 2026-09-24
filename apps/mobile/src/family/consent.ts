@@ -16,6 +16,13 @@ export interface ConsentBanner {
   readonly testNote: string | null;
   readonly action: ConsentAction;
   readonly actionLabel: string | null;
+  /**
+   * A second, always-working way forward. While consent is pending this restarts it: the API
+   * allows starting again, and it is the only way back when the parent closed the provider's page
+   * or the API answers "Start consent again with the current provider" (RV-family-5).
+   */
+  readonly secondaryAction: ConsentAction;
+  readonly secondaryLabel: string | null;
 }
 
 const TEST_RECORD_NOTE =
@@ -32,6 +39,8 @@ export function consentBanner(status: ConsentStatus | null): ConsentBanner {
       testNote: null,
       action: 'none',
       actionLabel: null,
+      secondaryAction: 'none',
+      secondaryLabel: null,
     };
   }
   const testNote = status.isTestProvider
@@ -48,15 +57,19 @@ export function consentBanner(status: ConsentStatus | null): ConsentBanner {
         testNote,
         action: 'start',
         actionLabel: 'Start consent',
+        secondaryAction: 'none',
+        secondaryLabel: null,
       };
     case 'pending':
       return {
         tone: 'blocked',
         title: 'Consent is waiting for verification',
-        body: 'Finish the steps with the consent provider, then check the status here.',
+        body: 'Finish the steps with the consent provider, then check the status here. Closed the provider’s page, or asked to start again? Start consent again: it replaces this waiting request.',
         testNote,
         action: 'refresh',
         actionLabel: 'Check status',
+        secondaryAction: 'start',
+        secondaryLabel: 'Start consent again',
       };
     case 'verified':
       return {
@@ -66,6 +79,8 @@ export function consentBanner(status: ConsentStatus | null): ConsentBanner {
         testNote,
         action: 'none',
         actionLabel: null,
+        secondaryAction: 'none',
+        secondaryLabel: null,
       };
     case 'failed':
       return {
@@ -75,6 +90,8 @@ export function consentBanner(status: ConsentStatus | null): ConsentBanner {
         testNote,
         action: 'start',
         actionLabel: 'Start consent again',
+        secondaryAction: 'none',
+        secondaryLabel: null,
       };
     case 'withdrawn':
       return {
@@ -84,6 +101,8 @@ export function consentBanner(status: ConsentStatus | null): ConsentBanner {
         testNote,
         action: 'start',
         actionLabel: 'Give consent again',
+        secondaryAction: 'none',
+        secondaryLabel: null,
       };
   }
 }

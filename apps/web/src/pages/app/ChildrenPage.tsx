@@ -2,6 +2,8 @@ import { useId, useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
 import {
   AGE_BANDS,
+  CHILD_ACTIVATION_RULES,
+  childActivationResponseSchema,
   createChildProfileResponseSchema,
   createPairingCodeResponseSchema,
   familyOverviewResponseSchema,
@@ -21,9 +23,11 @@ import {
 } from './SecurityPage.tsx';
 
 /**
- * Child profiles and device pairing (spec P3, P14 "child list", "add-child/paid-slot management";
- * AC_ACCESS_04). Adding a child creates an uncharged draft. A child becomes active only when a paid
- * slot is assigned; only active children can be paired with a device. Pairing codes are shown once.
+ * Child profiles and device pairing (spec P3, P11, P14 "child list", "add-child/paid-slot
+ * management"; AC_ACCESS_04, AC_CAPACITY_03). Adding a child creates an uncharged draft. A draft
+ * becomes active when one of the family's unused paid slots is assigned to it (no new purchase);
+ * only active children can be paired with a device. Pairing codes are shown once. This page never
+ * sells capacity: new paid slots are bought in the PencilLift app from the App Store/Google Play.
  */
 export default function ChildrenPage() {
   return (
@@ -77,21 +81,30 @@ function Children() {
   );
 }
 
+/** Paid slots not yet assigned to an active child. Only these can be assigned without buying. */
+export function unusedPaidSlots(data: FamilyOverview): number {
+  const active = data.children.filter((c) => c.status === 'active').length;
+  return Math.max(0, data.paidSlots - active);
+}
+
 function ChildrenContent({ data, onChanged }: { data: FamilyOverview; onChanged: () => void }) {
   const active = data.children.filter((c) => c.status === 'active').length;
+  const unused = unusedPaidSlots(data);
   return (
     <>
       <section className="card" aria-labelledby="slots-title">
         <h2 id="slots-title">Paid child slots</h2>
         <p>
           Your plan has <strong>{data.paidSlots}</strong> paid child{' '}
-          {data.paidSlots === 1 ? 'slot' : 'slots'}; <strong>{active}</strong> in use.
+          {data.paidSlots === 1 ? 'slot' : 'slots'}; <strong>{active}</strong> in use,{' '}
+          <strong>{unused}</strong> unused.
         </p>
         <p>
           New children start as <strong>draft</strong> profiles. A draft costs nothing and can’t be
-          used on a device. Activating a child assigns one of your paid slots; slots come from your
-          subscription in the PencilLift app. Assigning a slot from this portal isn’t available yet,
-          so activation happens in subscription management in the app.
+          used on a device. Activating a draft assigns one of your unused paid slots to it, with no
+          new purchase. New paid slots are bought in the PencilLift app through the App Store or
+          Google Play; this portal never charges you. See your{' '}
+          <Link to="/app/subscription">subscription</Link> for the plan and managing store.
         </p>
       </section>
 
@@ -102,7 +115,13 @@ function ChildrenContent({ data, onChanged }: { data: FamilyOverview; onChanged:
         ) : (
           <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 12 }}>
             {data.children.map((child) => (
-              <ChildCard key={child.id} child={child} />
+              <ChildCard
+                key={child.id}
+                child={child}
+                unusedSlots={unused}
+                paidSlots={data.paidSlots}
+                onChanged={onChanged}
+              />
             ))}
           </ul>
         )}
@@ -113,14 +132,42 @@ function ChildrenContent({ data, onChanged }: { data: FamilyOverview; onChanged:
   );
 }
 
-function ChildCard({ child }: { child: FamilyChild }) {
+function ChildCard({
+  child,
+  unusedSlots,
+  paidSlots,
+  onChanged,
+}: {
+  child: FamilyChild;
+  unusedSlots: number;
+  paidSlots: number;
+  onChanged: () => void;
+}) {
   const { api } = useSession();
   const { busy, feedback, run, setFeedback } = useAction();
   const [code, setCode] = useState<{ code: string; expiresAt: string } | null>(null);
+  const [lastAction, setLastAction] = useState<'code' | 'activate' | null>(null);
   const titleId = useId();
 
-  const createCode = () =>
-    run('code', async () => {
+  // Spec P11 / AC_CAPACITY_03: an unused paid slot is assigned without buying again. The server
+  // re-checks the slot count, consent and a recent PIN unlock; this never purchases anything.
+  const activate = async () => {
+    setLastAction('activate');
+    const ok = await run('activate', async () => {
+      const result = await api.send(
+        'POST',
+        `/v1/children/${child.id}/activate`,
+        undefined,
+        childActivationResponseSchema,
+      );
+      return `${child.nickname} is active and uses one of your paid slots (${result.assignedSlots} of ${result.paidSlots} in use). You can now create a pairing code.`;
+    });
+    if (ok) onChanged();
+  };
+
+  const createCode = () => {
+    setLastAction('code');
+    return run('code', async () => {
       const result = await api.send(
         'POST',
         `/v1/children/${child.id}/pairing-code`,
@@ -130,6 +177,10 @@ function ChildCard({ child }: { child: FamilyChild }) {
       setCode(result);
       return `Pairing code created for ${child.nickname}.`;
     });
+  };
+
+  const activationError =
+    feedback?.kind === 'error' && lastAction === 'activate' ? feedback.error : null;
 
   return (
     <li className="card" aria-labelledby={titleId}>
@@ -152,9 +203,39 @@ function ChildCard({ child }: { child: FamilyChild }) {
           </button>
         </div>
       ) : child.status === 'draft' ? (
-        <p style={{ margin: '4px 0' }}>
-          Pairing a device becomes available once {child.nickname} has a paid slot.
-        </p>
+        <>
+          <p style={{ margin: '4px 0' }}>
+            Pairing a device becomes available once {child.nickname} has a paid slot.
+          </p>
+          {unusedSlots > 0 ? (
+            <div style={buttonRow}>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy !== null}
+                aria-label={`Assign an unused paid slot to ${child.nickname}`}
+                onClick={() => void activate()}
+              >
+                {busy === 'activate' ? 'Assigning…' : 'Assign an unused paid slot'}
+              </button>
+            </div>
+          ) : (
+            <p style={{ margin: '4px 0' }}>
+              {paidSlots === 0
+                ? `Your family has no paid child slots yet. To activate ${child.nickname}, subscribe in the PencilLift app.`
+                : `All ${paidSlots} paid ${paidSlots === 1 ? 'slot is' : 'slots are'} in use. To activate ${child.nickname}, add a child slot to your plan in the PencilLift app.`}
+            </p>
+          )}
+        </>
+      ) : null}
+      {activationError?.rule === CHILD_ACTIVATION_RULES.consentRequired ? (
+        <div className="notice" role="alert">
+          <p style={{ margin: 0 }}>
+            <strong>Parental consent comes first.</strong> A child can start only after a consent
+            provider verifies an adult. <Link to="/app">Give consent on the family dashboard</Link>,
+            then try again.
+          </p>
+        </div>
       ) : null}
       {code ? (
         <PairingCodePanel
@@ -166,7 +247,14 @@ function ChildCard({ child }: { child: FamilyChild }) {
           }}
         />
       ) : (
-        <ActionFeedback feedback={feedback} stepUpAction="Creating a pairing code" />
+        <ActionFeedback
+          feedback={
+            activationError?.rule === CHILD_ACTIVATION_RULES.consentRequired ? null : feedback
+          }
+          stepUpAction={
+            lastAction === 'activate' ? 'Assigning a paid slot' : 'Creating a pairing code'
+          }
+        />
       )}
     </li>
   );

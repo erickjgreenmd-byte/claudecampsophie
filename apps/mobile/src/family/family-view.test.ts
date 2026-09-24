@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { ChildDevice, FamilyOverview } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
-import { childRows, deviceRows, parentActionError, slotSummary } from './family-view.ts';
+import {
+  activationError,
+  activationMessage,
+  childRows,
+  deviceRows,
+  parentActionError,
+  slotSummary,
+  unusedPaidSlots,
+} from './family-view.ts';
 
 const RILEY = '6f1c2f0e-1f4b-4c8e-9b3a-2d3e4f5a6b7c';
 const SAM = '7a2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f';
@@ -36,8 +44,62 @@ describe('family view models', () => {
     expect(sam?.pairingNote).toMatch(/once Sam has a paid slot/);
   });
 
+  it('lets a draft take an unused paid slot without buying, and says why when none is free (RV-family-3)', () => {
+    // One paid slot, held by Riley: Sam cannot be activated here, and the row says why.
+    expect(unusedPaidSlots(family)).toBe(0);
+    const [riley, sam] = childRows(family);
+    expect(riley).toMatchObject({ canActivate: false, activationNote: null });
+    expect(sam).toMatchObject({
+      canActivate: false,
+      activationNote:
+        'All 1 paid slot is in use. To activate Sam, add a child slot under Plan and child slots.',
+    });
+    // A second paid slot is unused: Sam's draft can take it.
+    const twoSlots = { ...family, paidSlots: 2 };
+    expect(unusedPaidSlots(twoSlots)).toBe(1);
+    expect(childRows(twoSlots)[1]).toMatchObject({ canActivate: true, activationNote: null });
+    // No subscription at all.
+    const none = { ...family, paidSlots: 0, children: [family.children[1]!] };
+    expect(childRows(none)[0]?.activationNote).toMatch(/no paid child slots yet/);
+    // Archived children are never offered a slot here.
+    const archived = {
+      ...twoSlots,
+      children: [{ ...family.children[1]!, status: 'archived' as const }],
+    };
+    expect(childRows(archived)[0]).toMatchObject({ canActivate: false, activationNote: null });
+  });
+
+  it('confirms activation and maps its refusals by rule code', () => {
+    expect(
+      activationMessage('Sam', { childId: SAM, status: 'active', paidSlots: 2, assignedSlots: 2 }),
+    ).toBe(
+      'Sam is active and uses one of your paid slots (2 of 2 in use). You can now pair a device.',
+    );
+    expect(
+      activationError(
+        new ApiRequestError('BUSINESS_RULE', 'Parental consent is needed', 422, 'CONSENT_REQUIRED'),
+      ).message,
+    ).toMatch(/^Parental consent comes first/);
+    expect(
+      activationError(new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403))
+        .needsPin,
+    ).toBe(true);
+    expect(
+      activationError(
+        new ApiRequestError(
+          'BUSINESS_RULE',
+          'All 1 paid child slots are in use. Add a child slot to your plan first.',
+          422,
+          'NEEDS_PAID_SLOT',
+        ),
+      ).message,
+    ).toBe('All 1 paid child slots are in use. Add a child slot to your plan first.');
+  });
+
   it('summarizes paid slots honestly', () => {
     expect(slotSummary(family)).toMatch(/^1 paid child slot, 1 in use\./);
+    expect(slotSummary(family)).toMatch(/with no new purchase\.$/);
+    expect(slotSummary(family)).not.toMatch(/isn’t available/);
     expect(slotSummary({ ...family, paidSlots: 0, children: [] })).toMatch(/^0 paid child slots/);
   });
 

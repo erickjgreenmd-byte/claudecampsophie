@@ -181,9 +181,16 @@ function Security() {
       <section className="card" style={sectionStyle} aria-labelledby="reset-title">
         <h2 id="reset-title">Forgot your PIN?</h2>
         <p>
-          Resetting a forgotten PIN requires verified account recovery, which isn’t available in the
-          portal yet. Please <Link to="/support">contact support</Link>. After five incorrect tries
-          the PIN locks for 15 minutes.
+          You can choose a new PIN after confirming it’s you with your account password. Your PIN,
+          this device or an old session can’t reset it on their own. Resetting ends any current
+          unlock, on every device.
+        </p>
+        <p>
+          <Link to="/app/security/reset-pin">Reset your parent PIN</Link>
+        </p>
+        <p>
+          After five incorrect tries the PIN locks for 15 minutes. If you can’t sign in to your
+          account either, <Link to="/support">contact support</Link>.
         </p>
       </section>
     </>
@@ -269,6 +276,12 @@ function UnlockSection() {
         <ActionFeedback feedback={feedback} stepUpAction="This" />
       ) : null}
       {message ? <ErrorState message={message} /> : null}
+      {error?.code === 'LOCKED_OUT' ? (
+        <p style={{ margin: '4px 0' }}>
+          Forgot your PIN? <Link to="/app/security/reset-pin">Reset it</Link> after confirming your
+          account password.
+        </p>
+      ) : null}
     </section>
   );
 }

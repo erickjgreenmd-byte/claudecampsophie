@@ -16,7 +16,7 @@ import {
 } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
 import type { Tx } from '../db.ts';
-import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
+import { ApiError, businessRule, isUniqueViolation, pgErrorCode } from '../errors.ts';
 import { assertRecentUnlock, requireParent } from '../middleware/auth.ts';
 import type { AppDeps, AppEnv } from '../middleware/context.ts';
 import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
@@ -113,6 +113,9 @@ async function adultEmail(
     throw error;
   }
 }
+
+/** Unique index requested from the migration owner (see the accept route). */
+const ONE_FAMILY_PER_ADULT_INDEX = 'family_memberships_one_active_family_per_user';
 
 function isAdultLimitError(error: unknown): boolean {
   return (
@@ -395,10 +398,16 @@ export function guardiansRoutes(): Hono<AppEnv> {
         returning id`;
       if (rows.length === 0) return false;
       // Pending privileged actions die with the membership (AC_ACCESS_09): step-up unlocks on
-      // every session, invitations they sent, and consent they started but never completed.
+      // every session, unredeemed device pairing codes they created (a code would otherwise still
+      // mint a 30-day child session), invitations they sent, and consent they started but never
+      // completed. Marking a code consumed is how every other path retires one (family.ts).
       await tx`
         update private.adult_unlocks set revoked_at = ${now}
          where user_id = ${target.data} and revoked_at is null`;
+      await tx`
+        update private.child_pairing_codes set consumed_at = ${now}
+         where family_id = ${membership.familyId} and created_by = ${target.data}
+           and consumed_at is null`;
       await tx`
         update public.guardian_invitations set status = 'revoked'
          where family_id = ${membership.familyId} and invited_by = ${target.data} and status = 'pending'`;
@@ -439,6 +448,11 @@ export function guardiansRoutes(): Hono<AppEnv> {
     let outcome: Outcome;
     try {
       outcome = await deps.db.asService(async (tx): Promise<Outcome> => {
+        // One family per adult (spec P1). The adult-limit trigger locks only the *invited* family,
+        // so two acceptances into different families would both pass the membership check below.
+        // This per-adult transaction lock, taken first so lock order is always adult → invitation
+        // → family, makes the second acceptance wait and then see the first one's membership.
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`adult-membership:${parent.userId}`}, 0))`;
         const [invitation] = await tx<
           { id: string; family_id: string; email: string; status: string; expires_at: Date }[]
         >`
@@ -516,6 +530,13 @@ export function guardiansRoutes(): Hono<AppEnv> {
       });
     } catch (error) {
       if (isAdultLimitError(error)) throw adultLimitReached();
+      // Requested DB backstop (one active membership per adult, covering create_family(), which
+      // cannot take the lock above): a concurrent family creation surfaces as this violation.
+      if (isUniqueViolation(error, ONE_FAMILY_PER_ADULT_INDEX)) {
+        throw new ApiError('CONFLICT', 'You already belong to a family', {
+          rule: GUARDIAN_RULES.alreadyInFamily,
+        });
+      }
       throw error;
     }
     if (outcome.kind === 'error') throw outcome.error;

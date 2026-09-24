@@ -87,6 +87,34 @@ export async function unlockWithBiometrics(
   return outcome;
 }
 
+/** Where a forgotten PIN is reset: the portal's verified recovery page (re-auth, then new PIN). */
+export const PIN_RESET_PATH = '/app/security/reset-pin';
+
+export interface PinResetGuidance {
+  readonly text: string;
+  /** Absolute link to the portal's reset page, or null when this build has no portal origin. */
+  readonly url: string | null;
+}
+
+/**
+ * Honest "Forgot your PIN?" guidance (spec P3: reset only through verified parent recovery;
+ * AC_ACCESS_08). The reset works in the parent portal, so never say it does not exist
+ * (RV-family-4); link straight to it when the portal origin is configured.
+ */
+export function pinResetGuidance(portalUrl: string | null): PinResetGuidance {
+  const origin = portalUrl?.trim().replace(/\/+$/, '') ?? '';
+  if (!/^https:\/\/[^/\s]+$/.test(origin)) {
+    return {
+      text: 'Forgot your PIN? Reset it in the parent portal: open Security, choose “Reset your parent PIN”, and confirm your account password.',
+      url: null,
+    };
+  }
+  return {
+    text: 'Forgot your PIN? Reset it in the parent portal after confirming your account password.',
+    url: `${origin}${PIN_RESET_PATH}`,
+  };
+}
+
 /** Relocks the parent area on the server (switching to child mode, or the parent tapping Lock). */
 export async function lockParentArea(api: ApiClient): Promise<boolean> {
   try {

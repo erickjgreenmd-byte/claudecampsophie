@@ -372,6 +372,53 @@ describe('guardian invitations (AC_ACCESS_09)', () => {
   });
 });
 
+describe('guardian removal ends pending pairing codes (AC_ACCESS_09, RV-family-1)', () => {
+  it('retires only the removed guardian’s unredeemed codes; the owner’s codes keep working', async () => {
+    const ownerSession = '36666666-6666-4666-8666-666666666666';
+    const guardianSession = '37777777-7777-4777-8777-777777777777';
+    const email = 'riley.guardian.pairing@example.test';
+    const family = await seedFamily(api.db, { childCount: 2 }); // two active children
+    const [riley, sam] = family.children;
+    await grantAdultUnlock(api.db, family.ownerId, ownerSession, 3600);
+    const owner = await parentToken(family.ownerId, { sessionId: ownerSession });
+    expect((await invite(email, owner)).status).toBe(201);
+    const adultId = await api.db.createUser(email);
+    const adult = await parentToken(adultId, { sessionId: guardianSession });
+    expect((await accept(tokenFromOutbox(email), adult)).status).toBe(200);
+    await grantAdultUnlock(api.db, adultId, guardianSession, 3600);
+
+    const codeFor = async (childId: string, token: string) => {
+      const res = await api.request(`/v1/children/${childId}/pairing-code`, {
+        method: 'POST',
+        token,
+      });
+      expect(res.status).toBe(201);
+      return (await json<{ code: string }>(res)).code;
+    };
+    const guardianCode = await codeFor(riley!.id, adult);
+    const ownerCode = await codeFor(sam!.id, owner);
+
+    const removed = await api.request(`/v1/guardians/${adultId}`, {
+      method: 'DELETE',
+      token: owner,
+    });
+    expect(removed.status).toBe(200);
+
+    const pair = (code: string, ip: string) =>
+      api.request('/v1/child/pair', {
+        method: 'POST',
+        headers: { 'cf-connecting-ip': ip },
+        body: { code, deviceLabel: 'Synthetic tablet', platform: 'ios' },
+      });
+    expect((await pair(guardianCode, '198.51.100.31')).status).toBe(404);
+    expect((await pair(ownerCode, '198.51.100.32')).status).toBe(201);
+    const devices = await api.db.sql<{ child_id: string }[]>`
+      select child_id from public.child_devices
+       where family_id = ${family.familyId} and label = 'Synthetic tablet'`;
+    expect(devices.map((d) => d.child_id)).toEqual([sam!.id]);
+  });
+});
+
 describe('consent (spec P3, AC_ACCESS_01/02)', () => {
   let token: string;
   let consentId = '';

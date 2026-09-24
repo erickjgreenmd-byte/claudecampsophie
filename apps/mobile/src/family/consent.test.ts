@@ -28,12 +28,24 @@ describe('consent banner', () => {
     expect(banner.testNote).toMatch(/not real verification/);
   });
 
-  it('offers a status check while pending', () => {
+  it('offers a status check while pending, and a real way to start again (RV-family-5)', () => {
     expect(consentBanner(status({ state: 'pending', consentId: 'x' }))).toMatchObject({
       tone: 'blocked',
       action: 'refresh',
       actionLabel: 'Check status',
+      secondaryAction: 'start',
+      secondaryLabel: 'Start consent again',
     });
+  });
+
+  it('offers a second action only while pending', () => {
+    for (const state of ['none', 'verified', 'failed', 'withdrawn'] as const) {
+      expect(consentBanner(status({ state })), state).toMatchObject({
+        secondaryAction: 'none',
+        secondaryLabel: null,
+      });
+    }
+    expect(consentBanner(null).secondaryAction).toBe('none');
   });
 
   it('is ok only when verified, and still flags a test-provider record', () => {
