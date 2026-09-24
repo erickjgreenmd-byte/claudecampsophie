@@ -1,9 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { imagePart, PROMPTS, toStrictJsonSchema } from '@pencillift/ai';
 import { cryptoRandom } from '@pencillift/domain';
 import { seedOwnerAdmin } from '@pencillift/db/testing/fixtures';
 import { recordSpendAlerts, type JobDeps } from '../src/jobs/dispatcher.ts';
 import {
   acquireSpendHold,
+  IMAGE_INPUT_TOKEN_BOUND,
+  inputTokenUpperBound,
   releaseSpendHold,
   SPEND_HOLD_MINUTES,
   SpendCeilingReached,
@@ -205,6 +208,128 @@ describe('global AI spend ceiling admission (spec F4, AC_FIN_09)', () => {
     await expect(acquireSpendHold(deps, 1)).rejects.toBeInstanceOf(SpendCeilingReached);
     api.now.value = new Date(NOW.getTime() + (SPEND_HOLD_MINUTES * 60 + 1) * 1000);
     expect(await acquireSpendHold(deps, 150_000)).toEqual(expect.any(String));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Final lead review (LJA-F2, -F6, -F8)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `deps` whose service transactions stop right after the spend_budgets read until a second caller
+ * reaches the same point (or 300 ms pass). With the budget row lock the second caller cannot get
+ * past its own read while the first holds the lock, so the first times out alone; without the
+ * lock both reads return, both pass the barrier together and both would insert a hold.
+ */
+function racingAfterBudgetRead(): JobDeps {
+  const waiting: (() => void)[] = [];
+  let arrived = 0;
+  const barrier = () =>
+    new Promise<void>((resolve) => {
+      arrived += 1;
+      if (arrived >= 2) {
+        for (const release of waiting.splice(0)) release();
+        resolve();
+        return;
+      }
+      waiting.push(resolve);
+      setTimeout(resolve, 300);
+    });
+  return {
+    ...deps,
+    db: {
+      ...deps.db,
+      asService: (fn) =>
+        deps.db.asService((tx) =>
+          fn(
+            new Proxy(tx, {
+              apply(target, self, args: unknown[]) {
+                const result = Reflect.apply(target, self, args) as unknown;
+                const strings = args[0];
+                if (
+                  Array.isArray(strings) &&
+                  strings.join(' ').includes('from public.spend_budgets')
+                ) {
+                  return Promise.resolve(result).then(async (rows) => {
+                    await barrier();
+                    return rows;
+                  });
+                }
+                return result;
+              },
+            }),
+          ),
+        ),
+    },
+  };
+}
+
+describe('spend ceiling edges (final lead review LJA-F2, -F6, -F8)', () => {
+  it('outside development and test, a month without an owner budget admits no AI stage', async () => {
+    api.now.value = new Date('2027-04-10T12:00:00Z'); // no budget row for 2027-04
+    for (const environment of ['staging', 'production'] as const) {
+      const strict: JobDeps = { ...deps, config: { ...api.config, environment } };
+      api.logs.length = 0;
+      // Before the fix this resolved null (no cap at all) from 00:00 UTC on the 1st.
+      const refusal = acquireSpendHold(strict, 1);
+      await expect(refusal, environment).rejects.toBeInstanceOf(SpendCeilingReached);
+      await expect(refusal).rejects.toMatchObject({ name: 'SpendBudgetMissing' });
+      expect(await holdCount()).toBe(0);
+      expect(api.logs).toContainEqual({
+        level: 'error',
+        event: 'spend_budget_missing',
+        code: 'SPEND_BUDGET_MISSING',
+      });
+    }
+    // Development and test keep working without a budget (local runs, fixtures).
+    expect(await acquireSpendHold(deps, 1)).toBeNull();
+  });
+
+  it('two admissions that both read the budget before either inserts cannot both hold', async () => {
+    const spent = await spentThisMonth();
+    await setBudget(spent + 350_000n);
+    const racing = racingAfterBudgetRead();
+    const results = await Promise.allSettled([
+      acquireSpendHold(racing, 350_000),
+      acquireSpendHold(racing, 350_000),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const refused = results.filter((r) => r.status === 'rejected');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.reason).toBeInstanceOf(SpendCeilingReached);
+    expect(await holdCount()).toBe(1);
+  });
+
+  it('the input-token bound counts every byte sent and each image (LJA-F4)', () => {
+    const bytes = (text: string) => new TextEncoder().encode(text).length;
+    const text = 'Écris la phrase: “Le soleil brille.” '.repeat(200); // multi-byte characters
+    const bound = inputTokenUpperBound(PROMPTS.grading, [
+      { type: 'input_text', text },
+      imagePart('image/png', 'AAAA'),
+      imagePart('image/jpeg', 'AAAA'),
+    ]);
+    // A byte-level tokenizer never produces more tokens than bytes: instructions, schema, text.
+    expect(bound).toBeGreaterThanOrEqual(
+      bytes(PROMPTS.grading.instructions) +
+        bytes(JSON.stringify(toStrictJsonSchema(PROMPTS.grading.outputSchema))) +
+        bytes(text) +
+        2 * IMAGE_INPUT_TOKEN_BOUND,
+    );
+    expect(bytes(text)).toBeGreaterThan(text.length); // counted in bytes, not characters
+  });
+
+  it('a live hold from the previous month still counts after midnight UTC', async () => {
+    // The stage admitted at 23:59:50 is metered after midnight, so its cost lands in March.
+    api.now.value = new Date('2027-02-28T23:59:50Z');
+    await setBudget(10_000_000n);
+    const late = await acquireSpendHold(deps, 300_000);
+    expect(late).toEqual(expect.any(String));
+    api.now.value = new Date('2027-03-01T00:00:10Z');
+    expect(await spentThisMonth()).toBe(0n);
+    await setBudget(300_000n);
+    await expect(acquireSpendHold(deps, 300_000)).rejects.toBeInstanceOf(SpendCeilingReached);
+    await releaseSpendHold(deps, late);
+    expect(await acquireSpendHold(deps, 300_000)).toEqual(expect.any(String));
   });
 });
 
