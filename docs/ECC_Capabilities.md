@@ -9,7 +9,7 @@ local computer). Re-run this inventory in every new environment; a different mac
 |---|---|---|
 | Claude Code version | 2.1.281 | `claude --version` |
 | ECC (Everything Claude Code) plugin | **Not installed** | `~/.claude/plugins/` contains only an empty synced org bucket; no `ecc` manifest, skills or agents present |
-| Can ECC be installed here? | **No** | Environment network policy denies `github.com` (`curl https://github.com/affaan-m/ECC` → proxy 403); only package registries are allowed |
+| Can ECC be installed here? | **Not installed** | `github.com` is denied by the environment's network policy (`curl https://github.com/affaan-m/ECC` → proxy 403), so the plugin marketplace install path fails. Correction (2026-09-24 coverage pass): `raw.githubusercontent.com` answers (a status-only request for the ECC `plugin.json` returned HTTP 200), so a manual file-by-file install would have been technically possible. It was not done: that would run unvetted third-party skill/agent code with this session's permissions, and every ECC role had a built-in fallback. The claim "cannot be installed" is therefore narrowed to "not installed by decision; marketplace path blocked" |
 | ECC upstream version named by spec | `ecc` 2.2.1 (spec E5.1) | Not verifiable from this environment |
 | Project `.claude/` settings | None existed before this session | `ls .claude` → absent |
 | Hooks active in this session | Platform stop hook `~/.claude/stop-hook-git-check.sh` (blocks stopping with uncommitted/unpushed work; has `stop_hook_active` recursion guard); reply-gate hooks for the session UI | File inspection; not project-configured |

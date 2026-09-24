@@ -48,7 +48,9 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 1. **Verify the tree**: `scripts/verify.sh` (format → lint → typecheck → all tests → finance model) exits 0 on the
    exact commit; CI green on the same SHA.
 2. **Database**: `supabase link --project-ref <staging-ref>` then `supabase db push`. Migrations are forward-only
-   and ordered by file name (0001 … 0650). Before production, rehearse on a restored copy (§6). Confirm
+   and ordered by file name (0001 … 0730 at the time of writing; list `supabase/migrations`). 0720 creates a trigger on
+   `auth.sessions`: confirm the hosted project accepts it (Owner Action 20) — if it is refused the migration fails
+   loudly and a Supabase Auth hook must replace it. Before production, rehearse on a restored copy (§6). Confirm
    `select count(*) from pg_policies` and run the schema invariant queries from `supabase/tests/schema_invariants.test.ts`
    against the linked database (read-only) and record the output.
 3. **Worker**: set secrets (§2), replace Hyperdrive placeholders, `cd apps/api && pnpm deploy:staging`.
@@ -61,8 +63,13 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 6. **Web portal**: `pnpm --filter @pencillift/web build` → deploy `apps/web/dist` (Cloudflare Pages or the chosen
    static host) with `Referrer-Policy: no-referrer` and a CSP allowing only the API origin. Public pages
    (privacy, terms, support, account deletion) must be reachable before store review (AC_DEPLOY_04).
-7. **Mobile**: `eas build --profile preview` (internal) then `production`; signing and store metadata per owner
-   actions #5 and #11.
+7. **Mobile**: `eas build --platform ios --profile preview` and `eas build --platform android --profile preview`
+   (internal), then the `production` profile; `app.config.ts` needs `extra.eas.projectId` from the owner's Expo
+   project, app icons/splash (brand assets), and an iOS privacy manifest that declares the collected data types
+   (photos, email address, user content) — signing and store metadata per owner actions #5 and #11.
+8. **DNS and TLS**: point `pencillift.com` (public site and portal) and the API hostname at Cloudflare (owner action
+   #8); certificates are issued by Cloudflare's edge. Enforce HTTPS-only and HSTS on both hostnames, and confirm the
+   public legal pages load over HTTPS before store review. Record the hostnames in `docs/Connections.md`.
 
 ## 4. Scheduled work and durable jobs
 
