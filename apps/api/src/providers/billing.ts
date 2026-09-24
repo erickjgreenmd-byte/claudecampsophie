@@ -27,6 +27,11 @@ export interface StripeBillingClient {
   readonly isMock: boolean;
   /** Attaches a one-time coupon to a DRAFT renewal invoice only (never a proration invoice). */
   addDiscountToDraftInvoice(invoiceId: string, couponId: string): Promise<void>;
+  /**
+   * The invoice a charge paid, for refunds and disputes (a Dispute references only the charge and
+   * payment intent). Null when the charge paid no invoice.
+   */
+  invoiceForCharge(chargeId: string, paymentIntentId: string | null): Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -161,6 +166,30 @@ export function createStripeClient(
       );
       if (!response.ok) throw new Error(`Stripe invoice discount failed with ${response.status}`);
     },
+    async invoiceForCharge(chargeId, paymentIntentId) {
+      const headers = { authorization: `Bearer ${secretKey}` };
+      // Older API versions expose charge.invoice directly.
+      const charge = await fetchImpl(
+        `https://api.stripe.com/v1/charges/${encodeURIComponent(chargeId)}`,
+        { headers },
+      );
+      if (!charge.ok) throw new Error(`Stripe charge lookup failed with ${charge.status}`);
+      const body = (await charge.json()) as { invoice?: unknown; payment_intent?: unknown };
+      if (typeof body.invoice === 'string') return body.invoice;
+      // Newer API versions link invoices to payments through invoice payments.
+      const intent =
+        paymentIntentId ?? (typeof body.payment_intent === 'string' ? body.payment_intent : null);
+      if (!intent) return null;
+      const payments = await fetchImpl(
+        `https://api.stripe.com/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=${encodeURIComponent(intent)}`,
+        { headers },
+      );
+      if (!payments.ok)
+        throw new Error(`Stripe invoice payment lookup failed with ${payments.status}`);
+      const list = (await payments.json()) as { data?: { invoice?: unknown }[] };
+      const invoice = list.data?.[0]?.invoice;
+      return typeof invoice === 'string' ? invoice : null;
+    },
   };
 }
 
@@ -184,15 +213,22 @@ export function createSubscriberStateMock(): SubscriberStateProvider & {
 
 export function createStripeClientMock(): StripeBillingClient & {
   readonly discounts: { invoiceId: string; couponId: string }[];
+  /** What the (mocked) Stripe API answers for charge -> invoice lookups. */
+  readonly chargeInvoices: Map<string, string>;
 } {
   const discounts: { invoiceId: string; couponId: string }[] = [];
+  const chargeInvoices = new Map<string, string>();
   return {
     name: 'stripe_mock',
     isMock: true,
     discounts,
+    chargeInvoices,
     addDiscountToDraftInvoice(invoiceId, couponId) {
       discounts.push({ invoiceId, couponId });
       return Promise.resolve();
+    },
+    invoiceForCharge(chargeId) {
+      return Promise.resolve(chargeInvoices.get(chargeId) ?? null);
     },
   };
 }

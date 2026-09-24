@@ -147,7 +147,11 @@ export interface StripeInvoice {
   readonly period_start?: number;
   readonly period_end?: number;
   readonly lines?: {
-    data?: { period?: { start: number; end: number }; price?: { id?: string } | null }[];
+    data?: {
+      period?: { start: number; end: number };
+      price?: { id?: string } | null;
+      proration?: boolean | null;
+    }[];
   } | null;
   readonly metadata?: Record<string, string> | null;
   readonly subscription_details?: { metadata?: Record<string, string> | null } | null;
@@ -160,8 +164,22 @@ export function stripeBillingRef(invoice: StripeInvoice): string | null {
   );
 }
 
+/**
+ * The subscription line defines the period and price. A renewal invoice can list pending proration
+ * lines (mid-cycle plan changes) first; they never define the period (RV-lead-billing-p17-8).
+ */
+function subscriptionLine(invoice: StripeInvoice) {
+  const lines = (invoice.lines?.data ?? []).filter((l) => l.period && l.price?.id);
+  const regular = lines.filter((l) => l.proration !== true);
+  const pool = regular.length > 0 ? regular : lines;
+  return pool.reduce<(typeof lines)[number] | undefined>(
+    (best, l) => (best === undefined || l.period!.start > best.period!.start ? l : best),
+    undefined,
+  );
+}
+
 export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeriod | null {
-  const line = invoice.lines?.data?.[0];
+  const line = subscriptionLine(invoice);
   const period = line?.period;
   if (!period || !line?.price?.id) return null;
   const kind =
@@ -379,6 +397,22 @@ export async function recordBillingPeriod(
       settled_at = coalesce(public.billing_periods.settled_at, excluded.settled_at)
     returning id
   `;
+  // A refund that arrived before this charge is applied now (RV-lead-billing-p17-3).
+  const [parked] = await tx<{ kind: SettlementEvent; refunded_cents: number | null }[]>`
+    delete from public.pending_refunds
+     where channel = ${period.channel} and provider_period_id = ${period.providerPeriodId} and family_id = ${familyId}
+    returning kind, refunded_cents
+  `;
+  if (parked) {
+    await applyRefund(
+      tx,
+      familyId,
+      period.channel,
+      period.providerPeriodId,
+      parked.kind,
+      parked.refunded_cents,
+    );
+  }
   return { id: row!.id, paidSlots, regularCents };
 }
 
@@ -409,13 +443,24 @@ export async function reconcilePromotionsForPeriod(
      where family_id = ${familyId} and channel = ${period.channel} and state in ('reserved', 'provider_pending')
      for update
   `;
-  const matching = candidates.filter((r) =>
-    isFirstPurchase
-      ? r.target_period_key === `first:${period.channel}`
-      : r.target_period_start !== null &&
-        Math.abs(r.target_period_start.getTime() - period.periodStart.getTime()) <=
-          MATCH_TOLERANCE_MS,
-  );
+  const firstPrefix = `first:${period.channel}`;
+  const matching = candidates.filter((r) => {
+    const key = r.target_period_key;
+    if (key === firstPrefix) return isFirstPurchase;
+    if (key.startsWith(`${firstPrefix}:`)) {
+      // A lapsed family's first period after the lapse (RV-lead-billing-p17-1): the store may
+      // report the re-subscription as an initial purchase or as a renewal.
+      const lapsedEnd = Date.parse(key.slice(firstPrefix.length + 1));
+      return (
+        !Number.isNaN(lapsedEnd) && period.periodStart.getTime() >= lapsedEnd - MATCH_TOLERANCE_MS
+      );
+    }
+    return (
+      !isFirstPurchase &&
+      r.target_period_start !== null &&
+      Math.abs(r.target_period_start.getTime() - period.periodStart.getTime()) <= MATCH_TOLERANCE_MS
+    );
+  });
   const confirmed: string[] = [];
   const rejected: string[] = [];
   const discounted = period.discountSources.includes('promo_code');
@@ -468,33 +513,71 @@ export async function reconcilePromotionsForPeriod(
 }
 
 /** Refund/chargeback: marks the period and records exactly one donation reversal if it had accrued. */
+export type SettlementEvent = 'refund' | 'partial_refund' | 'chargeback' | 'chargeback_reversed';
+
+/**
+ * Refund/chargeback (and a won dispute): marks the period and records at most one donation
+ * reversal (or reinstatement). A full `refund` with a provider amount below the charge is recorded
+ * as partial (RV-lead-billing-p17-7). An event for a period we have not recorded yet is parked in
+ * `pending_refunds` and applied when the period arrives (RV-lead-billing-p17-3).
+ */
 export async function applyRefund(
   tx: Tx,
   familyId: string,
   channel: BillingChannel,
   providerPeriodId: string,
-  kind: 'refund' | 'partial_refund' | 'chargeback',
+  kind: SettlementEvent,
   refundedCents: number | null,
-): Promise<{ adjusted: boolean }> {
+): Promise<{ adjusted: boolean; pending?: boolean }> {
+  const [current] = await tx<{ id: string; charged_amount_cents: number; settlement: string }[]>`
+    select id, charged_amount_cents, settlement from public.billing_periods
+     where family_id = ${familyId} and channel = ${channel} and provider_period_id = ${providerPeriodId}
+     for update
+  `;
+  if (!current) {
+    if (kind === 'chargeback_reversed') return { adjusted: false };
+    await tx`
+      insert into public.pending_refunds (family_id, channel, provider_period_id, kind, refunded_cents)
+      values (${familyId}, ${channel}, ${providerPeriodId}, ${kind}, ${refundedCents})
+      on conflict (channel, provider_period_id) do update
+        set kind = case when excluded.kind = 'chargeback' or public.pending_refunds.kind = 'chargeback' then 'chargeback'
+                        when excluded.kind = 'refund' or public.pending_refunds.kind = 'refund' then 'refund'
+                        else 'partial_refund' end,
+            refunded_cents = greatest(public.pending_refunds.refunded_cents, excluded.refunded_cents)
+        where public.pending_refunds.family_id = ${familyId}
+    `;
+    return { adjusted: false, pending: true };
+  }
+  const effective: SettlementEvent =
+    kind === 'refund' && refundedCents !== null && refundedCents < current.charged_amount_cents
+      ? 'partial_refund'
+      : kind;
   const [period] = await tx<
     {
       id: string;
-      charged_amount_cents: number;
-      settlement: 'refunded' | 'partially_refunded' | 'chargeback';
+      settlement: 'settled' | 'refunded' | 'partially_refunded' | 'chargeback';
       refunded_cents: number;
     }[]
   >`
     update public.billing_periods
-       set settlement = ${kind === 'chargeback' ? 'chargeback' : kind === 'partial_refund' ? 'partially_refunded' : 'refunded'},
-           refunded_cents = greatest(refunded_cents, ${refundedCents ?? 0}, case when ${kind} = 'refund' then charged_amount_cents else 0 end)
-     where family_id = ${familyId} and channel = ${channel} and provider_period_id = ${providerPeriodId}
-     returning id, charged_amount_cents, settlement, refunded_cents
+       set settlement = case
+             when ${effective} = 'chargeback_reversed' then
+               case when settlement = 'chargeback' then 'settled' else settlement end
+             when ${effective} = 'chargeback' then 'chargeback'
+             when ${effective} = 'partial_refund' then
+               case when settlement in ('refunded', 'chargeback') then settlement else 'partially_refunded' end
+             else 'refunded' end,
+           refunded_cents = case
+             when ${effective} = 'chargeback_reversed' then refunded_cents
+             when ${effective} = 'refund' then greatest(refunded_cents, ${refundedCents ?? 0}, charged_amount_cents)
+             else greatest(refunded_cents, ${refundedCents ?? 0}) end
+     where id = ${current.id}
+     returning id, settlement, refunded_cents
   `;
-  if (!period) return { adjusted: false };
   const [accrual] = await tx<
     { id: string; amount_cents: number; payout_batch_id: string | null }[]
   >`
-    select id, amount_cents, payout_batch_id from public.donation_accruals where billing_period_id = ${period.id}
+    select id, amount_cents, payout_batch_id from public.donation_accruals where billing_period_id = ${period!.id}
   `;
   if (!accrual) return { adjusted: false };
   const existing = await tx<
@@ -506,9 +589,9 @@ export async function applyRefund(
       amountCents: accrual.amount_cents,
       payoutStatus: accrual.payout_batch_id ? 'paid' : 'unpaid',
     },
-    event: kind,
+    event: effective,
     existingAdjustmentKeys: new Set(existing.map((e) => e.idempotency_key)),
-    providerState: { settlement: period.settlement, refundedCents: period.refunded_cents },
+    providerState: { settlement: period!.settlement, refundedCents: period!.refunded_cents },
   });
   if (!adjustment) return { adjusted: false };
   const rows = await tx`
@@ -518,4 +601,79 @@ export async function applyRefund(
     returning id
   `;
   return { adjusted: rows.length > 0 };
+}
+
+const TARGET_ELAPSED_MS = 35 * 24 * 3600 * 1000;
+const FIRST_PERIOD_TIMEOUT_MS = 30 * 24 * 3600 * 1000;
+const ENDED_STATUSES = new Set(['expired', 'revoked', 'refunded']);
+
+/**
+ * Resolves in-flight (provider_pending) redemptions whose target can no longer happen
+ * (RV-lead-billing-p17-2), so a family is never blocked for good and a cap slot never leaks. Only
+ * provider-derived facts decide: the channel's subscription ended at or before the targeted
+ * renewal, or the targeted month has fully elapsed without any matching charge, or a first-period
+ * redemption saw no subscription start for 30 days. Resolved rows become `rejected` (the offer
+ * cannot have applied); confirmed benefits are never touched.
+ */
+export async function resolveUnreachableRedemptions(
+  tx: Tx,
+  now: Date,
+  familyId: string | null = null,
+): Promise<string[]> {
+  const pending = await tx<
+    {
+      id: string;
+      family_id: string;
+      channel: BillingChannel;
+      target_period_key: string;
+      target_period_start: Date | null;
+      created_at: Date;
+    }[]
+  >`
+    select id, family_id, channel, target_period_key, target_period_start, created_at
+      from public.promo_redemptions
+     where state = 'provider_pending' and (${familyId}::uuid is null or family_id = ${familyId}::uuid)
+     order by created_at
+     limit 200
+     for update skip locked
+  `;
+  const resolved: string[] = [];
+  for (const r of pending) {
+    const entitlements = await tx<
+      { status: string; period_start: Date | null; period_end: Date | null }[]
+    >`
+      select status, period_start, period_end from public.family_entitlements
+       where family_id = ${r.family_id} and channel = ${r.channel}
+    `;
+    let reason: string | null = null;
+    if (r.target_period_start !== null) {
+      const start = r.target_period_start.getTime();
+      const ended =
+        entitlements.length > 0 &&
+        entitlements.every(
+          (e) =>
+            ENDED_STATUSES.has(e.status) &&
+            e.period_end !== null &&
+            e.period_end.getTime() <= start + MATCH_TOLERANCE_MS,
+        );
+      if (ended && now.getTime() >= start) reason = 'TARGET_PERIOD_NOT_RENEWED';
+      else if (now.getTime() > start + TARGET_ELAPSED_MS) reason = 'TARGET_PERIOD_ELAPSED';
+    } else if (now.getTime() - r.created_at.getTime() > FIRST_PERIOD_TIMEOUT_MS) {
+      const started = entitlements.some(
+        (e) => e.period_start !== null && e.period_start.getTime() >= r.created_at.getTime(),
+      );
+      if (!started) reason = 'FIRST_PERIOD_NOT_STARTED';
+    }
+    if (reason === null) continue;
+    const next = transitionRedemption('provider_pending', 'reconcile_not_applied');
+    if (!next.ok) continue;
+    await tx`update public.promo_redemptions set state = ${next.value} where id = ${r.id}`;
+    await tx`
+      insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+      values (${r.family_id}, 'system', 'promo.redemption_unreachable', 'promo_redemption', ${r.id},
+              ${JSON.stringify({ reason })}::text::jsonb)
+    `;
+    resolved.push(r.id);
+  }
+  return resolved;
 }

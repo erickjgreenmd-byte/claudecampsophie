@@ -136,7 +136,14 @@ begin
     left join public.donation_payout_batches b on b.id = d.payout_batch_id
    where d.school_id = p_school and d.donation_month = p_month;
   hide_signups := not exact and signups between 1 and 4;
-  hide_eligible := not exact and (eligible between 1 and 4 or abs(signups - eligible) between 1 and 4);
+  -- Every family is worth exactly 100 cents, so the amounts are counts too (RV-lead-billing-p17-9):
+  -- eligible*100 - accrued counts refunded/charged-back families and eligible*100 - paid counts
+  -- unpaid ones. Any such group of 1-4 withholds the eligible count and both amounts.
+  hide_eligible := not exact and (
+    eligible between 1 and 4
+    or abs(signups - eligible) between 1 and 4
+    or abs(eligible * 100 - accrued) between 1 and 499
+    or abs(eligible * 100 - paid) between 1 and 499);
   return query select
     p_school,
     p_month,

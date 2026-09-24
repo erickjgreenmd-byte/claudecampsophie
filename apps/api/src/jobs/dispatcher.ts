@@ -1,6 +1,6 @@
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
 import type { AppDeps } from '../middleware/context.ts';
-import { applySnapshots } from '../services/billing-sync.ts';
+import { applySnapshots, resolveUnreachableRedemptions } from '../services/billing-sync.ts';
 import { purgeExpiredServes } from '../services/monetization-retention.ts';
 import { runDonationAccrual, runGeneration } from '../services/p17-jobs.ts';
 
@@ -170,7 +170,10 @@ export async function expireStaleReservations(deps: JobDeps): Promise<number> {
       returning id
     `,
   );
-  return rows.length;
+  // In-flight redemptions whose target can no longer happen are resolved from provider state
+  // (RV-lead-billing-p17-2): the family is never blocked for good and cap slots do not leak.
+  const resolved = await deps.db.asService((tx) => resolveUnreachableRedemptions(tx, deps.clock()));
+  return rows.length + resolved.length;
 }
 
 /**

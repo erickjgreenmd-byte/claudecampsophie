@@ -237,7 +237,11 @@ export async function runDonationAccrual(
   let skipped = 0;
   for (const { family_id: familyId } of families) {
     const counts = await db.asService(async (tx) => {
-      await tx`select 1 from public.families where id = ${familyId} for update`;
+      // Re-check the tombstone under the lock: a deletion may have committed since the family
+      // list was read (RV-lead-billing-p17-10).
+      const [live] = await tx<{ deleted_at: Date | null }[]>`
+        select deleted_at from public.families where id = ${familyId} for update`;
+      if (!live || live.deleted_at) return { inserted: 0, skipped: 0 };
       const periods = await tx<PeriodRow[]>`
         select id, family_id, channel, provider_period_id, kind, period_start, period_end, paid_slots, regular_amount_cents,
                charged_amount_cents, discount_cents, discount_sources, settlement, settled_at, refunded_cents
