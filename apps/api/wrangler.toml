@@ -1,0 +1,48 @@
+# PencilLift API Worker (spec E2 Deployment). Secrets are set with `wrangler secret put` and are never
+# committed; see docs/Deployment_Runbook.md for the required names. The Hyperdrive ids below are
+# placeholders until the owner creates the Hyperdrive configs (docs/Owner_Actions.md) — deploy fails
+# closed rather than pointing at an invented database.
+name = "pencillift-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[observability]
+enabled = true
+
+# Durable scheduled work (apps/api/src/jobs/dispatcher.ts). Every task is idempotent, so an
+# overlapping or repeated tick is harmless.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+APP_ENV = "development"
+PROGRAM_TIMEZONE = "UTC"
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "OWNER_ACTION_HYPERDRIVE_ID_DEV"
+localConnectionString = "postgres://postgres:postgres@127.0.0.1:5432/postgres"
+
+[env.staging]
+name = "pencillift-api-staging"
+[env.staging.vars]
+APP_ENV = "staging"
+PROGRAM_TIMEZONE = "UTC"
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+[[env.staging.hyperdrive]]
+binding = "HYPERDRIVE"
+id = "OWNER_ACTION_HYPERDRIVE_ID_STAGING"
+
+[env.production]
+name = "pencillift-api-production"
+[env.production.vars]
+APP_ENV = "production"
+PROGRAM_TIMEZONE = "UTC"
+[env.production.triggers]
+crons = ["*/5 * * * *"]
+[[env.production.hyperdrive]]
+binding = "HYPERDRIVE"
+id = "OWNER_ACTION_HYPERDRIVE_ID_PRODUCTION"
