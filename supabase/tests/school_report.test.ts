@@ -39,20 +39,35 @@ async function family(chargedCents: number | null, month = '2026-10') {
   }
 }
 
-const counts = (viewer: string, aal: 'aal1' | 'aal2') =>
+interface CountsRow {
+  active_families: string;
+  positive_paying_families: string;
+  fully_discounted_families: string;
+}
+
+/**
+ * The counts as the API reads them (0740): the program calendar zone (`stated`) is set for the
+ * transaction, then the function is called with `zone`. `stated: null` is a direct client call.
+ */
+const countsIn = (
+  viewer: string,
+  aal: 'aal1' | 'aal2',
+  zone: string,
+  stated: string | null,
+  month = '2026-10',
+) =>
   db.asParent(
     viewer,
-    (tx) => tx<
-      {
-        active_families: string;
-        positive_paying_families: string;
-        fully_discounted_families: string;
-      }[]
-    >`
-      select active_families, positive_paying_families, fully_discounted_families
-        from public.school_month_report_counts(${schoolId}, '2026-10', 'UTC')`,
+    async (tx) => {
+      if (stated !== null) await tx`select set_config('pencillift.program_zone', ${stated}, true)`;
+      return tx<CountsRow[]>`
+        select active_families, positive_paying_families, fully_discounted_families
+          from public.school_month_report_counts(${schoolId}, ${month}, ${zone})`;
+    },
     { aal },
   );
+
+const counts = (viewer: string, aal: 'aal1' | 'aal2') => countsIn(viewer, aal, 'UTC', 'UTC');
 
 describe('school report counts and suppression', () => {
   it('withholds every count from a school viewer when subtraction would reveal 1-4 families', async () => {
@@ -97,6 +112,42 @@ describe('school report counts and suppression', () => {
     );
     // 10 signups, 0 accruals: difference 10, nothing small -> exact values are safe to show.
     expect(rows[0]).toMatchObject({ attributed_signups: '10', donation_eligible_families: '0' });
+  });
+
+  it('a school viewer cannot choose the zone: only the program zone the API states is served (BUG-074)', async () => {
+    // Same month, two zones: a viewer who could difference them would isolate the families whose
+    // period started inside the offset band, which per-call suppression cannot see.
+    await expect(countsIn(schoolViewer, 'aal1', 'Pacific/Kiritimati', 'UTC')).rejects.toThrow(
+      /program calendar zone/,
+    );
+    await expect(countsIn(schoolViewer, 'aal1', 'Etc/GMT+12', 'UTC')).rejects.toThrow(
+      /program calendar zone/,
+    );
+    // A direct client call states no zone at all: refused whatever zone it names.
+    await expect(countsIn(schoolViewer, 'aal1', 'UTC', null)).rejects.toThrow(
+      /program calendar zone/,
+    );
+    // The zone the API states is served, in that zone.
+    const [served] = await countsIn(
+      schoolViewer,
+      'aal1',
+      'America/Los_Angeles',
+      'America/Los_Angeles',
+    );
+    expect(served).toBeDefined();
+  });
+
+  it('the owner (exact figures) may read the counts in any zone', async () => {
+    const [utc] = await countsIn(owner, 'aal2', 'UTC', null);
+    const [kiritimati] = await countsIn(owner, 'aal2', 'Pacific/Kiritimati', null);
+    expect(utc).toBeDefined();
+    expect(kiritimati).toBeDefined();
+  });
+
+  it('clients cannot call the stated-zone helper', async () => {
+    await expect(
+      db.asParent(schoolViewer, (tx) => tx`select app.program_calendar_zone()`),
+    ).rejects.toThrow(/permission denied/);
   });
 
   it('a user who is not an admin of this school gets nothing', async () => {

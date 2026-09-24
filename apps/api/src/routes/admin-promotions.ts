@@ -542,9 +542,11 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
       `,
     );
     if (!row) throw new ApiError('NOT_FOUND', 'School not found');
-    const [counts] = await c.var.deps.db.asParent(
-      c.var.parent,
-      (tx) => tx<
+    const zone = c.var.deps.config.programTimezone;
+    const [counts] = await c.var.deps.db.asParent(c.var.parent, async (tx) => {
+      // A school viewer is served only in the program zone this transaction states (0740, BUG-074).
+      await tx`select set_config('pencillift.program_zone', ${zone}, true)`;
+      return tx<
         {
           active_families: string;
           positive_paying_families: string;
@@ -552,9 +554,9 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
         }[]
       >`
         select active_families, positive_paying_families, fully_discounted_families
-          from public.school_month_report_counts(${id}, ${month}, ${c.var.deps.config.programTimezone})
-      `,
-    );
+          from public.school_month_report_counts(${id}, ${month}, ${zone})
+      `;
+    });
     return c.json({
       schoolId: row.school_id,
       month: row.donation_month,

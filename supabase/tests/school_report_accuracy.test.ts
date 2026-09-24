@@ -142,9 +142,13 @@ const counts = (schoolId: string, viewer: string, aal: 'aal1' | 'aal2') =>
   db
     .asParent(
       viewer,
-      (tx) => tx<CountsRow[]>`
-        select active_families, positive_paying_families, fully_discounted_families
-          from public.school_month_report_counts(${schoolId}, '2026-10', 'UTC')`,
+      async (tx) => {
+        // As the API does (0740): the program calendar zone is stated for the transaction.
+        await tx`select set_config('pencillift.program_zone', 'UTC', true)`;
+        return tx<CountsRow[]>`
+          select active_families, positive_paying_families, fully_discounted_families
+            from public.school_month_report_counts(${schoolId}, '2026-10', 'UTC')`;
+      },
       { aal },
     )
     .then((rows) => rows[0]!);

@@ -48,7 +48,7 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 1. **Verify the tree**: `scripts/verify.sh` (format → lint → typecheck → all tests → finance model) exits 0 on the
    exact commit; CI green on the same SHA.
 2. **Database**: `supabase link --project-ref <staging-ref>` then `supabase db push`. Migrations are forward-only
-   and ordered by file name (0001 … 0730 at the time of writing; list `supabase/migrations`). 0720 creates a trigger on
+   and ordered by file name (0001 … 0740 at the time of writing; list `supabase/migrations`). 0720 creates a trigger on
    `auth.sessions`: confirm the hosted project accepts it (Owner Action 20) — if it is refused the migration fails
    loudly and a Supabase Auth hook must replace it. Before production, rehearse on a restored copy (§6). Confirm
    `select count(*) from pg_policies` and run the schema invariant queries from `supabase/tests/schema_invariants.test.ts`
