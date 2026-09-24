@@ -25,6 +25,9 @@ import { hmacSha256, timingSafeEqual, toHex } from '../security/crypto.ts';
  * tests; `apply*` functions run inside the webhook transaction with the family row locked.
  */
 
+/** What the whole-family sync needs; the request context and the scheduled tick both provide it. */
+export type BillingSyncDeps = Pick<AppDeps, 'db' | 'providers' | 'config' | 'log'>;
+
 /** A store subscription already belongs to another family's ledger (BUG-006); never skipped. */
 export class SubscriptionBoundElsewhere extends Error {
   constructor() {
@@ -869,7 +872,7 @@ export async function reconcileFamilyBilling(
 
 /** Fetches a family's provider state and reconciles it with the family row locked. */
 export async function syncFamilyFromProvider(
-  deps: AppDeps,
+  deps: BillingSyncDeps,
   familyId: string,
   billingRef: string,
   now: Date,
@@ -894,7 +897,7 @@ export async function syncFamilyFromProvider(
  * logged, and that family is corrected by its own next sync.
  */
 export async function reverifyFormerHolders(
-  deps: AppDeps,
+  deps: BillingSyncDeps,
   familyId: string,
   claims: readonly NewClaim[],
   now: Date,

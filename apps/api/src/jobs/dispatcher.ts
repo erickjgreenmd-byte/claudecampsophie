@@ -1,7 +1,13 @@
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
 import type { Tx } from '../db.ts';
 import type { AppDeps } from '../middleware/context.ts';
-import { applySnapshots, resolveUnreachableRedemptions } from '../services/billing-sync.ts';
+import { runIdentityHousekeeping } from '../auth/housekeeping.ts';
+import {
+  resolveUnreachableRedemptions,
+  reverifyFormerHolders,
+  syncFamilyFromProvider,
+} from '../services/billing-sync.ts';
+import { enqueueDueLearningJobs } from './learning-jobs.ts';
 import { purgeExpiredServes } from '../services/monetization-retention.ts';
 import { runDonationAccrual, runGeneration } from '../services/p17-jobs.ts';
 
@@ -146,6 +152,10 @@ export interface TickReport {
   placementServesPurged: number;
   entitlementsReconciled: number;
   inactivity: { notified: number; deleted: number };
+  /** Rate-limit buckets and sign-out records cleared in bulk (migration 0720). */
+  identityHousekeeping: { rateLimitBuckets: number; endedAuthSessions: number };
+  /** Daily, Thursday and top-up jobs queued this tick (0 when learning handlers are not registered). */
+  learningJobsEnqueued: number;
   jobs: { succeeded: number; retried: number; deadLettered: number };
   /** Steps that failed this tick (logged by code); the other steps still ran. */
   failedSteps: string[];
@@ -537,15 +547,13 @@ export async function reconcileStaleEntitlements(deps: JobDeps, limit = 25): Pro
   let reconciled = 0;
   for (const family of families) {
     try {
-      const snapshots = await deps.providers.subscriptions.fetchSubscriptions(
-        family.billing_ref,
-        now,
-      );
-      await deps.db.asService(async (tx) => {
-        await tx`select 1 from public.families where id = ${family.id} for update`;
-        await applySnapshots(tx, family.id, snapshots, deps.config.billingEnvironment, now);
-      });
-      reconciled += 1;
+      // The same whole-family reconciliation as sync and webhooks: a subscription the provider no
+      // longer lists stops granting, released children go back to draft (RV-billing-1/2).
+      const result = await syncFamilyFromProvider(deps, family.id, family.billing_ref, now);
+      if (result) {
+        await reverifyFormerHolders(deps, family.id, result.newClaims, now, 'scheduled');
+        reconciled += 1;
+      }
     } catch {
       // One provider failure never stops the sweep; the next tick retries this family.
       deps.log({ level: 'warn', event: 'entitlement_reconcile_failed' });
@@ -782,6 +790,18 @@ export async function runScheduledTick(
       throw error;
     }
   });
+  const identityHousekeeping = await step(
+    'identity_housekeeping',
+    { rateLimitBuckets: 0, endedAuthSessions: 0 },
+    () => runIdentityHousekeeping(deps.db, now),
+  );
+  // Learning jobs are queued only where a worker will run them, and before the job ledger so a due
+  // set is built in the same tick.
+  const learningJobsEnqueued = await step('learning_enqueue', 0, async () => {
+    if (!handlers.daily_set_generate) return 0;
+    const r = await enqueueDueLearningJobs(deps, now);
+    return r.dailyJobs + r.reviewJobs + r.topUpJobs;
+  });
   const jobs = await step('jobs', { succeeded: 0, retried: 0, deadLettered: 0 }, () =>
     runJobs(deps, handlers),
   );
@@ -796,6 +816,8 @@ export async function runScheduledTick(
     placementServesPurged,
     entitlementsReconciled,
     inactivity,
+    identityHousekeeping,
+    learningJobsEnqueued,
     jobs,
     failedSteps,
   };

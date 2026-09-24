@@ -63,6 +63,7 @@ import {
 import type { Tx } from '../db.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
+import { acquireSpendHold, releaseSpendHold, SpendCeilingReached } from './spend-ceiling.ts';
 
 /**
  * Daily practice, Thursday reviews and late-scan top-ups (spec P7, P8, P9, P12; AC_LEARNING_03..09).
@@ -543,18 +544,6 @@ async function recordUsage(
   }
 }
 
-async function spendCeilingReached(deps: JobDeps): Promise<boolean> {
-  const month = deps.clock().toISOString().slice(0, 7);
-  const [budget] = await deps.db.asService(
-    (tx) => tx<{ budget_micros: string; spent: string }[]>`
-      select b.budget_micros::text,
-             coalesce((select sum(cost_micros) from public.ai_usage_events
-                        where created_at >= date_trunc('month', ${deps.clock()}::timestamptz)), 0)::text as spent
-        from public.spend_budgets b where b.scope = 'global' and b.period_key = ${month}`,
-  );
-  return budget !== undefined && BigInt(budget.spent) >= BigInt(budget.budget_micros);
-}
-
 /**
  * One bounded request that may re-theme word problems and add an intro line. Fails closed to the
  * unchanged bank items on no client, no consent, the ZDR gate, the spend ceiling, any provider or
@@ -591,7 +580,13 @@ export async function personalizeItems(
     deps.log({ level: 'info', event: 'practice_ai_skipped', code: 'AI_NOT_AVAILABLE' });
     return unchanged;
   }
-  if (await spendCeilingReached(deps)) {
+  // Admitted only while recorded spend plus every in-flight hold (scans included) is below the
+  // owner's cap; the hold covers this stage's upper-bound cost (RV-lead-jobs-ai-10).
+  let hold: string | null;
+  try {
+    hold = await acquireSpendHold(deps, PROPOSED_STAGE_LIMITS[stage].maxCostMicros);
+  } catch (error) {
+    if (!(error instanceof SpendCeilingReached)) throw error;
     deps.log({ level: 'warn', event: 'practice_ai_skipped', code: 'SPEND_CEILING' });
     return unchanged;
   }
@@ -608,26 +603,31 @@ export async function personalizeItems(
     });
   });
   const prompt = stage === 'daily_set' ? PROMPTS.daily_set : PROMPTS.thursday_bundle;
-  const out = await runStage<typeof prompt.outputSchema>({
-    prompt,
-    input: [
-      dataEnvelope({
-        gradeLevel: ctx.grade,
-        ageBand: ctx.ageBand,
-        // Skill labels only: no names, homework text, answers or scores.
-        focusSkills: focusSkills.slice(0, 6).map(skillLabel),
-        wordProblems,
-      }),
-    ],
-    client: ai,
-    limits: PROPOSED_STAGE_LIMITS[stage],
-    rates: options.rates ?? DEFAULT_RATE_TABLE_2026_09_18,
-    gate,
-    metadata: { stage },
-    estimatedInputTokens: 700 + 80 * wordProblems.length,
-    ...(options.sleep ? { sleep: options.sleep } : {}),
-  });
-  await recordUsage(deps, ctx, out.attempts);
+  let out: Awaited<ReturnType<typeof runStage<typeof prompt.outputSchema>>>;
+  try {
+    out = await runStage<typeof prompt.outputSchema>({
+      prompt,
+      input: [
+        dataEnvelope({
+          gradeLevel: ctx.grade,
+          ageBand: ctx.ageBand,
+          // Skill labels only: no names, homework text, answers or scores.
+          focusSkills: focusSkills.slice(0, 6).map(skillLabel),
+          wordProblems,
+        }),
+      ],
+      client: ai,
+      limits: PROPOSED_STAGE_LIMITS[stage],
+      rates: options.rates ?? DEFAULT_RATE_TABLE_2026_09_18,
+      gate,
+      metadata: { stage },
+      estimatedInputTokens: 700 + 80 * wordProblems.length,
+      ...(options.sleep ? { sleep: options.sleep } : {}),
+    });
+    await recordUsage(deps, ctx, out.attempts);
+  } finally {
+    await releaseSpendHold(deps, hold); // after the stage's actual cost is recorded
+  }
   if (!out.result.ok) {
     deps.log({ level: 'warn', event: 'practice_ai_failed', code: out.result.error.code });
     return unchanged;

@@ -7,8 +7,14 @@ import {
 } from '@pencillift/ai';
 import { cryptoRandom } from '@pencillift/domain';
 import { generateSkillItems, seededRandom } from '@pencillift/domain/bank';
-import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
-import { runJobs, type JobDeps, type JobRow } from '../src/jobs/dispatcher.ts';
+import { seedFamily, seedOwnerAdmin, type SeededFamily } from '@pencillift/db/testing/fixtures';
+import {
+  DEFAULT_HANDLERS,
+  runJobs,
+  runScheduledTick,
+  type JobDeps,
+  type JobRow,
+} from '../src/jobs/dispatcher.ts';
 import {
   createLearningHandlers,
   enqueueDueLearningJobs,
@@ -347,6 +353,28 @@ describe('daily practice (AC_LEARNING_03/04)', () => {
     expect(notes!.notes.map((n) => n.code)).toContain('NO_HISTORY_GRADE_DIAGNOSTIC');
   });
 
+  it('one scheduled tick enqueues and builds the due daily set (production wiring)', async () => {
+    const fam = await family('America/Los_Angeles');
+    const child = fam.children[0]!.id;
+    at('2026-09-26T23:00:00Z'); // Saturday 16:00 PDT, after the 15:30 default release
+    const report = await runScheduledTick(deps, {
+      ...DEFAULT_HANDLERS,
+      ...createLearningHandlers({ sleep: () => Promise.resolve() }),
+    });
+    expect(report.failedSteps).toEqual([]);
+    expect(report.learningJobsEnqueued).toBeGreaterThanOrEqual(1);
+    const daily = (await sets(child)).filter((s) => s.kind === 'daily');
+    expect(daily.map((s) => s.set_key)).toEqual([`daily:${child}:2026-09-26`]);
+  });
+
+  it('a tick without learning handlers queues no learning work', async () => {
+    const fam = await family('America/Los_Angeles');
+    at('2026-09-26T23:00:00Z');
+    const report = await runScheduledTick(deps, DEFAULT_HANDLERS);
+    expect(report.learningJobsEnqueued).toBe(0);
+    expect(await jobs(fam.children[0]!.id, 'daily_set_generate')).toEqual([]);
+  });
+
   it('weights weak skills from homework evidence', async () => {
     const fam = await family('America/New_York');
     const child = fam.children[0]!.id;
@@ -592,6 +620,43 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
       'rejected_by_validation',
       'rejected_by_validation',
     ]);
+  });
+
+  it('concurrent personalizations at the spend ceiling make at most one AI call (RV-lead-jobs-ai-10)', async () => {
+    const fam = await family();
+    await consent(fam);
+    const adminId = await seedOwnerAdmin(api.db);
+    const [spent] = await api.db.sql<{ micros: string }[]>`
+      select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+    // Room for exactly one stage: recorded spend is one micro below the owner's cap.
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${(BigInt(spent!.micros) + 1n).toString()}::bigint, ${adminId})`;
+    let release!: () => void;
+    const inFlight = new Promise<void>((resolve) => (release = resolve));
+    const client = createMockResponsesClient(async () => {
+      await inFlight; // both runs are admitted or refused before either records its cost
+      return ok({ intro: 'Let’s practice!', items: [] });
+    });
+    try {
+      const ctx = await context(fam);
+      const runs = [1, 2].map(() =>
+        personalizeItems(deps, { ai: client }, ctx, wordProblems, 'daily_set', [
+          'math.word_problems',
+        ]),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      release();
+      const outs = await Promise.all(runs);
+      expect(client.requests).toHaveLength(1);
+      // The refused run falls back to the unchanged bank items.
+      expect(
+        outs.filter((o) => o.rethemed === 0 && o.intro === null).length,
+      ).toBeGreaterThanOrEqual(1);
+    } finally {
+      release();
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
   });
 
   it('without consent nothing is sent to AI and the bank set is generated', async () => {

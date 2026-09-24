@@ -429,6 +429,46 @@ describe('entitlement safety net (spec P11: lost webhooks)', () => {
   });
 });
 
+describe('scheduled billing and identity upkeep (lead wiring)', () => {
+  it('a stale subscription the provider no longer lists stops granting (RV-billing-1 on the tick)', async () => {
+    await api.db.sql`
+      insert into public.store_product_mappings (channel, product_id, environment, paid_slots)
+      values ('app_store', 'pl_family_2', 'sandbox', 2) on conflict do nothing`;
+    const fam = await seedFamily(api.db, { childCount: 0 });
+    const [f] = await api.db.sql<{ billing_ref: string }[]>`
+      select billing_ref from public.families where id = ${fam.familyId}`;
+    const ref = f!.billing_ref;
+    await api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${fam.familyId}, 2, 'app_store')`;
+    // Still inside its period, but last fetched days ago: the sweep re-fetches it.
+    await api.db.sql`
+      insert into public.family_entitlements (family_id, channel, provider_subscription_id, product_id, paid_slots, status,
+        environment, period_start, period_end, provider_updated_at, fetched_at)
+      values (${fam.familyId}, 'app_store', ${`rc:${ref}:app_store:pl_family_2`}, 'pl_family_2', 2, 'active', 'sandbox',
+              '2026-09-10T00:00:00Z', '2026-10-10T00:00:00Z', '2026-09-10T00:00:00Z', '2026-09-20T00:00:00Z')`;
+    api.providers.subscriptions.state.set(ref, []); // moved to another account
+    expect(await reconcileStaleEntitlements(deps)).toBeGreaterThanOrEqual(1);
+    const [row] = await api.db.sql<{ status: string; paid_slots: number }[]>`
+      select e.status, c.paid_slots from public.family_entitlements e
+        join public.family_capacity c on c.family_id = e.family_id
+       where e.family_id = ${fam.familyId}`;
+    expect(row).toEqual({ status: 'revoked', paid_slots: 0 });
+  });
+
+  it('the tick clears rate-limit buckets whose window has ended', async () => {
+    const ended = new Date(api.now.value.getTime() - 60 * 60_000);
+    await api.db.sql`
+      insert into private.rate_limit_buckets (bucket_key, window_start, hits, expires_at)
+      values ('tick-probe:v4:192.0.2.9', ${new Date(ended.getTime() - 15 * 60_000)}, 3, ${ended})`;
+    const report = await runScheduledTick(deps);
+    expect(report.identityHousekeeping.rateLimitBuckets).toBeGreaterThanOrEqual(1);
+    const left = await api.db.sql`
+      select 1 from private.rate_limit_buckets where bucket_key = 'tick-probe:v4:192.0.2.9'`;
+    expect(left).toHaveLength(0);
+  });
+});
+
 describe('inactivity retention (spec P4; disabled until the owner approves the period)', () => {
   const enabled = (): JobDeps => ({
     ...deps,

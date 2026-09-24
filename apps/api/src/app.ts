@@ -1,10 +1,8 @@
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import type { z } from 'zod';
-import { loadReadinessFacts, productionReadiness } from './config.ts';
 import { ApiError, isTransientDbError, knownConstraintError, pgErrorCode } from './errors.ts';
 import { withLiveSessionCheck } from './auth/parent.ts';
-import { assertOwnerAdmin, requireParent } from './middleware/auth.ts';
 import type { AppDeps, AppEnv } from './middleware/context.ts';
 import { toBase64Url, randomBytes } from './security/crypto.ts';
 import { healthRoutes } from './routes/health.ts';
@@ -143,14 +141,6 @@ export function createApp(appDeps: AppDeps): Hono<AppEnv> {
     ),
   );
 
-  // Owner readiness (AC_DEPLOY_07). Registered before healthRoutes(), whose config-only handler for
-  // the same path it supersedes: this one adds database facts (this month's AI spend cap).
-  app.get('/v1/admin/readiness', requireParent, async (c) => {
-    await assertOwnerAdmin(c);
-    const { config, db, clock } = c.var.deps;
-    const facts = await loadReadinessFacts(db, clock());
-    return c.json({ environment: config.environment, checks: productionReadiness(config, facts) });
-  });
   app.route('/', healthRoutes());
   app.route('/v1/adult', adultRoutes());
   app.route('/v1/child', childAuthRoutes());
