@@ -878,16 +878,24 @@ describe('scan hardening (RV-lead-jobs-ai-2, -3, -9, -10, -19)', () => {
   it('the spend ceiling pauses a scan without spending an attempt; the rerun grades the stored questions', async () => {
     const scan = await queuedScan({ pages: 1, maxAttempts: 1 });
     const adminId = await seedOwnerAdmin(api.db);
-    const [spent] = await api.db.sql<{ micros: string }[]>`
-      select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const recorded = async () => {
+      const [row] = await api.db.sql<{ micros: string }[]>`
+        select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+      return BigInt(row!.micros);
+    };
+    // Room for exactly one stage: the owner's cap is recorded spend plus the extraction's upper-bound
+    // estimate, so extraction is admitted and grading + verification would cross the cap.
+    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_LIMITS.extraction.maxCostMicros);
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
-      values ('global', '2026-09', ${(BigInt(spent!.micros) + 1n).toString()}::bigint, ${adminId})`;
+      values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
     const client = scriptedModel({ questions: WORKSHEET.slice(0, 2) });
     try {
       const first = await runJobs(deps, handlerFor(client));
       expect(first).toEqual({ succeeded: 0, retried: 1, deadLettered: 0 });
       expect(client.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+      expect(await recorded()).toBeLessThanOrEqual(cap); // the application never overshoots the cap
       expect(await assignment(scan.assignmentId)).toEqual({
         status: 'failed_retryable',
         error_code: 'SPEND_CEILING',

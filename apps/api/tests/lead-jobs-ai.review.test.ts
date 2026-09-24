@@ -836,10 +836,15 @@ describe('global AI spend ceiling (spec F4, E4 Cost controls)', () => {
     await scanHandler(client)(e.deps, await jobRow(e, scan.jobId));
     const [after] = await e.api.db.sql<{ micros: string }[]>`
       select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
-    expect(BigInt(after!.micros)).toBeGreaterThan(BigInt(spent!.micros) + 1n); // ceiling crossed
-    // The first call crossed the ceiling; everything after it is spend the application should
-    // have refused ("Enforce caps in the application because a provider alert may lag").
+    // Lead update (strict ceiling, coverage pass 2026-09-24): the original line here asserted the
+    // ceiling WAS crossed by the first call — the lenient rule this review called a defect. With
+    // admission requiring spent + held + estimate <= budget, no stage fits one micro-dollar of
+    // headroom, so the stronger form holds: recorded spend never passes the owner's cap.
+    expect(BigInt(after!.micros)).toBeLessThanOrEqual(BigInt(spent!.micros) + 1n);
+    // Everything after the ceiling is spend the application must refuse ("Enforce caps in the
+    // application because a provider alert may lag").
     expect(client.requests.length).toBeLessThanOrEqual(1);
+    expect(client.requests).toEqual([]);
   });
 });
 

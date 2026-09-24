@@ -63,7 +63,12 @@ import {
 import type { Tx } from '../db.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
-import { acquireSpendHold, releaseSpendHold, SpendCeilingReached } from './spend-ceiling.ts';
+import {
+  acquireSpendHold,
+  releaseSpendHold,
+  SpendCeilingReached,
+  SpendCeilingUnevaluable,
+} from './spend-ceiling.ts';
 
 /**
  * Daily practice, Thursday reviews and late-scan top-ups (spec P7, P8, P9, P12; AC_LEARNING_03..09).
@@ -580,15 +585,22 @@ export async function personalizeItems(
     deps.log({ level: 'info', event: 'practice_ai_skipped', code: 'AI_NOT_AVAILABLE' });
     return unchanged;
   }
-  // Admitted only while recorded spend plus every in-flight hold (scans included) is below the
-  // owner's cap; the hold covers this stage's upper-bound cost (RV-lead-jobs-ai-10).
+  // Admitted only when recorded spend + every live hold (scans included) + this stage's upper-bound
+  // estimate stays within the owner's cap (RV-lead-jobs-ai-10). A refused or undecidable budget keeps
+  // the reviewed bank items: the set is still delivered, without an AI call.
   let hold: string | null;
   try {
     hold = await acquireSpendHold(deps, PROPOSED_STAGE_LIMITS[stage].maxCostMicros);
   } catch (error) {
-    if (!(error instanceof SpendCeilingReached)) throw error;
-    deps.log({ level: 'warn', event: 'practice_ai_skipped', code: 'SPEND_CEILING' });
-    return unchanged;
+    if (error instanceof SpendCeilingReached) {
+      deps.log({ level: 'warn', event: 'practice_ai_skipped', code: 'SPEND_CEILING' });
+      return unchanged;
+    }
+    if (error instanceof SpendCeilingUnevaluable) {
+      deps.log({ level: 'error', event: 'practice_ai_skipped', code: 'SPEND_UNEVALUABLE' });
+      return unchanged;
+    }
+    throw error;
   }
   const refs = new Map<string, number>();
   const wordProblems: { ref: string; template: string; context: unknown }[] = [];

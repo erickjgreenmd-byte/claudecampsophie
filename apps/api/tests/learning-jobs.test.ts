@@ -626,12 +626,18 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const fam = await family();
     await consent(fam);
     const adminId = await seedOwnerAdmin(api.db);
-    const [spent] = await api.db.sql<{ micros: string }[]>`
-      select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
-    // Room for exactly one stage: recorded spend is one micro below the owner's cap.
+    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const recorded = async () => {
+      const [row] = await api.db.sql<{ micros: string }[]>`
+        select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+      return BigInt(row!.micros);
+    };
+    // Room for exactly one stage: the owner's cap is recorded spend plus one daily-set upper-bound
+    // estimate, so a second concurrent daily set would cross it.
+    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros);
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
-      values ('global', '2026-09', ${(BigInt(spent!.micros) + 1n).toString()}::bigint, ${adminId})`;
+      values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
     let release!: () => void;
     const inFlight = new Promise<void>((resolve) => (release = resolve));
     const client = createMockResponsesClient(async () => {
@@ -649,12 +655,42 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
       release();
       const outs = await Promise.all(runs);
       expect(client.requests).toHaveLength(1);
+      expect(await recorded()).toBeLessThanOrEqual(cap); // the application never overshoots the cap
       // The refused run falls back to the unchanged bank items.
       expect(
         outs.filter((o) => o.rethemed === 0 && o.intro === null).length,
       ).toBeGreaterThanOrEqual(1);
     } finally {
       release();
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
+  });
+
+  it('an undecidable spend budget keeps the bank items and makes no AI call', async () => {
+    const fam = await family();
+    await consent(fam);
+    const adminId = await seedOwnerAdmin(api.db);
+    // A cap beyond the safe integer range cannot be compared exactly: fail closed to the bank.
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', 9223372036854775807, ${adminId})`;
+    const client = createMockResponsesClient(() => ok({ intro: 'Hi', items: [] }));
+    try {
+      const out = await personalizeItems(
+        deps,
+        { ai: client },
+        await context(fam),
+        wordProblems,
+        'daily_set',
+        ['math.word_problems'],
+      );
+      expect(client.requests).toHaveLength(0);
+      expect(out.items).toEqual(wordProblems);
+      expect(out.intro).toBeNull();
+      expect(
+        api.logs.some((l) => l.event === 'practice_ai_skipped' && l.code === 'SPEND_UNEVALUABLE'),
+      ).toBe(true);
+    } finally {
       await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
     }
   });
