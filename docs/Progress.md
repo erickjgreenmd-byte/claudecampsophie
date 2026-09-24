@@ -1,40 +1,45 @@
 # PencilLift progress (spec E1 record; resume from here)
 
-Branch: `claude/new-session-vil6cz` (pushed after every lead commit). Spec: `PencilLift_Claude_Code_Master_Prompt.md`
-Revision 8. Pricing: $39.99 first child + $9.99 each additional (1–4 paid slots) — unchanged.
+Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on `claude/**` pushes since e067f32).
+Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
+(1–4 paid slots) — unchanged.
 
-## Current milestone
+## Current state (2026-09-24)
 
-M2–M4 build (software) with M0 records done. Everything that needs an external account is blocked on
-`docs/Owner_Actions.md`; nothing is deployed, no live provider has been exercised, no measured AI usage exists.
+Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
+approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
+Acceptance coverage (153 criteria, skeptic-verified): integration_tested 29, unit_tested 16, db_tested 1,
+verified_by_inspection 21, mock_only 14, blocked_external 26, in_progress 45, not_tested 1
+(`docs/Requirement_Coverage.md`, with each row's gap).
 
 ## Done and committed (lead-verified)
 
 | Area | Evidence |
 |---|---|
-| Monorepo, CI, fail-fast gate `scripts/verify.sh` | CI workflow + local runs |
-| Schema 0001–0630 with RLS, append-only ledgers, deletion purge, jsonb shape checks | `supabase/tests` 130 tests on real Postgres 16 |
-| Parent/child auth, PIN step-up, pairing, sessions | `apps/api/tests/auth.test.ts` |
-| P17: parent school/promo flows, owner console API, monthly generation, donation accrual, billing webhooks with promo reconciliation | `promotions`, `admin-promotions`, `webhooks` API tests |
-| Durable scheduler + job ledger (SKIP LOCKED, retries, dead letters), deletion purge job, retention, reservation expiry | `apps/api/tests/scheduled.test.ts` 11 tests |
-| Scan processing pipeline (extraction → checks → verification → guarded coaching) | `apps/api/tests/scan-process.test.ts` 11 tests (mock AI, labeled) |
-| Domain: pricing, promotions, donations, entitlements, quotas, rewards, grading, answer-guard, learning | package tests (≈1,500) |
+| Monorepo, CI, fail-fast gate `scripts/verify.sh`; pre-commit hook typechecks and secret-scans the staged tree | `scripts/git-hooks/pre-commit`, BUG-024/034 |
+| Schema 0001–0720 (+0730 in flight) with RLS, append-only ledgers, deletion purge, jobs and identity hardening | `supabase/tests` 212 tests on real Postgres 16 |
+| Parent/child auth, PIN step-up, pairing, sessions, sign-out ending API access | API auth, identity-hardening and lead identity review tests |
+| Family, guardians, consent (mock provider only), privacy, deletion, exports | vertical API/web/mobile suites |
+| Homework capture and the scan pipeline (extraction → deterministic checks → grading → verification → guarded coaching) | `scan-process.test.ts` (labeled mock AI) |
+| Learning: question bank, daily/Thursday/top-up jobs, practice API, planner (web, mobile), child practice/review | learning suites |
+| Rewards, P16 monetization (every kill switch off), P17 promotions/schools/donations | vertical suites |
+| Billing: status/sync/capacity changes, webhooks and TRANSFER, native offer step (mock provider only) | billing suites |
+| Domain modules (pricing, entitlements, quotas, promotions, donations, rewards, grading, answer guard, learning, scheduling, monetization, bank) | `packages/domain` 2,129 tests |
+| Independent adversarial reviews of every module, vertical and of the lead's own code, each followed by fixes and (for lead code) adversarial checks | `docs/ECC_Runs.md`, BUG-013..062 |
 
-## In flight (background workflows; see `docs/ECC_Runs.md`)
+## In flight
 
-- `wf_937b0690-525` domain modules: adversarial reviews + fixes for all nine modules (scheduling not yet committed).
-- `wf_984c4069-620` feature verticals: public site, rewards, homework, family/guardians/consent, privacy, P17 UI.
-- `wf_96d96581-4a8` P16 monetization (migration 0640, domain, API, web, mobile).
-- `wf_b5f6dbc1-69a` learning vertical (question bank, daily/Thursday jobs, practice API, exports, planner UI).
-
-Uncommitted working-tree files belong to those agents until the lead integrates them.
+- `wf_aea7bbc1-d46` fixes the concrete defects the coverage pass found: archived-child history on parent reads,
+  PDF import offered but unsupported, rubric feedback not shown, school-report accuracy and late donation
+  accruals (migration 0730), capacity-change price gate, ad-cohort environment filter, explicit consent
+  provider selection, strict spend ceiling, arithmetic-expression answer leaks in hints.
+- First CI runs on the branch (runs #1–#3; earlier runs are cancelled by newer pushes).
 
 ## Next exact steps
 
-1. As each workflow finishes: read its journal result, run `scripts/verify.sh` on the combined tree, record
-   findings in `docs/Bug_Ledger.md`, commit, push.
-2. Integration items owned by the lead: wire `enqueueDueLearningJobs` + learning handlers + export builder +
-   `purgeExpiredServes` into the tick; wire the Supabase Storage adapter in `apps/api/src/index.ts`;
-   reconcile the privacy route's purge enqueue with `request_deletion` (which now enqueues the purge itself);
-   make the mobile scan flow convert HEIC to JPEG (the pipeline refuses HEIC/PDF until the converter exists).
-3. Final: sequential full verification, `Test_Evidence.md`, `Release_Readiness.md`, coverage render, report.
+1. Integrate `wf_aea7bbc1-d46` slice by slice (verify on the combined tree, ledger, commit), then update the
+   coverage entries it changes and re-render.
+2. Full `scripts/verify.sh` + `node scripts/assert-test-count.mjs` on an idle machine; Worker bundle dry run,
+   web build and Expo web export; record in `docs/Test_Evidence.md`; confirm a green CI run on the same SHA.
+3. Owner actions in `docs/Owner_Actions.md` unblock everything else (accounts, consent provider, ZDR approval,
+   store products and prices, email provider, legal review, spend cap, hosted Supabase check).
