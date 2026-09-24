@@ -35,7 +35,11 @@ if [ -z "$ONLY" ]; then
   echo "▶ format"; pnpm -s format:check
   echo "▶ lint"; pnpm -s lint
   echo "▶ typecheck"; pnpm -s typecheck
-  if [ "$RUN_TESTS" = 1 ]; then echo "▶ tests"; pnpm -s test; fi
+  if [ "$RUN_TESTS" = 1 ]; then
+    echo "▶ tests"; pnpm -s test
+    # Same audit as CI: every package ran at least its floor of tests, none failed or skipped.
+    echo "▶ gate audit"; node scripts/assert-test-count.mjs
+  fi
   echo "▶ finance"; pnpm -s finance:check
   if [ "$RUN_ARTIFACTS" = 1 ]; then
     # Same release builds, scan and negative control as CI (AC_SECURITY_04); nothing is deployed.

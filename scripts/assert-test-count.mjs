@@ -6,6 +6,10 @@ import path from 'node:path';
 
 const root = path.resolve(import.meta.dirname, '..');
 const minimums = JSON.parse(readFileSync(path.join(root, 'scripts/test-minimums.json'), 'utf8'));
+// Reports directory; overridable only so the audit's own self-test can feed it synthetic reports.
+const reportsDir = process.env.PL_TEST_RESULTS_DIR
+  ? path.resolve(process.env.PL_TEST_RESULTS_DIR)
+  : path.join(root, 'test-results');
 
 const packageDirs = ['apps', 'packages']
   .flatMap((dir) =>
@@ -22,7 +26,7 @@ for (const dir of packageDirs) {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   if (!manifest.scripts?.test) continue;
   const name = manifest.name;
-  const reportPath = path.join(root, 'test-results', `${name.replace('@pencillift/', '')}.json`);
+  const reportPath = path.join(reportsDir, `${name.replace('@pencillift/', '')}.json`);
   if (!existsSync(reportPath)) {
     console.error(`✗ ${name}: no test report at ${path.relative(root, reportPath)}`);
     failed = true;
