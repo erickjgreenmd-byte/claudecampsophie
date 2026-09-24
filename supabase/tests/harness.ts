@@ -38,6 +38,8 @@ export interface TestDb {
   /** Superuser connection to the isolated database (bypasses RLS; use only for fixtures). */
   readonly sql: Sql;
   readonly name: string;
+  /** Connection URL of the isolated database, for clients built with production options. */
+  readonly url: string;
   asParent<T>(userId: string, fn: (tx: Tx) => Promise<T>, claims?: ParentClaims): Promise<T>;
   asChild<T>(claims: ChildClaims, fn: (tx: Tx) => Promise<T>): Promise<T>;
   asAnon<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
@@ -114,6 +116,7 @@ export async function createTestDb(): Promise<TestDb> {
   return {
     sql,
     name,
+    url: url.toString(),
     asParent(userId, fn, claims = {}) {
       return run(
         'authenticated',

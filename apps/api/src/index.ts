@@ -1,4 +1,5 @@
-import postgres from 'postgres';
+import type { Sql } from 'postgres';
+import { createPostgresClient } from './pg-client.ts';
 import { createApp } from './app.ts';
 import { createParentVerifier } from './auth/parent.ts';
 import { loadConfig } from './config.ts';
@@ -41,7 +42,7 @@ function stringEnv(env: WorkerEnv): Record<string, string | undefined> {
 
 interface Runtime {
   readonly deps: AppDeps;
-  readonly sql: postgres.Sql;
+  readonly sql: Sql;
 }
 
 type RuntimeResult = { ok: true; runtime: Runtime } | { ok: false; code: string; message: string };
@@ -59,11 +60,8 @@ function buildRuntime(env: WorkerEnv): RuntimeResult {
     // AC_DEPLOY_07: production never serves with the development consent or storage mocks.
     return { ok: false, code: 'BLOCKED_EXTERNAL', message: 'Service is not ready' };
   }
-  const sql = postgres(env.HYPERDRIVE.connectionString, {
-    max: 5,
-    fetch_types: false,
-    prepare: false,
-  });
+  // One client configuration for the Worker and the tests (BUG-063: array parameters need types).
+  const sql = createPostgresClient(env.HYPERDRIVE.connectionString);
   const db = createDb(sql);
   const deps: AppDeps = {
     config,
