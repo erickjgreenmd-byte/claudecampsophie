@@ -1,6 +1,11 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
-import { ENTITLEMENT_STATUSES, grantsAccess, type EntitlementStatus } from './status.ts';
+import {
+  ENTITLEMENT_STATUSES,
+  MAX_ACCESS_AFTER_PERIOD_END_MS,
+  grantsAccess,
+  type EntitlementStatus,
+} from './status.ts';
 import { NOW, PERIOD_END } from './test-fixtures.ts';
 
 const anyInstant = fc
@@ -25,6 +30,32 @@ describe('P11 access states (AC_BILLING_03)', () => {
     expect(grantsAccess('cancelled_active', PERIOD_END, PERIOD_END)).toBe(false);
     expect(grantsAccess('cancelled_active', PERIOD_END, new Date(PERIOD_END.getTime() + 1))).toBe(
       false,
+    );
+  });
+
+  it('active and grace_period are time-bounded: they lapse a fixed window after the period end', () => {
+    const limit = new Date(PERIOD_END.getTime() + MAX_ACCESS_AFTER_PERIOD_END_MS);
+    expect(MAX_ACCESS_AFTER_PERIOD_END_MS).toBe(30 * 86_400_000);
+    for (const status of ['active', 'grace_period'] as const) {
+      expect(grantsAccess(status, PERIOD_END, new Date(limit.getTime() - 1))).toBe(true);
+      expect(grantsAccess(status, PERIOD_END, limit)).toBe(false);
+      expect(grantsAccess(status, PERIOD_END, new Date(limit.getTime() + 365 * 86_400_000))).toBe(
+        false,
+      );
+    }
+  });
+
+  it('property: no status grants access once the post-period window has passed', () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom(...ENTITLEMENT_STATUSES),
+        anyInstant,
+        fc.integer({ min: 0, max: 5 * 365 * 86_400_000 }),
+        (status, end, pastLimit) => {
+          const now = new Date(end.getTime() + MAX_ACCESS_AFTER_PERIOD_END_MS + pastLimit);
+          expect(grantsAccess(status, end, now)).toBe(false);
+        },
+      ),
     );
   });
 

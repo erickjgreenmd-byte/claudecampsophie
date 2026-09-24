@@ -1,5 +1,10 @@
 // Paid capacity, the normalized family entitlement ledger and child slot assignment (spec P11, E2).
-export { ENTITLEMENT_STATUSES, grantsAccess, type EntitlementStatus } from './status.ts';
+export {
+  ENTITLEMENT_STATUSES,
+  MAX_ACCESS_AFTER_PERIOD_END_MS,
+  grantsAccess,
+  type EntitlementStatus,
+} from './status.ts';
 export {
   RESOLVE_PAID_SLOTS_ERROR_CODES,
   resolvePaidSlots,

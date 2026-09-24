@@ -38,10 +38,15 @@ export function minutesAfter(base: Date, minutes: number): Date {
   return new Date(base.getTime() + minutes * 60_000);
 }
 
-/** A verified, auto-renewing 2-slot Apple subscription for the synthetic Riley/Sam family. */
+/**
+ * A verified, auto-renewing 2-slot Apple subscription for the synthetic Riley/Sam family. Unless
+ * overridden, it was fetched one minute after its (possibly overridden) provider update: a
+ * last-modified instant can never be later than the fetch that observed it (RV-entitlements-1).
+ */
 export function snapshot(
   overrides: Partial<ProviderSubscriptionSnapshot> = {},
 ): ProviderSubscriptionSnapshot {
+  const providerUpdatedAt = overrides.providerUpdatedAt ?? UPDATED_AT;
   return {
     channel: 'app_store',
     providerSubscriptionId: 'sub_apple_family_riley',
@@ -51,8 +56,8 @@ export function snapshot(
     periodEnd: PERIOD_END,
     autoRenew: true,
     environment: 'production',
-    providerUpdatedAt: UPDATED_AT,
-    fetchedAt: minutesAfter(UPDATED_AT, 1),
+    providerUpdatedAt,
+    fetchedAt: minutesAfter(providerUpdatedAt, 1),
     ...overrides,
   };
 }

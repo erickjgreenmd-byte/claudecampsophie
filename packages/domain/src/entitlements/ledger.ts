@@ -22,6 +22,8 @@ export interface EntitlementRecord extends ProviderSubscriptionSnapshot {
   readonly mappingError: ResolvePaidSlotsErrorCode | null;
   /** Resolved tier of `pendingProductId`, or null when absent/unresolvable. */
   readonly pendingPaidSlots: number | null;
+  /** Why `pendingProductId` grants no capacity; present only when it is set and did not resolve. */
+  readonly pendingMappingError?: ResolvePaidSlotsErrorCode;
 }
 
 /** An access-granting ledger row, as shown to the parent ("actual paid slot count and managing store"). */
@@ -39,8 +41,11 @@ export interface CapacitySource {
 export type CapacityConflict = 'duplicate_active_subscriptions';
 
 export interface PendingCapacityChange {
+  /** Paid slots after the change; 0 when the scheduled product grants no verified capacity. */
   readonly targetSlots: number;
   readonly effectiveAt: Date;
+  /** Present when the scheduled product did not resolve to a verified, active capacity tier. */
+  readonly mappingError?: ResolvePaidSlotsErrorCode;
 }
 
 export interface FamilyCapacity {
@@ -50,7 +55,10 @@ export interface FamilyCapacity {
   readonly sources: readonly CapacitySource[];
   readonly conflict: CapacityConflict | null;
   readonly managingChannel: BillingChannel | null;
-  /** Provider-scheduled tier change on the managing subscription; informational until confirmed. */
+  /**
+   * Provider-scheduled product change on the managing subscription; informational until confirmed.
+   * Shown whenever the provider schedules one, including a change to a product that grants nothing.
+   */
   readonly pendingChange?: PendingCapacityChange;
 }
 
@@ -81,6 +89,14 @@ export interface ReconcileResult {
  *
  * Decision: a snapshot from another environment is rejected without touching the ledger, so a
  * sandbox subscription can neither add production capacity nor overwrite a production row.
+ * Decision: a runtime-environment snapshot whose (channel, providerSubscriptionId) key already
+ * belongs to a row from the other environment throws a RangeError instead of replacing that row
+ * (RV-entitlements-4). The key must be unique across environments, as the ledger table's unique
+ * key is; a collision means the caller's id derivation is wrong, so it fails loudly.
+ * Decision: `providerUpdatedAt` is the provider's own last-modified instant, so a snapshot with
+ * `providerUpdatedAt > fetchedAt` or `fetchedAt > now` is impossible and throws a RangeError. A
+ * future-dated observation would otherwise outrank every genuine later one, a refund included
+ * (RV-entitlements-1). Callers bound provider clock skew before calling.
  * Decision: a same-environment snapshot whose product cannot be resolved (unknown, inactive,
  * ambiguous) is still recorded — with `paidSlots: 0` and `mappingError` — so that its status change
  * (e.g. a refund) takes effect and the family fails closed instead of keeping stale capacity.
@@ -93,8 +109,8 @@ export function reconcileEntitlements(
   now: Date,
   maxSlots: number = DEFAULT_MAX_PAID_SLOTS,
 ): ReconcileResult {
-  assertValidSnapshot(snapshot);
   assertValidInstant(now, 'now');
+  assertValidSnapshot(snapshot, now);
   assertUniqueKeys(records);
 
   const unchanged = (
@@ -119,6 +135,11 @@ export function reconcileEntitlements(
       r.providerSubscriptionId === candidate.providerSubscriptionId,
   );
   const existing = index === -1 ? undefined : records[index];
+  if (existing !== undefined && existing.environment !== candidate.environment) {
+    throw new RangeError(
+      `A ${candidate.environment} snapshot collides with a ${existing.environment} ledger row for the same ${candidate.channel} subscription key`,
+    );
+  }
 
   let outcome: ReconcileOutcome;
   if (existing === undefined) {
@@ -182,16 +203,19 @@ export function computeFamilyCapacity(
     conflict: granting.length > 1 ? ('duplicate_active_subscriptions' as const) : null,
     managingChannel: managing?.channel ?? null,
   };
-  if (
-    managing?.pendingPaidSlots !== null &&
-    managing?.pendingPaidSlots !== undefined &&
-    managing.pendingEffectiveAt !== undefined
-  ) {
+  if (managing?.pendingProductId !== undefined && managing.pendingEffectiveAt !== undefined) {
+    // Decision: a scheduled change to a product that does not resolve is still shown, with 0 target
+    // slots, because at the effective date the family keeps no verified capacity from this
+    // subscription (P11 "always show ... pending changes"; RV-entitlements-3).
+    const resolved = managing.pendingPaidSlots !== null;
     return {
       ...base,
       pendingChange: {
-        targetSlots: managing.pendingPaidSlots,
-        effectiveAt: new Date(managing.pendingEffectiveAt.getTime()),
+        targetSlots: managing.pendingPaidSlots ?? 0,
+        effectiveAt: copy(managing.pendingEffectiveAt),
+        ...(resolved || managing.pendingMappingError === undefined
+          ? {}
+          : { mappingError: managing.pendingMappingError }),
       },
     };
   }
@@ -233,6 +257,7 @@ function toRecord(
 ): EntitlementRecord {
   const resolved = resolvePaidSlots(snapshot, mappings, runtimeEnvironment, maxSlots);
   let pendingPaidSlots: number | null = null;
+  let pendingMappingError: ResolvePaidSlotsErrorCode | null = null;
   if (snapshot.pendingProductId !== undefined) {
     const pending = resolveProductSlots(
       snapshot.channel,
@@ -242,7 +267,11 @@ function toRecord(
       runtimeEnvironment,
       maxSlots,
     );
-    pendingPaidSlots = pending.ok ? pending.value : null;
+    if (pending.ok) {
+      pendingPaidSlots = pending.value;
+    } else {
+      pendingMappingError = pending.error.code;
+    }
   }
   // Built field by field (and dates copied) so stray properties on the input never reach the ledger.
   return {
@@ -265,6 +294,7 @@ function toRecord(
     paidSlots: resolved.ok ? resolved.value : 0,
     mappingError: resolved.ok ? null : resolved.error.code,
     pendingPaidSlots,
+    ...(pendingMappingError === null ? {} : { pendingMappingError }),
   };
 }
 
@@ -286,8 +316,17 @@ function copy(date: Date): Date {
 }
 
 function compareRecency(a: EntitlementRecord, b: EntitlementRecord): number {
-  const updated = a.providerUpdatedAt.getTime() - b.providerUpdatedAt.getTime();
+  const updated = observedAt(a) - observedAt(b);
   return updated !== 0 ? updated : a.fetchedAt.getTime() - b.fetchedAt.getTime();
+}
+
+/**
+ * Ordering instant of a record: `providerUpdatedAt`, bounded by when it was fetched. New snapshots
+ * are validated so the bound changes nothing for them; it only stops a future-dated row stored
+ * before that validation from shadowing later genuine observations (RV-entitlements-1).
+ */
+function observedAt(r: EntitlementRecord): number {
+  return Math.min(r.providerUpdatedAt.getTime(), r.fetchedAt.getTime());
 }
 
 /** Canonical content of a record, excluding the observation time `fetchedAt`. */
@@ -307,6 +346,7 @@ function materialKey(r: EntitlementRecord): string {
     r.paidSlots,
     r.mappingError,
     r.pendingPaidSlots,
+    r.pendingMappingError ?? null,
   ]);
 }
 
@@ -332,7 +372,7 @@ function compareSourcePriority(a: EntitlementRecord, b: EntitlementRecord): numb
   return 0;
 }
 
-function assertValidSnapshot(snapshot: ProviderSubscriptionSnapshot): void {
+function assertValidSnapshot(snapshot: ProviderSubscriptionSnapshot, now: Date): void {
   if (
     typeof snapshot.providerSubscriptionId !== 'string' ||
     snapshot.providerSubscriptionId === ''
@@ -351,6 +391,14 @@ function assertValidSnapshot(snapshot: ProviderSubscriptionSnapshot): void {
   }
   if (snapshot.periodEnd.getTime() < snapshot.periodStart.getTime()) {
     throw new RangeError('periodEnd must not precede periodStart');
+  }
+  // A last-modified instant cannot be later than the fetch that observed it, and a fetch cannot be
+  // later than the reconciliation using it (RV-entitlements-1).
+  if (snapshot.providerUpdatedAt.getTime() > snapshot.fetchedAt.getTime()) {
+    throw new RangeError('providerUpdatedAt must not be later than fetchedAt');
+  }
+  if (snapshot.fetchedAt.getTime() > now.getTime()) {
+    throw new RangeError('fetchedAt must not be later than now');
   }
 }
 

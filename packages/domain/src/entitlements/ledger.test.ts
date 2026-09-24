@@ -10,7 +10,7 @@ import {
   type ReconcileResult,
 } from './ledger.ts';
 import type { ProviderSubscriptionSnapshot } from './products.ts';
-import { ENTITLEMENT_STATUSES } from './status.ts';
+import { ENTITLEMENT_STATUSES, MAX_ACCESS_AFTER_PERIOD_END_MS } from './status.ts';
 import {
   CHANNELS,
   MAPPINGS,
@@ -406,5 +406,195 @@ describe('sandbox and production are isolated (AC_CONN_05)', () => {
     );
     expect(inSandbox.capacity.paidSlots).toBe(2);
     expect(computeFamilyCapacity(inSandbox.records, 'production', NOW).paidSlots).toBe(0);
+  });
+});
+
+describe('observation timestamps are bounded (RV-entitlements-1, AC_BILLING_04)', () => {
+  it('rejects a snapshot whose provider update is later than its own fetch', () => {
+    const futureDated = snapshot({ providerUpdatedAt: later(30), fetchedAt: later(29) });
+    expect(() => reconcile([], futureDated)).toThrow(RangeError);
+  });
+
+  it('rejects a snapshot fetched after the reconciliation instant', () => {
+    const fetchedLater = snapshot({ fetchedAt: later(30) });
+    expect(() => reconcile([], fetchedLater, later(29))).toThrow(RangeError);
+    // At the fetch instant itself it is accepted.
+    expect(reconcile([], fetchedLater, later(30)).outcome).toBe('inserted');
+  });
+
+  it('a future-dated row stored before validation cannot shadow a later refund', () => {
+    const first = reconcile([], snapshot({ status: 'grace_period' }));
+    const legacy = first.records.map((r) => ({
+      ...r,
+      providerUpdatedAt: new Date(PERIOD_END.getTime() + 16 * 86_400_000),
+    }));
+    const refund = reconcile(
+      legacy,
+      snapshot({ status: 'refunded', providerUpdatedAt: later(60) }),
+    );
+    expect(refund.outcome).toBe('updated');
+    expect(refund.records[0]?.status).toBe('refunded');
+    expect(refund.capacity.paidSlots).toBe(0);
+  });
+
+  it('an honest observation fetched later still orders by the provider update, not the fetch', () => {
+    const refunded = reconcile([], snapshot({ status: 'refunded', providerUpdatedAt: later(60) }));
+    const lateFetchOfOlderState = reconcile(
+      refunded.records,
+      snapshot({ status: 'active', providerUpdatedAt: later(10), fetchedAt: later(120) }),
+    );
+    expect(lateFetchOfOlderState.outcome).toBe('ignored_stale');
+    expect(lateFetchOfOlderState.capacity.paidSlots).toBe(0);
+  });
+});
+
+describe('stale ledger rows do not grant forever (RV-entitlements-2, AC_CAPACITY_10)', () => {
+  const limit = new Date(PERIOD_END.getTime() + MAX_ACCESS_AFTER_PERIOD_END_MS);
+
+  it('an unrefreshed active row keeps capacity through the window, then lapses', () => {
+    const { records } = reconcile([], snapshot());
+    expect(computeFamilyCapacity(records, 'production', new Date(limit.getTime() - 1))).toEqual(
+      expect.objectContaining({ paidSlots: 2, managingChannel: 'app_store' }),
+    );
+    expect(computeFamilyCapacity(records, 'production', limit)).toEqual({
+      paidSlots: 0,
+      sources: [],
+      conflict: null,
+      managingChannel: null,
+    });
+  });
+
+  it('a lapsed row is restored by a newer provider observation of the renewed period', () => {
+    const { records } = reconcile([], snapshot());
+    const nextPeriodEnd = new Date(PERIOD_END.getTime() + 31 * 86_400_000);
+    const renewedAt = new Date(limit.getTime() + 60_000);
+    const renewed = reconcile(
+      records,
+      snapshot({
+        periodStart: PERIOD_END,
+        periodEnd: nextPeriodEnd,
+        providerUpdatedAt: renewedAt,
+        fetchedAt: renewedAt,
+      }),
+      renewedAt,
+    );
+    expect(renewed.capacity.paidSlots).toBe(2);
+  });
+
+  it('a lapsed duplicate subscription no longer raises a conflict', () => {
+    const apple = reconcile([], snapshot());
+    const both = reconcile(
+      apple.records,
+      snapshot({
+        channel: 'play_store',
+        providerSubscriptionId: 'GPA.0000-riley-family',
+        productId: productFor('play_store', 3),
+        periodEnd: new Date(PERIOD_END.getTime() + 60 * 86_400_000),
+      }),
+    );
+    expect(both.capacity.conflict).toBe('duplicate_active_subscriptions');
+    const afterWindow = computeFamilyCapacity(both.records, 'production', limit);
+    expect(afterWindow.paidSlots).toBe(3);
+    expect(afterWindow.conflict).toBeNull();
+    expect(afterWindow.managingChannel).toBe('play_store');
+  });
+});
+
+describe('scheduled provider changes are always shown (RV-entitlements-3, AC_CAPACITY_08)', () => {
+  it('a change to an unknown product shows zero target slots with the mapping error', () => {
+    const result = reconcile(
+      [],
+      snapshot({
+        pendingProductId: 'com.pencillift.capacity.retired_basic',
+        pendingEffectiveAt: PERIOD_END,
+      }),
+    );
+    expect(result.capacity.paidSlots).toBe(2);
+    expect(result.capacity.pendingChange).toEqual({
+      targetSlots: 0,
+      effectiveAt: PERIOD_END,
+      mappingError: 'UNKNOWN_PRODUCT',
+    });
+  });
+
+  it('a change to an inactive product reports INACTIVE_MAPPING', () => {
+    const retired = productFor('app_store', 1);
+    const mappings = MAPPINGS.map((m) =>
+      m.channel === 'app_store' && m.productId === retired ? { ...m, active: false } : m,
+    );
+    const result = reconcileEntitlements(
+      [],
+      snapshot({ pendingProductId: retired, pendingEffectiveAt: PERIOD_END }),
+      mappings,
+      'production',
+      NOW,
+    );
+    expect(result.capacity.pendingChange).toEqual({
+      targetSlots: 0,
+      effectiveAt: PERIOD_END,
+      mappingError: 'INACTIVE_MAPPING',
+    });
+  });
+
+  it('replaying a snapshot with an unresolvable pending product is still idempotent', () => {
+    const snap = snapshot({
+      pendingProductId: 'com.pencillift.capacity.retired_basic',
+      pendingEffectiveAt: PERIOD_END,
+    });
+    const first = reconcile([], snap);
+    const replay = reconcile(first.records, snap);
+    expect(replay.outcome).toBe('ignored_duplicate');
+    expect(replay.records).toEqual(first.records);
+  });
+
+  it('a pending product without an effective date is not presented as a scheduled change', () => {
+    const result = reconcile([], snapshot({ pendingProductId: productFor('app_store', 1) }));
+    expect(result.capacity.pendingChange).toBeUndefined();
+  });
+});
+
+describe('one ledger may hold both environments without collisions (RV-entitlements-4, AC_CONN_05)', () => {
+  it('a sandbox snapshot sharing a production key is refused loudly under the sandbox runtime', () => {
+    const production = reconcile([], snapshot());
+    const sandboxRefund = snapshot({
+      environment: 'sandbox',
+      status: 'refunded',
+      providerUpdatedAt: later(10),
+    });
+    expect(() =>
+      reconcileEntitlements(production.records, sandboxRefund, MAPPINGS, 'sandbox', NOW),
+    ).toThrow(RangeError);
+  });
+
+  it('a production snapshot sharing a sandbox key is refused loudly under the production runtime', () => {
+    const sandbox = reconcileEntitlements(
+      [],
+      snapshot({ environment: 'sandbox' }),
+      MAPPINGS,
+      'sandbox',
+      NOW,
+    );
+    expect(() =>
+      reconcile(sandbox.records, snapshot({ status: 'refunded', providerUpdatedAt: later(10) })),
+    ).toThrow(RangeError);
+  });
+
+  it('distinct sandbox and production subscriptions coexist and each grants only its runtime', () => {
+    const production = reconcile([], snapshot());
+    const both = reconcileEntitlements(
+      production.records,
+      snapshot({
+        environment: 'sandbox',
+        providerSubscriptionId: 'sub_sandbox_tester',
+        productId: productFor('app_store', 4),
+      }),
+      MAPPINGS,
+      'sandbox',
+      NOW,
+    );
+    expect(both.outcome).toBe('inserted');
+    expect(both.records.filter((r) => r.environment === 'production')).toEqual(production.records);
+    expect(both.capacity.paidSlots).toBe(4);
+    expect(computeFamilyCapacity(both.records, 'production', NOW).paidSlots).toBe(2);
   });
 });

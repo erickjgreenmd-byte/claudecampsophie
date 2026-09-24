@@ -24,12 +24,26 @@ export function assertValidInstant(value: Date, label: string): Date {
 }
 
 /**
+ * Longest time after a subscription's provider period end that an `active` or `grace_period`
+ * observation keeps granting paid access without a newer provider observation (RV-entitlements-2).
+ *
+ * Decision: 30 days. That covers the longest configurable store billing grace period (Apple up to
+ * 28 days, Google Play up to 30; confirm against the live store configuration at activation) and
+ * leaves renewal webhooks and the reconciliation sweep time to deliver the next period. A genuine
+ * renewal or grace state is re-observed with a new period end (or `grace_period` within this
+ * window), so honest subscriptions never reach the bound. A row that was never re-verified, e.g.
+ * because an EXPIRATION webhook was lost, stops granting instead of unlocking paid service forever
+ * ("A local boolean never unlocks paid service", P11; AC_BILLING_03, AC_CAPACITY_10).
+ */
+export const MAX_ACCESS_AFTER_PERIOD_END_MS = 30 * 86_400_000;
+
+/**
  * Whether a subscription in `status` grants paid access at `now`.
  *
- * - `active` and `grace_period` grant. Decision: neither is gated on `periodEnd`. Renewal events
- *   routinely arrive after the nominal period end and a store grace period by definition runs past
- *   it; the freshly fetched provider status is authoritative, and snapshot staleness is handled by
- *   provider reconciliation, not by guessing here.
+ * - `active` and `grace_period` grant while `now < periodEnd + MAX_ACCESS_AFTER_PERIOD_END_MS`.
+ *   Decision: neither lapses exactly at `periodEnd`, because renewal events routinely arrive after
+ *   the nominal period end and a store grace period by definition runs past it. They are still
+ *   time-bounded, so a stale ledger row cannot grant capacity indefinitely.
  * - `cancelled_active` grants only while `now < periodEnd` (Decision: the end instant is exclusive),
  *   so capacity lapses at period end even if no expiry event is ever delivered.
  * - `billing_retry` does NOT grant. Decision: RevenueCat/store grace periods are normalized to
@@ -44,7 +58,7 @@ export function grantsAccess(status: EntitlementStatus, periodEnd: Date, now: Da
   switch (status) {
     case 'active':
     case 'grace_period':
-      return true;
+      return now.getTime() < periodEnd.getTime() + MAX_ACCESS_AFTER_PERIOD_END_MS;
     case 'cancelled_active':
       return now.getTime() < periodEnd.getTime();
     case 'billing_retry':
