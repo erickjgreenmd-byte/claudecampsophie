@@ -20,7 +20,8 @@
     "./answer-guard": "./src/answer-guard/index.ts",
     "./learning": "./src/learning/index.ts",
     "./scheduling": "./src/scheduling/index.ts",
-    "./monetization": "./src/monetization/index.ts"
+    "./monetization": "./src/monetization/index.ts",
+    "./bank": "./src/bank/index.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
