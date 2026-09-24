@@ -23,20 +23,54 @@ export const REWARD_BUSINESS_RULES = ['INSUFFICIENT_POINTS', 'INVALID_TRANSITION
 export type RewardBusinessRule = (typeof REWARD_BUSINESS_RULES)[number];
 
 /**
- * Decision: reward text is shown to children and P16.3/P16.4 keep learning rewards independent of
- * monetization, so titles and instructions may not contain links (URL scheme, `www.`, or a bare host
- * with a common public suffix such as amzn.to). Mirrors @pencillift/domain/rewards catalog rules.
+ * Decision: reward text is shown to children and P16.3 ("No affiliate URL in a push, SMS, exported
+ * child worksheet or learning reward") keeps learning rewards free of merchant links, so titles and
+ * instructions may not contain any link. A link is any of:
+ * - a URL scheme (`https://`) or `www.`;
+ * - an Amazon or Amazon short-link host with any country suffix (`amazon.fr`, `amzn.eu`,
+ *   `amazon.com.be`), because a fixed suffix list let marketplaces through (RV-rewards-1);
+ * - any host followed by a path (`name.tld/…`), whatever the suffix, which is how share links look;
+ * - a bare host with a common public suffix (e.g. `a.co`, `shop.example.net`).
+ * The text is NFKC-normalized and stripped of invisible code points first, so full-width letters or
+ * a zero-width space inside a host cannot hide a link. Prose such as "Dr. Seuss book", "2.5 hours"
+ * or "pizza/tacos" is unaffected. Mirrors the @pencillift/domain/rewards catalog rule.
  */
-const LINK_PATTERN =
-  /[a-z][a-z0-9+.-]*:\/\/|\bwww\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|co|io|app|shop|store|ly|me|to|us|uk|ca|au|de|in|biz|info|link|gl|gd|site|online|xyz)\b/i;
+const PUBLIC_SUFFIXES =
+  'com|net|org|co|io|app|shop|store|ly|me|to|us|uk|ca|au|de|in|biz|info|link|gl|gd|site|online|xyz' +
+  // Amazon marketplace and short-link suffixes.
+  '|eu|asia|fr|es|nl|se|pl|sg|ae|sa|eg|jp|mx|br|nz|ie|cn|tr';
+const LINK_PATTERN = new RegExp(
+  [
+    String.raw`[a-z][a-z0-9+.-]*:\/\/`,
+    String.raw`\bwww\.`,
+    String.raw`\b(?:amzn|amazon)\.[a-z]{2,}`,
+    String.raw`\b[a-z0-9-]+\.[a-z]{2,63}\/`,
+    String.raw`\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:${PUBLIC_SUFFIXES})\b`,
+  ].join('|'),
+  'i',
+);
+/** Code points that render as nothing (zero-width spaces/joiners, soft hyphen, BOM, fillers). */
+const INVISIBLE = /\p{Default_Ignorable_Code_Point}/gu;
 const MEANINGFUL_PATTERN = /[\p{L}\p{N}]/u;
 
 export function rewardTextContainsLink(text: string): boolean {
-  return LINK_PATTERN.test(text);
+  return LINK_PATTERN.test(text.normalize('NFKC').replace(INVISIBLE, ''));
+}
+
+/**
+ * Decision: free text (reward title, instructions, adjustment reason) refuses control characters
+ * other than tab, line feed and carriage return. Postgres cannot store U+0000 in text at all, so a
+ * NUL used to surface as a 500 (RV-rewards-2), and the other controls have no place in
+ * child-visible text or an audit reason.
+ */
+export function textHasControlCharacter(text: string): boolean {
+  return /\p{Cc}/u.test(text.replace(/[\t\n\r]/g, ''));
 }
 
 const noLinks = (text: string) => !rewardTextContainsLink(text);
+const noControls = (text: string) => !textHasControlCharacter(text);
 const LINK_MESSAGE = 'Links are not allowed in rewards';
+const CONTROL_MESSAGE = 'Remove the hidden control characters';
 
 // ---------------------------------------------------------------------------------------------
 // Shared fields
@@ -47,6 +81,7 @@ export const rewardTitleSchema = z
   .trim()
   .min(1)
   .max(REWARD_TITLE_MAX_LENGTH)
+  .refine(noControls, CONTROL_MESSAGE)
   .refine((t) => MEANINGFUL_PATTERN.test(t), 'Give the reward a name')
   .refine(noLinks, LINK_MESSAGE);
 
@@ -54,6 +89,7 @@ export const rewardInstructionsSchema = z
   .string()
   .trim()
   .max(REWARD_INSTRUCTIONS_MAX_LENGTH)
+  .refine(noControls, CONTROL_MESSAGE)
   .refine(noLinks, LINK_MESSAGE);
 
 export const rewardPointCostSchema = z.number().int().min(1).max(REWARD_POINT_COST_MAX);
@@ -182,6 +218,7 @@ export const pointsAdjustmentRequestSchema = z.strictObject({
     .trim()
     .min(1)
     .max(POINTS_REASON_MAX_LENGTH)
+    .refine(noControls, CONTROL_MESSAGE)
     .refine((r) => MEANINGFUL_PATTERN.test(r), 'Explain why the points are being adjusted'),
   /** Client-generated; retrying with the same id never applies the adjustment twice. */
   adjustmentId: uuidSchema,

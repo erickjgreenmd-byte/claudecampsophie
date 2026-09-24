@@ -88,9 +88,11 @@ export function buildChildRewardsView(data: ChildRewards): ChildRewardsView {
   });
   return {
     balanceLabel: `You have ${pointsText(balance)}`,
+    // Decision (RV-rewards-5): awards are capped per question and per set (spec P9), so the copy
+    // says finished practice *can* earn points and never promises points for every attempt.
     encouragement:
       balance === 0
-        ? 'Every bit of practice adds points. You’ve got this!'
+        ? 'Finishing your practice can earn points. You’ve got this!'
         : 'Great work! Keep practicing to reach your next reward.',
     rewards,
     requests,

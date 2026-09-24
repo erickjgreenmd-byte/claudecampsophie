@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -10,47 +10,64 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { RewardDecisionAction, RewardsOverview } from '@pencillift/contracts';
+import type { ApiClient } from '@pencillift/contracts/client';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
-import { createMobileApi } from '../../src/lib/api.ts';
+import {
+  ErrorBox,
+  ParentAccessState,
+  Screen,
+  Title,
+  useParentAccess,
+} from '../../src/family/ui.tsx';
 import { decideRequestAction, loadRewardsOverview } from '../../src/rewards/actions.ts';
 import {
   buildParentApprovalsView,
   parentActionError,
   type ParentRequestCard,
 } from '../../src/rewards/parent-view-model.ts';
-import { parentRewardsTokenSource } from '../../src/rewards/session.ts';
 
 type ScreenState =
-  | { status: 'signed_out' }
   | { status: 'loading' }
-  | { status: 'error'; message: string }
+  | { status: 'error'; message: string; needsPin: boolean }
   | { status: 'ready'; data: RewardsOverview };
+
+type Notice = { ok: boolean; needsPin: boolean; text: string };
 
 /**
  * Parent reward approvals (spec P9, P14 "requests"). Approve/decline pending requests and record
  * when a reward was given. Decisions need a recent parent-PIN step-up, enforced by the API.
+ *
+ * Decision (RV-rewards-3, spec P3 / AC_ACCESS_07): the screen goes through the same parent-area
+ * gate as every other parent screen. A device in child mode never loads family balances or
+ * requests here, even through a deep link, and never shows the decision buttons; it offers the
+ * PIN unlock instead. The parent sign-in stays on the device in child mode, so a registered token
+ * alone is not proof that a grown-up is present.
  */
 export default function ParentRewardsScreen() {
-  const tokenSource = parentRewardsTokenSource();
-  const api = useMemo(() => (tokenSource ? createMobileApi(tokenSource) : null), [tokenSource]);
-  const [state, setState] = useState<ScreenState>(
-    api ? { status: 'loading' } : { status: 'signed_out' },
-  );
+  const access = useParentAccess();
+  if (access.status !== 'ready') {
+    return (
+      <Screen>
+        <Title>Reward requests</Title>
+        <ParentAccessState access={access} />
+      </Screen>
+    );
+  }
+  return <RewardApprovals api={access.api} />;
+}
+
+function RewardApprovals({ api }: { api: ApiClient }) {
+  const [state, setState] = useState<ScreenState>({ status: 'loading' });
   const [busy, setBusy] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ ok: boolean; needsPin: boolean; text: string } | null>(
-    null,
-  );
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
-    if (!api) {
-      setState({ status: 'signed_out' });
-      return;
-    }
     try {
       setState({ status: 'ready', data: await loadRewardsOverview(api) });
     } catch (error) {
-      setState({ status: 'error', message: parentActionError(error).message });
+      const problem = parentActionError(error);
+      setState({ status: 'error', message: problem.message, needsPin: problem.needsPin });
     }
   }, [api]);
 
@@ -65,13 +82,15 @@ export default function ParentRewardsScreen() {
   };
 
   const decide = async (card: ParentRequestCard, action: RewardDecisionAction) => {
-    if (!api || busy !== null) return;
+    if (busy !== null) return;
     setBusy(`${card.id}:${action}`);
     setNotice(null);
     const result = await decideRequestAction(api, card.request, action);
     setNotice({ ok: result.ok, needsPin: result.needsPin, text: result.message });
     setBusy(null);
-    if (result.ok) await load();
+    // After a success, or when the request already changed elsewhere (RV-rewards-7), the list is
+    // stale: reload so no button stays on screen that can only fail.
+    if (result.reload) await load();
   };
 
   const view = state.status === 'ready' ? buildParentApprovalsView(state.data) : null;
@@ -112,11 +131,7 @@ export default function ParentRewardsScreen() {
     <SafeAreaView style={styles.screen} edges={['left', 'right', 'bottom']}>
       <ScrollView
         contentContainerStyle={styles.content}
-        refreshControl={
-          api ? (
-            <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />
-          ) : undefined
-        }
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />}
       >
         <Text accessibilityRole="header" style={styles.title}>
           Reward requests
@@ -125,12 +140,6 @@ export default function ParentRewardsScreen() {
           Points are a family motivation tool, not money. You give rewards yourself, outside the
           app.
         </Text>
-
-        {state.status === 'signed_out' ? (
-          <Text style={styles.body}>
-            Parent sign-in isn’t connected on this device yet, so requests can’t be shown here.
-          </Text>
-        ) : null}
 
         {state.status === 'loading' ? (
           <ActivityIndicator
@@ -141,30 +150,29 @@ export default function ParentRewardsScreen() {
         ) : null}
 
         {state.status === 'error' ? (
-          <View accessibilityRole="alert" style={styles.card}>
-            <Text style={styles.body}>{state.message}</Text>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Try loading reward requests again"
-              onPress={() => {
-                setState({ status: 'loading' });
-                void load();
-              }}
-              style={styles.button}
-            >
-              <Text style={styles.buttonText}>Try again</Text>
-            </Pressable>
-          </View>
+          <ErrorBox
+            message={state.message}
+            needsPin={state.needsPin}
+            onRetry={() => {
+              setState({ status: 'loading' });
+              void load();
+            }}
+          />
         ) : null}
 
-        {notice ? (
+        {notice?.ok ? (
           <View
-            accessibilityRole={notice.ok ? 'text' : 'alert'}
+            accessibilityRole="text"
             accessibilityLiveRegion="polite"
-            style={[styles.notice, notice.ok ? styles.noticeOk : styles.noticeProblem]}
+            style={[styles.notice, styles.noticeOk]}
           >
-            <Text style={[styles.body, notice.needsPin && styles.strong]}>{notice.text}</Text>
+            <Text style={styles.body}>{notice.text}</Text>
           </View>
+        ) : null}
+        {notice && !notice.ok ? (
+          // RV-rewards-4: a STEP_UP_REQUIRED answer comes with an "Unlock with parent PIN" button
+          // (to /(parent)/unlock), so an expired unlock is recoverable from this screen.
+          <ErrorBox message={notice.text} needsPin={notice.needsPin} />
         ) : null}
 
         {view ? (
@@ -224,7 +232,6 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   body: { fontSize: typography.scale.md, color: colors.navy },
-  strong: { fontWeight: '800' },
   muted: { fontSize: typography.scale.md, color: colors.muted },
   spaced: { marginTop: spacing.md },
   loading: { marginVertical: spacing.lg },
@@ -244,7 +251,6 @@ const styles = StyleSheet.create({
     backgroundColor: colors.white,
   },
   noticeOk: { borderLeftColor: colors.success },
-  noticeProblem: { borderLeftColor: colors.danger },
   button: {
     minHeight: minTouchTarget,
     borderRadius: radii.pill,

@@ -41,6 +41,20 @@ describe('parent adjustments carry a reason and are new ledger rows (AC_REWARDS_
     },
   );
 
+  it.each(['\u200B\u200B', '\uFFA0', '± × ÷', '|'])(
+    'an invisible or symbol-only reason %j is refused (RV-rewards-2 neighbors)',
+    (reason) => {
+      expect(errorCode(parentAdjustment({ ...BASE, reason }))).toBe('REASON_REQUIRED');
+    },
+  );
+
+  it.each(['+5 for reading', '2nd chore done', 'Ménage fait'])(
+    'a reason %j with a visible letter or number is accepted',
+    (reason) => {
+      expect(unwrap(parentAdjustment({ ...BASE, reason })).reason).toBe(reason);
+    },
+  );
+
   it('a non-string reason from untrusted input is refused', () => {
     const input = { ...BASE, reason: undefined } as unknown as ParentAdjustmentInput;
     expect(errorCode(parentAdjustment(input))).toBe('REASON_REQUIRED');

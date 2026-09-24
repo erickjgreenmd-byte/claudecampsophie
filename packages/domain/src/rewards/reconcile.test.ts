@@ -148,3 +148,19 @@ describe('reconcileLedger: history and reversals must reconcile (P9, AC_REWARDS_
     );
   });
 });
+
+describe('reconciliation applies the adjustment reason rule (RV-rewards-2)', () => {
+  it('flags a stored adjustment whose reason is symbol-only as INVALID_ENTRY', () => {
+    const symbolReason: LedgerEntry = {
+      idempotencyKey: 'adjust:a-1',
+      childId: RILEY,
+      kind: 'adjustment',
+      points: 2,
+      reason: '+',
+      actor: 'parent',
+    };
+    expect(reconcileLedger([fundingAward(5), symbolReason], []).map((v) => v.code)).toEqual([
+      'INVALID_ENTRY',
+    ]);
+  });
+});

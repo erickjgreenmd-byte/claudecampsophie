@@ -48,6 +48,7 @@ export const MAX_REWARD_POINT_COST = 100_000;
 
 export const REQUEST_REDEMPTION_ERROR_CODES = [
   'INVALID_PRINCIPAL',
+  'STEP_UP_REQUIRED',
   'INVALID_REQUEST',
   'INVALID_POINT_COST',
   'REWARD_INACTIVE',
@@ -58,6 +59,11 @@ export type RequestRedemptionErrorCode = (typeof REQUEST_REDEMPTION_ERROR_CODES)
 export interface RequestRedemptionInput {
   /** Derived from verified claims, never from a request body. */
   readonly principal: RewardsPrincipal;
+  /**
+   * True only when the server verified a recent PIN/biometric step-up for this session. Required
+   * (and must be exactly `true`) when the principal is a parent; ignored for a child.
+   */
+  readonly recentAdultUnlock?: boolean;
   readonly childId: string;
   /** Client-generated id; its reserve key is unique, so a retried request cannot reserve twice. */
   readonly requestId: string;
@@ -88,9 +94,10 @@ function assertBalance(currentBalance: number): void {
  * second request sees the reduced balance and gets INSUFFICIENT_POINTS; `appendToLedger` (and the
  * database balance check it specifies) rejects any write that would still go negative.
  *
- * Decision: a parent may also request on the child's behalf without a step-up here, because
- * requesting only reserves points; approval, decline, fulfillment and cancellation by a parent all
- * require a recent adult unlock.
+ * Decision: a parent may also request on the child's behalf, but only with a recent adult unlock,
+ * because reserving spends the child's points and P3 requires server-side recent reauthentication
+ * for rewards actions (review finding RV-rewards-4). Approval, decline, fulfillment, cancellation and
+ * adjustment by a parent require the same step-up. Authorization is checked before anything else.
  */
 export function requestRedemption(
   input: RequestRedemptionInput,
@@ -98,6 +105,9 @@ export function requestRedemption(
   const { principal, childId, requestId, reward, currentBalance } = input;
   if (principal !== 'child' && principal !== 'parent') {
     return err('INVALID_PRINCIPAL', 'Only a verified child or parent can request a reward');
+  }
+  if (principal === 'parent' && input.recentAdultUnlock !== true) {
+    return err('STEP_UP_REQUIRED', 'Unlock the adult area to request a reward for your child');
   }
   if (!isValidId(childId) || !isValidId(requestId) || !isValidId(reward.id)) {
     return err('INVALID_REQUEST', 'Child, request and reward ids must be valid identifiers');

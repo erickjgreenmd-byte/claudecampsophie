@@ -100,6 +100,12 @@ describe('child rewards view model (spec P9, P14)', () => {
     }
     expect(buildChildRewardsView(data({ balance: 1 })).balanceLabel).toBe('You have 1 point');
     expect(buildChildRewardsView(data({ balance: 0 })).encouragement).toMatch(/practice/i);
+    // Awards are capped per question and per set (P9): never promise points for every attempt.
+    for (const balance of [0, 3]) {
+      expect(buildChildRewardsView(data({ balance })).encouragement).not.toMatch(
+        /\b(every|all|any|always)\b/i,
+      );
+    }
   });
 
   it('has honest empty states', () => {

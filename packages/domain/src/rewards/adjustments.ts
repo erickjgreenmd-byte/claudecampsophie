@@ -2,7 +2,7 @@
 import { err, ok, type Result } from '../shared/result.ts';
 import { adjustmentKey, isValidId } from './ids.ts';
 import type { LedgerEntry, RewardsPrincipal } from './ledger.ts';
-import { codePointLength, isMeaningfulText } from './text.ts';
+import { codePointLength, hasLetterOrNumber } from './text.ts';
 
 /** Decision: one adjustment may move at most 10,000 points either way (sane cap). */
 export const MAX_ADJUSTMENT_POINTS = 10_000;
@@ -39,8 +39,9 @@ export interface ParentAdjustmentInput {
  * after a grading override). Requires a parent with a recent adult unlock, a meaningful reason,
  * and may not take the balance below zero.
  *
- * Decision: a reason must contain at least one letter or number (punctuation-only is treated as
- * blank) and is stored trimmed.
+ * Decision: a reason must contain at least one visible letter or number (`hasLetterOrNumber`):
+ * punctuation-only, symbol-only ("+", "~~~", "<>=") and invisible-character reasons are treated as
+ * blank. The reason is stored trimmed.
  */
 export function parentAdjustment(
   input: ParentAdjustmentInput,
@@ -55,7 +56,7 @@ export function parentAdjustment(
     return err('INVALID_REQUEST', 'Child and adjustment ids must be valid identifiers');
   }
   const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
-  if (!isMeaningfulText(reason)) {
+  if (!hasLetterOrNumber(reason)) {
     return err('REASON_REQUIRED', 'Explain why the points are being adjusted');
   }
   if (codePointLength(reason) > MAX_ADJUSTMENT_REASON_LENGTH) {

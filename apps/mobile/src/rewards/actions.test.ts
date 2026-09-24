@@ -139,6 +139,7 @@ describe('parent actions', () => {
     expect(result).toEqual({
       ok: true,
       needsPin: false,
+      reload: true,
       message: 'Approved Riley’s request for Trip to the library.',
     });
     expect(api.calls[1]).toEqual({
@@ -151,7 +152,33 @@ describe('parent actions', () => {
   it('asks for the parent PIN when a step-up is required', async () => {
     const api = fakeApi(() => new ApiRequestError('STEP_UP_REQUIRED', 'raw', 403));
     const result = await decideRequestAction(api, parentRequest, 'decline');
-    expect(result).toMatchObject({ ok: false, needsPin: true });
+    expect(result).toMatchObject({ ok: false, needsPin: true, reload: false });
     expect(result.message).toMatch(/Enter your parent PIN/);
+  });
+
+  it('asks the screen to reload when the request already changed elsewhere', async () => {
+    for (const error of [
+      new ApiRequestError('BUSINESS_RULE', 'raw', 422, 'INVALID_TRANSITION'),
+      new ApiRequestError('NOT_FOUND', 'raw', 404),
+    ]) {
+      const result = await decideRequestAction(
+        fakeApi(() => error),
+        parentRequest,
+        'approve',
+      );
+      expect(result).toMatchObject({ ok: false, needsPin: false, reload: true });
+    }
+    // Offline or insufficient points: the list is still right, so keep it (no reload).
+    for (const error of [
+      new ApiRequestError('NETWORK', 'raw', 0),
+      new ApiRequestError('BUSINESS_RULE', 'raw', 422, 'INSUFFICIENT_POINTS'),
+    ]) {
+      const result = await decideRequestAction(
+        fakeApi(() => error),
+        parentRequest,
+        'approve',
+      );
+      expect(result).toMatchObject({ ok: false, reload: false });
+    }
   });
 });

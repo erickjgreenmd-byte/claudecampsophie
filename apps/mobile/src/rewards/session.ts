@@ -25,7 +25,13 @@ export function childRewardsTokenSource(): TokenSource | null {
   return childSource;
 }
 
-/** The signed-in parent's token source, or null when no parent session is available. */
+/**
+ * The signed-in parent's token source, or null when no parent session is available.
+ *
+ * Not a parent-area gate: the parent stays signed in while the device is in child mode (spec P3,
+ * AC_ACCESS_07), so parent screens must get their client from `useParentAccess()` in
+ * src/family/ui.tsx, which refuses in child mode (RV-rewards-3). The approvals screen does.
+ */
 export function parentRewardsTokenSource(): TokenSource | null {
   return parentSource;
 }

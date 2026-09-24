@@ -11,6 +11,7 @@ import {
   type LedgerEntry,
   type RedemptionAction,
   type RedemptionRequest,
+  type RequestRedemptionInput,
   type RewardOffer,
   type RewardsPrincipal,
   type TransitionContext,
@@ -97,6 +98,64 @@ describe('requestRedemption reserves the cost atomically (P9)', () => {
       ).toBe('INVALID_POINT_COST');
     },
   );
+
+  it('a parent with a recent adult unlock may request on the child’s behalf', () => {
+    const outcome = unwrap(
+      requestRedemption({
+        principal: 'parent',
+        recentAdultUnlock: true,
+        childId: RILEY,
+        requestId: 'req-p',
+        reward: BOOK,
+        currentBalance: 10,
+      }),
+    );
+    expect(outcome.request.requestedBy).toBe('parent');
+    expect(outcome.entries.map((entry) => [entry.actor, entry.points])).toEqual([['parent', -8]]);
+  });
+
+  it.each([
+    ['no unlock evidence', {}],
+    ['a stale unlock', { recentAdultUnlock: false }],
+    ['a truthy but non-boolean unlock flag', { recentAdultUnlock: 'yes' }],
+  ])('a parent request with %s is STEP_UP_REQUIRED (P3, RV-rewards-4)', (_label, unlock) => {
+    const input = {
+      principal: 'parent',
+      childId: RILEY,
+      requestId: 'req-p',
+      reward: BOOK,
+      currentBalance: 10,
+      ...unlock,
+    } as unknown as RequestRedemptionInput;
+    expect(errorCode(requestRedemption(input))).toBe('STEP_UP_REQUIRED');
+  });
+
+  it('the step-up is checked before anything else, so a locked parent learns nothing', () => {
+    expect(
+      errorCode(
+        requestRedemption({
+          principal: 'parent',
+          childId: RILEY,
+          requestId: 'req-p',
+          reward: { ...BOOK, active: false },
+          currentBalance: 0,
+        }),
+      ),
+    ).toBe('STEP_UP_REQUIRED');
+  });
+
+  it('a child request needs no adult unlock', () => {
+    expect(
+      requestRedemption({
+        principal: 'child',
+        recentAdultUnlock: false,
+        childId: RILEY,
+        requestId: 'req-c',
+        reward: BOOK,
+        currentBalance: 10,
+      }).ok,
+    ).toBe(true);
+  });
 
   it('an unrecognized principal (e.g. a system/monetization trigger) cannot request', () => {
     expect(

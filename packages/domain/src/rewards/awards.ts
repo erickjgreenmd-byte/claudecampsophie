@@ -35,8 +35,24 @@ export type AwardErrorCode = (typeof AWARD_ERROR_CODES)[number];
 /** Keys already recorded in the child's ledger (from the store, inside the award transaction). */
 export type ExistingIdempotencyKeys = ReadonlySet<string> | readonly string[];
 
+/**
+ * Normalizes the recorded keys, failing closed. `new Set(undefined)`/`new Set(null)` is empty and
+ * `new Set('attempt:qi-1')` is a set of characters, so accepting a missing or malformed collection
+ * would re-award an instance that was already paid (review finding RV-rewards-3). Anything other
+ * than a Set or array of strings means the store read was wired wrongly: a programmer error, so it
+ * throws instead of awarding. (The store's unique key constraint remains the last line of defense.)
+ */
 function toKeySet(keys: ExistingIdempotencyKeys): ReadonlySet<string> {
-  return keys instanceof Set ? keys : new Set(keys);
+  const collection: unknown = keys;
+  if (!(collection instanceof Set) && !Array.isArray(collection)) {
+    throw new TypeError('existingIdempotencyKeys must be a Set or array of recorded keys');
+  }
+  for (const key of collection as Iterable<unknown>) {
+    if (typeof key !== 'string') {
+      throw new TypeError('existingIdempotencyKeys must contain only string keys');
+    }
+  }
+  return collection instanceof Set ? (collection as ReadonlySet<string>) : new Set(keys);
 }
 
 /**
@@ -115,9 +131,9 @@ export function computeAwards(
   existingIdempotencyKeys: ExistingIdempotencyKeys,
 ): Result<readonly LedgerEntry[], AwardErrorCode> {
   assertValidRules(rules);
+  const existing = toKeySet(existingIdempotencyKeys);
   const parsed = parseLearningEvent(event);
   if (!parsed.ok) return parsed;
-  const existing = toKeySet(existingIdempotencyKeys);
   const learning = parsed.value;
 
   if (learning.kind === 'set_completed') {
@@ -168,11 +184,11 @@ export function overrideAwards(
   existingIdempotencyKeys: ExistingIdempotencyKeys,
 ): readonly LedgerEntry[] {
   assertValidRules(rules);
+  const existing = toKeySet(existingIdempotencyKeys);
   if (!isValidId(override.childId) || !isValidId(override.questionInstanceId)) {
     throw new RangeError('Grading override requires valid child and question instance ids');
   }
   if (override.independentCorrect !== true || rules.independentCorrectBonus === 0) return [];
-  const existing = toKeySet(existingIdempotencyKeys);
   const bonusKey = independentKey(override.questionInstanceId);
   if (!existing.has(attemptKey(override.questionInstanceId)) || existing.has(bonusKey)) return [];
   return [award(override.childId, bonusKey, rules.independentCorrectBonus, 'grading_override')];

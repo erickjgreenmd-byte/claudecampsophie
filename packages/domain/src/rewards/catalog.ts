@@ -3,7 +3,7 @@
 import { err, ok, type Result } from '../shared/result.ts';
 import { isValidId } from './ids.ts';
 import { MAX_REWARD_POINT_COST, isValidPointCost, type RewardOffer } from './redemption.ts';
-import { codePointLength, isMeaningfulText } from './text.ts';
+import { codePointLength, isMeaningfulText, withoutInvisible } from './text.ts';
 
 export const MAX_REWARD_TITLE_LENGTH = 80;
 export const MAX_REWARD_INSTRUCTIONS_LENGTH = 500;
@@ -37,15 +37,33 @@ export type RewardDefinitionErrorCode = (typeof REWARD_DEFINITION_ERROR_CODES)[n
 
 /**
  * Decision: reward text is child-visible and P16.3 forbids affiliate URLs in a learning reward, so
- * reward titles and instructions may not contain any link: a URL scheme, `www.`, or a bare host
- * name with a common public suffix (e.g. amzn.to, a.co). Ordinary prose such as "Dr. Seuss book"
- * or "2.5 hours" is unaffected.
+ * reward titles and instructions may not contain any link. A link is any of:
+ * - a URL scheme (`https://`) or `www.`;
+ * - an Amazon or Amazon short-link host with any country suffix (`amazon.fr`, `amazon.com.be`,
+ *   `amzn.eu`, `amzn.asia`), because a fixed suffix list missed marketplaces (RV-rewards-5);
+ * - any host followed by a path (`name.tld/…`), whatever the suffix, which is how share links look;
+ * - a bare host name with a common public suffix (e.g. `a.co`, `shop.example.net`).
+ * The text is NFKC-normalized and stripped of invisible code points first, so full-width letters
+ * or a zero-width space inside a host cannot hide a link. Ordinary prose such as "Dr. Seuss book",
+ * "2.5 hours" or "pizza/tacos" is unaffected.
  */
-const LINK_PATTERN =
-  /[a-z][a-z0-9+.-]*:\/\/|\bwww\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|co|io|app|shop|store|ly|me|to|us|uk|ca|au|de|in|biz|info|link|gl|gd|site|online|xyz)\b/i;
+const PUBLIC_SUFFIXES =
+  'com|net|org|co|io|app|shop|store|ly|me|to|us|uk|ca|au|de|in|biz|info|link|gl|gd|site|online|xyz' +
+  // Amazon marketplace and short-link suffixes (RV-rewards-5).
+  '|eu|asia|fr|es|nl|se|pl|sg|ae|sa|eg|jp|mx|br|nz|ie|cn|tr';
+const LINK_PATTERN = new RegExp(
+  [
+    String.raw`[a-z][a-z0-9+.-]*:\/\/`,
+    String.raw`\bwww\.`,
+    String.raw`\b(?:amzn|amazon)\.[a-z]{2,}`,
+    String.raw`\b[a-z0-9-]+\.[a-z]{2,63}\/`,
+    String.raw`\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:${PUBLIC_SUFFIXES})\b`,
+  ].join('|'),
+  'i',
+);
 
 function containsLink(text: string): boolean {
-  return LINK_PATTERN.test(text);
+  return LINK_PATTERN.test(withoutInvisible(text.normalize('NFKC')));
 }
 
 /** Validates a parent-entered reward. Text is trimmed and treated as untrusted display data. */

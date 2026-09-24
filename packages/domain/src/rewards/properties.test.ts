@@ -31,7 +31,13 @@ const REWARDS: readonly RewardOffer[] = [
 type Op =
   | { t: 'event'; event: LearningEvent }
   | { t: 'override'; q: string; correct: boolean }
-  | { t: 'request'; requestId: string; reward: number; principal: RewardsPrincipal }
+  | {
+      t: 'request';
+      requestId: string;
+      reward: number;
+      principal: RewardsPrincipal;
+      unlock: boolean;
+    }
   | {
       t: 'transition';
       requestId: string;
@@ -54,7 +60,7 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
         kind: fc.constant('practice_attempt' as const),
         childId: fc.constant(RILEY),
         questionInstanceId: fc.constantFrom(...questionIds),
-        answerText: fc.constantFrom('', '  ', '?', '7', 'seven', '3/4'),
+        answerText: fc.constantFrom('', '  ', '?', '\u3164', '7', 'seven', '3/4'),
         responseTimeMs: fc.integer({ min: 0, max: 6_000 }),
         independentCorrect: fc.boolean(),
       }),
@@ -75,6 +81,7 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
     requestId: fc.constantFrom(...requestIds),
     reward: fc.integer({ min: 0, max: REWARDS.length - 1 }),
     principal: principalArb,
+    unlock: fc.boolean(),
   }),
   fc.record({
     t: fc.constant('transition' as const),
@@ -88,7 +95,7 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
     t: fc.constant('adjust' as const),
     adjustmentId: fc.constantFrom('adj-1', 'adj-2', 'adj-3'),
     points: fc.integer({ min: -15, max: 15 }),
-    reason: fc.constantFrom('Great focus this week', '', 'Undo extra bonus'),
+    reason: fc.constantFrom('Great focus this week', '', '+', 'Undo extra bonus'),
     unlock: fc.boolean(),
   }),
 );
@@ -134,11 +141,16 @@ function apply(store: Store, op: Op): void {
       if (reward === undefined) throw new Error('bad reward index');
       const result = requestRedemption({
         principal: op.principal,
+        recentAdultUnlock: op.unlock,
         childId: RILEY,
         requestId: op.requestId,
         reward,
         currentBalance: balance(store.ledger),
       });
+      // P3: a parent spends the child's points only with a recent adult unlock (RV-rewards-4).
+      if (op.principal === 'parent' && !op.unlock) {
+        expect(result.ok ? 'accepted' : result.error.code).toBe('STEP_UP_REQUIRED');
+      }
       if (!result.ok) return;
       if (commit(store, result.value.entries, store.requests.has(op.requestId))) {
         store.requests.set(op.requestId, result.value.request);

@@ -214,6 +214,18 @@ const DECISION_DONE: Record<RewardDecisionAction, string> = {
   cancel: 'Cancelled',
 };
 
+/**
+ * True when the server refused a decision because the request is no longer where this page thinks
+ * it is (the child cancelled on their device, another guardian decided, or it was removed).
+ */
+function requestChangedElsewhere(error: unknown): boolean {
+  return (
+    error instanceof ApiRequestError &&
+    ((error.code === 'BUSINESS_RULE' && error.rule === 'INVALID_TRANSITION') ||
+      error.code === 'NOT_FOUND')
+  );
+}
+
 function RequestsSection({ data, onChanged }: { data: RewardsOverview; onChanged: () => void }) {
   const { api } = useSession();
   const { busy, feedback, run } = useAction();
@@ -221,12 +233,19 @@ function RequestsSection({ data, onChanged }: { data: RewardsOverview; onChanged
 
   const decide = (request: ParentRewardRequest, action: RewardDecisionAction) =>
     void run(`${request.id}:${action}`, async () => {
-      await api.send(
-        'POST',
-        `/v1/reward-requests/${request.id}/decision`,
-        { action },
-        rewardDecisionResponseSchema,
-      );
+      try {
+        await api.send(
+          'POST',
+          `/v1/reward-requests/${request.id}/decision`,
+          { action },
+          rewardDecisionResponseSchema,
+        );
+      } catch (error) {
+        // Decision (RV-rewards-7): reload so a request that already changed stops offering buttons
+        // that can only fail. The error stays on screen to explain what happened.
+        if (requestChangedElsewhere(error)) onChanged();
+        throw error;
+      }
       onChanged();
       return `${DECISION_DONE[action]} ${request.childNickname}’s request for “${request.rewardTitle}”.`;
     });
@@ -462,6 +481,13 @@ function HistorySection({ child, version }: { child: RewardChildBalance; version
 // Adjustments
 // ---------------------------------------------------------------------------------------------
 
+type AdjustmentDirection = 'add' | 'remove';
+
+const DIRECTION_OPTIONS: readonly { value: AdjustmentDirection; label: string }[] = [
+  { value: 'add', label: 'Add points' },
+  { value: 'remove', label: 'Remove points' },
+];
+
 function AdjustmentSection({
   childBalances,
   onChanged,
@@ -472,8 +498,11 @@ function AdjustmentSection({
   const { api } = useSession();
   const { busy, feedback, run } = useAction();
   const headingId = useId();
-  const ids = { child: useId(), points: useId(), reason: useId(), error: useId() };
+  const ids = { child: useId(), points: useId(), hint: useId(), reason: useId(), error: useId() };
   const [childId, setChildId] = useState('');
+  // Decision (RV-rewards-8): the direction is an explicit Add/Remove choice, because a phone's
+  // numeric keypad (inputMode="numeric") has no minus key. The number field holds the size only.
+  const [direction, setDirection] = useState<AdjustmentDirection>('add');
   const [points, setPoints] = useState('');
   const [reason, setReason] = useState('');
   const [problem, setProblem] = useState<string | null>(null);
@@ -481,24 +510,37 @@ function AdjustmentSection({
   // applies the adjustment at most once. A fresh id is issued only after success.
   const [adjustmentId, setAdjustmentId] = useState(newId);
 
+  const changePoints = (raw: string) => {
+    // A sign typed on a full keyboard ("-3", "+3") picks the direction, which stays visible above.
+    const signed = /^\s*([-−+])\s*(.*)$/u.exec(raw);
+    if (signed) {
+      setDirection(signed[1] === '+' ? 'add' : 'remove');
+      setPoints(signed[2] ?? '');
+    } else {
+      setPoints(raw);
+    }
+    setAdjustmentId(newId());
+  };
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const amount = Number(points.trim());
+    const size = Number(points.trim());
     const child = childBalances.find((c) => c.childId === childId);
     const trimmedReason = reason.trim();
     let issue: string | null = null;
     if (!child) issue = 'Choose a child.';
     else if (
       points.trim() === '' ||
-      !Number.isInteger(amount) ||
-      amount === 0 ||
-      Math.abs(amount) > POINTS_ADJUSTMENT_MAX
+      !Number.isInteger(size) ||
+      size <= 0 ||
+      size > POINTS_ADJUSTMENT_MAX
     )
-      issue = `Enter a whole number other than 0 (up to ${POINTS_ADJUSTMENT_MAX} either way).`;
+      issue = `Enter a whole number other than 0 (up to ${POINTS_ADJUSTMENT_MAX}).`;
     else if (!/[\p{L}\p{N}]/u.test(trimmedReason))
       issue = 'Add a reason. It is saved with the adjustment in the points history.';
     setProblem(issue);
     if (issue || !child) return;
+    const amount = direction === 'remove' ? -size : size;
     void run('adjust', async () => {
       const result = await api.send(
         'POST',
@@ -507,6 +549,7 @@ function AdjustmentSection({
         pointsAdjustmentResponseSchema,
       );
       setAdjustmentId(newId());
+      setDirection('add');
       setPoints('');
       setReason('');
       onChanged();
@@ -540,15 +583,37 @@ function AdjustmentSection({
             </option>
           ))}
         </select>
-        <label htmlFor={ids.points}>Points to add or remove (use a minus sign to remove)</label>
+        <fieldset style={{ border: 0, padding: 0, margin: '12px 0 0' }}>
+          <legend style={{ fontWeight: 700 }}>Add or remove</legend>
+          {DIRECTION_OPTIONS.map((option) => (
+            <label key={option.value} style={{ fontWeight: 400, display: 'flex', gap: 8 }}>
+              <input
+                type="radio"
+                name={`${ids.points}-direction`}
+                value={option.value}
+                checked={direction === option.value}
+                style={{ width: 'auto', minHeight: 24 }}
+                onChange={() => {
+                  setDirection(option.value);
+                  setAdjustmentId(newId());
+                }}
+              />
+              {option.label}
+            </label>
+          ))}
+        </fieldset>
+        <label htmlFor={ids.points}>Points to add or remove</label>
+        <p id={ids.hint} style={{ margin: 0, color: 'var(--muted)' }}>
+          {direction === 'remove'
+            ? 'Removing points. Enter how many as a whole number.'
+            : 'Adding points. Enter how many as a whole number.'}
+        </p>
         <input
           id={ids.points}
           inputMode="numeric"
           value={points}
-          onChange={(e) => {
-            setPoints(e.target.value);
-            setAdjustmentId(newId());
-          }}
+          onChange={(e) => changePoints(e.target.value)}
+          aria-describedby={ids.hint}
           aria-invalid={problem !== null && problem.startsWith('Enter')}
         />
         <label htmlFor={ids.reason}>Reason</label>

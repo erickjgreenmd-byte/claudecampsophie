@@ -255,6 +255,68 @@ describe('RewardsPage (spec P9, P14; AC_UX_02)', () => {
     expect(sends[1]!.body).toMatchObject({ points: -3 });
   });
 
+  it('a removal can be entered with the Add/Remove choice on a digits-only keypad', async () => {
+    const { api, sends } = fakeApi({
+      send: () => ({ childId: RILEY, balance: 8, applied: true }),
+    });
+    renderPage(<RewardsPage />, { api });
+    const form = await screen.findByRole('form', { name: 'Adjust points' });
+    const field = within(form).getByLabelText(/Points to add or remove/);
+    expect(field.getAttribute('inputmode')).toBe('numeric');
+    expect(within(form).getByRole('radio', { name: 'Add points' })).toHaveProperty('checked', true);
+    await userEvent.selectOptions(within(form).getByLabelText('Child'), RILEY);
+    await userEvent.click(within(form).getByRole('radio', { name: 'Remove points' }));
+    await userEvent.type(field, '4');
+    await userEvent.type(within(form).getByLabelText('Reason'), 'Duplicate award reversed');
+    await userEvent.click(within(form).getByRole('button', { name: 'Save adjustment' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]!.body).toMatchObject({ childId: RILEY, points: -4 });
+    // After saving, the form returns to adding so the next entry is not a surprise removal.
+    expect(await screen.findByText(/Riley now has 8 points/)).toBeTruthy();
+    expect(within(form).getByRole('radio', { name: 'Add points' })).toHaveProperty('checked', true);
+  });
+
+  it('a typed minus sign selects Remove, and a typed plus sign selects Add', async () => {
+    const { api } = fakeApi();
+    renderPage(<RewardsPage />, { api });
+    const form = await screen.findByRole('form', { name: 'Adjust points' });
+    const field = within(form).getByLabelText(/Points to add or remove/);
+    await userEvent.type(field, '-6');
+    expect(field).toHaveProperty('value', '6');
+    expect(within(form).getByRole('radio', { name: 'Remove points' })).toHaveProperty(
+      'checked',
+      true,
+    );
+    await userEvent.clear(field);
+    await userEvent.type(field, '+2');
+    expect(field).toHaveProperty('value', '2');
+    expect(within(form).getByRole('radio', { name: 'Add points' })).toHaveProperty('checked', true);
+  });
+
+  it('a decision on a request that no longer exists refreshes the list', async () => {
+    let loads = 0;
+    const { api, gets } = fakeApi({
+      get: () => {
+        loads += 1;
+        return loads === 1 ? overview() : overview({ openRequests: [] });
+      },
+      send: () => new ApiRequestError('NOT_FOUND', 'Request not found', 404),
+    });
+    renderPage(<RewardsPage />, { api });
+    await userEvent.click(await screen.findByRole('button', { name: /Decline Riley’s request/ }));
+    expect(await screen.findByText(/Request not found/)).toBeTruthy();
+    await waitFor(() => expect(gets.filter((p) => p === '/v1/rewards')).toHaveLength(2));
+    expect(await screen.findByText(/No requests waiting/)).toBeTruthy();
+  });
+
+  it('a step-up failure on a decision does not reload the list', async () => {
+    const { api, gets } = fakeApi({ send: () => stepUp() });
+    renderPage(<RewardsPage />, { api });
+    await userEvent.click(await screen.findByRole('button', { name: /Approve Riley’s request/ }));
+    expect(await screen.findByText(/Enter your parent PIN/)).toBeTruthy();
+    expect(gets.filter((p) => p === '/v1/rewards')).toHaveLength(1);
+  });
+
   it('shows the insufficient-points rule clearly', async () => {
     const { api } = fakeApi({
       send: () =>

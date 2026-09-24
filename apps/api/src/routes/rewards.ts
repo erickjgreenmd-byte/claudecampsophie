@@ -180,6 +180,11 @@ function mapRewardsDbError(error: unknown, caller: 'parent' | 'child'): never {
     if (message.includes('child not found')) throw new ApiError('NOT_FOUND', 'Child not found');
     throw new ApiError('NOT_FOUND', 'Request not found');
   }
+  if (code === '22021' || code === '22P05') {
+    // Text Postgres cannot store (e.g. U+0000). The contracts refuse control characters first; this
+    // keeps any other unstorable text a 400 instead of an unhandled 500 (RV-rewards-2).
+    throw new ApiError('VALIDATION_FAILED', 'Some text contains characters that can’t be saved');
+  }
   if (code === '42501') {
     // Parent: the step-up expired between our check and the write (RLS / RPC re-check).
     if (caller === 'parent')

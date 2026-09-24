@@ -2,7 +2,7 @@
 // there is deliberately no cash-out, transfer, sale or purchase operation anywhere in this module.
 import { err, ok, type Result } from '../shared/result.ts';
 import { adjustmentKey, isValidId, releaseKey, reserveKey } from './ids.ts';
-import { isMeaningfulText, isPlainRecord, ownField } from './text.ts';
+import { hasLetterOrNumber, isPlainRecord, ownField } from './text.ts';
 
 export const LEDGER_ENTRY_KINDS = [
   'award',
@@ -121,8 +121,9 @@ export function describeEntryProblem(entry: unknown): string | null {
       if (points === 0) return 'adjustments must be non-zero';
       if (actor !== 'parent') return 'adjustments are parent entries';
       const reason = ownField(entry, 'reason');
-      if (typeof reason !== 'string' || !isMeaningfulText(reason)) {
-        return 'adjustments require a reason';
+      // Same rule as parentAdjustment, so append and reconciliation refuse what it refuses.
+      if (typeof reason !== 'string' || !hasLetterOrNumber(reason)) {
+        return 'adjustments require a reason with a letter or number';
       }
       if (!key.startsWith(adjustmentKey(''))) return 'adjustment key must start with adjust:';
       return null;
@@ -147,15 +148,24 @@ export const APPEND_ERROR_CODES = [
   'CHILD_MISMATCH',
   'DUPLICATE_IDEMPOTENCY_KEY',
   'NEGATIVE_BALANCE',
+  'RELEASE_WITHOUT_RESERVE',
+  'RELEASE_AMOUNT_MISMATCH',
 ] as const;
 export type AppendErrorCode = (typeof APPEND_ERROR_CODES)[number];
 
 /**
  * Pure model of the atomic ledger write: within one transaction (child ledger row locked) the
- * store checks well-formedness, the unique idempotency constraint and that the running balance
- * never drops below zero, then appends everything or nothing. The API's SQL implementation must
- * enforce the same rules with a unique index and a locked balance check; this function is the
- * executable specification used by tests.
+ * store checks well-formedness, the unique idempotency constraint, that every redemption release
+ * returns exactly the points of an earlier reserve for the same request, and that the running
+ * balance never drops below zero, then appends everything or nothing. The API's SQL
+ * implementation must enforce the same rules with a unique index, a release amount taken from the
+ * reserved request and a locked balance check; this function is the executable specification
+ * used by tests.
+ *
+ * Decision: a release with no earlier reserve for its request (in the ledger or earlier in the same
+ * batch) is RELEASE_WITHOUT_RESERVE, and one whose points differ from that reserve's cost is
+ * RELEASE_AMOUNT_MISMATCH, so a refund can never mint points (review finding RV-rewards-6). A
+ * second release for the same request is already a DUPLICATE_IDEMPOTENCY_KEY.
  */
 export function appendToLedger(
   ledger: readonly LedgerEntry[],
@@ -163,6 +173,13 @@ export function appendToLedger(
 ): Result<readonly LedgerEntry[], AppendErrorCode> {
   let running = balance(ledger);
   const keys = new Set(ledger.map((entry) => entry.idempotencyKey));
+  /** Reserved cost (positive) by request id, from the ledger and earlier entries in this batch. */
+  const reserved = new Map<string, number>();
+  for (const entry of ledger) {
+    if (entry.kind === 'redemption_reserve' && entry.requestId !== undefined) {
+      reserved.set(entry.requestId, -entry.points);
+    }
+  }
   const childId = ledger[0]?.childId ?? entries[0]?.childId;
   for (const [index, entry] of entries.entries()) {
     const problem = describeEntryProblem(entry);
@@ -175,6 +192,26 @@ export function appendToLedger(
         idempotencyKey: entry.idempotencyKey,
       });
     }
+    // describeEntryProblem guarantees a valid requestId on reserve and release entries.
+    const requestId = entry.requestId ?? '';
+    if (entry.kind === 'redemption_release') {
+      const cost = reserved.get(requestId);
+      if (cost === undefined) {
+        return err('RELEASE_WITHOUT_RESERVE', 'Only reserved points can be returned', {
+          index,
+          requestId,
+        });
+      }
+      if (entry.points !== cost) {
+        return err('RELEASE_AMOUNT_MISMATCH', 'A release must return exactly the reserved points', {
+          index,
+          requestId,
+          reserved: cost,
+          points: entry.points,
+        });
+      }
+    }
+    if (entry.kind === 'redemption_reserve') reserved.set(requestId, -entry.points);
     keys.add(entry.idempotencyKey);
     running += entry.points;
     if (running < 0) {

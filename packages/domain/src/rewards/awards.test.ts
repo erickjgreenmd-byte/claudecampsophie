@@ -96,6 +96,21 @@ describe('anti-farming: empty and rapid guesses earn nothing (AC_REWARDS_01)', (
     expect(awardsFor(attemptEvent({ answerText, independentCorrect: true }))).toEqual([]);
   });
 
+  it.each([
+    ['Hangul filler', '\u3164'],
+    ['halfwidth Hangul filler', '\uFFA0'],
+    ['soft hyphen and word joiner', '\u00AD\u2060'],
+  ])('an invisible %s answer earns no points (RV-rewards-1 neighbors)', (_label, answerText) => {
+    expect(awardsFor(attemptEvent({ answerText, independentCorrect: true }))).toEqual([]);
+  });
+
+  it.each(['한', '\u31647', 'x\u200B'])(
+    'a visible answer %j next to invisible characters still earns (no over-blocking)',
+    (answerText) => {
+      expect(sumPoints(awardsFor(attemptEvent({ answerText })))).toBe(2);
+    },
+  );
+
   it.each(['7', 'x', 'B', '½', 'π', '<', '=', '3/4', '-2', '١٢'])(
     'a short but meaningful answer %s earns effort points',
     (answerText) => {
@@ -274,6 +289,34 @@ describe('untrusted learning events are validated before awarding', () => {
     },
   );
 
+  it.each([
+    ['a Map', new Map([['attempt:qi-1', true]])],
+    ['a plain object', { 'attempt:qi-1': true }],
+    ['an array holding a non-string key', ['attempt:qi-1', 7]],
+    ['a Set holding a non-string key', new Set<unknown>([null])],
+  ])('fails closed (throws) when the existing keys are %s (RV-rewards-3)', (_label, keys) => {
+    const malformed = keys as unknown as readonly string[];
+    expect(() => computeAwards(attemptEvent(), DEFAULT_REWARD_RULES, malformed)).toThrow(TypeError);
+  });
+
+  it('checks the existing keys before the event, so a missing key read never awards', () => {
+    const missing = undefined as unknown as readonly string[];
+    expect(() => computeAwards(attemptEvent(), DEFAULT_REWARD_RULES, missing)).toThrow(TypeError);
+    expect(() =>
+      computeAwards(
+        { kind: 'set_completed', childId: RILEY, setId: 'set-mon' },
+        DEFAULT_REWARD_RULES,
+        missing,
+      ),
+    ).toThrow(TypeError);
+  });
+
+  it('accepts the recorded keys as an array of strings (the API store read)', () => {
+    expect(unwrap(computeAwards(attemptEvent(), DEFAULT_REWARD_RULES, ['attempt:qi-1']))).toEqual(
+      [],
+    );
+  });
+
   it('treats unvalidated rules as a programmer error', () => {
     const broken = { ...DEFAULT_REWARD_RULES, attemptPoints: -2 };
     expect(() => computeAwards(attemptEvent(), broken, [])).toThrow(RangeError);
@@ -318,6 +361,15 @@ describe('grading overrides never claw back earned points (AC_GRADING_10, P5)', 
         new Set<string>(),
       ),
     ).toEqual([]);
+  });
+
+  it('fails closed (throws) when the existing keys are missing or a bare string', () => {
+    const override = { childId: RILEY, questionInstanceId: 'qi-1', independentCorrect: true };
+    for (const keys of [undefined, null, 'attempt:qi-1']) {
+      expect(() =>
+        overrideAwards(override, DEFAULT_REWARD_RULES, keys as unknown as readonly string[]),
+      ).toThrow(TypeError);
+    }
   });
 
   it('property: overrideAwards never returns a negative entry or reuses an existing key', () => {

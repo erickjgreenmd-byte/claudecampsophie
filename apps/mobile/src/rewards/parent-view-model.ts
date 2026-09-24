@@ -129,7 +129,7 @@ export function parentActionError(error: unknown): { needsPin: boolean; message:
   if (code === 'BUSINESS_RULE' && error.rule === 'INVALID_TRANSITION')
     return {
       needsPin: false,
-      message: 'This request was already updated. Refresh to see its current status.',
+      message: 'This request was already updated. The list now shows where it is.',
     };
   if (code === 'BUSINESS_RULE') return { needsPin: false, message: error.message };
   if (code === 'NOT_FOUND')

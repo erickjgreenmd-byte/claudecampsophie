@@ -196,6 +196,53 @@ describe('parent reward catalog (spec P9)', () => {
     expect(childMove.status).toBe(400);
   });
 
+  it('reward text refuses marketplace, share and hidden links on create and edit, but not prose', async () => {
+    // P16.3: "No affiliate URL in a push, SMS, exported child worksheet or learning reward."
+    const base = { title: 'Board game night', pointCost: 20, childId: null };
+    for (const text of [
+      'Order amazon.it/dp/B000000000?tag=family-21',
+      'amazon.com.be deal',
+      'Book amzn.eu/d/abc123',
+      'See shop.example.fr for details',
+      'Look at bookshop.nu/list',
+      'amzn​.to/xyz', // zero-width space inside the host
+      'ａｍｚｎ.to/xyz', // full-width letters
+    ]) {
+      expect((await createReward({ ...base, instructions: text })).status, text).toBe(400);
+    }
+    const id = await newReward(5);
+    const linkEdit = await api.request(`/v1/rewards/${id}`, {
+      method: 'PATCH',
+      token,
+      body: { instructions: 'amazon.es/dp/B000000000' },
+    });
+    expect(linkEdit.status).toBe(400);
+    for (const title of ['Dr. Seuss book', '2.5 hours at the park', 'Pizza/tacos night']) {
+      expect((await createReward({ ...base, title })).status, title).toBe(201);
+    }
+  });
+
+  it('control characters in reward text or a reason are a 400, never stored (P13)', async () => {
+    const base = { title: 'Board game night', pointCost: 20, childId: null };
+    expect((await createReward({ ...base, title: 'Movie\u0001night' })).status).toBe(400);
+    expect((await createReward({ ...base, instructions: 'Stay up\u0000late' })).status).toBe(400);
+    const id = await newReward(5);
+    const edit = await api.request(`/v1/rewards/${id}`, {
+      method: 'PATCH',
+      token,
+      body: { title: 'Park\u0000trip' },
+    });
+    expect(edit.status).toBe(400);
+    // Line breaks in the instructions stay allowed.
+    const multiLine = await createReward({ ...base, instructions: 'Saturday\nafter lunch' });
+    expect(multiLine.status).toBe(201);
+    const [row] = await api.db.sql<
+      { title: string }[]
+    >`select title from public.rewards where id = ${id}`;
+    expect(row!.title).not.toContain('\u0000');
+    expect(api.logs.some((l) => l.event === 'unhandled_error')).toBe(false);
+  });
+
   it('another family cannot see or edit this family’s rewards', async () => {
     const id = await newReward(15);
     const edit = await api.request(`/v1/rewards/${id}`, {
@@ -543,6 +590,8 @@ describe('adjustments and history (AC_REWARDS_05)', () => {
       { ...body, reason: undefined },
       { ...body, reason: '   ' },
       { ...body, reason: '!!!' },
+      { ...body, reason: 'Helped\u0000out' },
+      { ...body, reason: 'Helped\u0007out' },
       { ...body, points: 0 },
       { ...body, points: 1.5 },
       { ...body, points: 10_001 },

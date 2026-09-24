@@ -18,7 +18,17 @@ import { DECISION_DONE, parentActionError } from './parent-view-model.ts';
  */
 
 export type ActionResult = { ok: true; message: string } | { ok: false; message: string };
-export type ParentActionResult = { ok: boolean; needsPin: boolean; message: string };
+/**
+ * `reload` is true when the family overview on screen is out of date: after a successful decision,
+ * and when the server refused because the request had already changed (the child cancelled, another
+ * guardian decided, or it is gone), so buttons that can only fail are not left on screen.
+ */
+export type ParentActionResult = {
+  ok: boolean;
+  needsPin: boolean;
+  reload: boolean;
+  message: string;
+};
 
 /**
  * Client-generated request ids per reward. A retry after a lost response reuses the id, so the
@@ -115,9 +125,18 @@ export async function decideRequestAction(
     return {
       ok: true,
       needsPin: false,
+      reload: true,
       message: `${DECISION_DONE[action]} ${request.childNickname}’s request for ${request.rewardTitle}.`,
     };
   } catch (error) {
-    return { ok: false, ...parentActionError(error) };
+    return { ok: false, reload: requestChangedElsewhere(error), ...parentActionError(error) };
   }
+}
+
+function requestChangedElsewhere(error: unknown): boolean {
+  return (
+    error instanceof ApiRequestError &&
+    ((error.code === 'BUSINESS_RULE' && error.rule === 'INVALID_TRANSITION') ||
+      error.code === 'NOT_FOUND')
+  );
 }

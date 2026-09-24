@@ -41,9 +41,14 @@ describe('parent-defined rewards are family records fulfilled outside the app (P
     expect(value).not.toHaveProperty('imageAssetId');
   });
 
-  it.each(['', '   ', '!!!'])('requires a meaningful title (%j)', (title) => {
-    expect(errorCode(validateRewardDefinition({ ...FIVE_DOLLARS, title }))).toBe('TITLE_REQUIRED');
-  });
+  it.each(['', '   ', '!!!', '\u3164', '\u200B\uFFA0'])(
+    'requires a meaningful title (%j)',
+    (title) => {
+      expect(errorCode(validateRewardDefinition({ ...FIVE_DOLLARS, title }))).toBe(
+        'TITLE_REQUIRED',
+      );
+    },
+  );
 
   it('bounds untrusted text length', () => {
     expect(
@@ -95,10 +100,29 @@ describe('no affiliate or merchant links in a learning reward (P16.3, P16.4, AC_
     );
   });
 
-  it.each(['A new book from the bookstore', 'Dr. Seuss book', 'Pick 2.5 hours of park time'])(
-    'ordinary text %j is not mistaken for a link',
-    (title) => {
-      expect(validateRewardDefinition({ ...FIVE_DOLLARS, title }).ok).toBe(true);
-    },
-  );
+  it.each([
+    ['title', 'Blocks from amazon.nl'],
+    ['title', 'Puzzle amazon.com.be'],
+    ['instructions', 'Use smile.amazon.de please'],
+    ['instructions', 'Any shop with a path: shop.example.it/deal'],
+    ['title', 'Full-width ａｍｚｎ．ｅｕ/d/x'],
+    ['title', 'Split amzn\u200B.eu/d/x'],
+  ] as const)('rejects a disguised or country-specific link in the %s: %s', (field, text) => {
+    expect(errorCode(validateRewardDefinition({ ...FIVE_DOLLARS, [field]: text }))).toBe(
+      'LINK_NOT_ALLOWED',
+    );
+  });
+
+  it.each([
+    'A new book from the bookstore',
+    'Dr. Seuss book',
+    'Pick 2.5 hours of park time',
+    'Riley picks dinner (pizza/tacos)',
+    'Movie night w/ Sam',
+    '1/2 hour of screen time',
+    'U.S. map puzzle',
+    'Ice cream at 4 p.m./after school',
+  ])('ordinary text %j is not mistaken for a link', (title) => {
+    expect(validateRewardDefinition({ ...FIVE_DOLLARS, title }).ok).toBe(true);
+  });
 });
