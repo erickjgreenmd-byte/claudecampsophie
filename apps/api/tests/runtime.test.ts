@@ -244,6 +244,46 @@ describe('buildRuntime wires billing from the configuration (AC_DEPLOY_07)', () 
   });
 });
 
+describe('buildRuntime wires storage and email explicitly (AC_DEPLOY_07, L-016)', () => {
+  it('development and test get the labeled storage and email mocks', () => {
+    for (const APP_ENV of ['development', 'test']) {
+      const built = build({ APP_ENV });
+      if (!built.ok) throw new Error(`${APP_ENV} should build: ${built.code}`);
+      const { storage, email } = built.runtime.deps.providers;
+      expect([storage.isMock, email.isMock]).toEqual([true, true]);
+    }
+  });
+
+  it('staging without storage keys or an email adapter gets providers that refuse, never mocks', async () => {
+    const built = build({ APP_ENV: 'staging' });
+    if (!built.ok) throw new Error(`staging should build: ${built.code}`);
+    const { storage, email } = built.runtime.deps.providers;
+    expect([storage.name, storage.isMock]).toEqual(['not_configured', false]);
+    expect([email.name, email.isMock]).toEqual(['not_configured', false]);
+    await expect(storage.createSignedUploadUrl('f/c/a/p.jpg', 60)).rejects.toThrow(
+      /not configured/,
+    );
+    await expect(storage.exists('f/c/a/p.jpg')).rejects.toThrow(/not configured/);
+    await expect(storage.stat('f/c/a/p.jpg')).rejects.toThrow(/not configured/);
+    await expect(
+      email.send({
+        to: 'riley.parent@example.invalid',
+        templateKey: 'guardian_invitation',
+        params: {},
+      }),
+    ).rejects.toThrow(/not configured/);
+  });
+
+  it('staging with Supabase keys gets real storage; email stays unavailable (no adapter exists)', () => {
+    const built = build({ APP_ENV: 'staging', ...REAL_STORAGE });
+    if (!built.ok) throw new Error(`staging should build: ${built.code}`);
+    const { storage, email } = built.runtime.deps.providers;
+    expect(storage.isMock).toBe(false);
+    expect(storage.name).not.toBe('not_configured');
+    expect([email.name, email.isMock]).toEqual(['not_configured', false]);
+  });
+});
+
 describe('selectBillingProviders is explicit and fails closed (AC_DEPLOY_07)', () => {
   it('production without keys gets the unavailable providers and readiness reports billing blocked', () => {
     const production = config({ APP_ENV: 'production', ...REAL_STORAGE });

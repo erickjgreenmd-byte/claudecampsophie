@@ -17,6 +17,8 @@ import {
   createMemoryStorageMock,
   createOutboxEmailMock,
   type ConsentProvider,
+  type EmailProvider,
+  type StorageProvider,
 } from './providers/index.ts';
 import { cryptoRandom } from '@pencillift/domain';
 import {
@@ -185,6 +187,54 @@ export function selectBillingProviders(
   return { ok: true, subscriptions, stripe };
 }
 
+/**
+ * Storage and email outside development/test without their credentials: a provider that refuses
+ * every call, never a labeled mock (L-016). An in-memory store loses homework photos and an outbox
+ * delivers nothing, yet both answer as if they worked.
+ */
+function createUnavailableStorage(): StorageProvider {
+  const refuse = () => Promise.reject(new Error('storage provider not configured'));
+  return {
+    name: 'not_configured',
+    isMock: false,
+    createSignedUploadUrl: refuse,
+    createSignedReadUrl: refuse,
+    exists: refuse,
+    stat: refuse,
+    remove: refuse,
+  };
+}
+
+function createUnavailableEmail(): EmailProvider {
+  return {
+    name: 'not_configured',
+    isMock: false,
+    send: () => Promise.reject(new Error('email provider not configured')),
+  };
+}
+
+/** Explicit storage and email selection: labeled mocks only in development and test. */
+export function selectStorageAndEmail(
+  config: ApiConfig,
+  env: WorkerEnv,
+): { storage: StorageProvider; email: EmailProvider } {
+  const mocksAllowed = MOCK_ENVIRONMENTS.has(config.environment);
+  const storage =
+    config.providers.storage === 'supabase' &&
+    typeof env.SUPABASE_URL === 'string' &&
+    typeof env.SUPABASE_SERVICE_ROLE_KEY === 'string'
+      ? createSupabaseStorage({
+          supabaseUrl: env.SUPABASE_URL,
+          serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+        })
+      : mocksAllowed
+        ? createMemoryStorageMock()
+        : createUnavailableStorage();
+  // No transactional email adapter exists yet (docs/Connections.md, Owner action #14).
+  const email = mocksAllowed ? createOutboxEmailMock() : createUnavailableEmail();
+  return { storage, email };
+}
+
 /** Builds the per-invocation dependencies shared by HTTP requests and Cron Triggers. */
 export function buildRuntime(env: WorkerEnv): RuntimeResult {
   const loaded = loadConfig(stringEnv(env));
@@ -211,19 +261,9 @@ export function buildRuntime(env: WorkerEnv): RuntimeResult {
     random: cryptoRandom,
     verifyParentToken: createParentVerifier(config),
     rateLimiter: createDbRateLimiter(db),
-    // Email adapters do not exist yet (docs/Connections.md); storage uses Supabase when set.
     providers: {
       consent: consent.provider,
-      storage:
-        config.providers.storage === 'supabase' &&
-        typeof env.SUPABASE_URL === 'string' &&
-        typeof env.SUPABASE_SERVICE_ROLE_KEY === 'string'
-          ? createSupabaseStorage({
-              supabaseUrl: env.SUPABASE_URL,
-              serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
-            })
-          : createMemoryStorageMock(),
-      email: createOutboxEmailMock(),
+      ...selectStorageAndEmail(config, env),
       subscriptions: billing.subscriptions,
       stripe: billing.stripe,
     },

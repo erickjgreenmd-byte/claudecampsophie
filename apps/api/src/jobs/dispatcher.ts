@@ -1,4 +1,5 @@
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
+import { MOCK_ENVIRONMENTS } from '../config.ts';
 import type { Tx } from '../db.ts';
 import type { AppDeps } from '../middleware/context.ts';
 import { runIdentityHousekeeping } from '../auth/housekeeping.ts';
@@ -588,8 +589,9 @@ export async function inactivitySweep(
   limit = 50,
 ): Promise<{ notified: number; deleted: number }> {
   if (!deps.config.flags.inactivityDeletionEnabled) return { notified: 0, deleted: 0 };
-  if (deps.config.environment === 'production' && deps.providers.email.isMock) {
-    // A notice that goes to an in-memory outbox is not a notice: never delete on the strength of it.
+  if (deps.providers.email.isMock && !MOCK_ENVIRONMENTS.has(deps.config.environment)) {
+    // A notice that goes to an in-memory outbox is not a notice: never delete on the strength of
+    // it, in staging as in production (only development and test may use the labeled outbox).
     deps.log({ level: 'error', event: 'inactivity_sweep_blocked', code: 'EMAIL_PROVIDER_MOCK' });
     return { notified: 0, deleted: 0 };
   }

@@ -517,6 +517,32 @@ describe('inactivity retention (spec P4; disabled until the owner approves the p
     expect(job!.status).toBe('queued');
   });
 
+  it('outside development and test a mock outbox is never a notice: nothing is notified or deleted', async () => {
+    const fam = await idleFamily();
+    const staging: JobDeps = {
+      ...enabled(),
+      config: {
+        ...api.config,
+        environment: 'staging',
+        flags: { ...api.config.flags, inactivityDeletionEnabled: true },
+      },
+    };
+    const outboxBefore = api.providers.email.outbox.length;
+    expect(await inactivitySweep(staging)).toEqual({ notified: 0, deleted: 0 });
+    api.now.value = new Date(api.now.value.getTime() + 31 * 86_400_000);
+    try {
+      expect(await inactivitySweep(staging)).toEqual({ notified: 0, deleted: 0 });
+    } finally {
+      api.now.value = new Date(api.now.value.getTime() - 31 * 86_400_000);
+    }
+    expect(api.providers.email.outbox.length).toBe(outboxBefore);
+    const [row] = await api.db.sql<{ notified: Date | null; deleted: boolean }[]>`
+      select inactivity_notified_at as notified, deleted_at is not null as deleted
+        from public.families where id = ${fam.familyId}`;
+    expect(row).toEqual({ notified: null, deleted: false });
+    expect(api.logs.some((l) => l.event === 'inactivity_sweep_blocked')).toBe(true);
+  });
+
   it('any parent activity after the notice cancels the deletion', async () => {
     const fam = await idleFamily();
     await inactivitySweep(enabled());
