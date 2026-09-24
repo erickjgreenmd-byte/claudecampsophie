@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   createMockResponsesClient,
@@ -320,7 +320,9 @@ async function queuedScan(fam?: SeededFamily): Promise<Scan> {
   await api.db.sql`
     insert into public.source_pages (id, assignment_id, family_id, child_id, page_number, storage_path, mime_type, byte_size, sha256)
     values (${pageId}, ${a!.id}, ${family.familyId}, ${childId}, 1, ${`${family.familyId}/${childId}/${a!.id}/${pageId}.jpg`},
-            'image/jpeg', 10, ${'e'.repeat(64)})`;
+            'image/jpeg', ${syntheticJpeg().length},
+            ${createHash('sha256').update(syntheticJpeg()).digest('hex')}) -- lead fixture update: registered bytes = stored bytes (stored-page integrity)
+    `;
   await api.db.sql`
     insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, max_attempts, run_after)
     values ('scan_process', ${`scan:${a!.id}:v1`}, ${family.familyId}, ${childId},

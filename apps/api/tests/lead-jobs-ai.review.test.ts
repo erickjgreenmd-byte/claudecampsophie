@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createMockResponsesClient,
@@ -262,8 +262,11 @@ async function queuedScan(
     const pageId = randomUUID();
     const path = `${fam.familyId}/${childId}/${a!.id}/${pageId}.jpg`;
     await sql`
+      -- Lead fixture update (stored-page integrity): registered with the size and sha256 of the bytes
+      -- storage returns, as a real device registers them; the scan now checks both.
       insert into public.source_pages (id, assignment_id, family_id, child_id, page_number, storage_path, mime_type, byte_size, sha256)
-      values (${pageId}, ${a!.id}, ${fam.familyId}, ${childId}, ${n}, ${path}, 'image/jpeg', 10, ${'e'.repeat(64)})`;
+      values (${pageId}, ${a!.id}, ${fam.familyId}, ${childId}, ${n}, ${path}, 'image/jpeg',
+              ${syntheticJpeg().length}, ${createHash('sha256').update(syntheticJpeg()).digest('hex')})`;
     e.api.providers.storage.objects.add(path);
   }
   const [r] = await sql<{ id: string }[]>`

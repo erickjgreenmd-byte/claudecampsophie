@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEFAULT_HOMEWORK_UPLOAD_LIMITS } from '@pencillift/contracts';
 import {
   checkChildDataGate,
   dataEnvelope,
@@ -438,17 +439,66 @@ const FEEDBACK_KIND: Readonly<
 };
 
 /** Reads a private object through a short-lived signed URL (Supabase Storage in production). */
+/** A stored page larger than any page registration allows: never read into memory in full. */
+export class StoredPageTooLarge extends Error {
+  constructor() {
+    super('STORED_PAGE_TOO_LARGE');
+    this.name = 'StoredPageTooLarge';
+  }
+}
+
+/**
+ * Reads a stored page through a short-lived signed URL, stopping at `maxBytes` (the page cap every
+ * registration is held to): an object that is somehow larger (a misconfigured bucket, a replaced
+ * object) is refused from its declared length or while streaming, never buffered whole.
+ */
 export function storageReader(
   storage: StorageProvider,
   fetchImpl: typeof fetch = fetch,
   timeoutMs = 20_000,
+  maxBytes = DEFAULT_HOMEWORK_UPLOAD_LIMITS.maxPageBytes,
 ): (path: string) => Promise<Uint8Array> {
   return async (path) => {
     const { url } = await storage.createSignedReadUrl(path, 60);
     const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) throw new Error(`storage read failed with HTTP ${response.status}`);
-    return new Uint8Array(await response.arrayBuffer());
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await response.body?.cancel();
+      throw new StoredPageTooLarge();
+    }
+    if (!response.body) {
+      const whole = new Uint8Array(await response.arrayBuffer());
+      if (whole.length > maxBytes) throw new StoredPageTooLarge();
+      return whole;
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = (await reader.read()) as ReadableStreamReadResult<Uint8Array>;
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new StoredPageTooLarge();
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return bytes;
   };
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  // A copy backed by a plain ArrayBuffer (digest does not accept shared memory).
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes)));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -865,8 +915,17 @@ class ScanRun {
   /** Extraction; returns the pages missing their source passage, or null when the scan ended. */
   private async extract(): Promise<ReadonlySet<number> | null> {
     const pages = await this.deps.db.asService(
-      (tx) => tx<{ id: string; page_number: number; storage_path: string; mime_type: string }[]>`
-        select id, page_number, storage_path, mime_type from public.source_pages
+      (tx) => tx<
+        {
+          id: string;
+          page_number: number;
+          storage_path: string;
+          mime_type: string;
+          byte_size: number;
+          sha256: string;
+        }[]
+      >`
+        select id, page_number, storage_path, mime_type, byte_size, sha256 from public.source_pages
          where assignment_id = ${this.ctx.id} and family_id = ${this.ctx.familyId} and deleted_at is null
          order by page_number
       `,
@@ -878,11 +937,25 @@ class ScanRun {
     }
     const images: InputPart[] = [];
     for (const page of pages) {
-      let bytes: Uint8Array;
+      let bytes: Uint8Array | null;
       try {
         bytes = await this.options.readObject(page.storage_path);
-      } catch {
-        throw new RetryableFailure('STORAGE_READ_FAILED');
+      } catch (error) {
+        if (!(error instanceof StoredPageTooLarge))
+          throw new RetryableFailure('STORAGE_READ_FAILED');
+        bytes = null;
+      }
+      // What reaches the AI is exactly what was registered and finalized: the stored size and
+      // sha256 must match the registration (a replaced or corrupted object is never sent).
+      if (
+        bytes === null ||
+        bytes.length !== page.byte_size ||
+        (await sha256Hex(bytes)) !== page.sha256
+      ) {
+        this.deps.log({ level: 'warn', event: 'scan_page_mismatch', code: 'PAGE_MISMATCH' });
+        await this.transition('needs_rescan', 'PAGE_MISMATCH');
+        await this.settleReservation('unreadable');
+        return null;
       }
       let clean: Uint8Array;
       try {

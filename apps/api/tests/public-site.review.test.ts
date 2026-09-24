@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createMockResponsesClient } from '@pencillift/ai';
 import { cryptoRandom } from '@pencillift/domain';
@@ -87,7 +87,9 @@ async function queuedSinglePageScan() {
   await api.db.sql`
     insert into public.source_pages (id, assignment_id, family_id, child_id, page_number, storage_path, mime_type, byte_size, sha256)
     values (${pageId}, ${a!.id}, ${fam.familyId}, ${childId}, 1, ${`${fam.familyId}/${childId}/${a!.id}/${pageId}.jpg`},
-            'image/jpeg', 10, ${'e'.repeat(64)})`;
+            'image/jpeg', ${jpegWithExifGps().length},
+            ${createHash('sha256').update(jpegWithExifGps()).digest('hex')}) -- lead fixture update: registered bytes = stored bytes (stored-page integrity)
+    `;
   const [r] = await api.db.sql<{ id: string }[]>`
     insert into public.usage_reservations (family_id, child_id, period_key, units, idempotency_key)
     values (${fam.familyId}, ${childId}, '2026-09', 1, ${`scan-usage:${a!.id}:v1`}) returning id`;

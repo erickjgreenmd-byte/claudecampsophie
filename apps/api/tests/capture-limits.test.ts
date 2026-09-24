@@ -494,7 +494,9 @@ describe('the scan job refuses a decompression bomb before any AI request (AC_CA
     await api.db.sql`
       insert into public.source_pages (id, assignment_id, family_id, child_id, page_number, storage_path, mime_type, byte_size, sha256)
       values (${pageId}, ${a!.id}, ${fam.familyId}, ${childId}, 1,
-              ${`${fam.familyId}/${childId}/${a!.id}/${pageId}.png`}, 'image/png', 61, ${'b'.repeat(64)})`;
+              ${`${fam.familyId}/${childId}/${a!.id}/${pageId}.png`}, 'image/png', 61,
+              ${createHash('sha256').update(pngBomb()).digest('hex')}) -- lead fixture update: registered bytes = stored bytes (stored-page integrity)
+    `;
     const [r] = await api.db.sql<{ id: string }[]>`
       insert into public.usage_reservations (family_id, child_id, period_key, units, idempotency_key)
       values (${fam.familyId}, ${childId}, 'pages:2026-09', 1, ${`scan-usage:${a!.id}:v1`}) returning id`;

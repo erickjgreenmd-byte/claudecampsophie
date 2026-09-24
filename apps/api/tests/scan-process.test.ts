@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   createMockResponsesClient,
@@ -19,6 +19,8 @@ import {
   createScanProcessHandler,
   keysAgree,
   protectedAnswers,
+  storageReader,
+  StoredPageTooLarge,
   TEMPLATE_FALLBACK,
 } from '../src/jobs/scan-process.ts';
 import { createTestApi, type TestApi } from './helpers.ts';
@@ -245,8 +247,20 @@ interface Scan {
   jobId: string;
 }
 
+/** What registration recorded for a page with these bytes (size and sha256, as a device sends). */
+function registered(bytes: Uint8Array): { byteSize: number; sha256: string } {
+  return { byteSize: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+}
+
 async function queuedScan(
-  options: { pages?: number; mime?: string; withConsent?: boolean; maxAttempts?: number } = {},
+  options: {
+    pages?: number;
+    mime?: string;
+    withConsent?: boolean;
+    maxAttempts?: number;
+    /** The bytes each page was registered with (default: the synthetic JPEG storage returns). */
+    registeredBytes?: Uint8Array;
+  } = {},
 ): Promise<Scan> {
   const fam = await seedFamily(api.db, { childCount: 1 });
   if (options.withConsent !== false) await consent(fam);
@@ -255,12 +269,15 @@ async function queuedScan(
   const [a] = await api.db.sql<{ id: string }[]>`
     insert into public.assignments (family_id, child_id, idempotency_key, created_by_kind, page_count, status)
     values (${fam.familyId}, ${childId}, ${'scan-' + randomUUID()}, 'child', ${pages}, 'queued') returning id`;
+  // Lead fixture update (stored-page integrity): pages are registered with the size and sha256 of
+  // the bytes storage returns, as a real device registers them; the scan now checks both.
+  const page = registered(options.registeredBytes ?? syntheticJpeg());
   for (let n = 1; n <= pages; n++) {
     const pageId = randomUUID();
     await api.db.sql`
       insert into public.source_pages (id, assignment_id, family_id, child_id, page_number, storage_path, mime_type, byte_size, sha256)
       values (${pageId}, ${a!.id}, ${fam.familyId}, ${childId}, ${n}, ${`${fam.familyId}/${childId}/${a!.id}/${pageId}.jpg`},
-              ${options.mime ?? 'image/jpeg'}, 10, ${'e'.repeat(64)})`;
+              ${options.mime ?? 'image/jpeg'}, ${page.byteSize}, ${page.sha256})`;
   }
   const [r] = await api.db.sql<{ id: string }[]>`
     insert into public.usage_reservations (family_id, child_id, period_key, units, idempotency_key)
@@ -517,12 +534,13 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
     }
     expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
 
-    const broken = await queuedScan({ pages: 1 });
+    const truncated = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+    const broken = await queuedScan({ pages: 1, registeredBytes: truncated });
     const second = scriptedModel({ questions: WORKSHEET });
     await runJobs(deps, {
       scan_process: createScanProcessHandler({
         ai: second,
-        readObject: () => Promise.resolve(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])),
+        readObject: () => Promise.resolve(truncated),
         sleep: () => Promise.resolve(),
       }),
     });
@@ -535,6 +553,66 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
       status: 'released',
       release_reason: 'unreadable',
     });
+  });
+
+  it('stored bytes that differ from what was registered never reach the AI (AC_CAPTURE_02)', async () => {
+    for (const [label, registeredBytes] of [
+      [
+        'same size, different content',
+        Uint8Array.from(syntheticJpeg(), (b, i) => (i === 40 ? b ^ 1 : b)),
+      ],
+      ['different size', new Uint8Array([...syntheticJpeg(), 0])],
+    ] as const) {
+      const scan = await queuedScan({ pages: 1, registeredBytes });
+      const client = scriptedModel({ questions: WORKSHEET });
+      await runJobs(deps, handlerFor(client));
+      expect({ label, requests: client.requests.length }).toEqual({ label, requests: 0 });
+      expect(await assignment(scan.assignmentId)).toEqual({
+        status: 'needs_rescan',
+        error_code: 'PAGE_MISMATCH',
+      });
+      expect(await reservation(scan.reservationId)).toEqual({
+        status: 'released',
+        release_reason: 'unreadable',
+      });
+    }
+  });
+
+  it('the storage reader stops at the page byte cap instead of reading an oversized object', async () => {
+    const storage = api.providers.storage;
+    const cap = 1024;
+    const over = new Uint8Array(cap + 1);
+    const withLength = storageReader(
+      storage,
+      () =>
+        Promise.resolve(new Response(over, { headers: { 'content-length': String(over.length) } })),
+      1000,
+      cap,
+    );
+    await expect(withLength('f/c/a/p.jpg')).rejects.toBeInstanceOf(StoredPageTooLarge);
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        controller.enqueue(new Uint8Array(512));
+        if (pulled > 1000) controller.close();
+      },
+    });
+    const streamed = storageReader(
+      storage,
+      () => Promise.resolve(new Response(endless)),
+      1000,
+      cap,
+    );
+    await expect(streamed('f/c/a/p.jpg')).rejects.toBeInstanceOf(StoredPageTooLarge);
+    expect(pulled).toBeLessThan(10); // stopped at the cap, not after reading everything
+    const exact = storageReader(
+      storage,
+      () => Promise.resolve(new Response(new Uint8Array(cap))),
+      1000,
+      cap,
+    );
+    expect((await exact('f/c/a/p.jpg')).length).toBe(cap);
   });
 
   it('a verifier disagreement goes to a grown-up, never silently to "wrong"', async () => {
