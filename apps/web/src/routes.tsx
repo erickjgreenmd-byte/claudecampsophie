@@ -29,8 +29,13 @@ export const routes: RouteObject[] = [
   { path: '/app/homework', lazy: page(() => import('./pages/app/HomeworkPage.tsx')) },
   { path: '/app/learning', lazy: page(() => import('./pages/app/LearningPlannerPage.tsx')) },
   { path: '/app/school', lazy: page(() => import('./pages/app/SchoolAndPromotionsPage.tsx')) },
+  { path: '/app/resources', lazy: page(() => import('./pages/app/ResourcesPage.tsx')) },
   { path: '/admin', lazy: page(() => import('./pages/admin/AdminHomePage.tsx')) },
   { path: '/admin/promotions', lazy: page(() => import('./pages/admin/PromotionsAdminPage.tsx')) },
   { path: '/admin/schools', lazy: page(() => import('./pages/admin/SchoolsAdminPage.tsx')) },
+  {
+    path: '/admin/monetization',
+    lazy: page(() => import('./pages/admin/MonetizationAdminPage.tsx')),
+  },
   { path: '*', lazy: page(() => import('./pages/public/NotFoundPage.tsx')) },
 ];

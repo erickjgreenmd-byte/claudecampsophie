@@ -15,6 +15,8 @@ import { learningRoutes } from './routes/learning.ts';
 import { promotionsRoutes } from './routes/promotions.ts';
 import { adminPromotionsRoutes } from './routes/admin-promotions.ts';
 import { webhooksRoutes } from './routes/webhooks.ts';
+import { monetizationRoutes } from './routes/monetization.ts';
+import { adminMonetizationRoutes } from './routes/admin-monetization.ts';
 
 /** Max JSON body accepted by any route (uploads use signed storage URLs, never the API body). */
 export const MAX_JSON_BYTES = 64 * 1024;
@@ -122,6 +124,8 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   app.route('/v1', learningRoutes()); // /v1/subjects*, /v1/schedules*, /v1/test-dates*, /v1/child/practice*
   app.route('/v1', promotionsRoutes()); // /v1/schools*, /v1/family/school*, /v1/family/promotions*
   app.route('/v1/admin', adminPromotionsRoutes()); // /v1/admin/promo-*, campaigns, schools, payouts
+  app.route('/v1', monetizationRoutes()); // /v1/resources*, /v1/placements*, /v1/outbound*
+  app.route('/v1/admin', adminMonetizationRoutes()); // /v1/admin/monetization/*
   app.route('/webhooks', webhooksRoutes()); // /webhooks/revenuecat, /webhooks/stripe
   return app;
 }
