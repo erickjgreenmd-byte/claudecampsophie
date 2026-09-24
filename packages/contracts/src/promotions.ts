@@ -41,6 +41,12 @@ export const familySchoolResponseSchema = z.strictObject({
 export const promoQuoteRequestSchema = z.strictObject({
   code: z.string().min(8).max(24),
   channel: channelSchema,
+  /**
+   * Only for a family without a paid subscription yet: the tier they are about to purchase. Ignored
+   * for existing subscribers (the verified paid capacity is used). Defaults to the number of child
+   * profiles (1..4).
+   */
+  paidSlots: z.number().int().min(1).max(12).optional(),
 });
 
 export const promoQuoteResponseSchema = z.strictObject({

@@ -1,0 +1,86 @@
+// School designations, the full-price-only $1 donation ledger, adjustments, payouts and school
+// reporting (spec P17 "School attribution and donation ledger", F7 "Approved donation rule").
+export {
+  DESIGNATION_ERROR_CODES,
+  designationForMonth,
+  planSchoolDesignation,
+  type Designation,
+  type DesignationErrorCode,
+  type PlanSchoolDesignationInput,
+  type SchoolDesignationPlan,
+} from './designation.ts';
+export {
+  resolveAttribution,
+  type Attribution,
+  type AttributionAction,
+  type AttributionReason,
+  type AttributionResolution,
+  type AttributionSource,
+  type ResolveAttributionInput,
+} from './attribution.ts';
+export {
+  DONATION_CENTS,
+  DONATION_INELIGIBLE_REASONS,
+  DONATION_POLICY,
+  DONATION_RULES_VERSION,
+  evaluateDonationEligibility,
+  type DonationCents,
+  type DonationEligibility,
+  type DonationEligibilitySnapshot,
+  type DonationIneligibleReason,
+  type DonationRule,
+  type EvaluateDonationEligibilityInput,
+  type EvaluatedRule,
+  type SchoolStatus,
+  type SchoolStatusLookup,
+} from './eligibility.ts';
+export {
+  donationIdempotencyKey,
+  planAccruals,
+  type AccrualPlan,
+  type AccrualSkipReason,
+  type PlanAccrualsInput,
+  type PlannedAccrual,
+  type SkippedPeriod,
+} from './accruals.ts';
+export {
+  ADJUSTMENT_EVENTS,
+  adjustmentKey,
+  planAdjustment,
+  type AccrualForAdjustment,
+  type AdjustmentEvent,
+  type AdjustmentKind,
+  type DonationAdjustment,
+  type PlanAdjustmentInput,
+  type ProviderPeriodState,
+} from './adjustments.ts';
+export {
+  PAYOUT_ERROR_CODES,
+  PAYOUT_STATUSES,
+  buildPayoutBatch,
+  previewPayoutBatch,
+  transitionPayout,
+  type BuildPayoutBatchInput,
+  type BuildPayoutErrorCode,
+  type PayoutAccrualInput,
+  type PayoutAdjustmentInput,
+  type PayoutBatchPlan,
+  type PayoutErrorCode,
+  type PayoutEvent,
+  type PayoutLine,
+  type PayoutPreview,
+  type PayoutPreviewInput,
+  type PayoutStatus,
+  type PayoutTransition,
+} from './payouts.ts';
+export {
+  DEFAULT_MIN_COHORT,
+  summarizeSchoolMonth,
+  toSchoolFacingReport,
+  type SchoolFacingReport,
+  type SchoolFamilyFact,
+  type SchoolMonthSummary,
+  type SummarizeSchoolMonthInput,
+  type SuppressedAmount,
+  type SuppressedCount,
+} from './reporting.ts';
