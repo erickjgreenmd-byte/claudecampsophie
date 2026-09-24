@@ -5,8 +5,9 @@
 // may be several words. A leading "?" makes a slot optional. Words are normalized exactly like
 // the screened text (case, NFKC, repeated letters collapsed: "kill" and "killll" both read "kil").
 //
-// `negatable`: a negation ("dont", "never", "not", ...) among the gap tokens or the two tokens
-// before the match cancels it ("I don't want to die" is fear, not ideation).
+// `negatable`: a negation ("dont", "never", "not", ...) among the gap tokens, right before the
+// match, or two tokens before it across "to" or an adverb (NEGATION_BRIDGES) cancels it ("I don't
+// want to die" is fear, not ideation).
 // `hypothetical`: "if" within three tokens before the match cancels it (body-safety lessons:
 // "If someone touches my private parts I tell a grown-up").
 // `exempt` (tier B): a word that is severe out of context but educational in one ("suicide" in a
@@ -53,11 +54,10 @@ export interface RuleDef {
    * a name hold the view too ("According to Cleopatra, ..."; not "to me", "to be honest", nor a
    * "To ..." that opens the sentence). `firstPersonAfter` (round 4): a first-person word later in
    * the sentence, within VOID_WINDOW tokens and outside a frame, voids the guard ("Some people say
-   * sex is our secret but my uncle says it too"). `quoteWords` (round 4, with `firstPersonAfter`):
-   * when the matched phrase itself names the child ("sex is OUR secret", "sex with ME"), only these
-   * words still hold the view, because the child is quoting someone ("If someone tells you ...",
-   * "Never say ...", "the villain says ..."); any other guard word does not ("He said it is a rule,
-   * sex is our secret").
+   * child abuse is normal but my uncle says it too"). Round 5 (CHK4-CS-1/7, lead decision): no guard
+   * holds a matched phrase that names the child ("sex is OUR secret", "touches MY private parts",
+   * "suicide is MY only way out"; screen.ts namesChild); only a negation right before or inside it
+   * cancels it. The round-4 `quoteWords` are gone.
    */
   readonly guard?: {
     readonly words: string;
@@ -65,7 +65,6 @@ export interface RuleDef {
     readonly stopAtFirstPerson?: boolean;
     readonly holderTo?: boolean;
     readonly firstPersonAfter?: boolean;
-    readonly quoteWords?: string;
   };
   /**
    * The rule reads the child's answer only, never the printed prompt (CHK2-CS-4: a worksheet's
@@ -238,18 +237,15 @@ const STRANGERS =
  */
 const CARING_TOUCH_TAILS =
   'to check if i have a fever|to check if i have a temperature|to check if im hot|to check if i am hot|to check my temperature|to check my forehead|to check my fever|to check for a fever|to check for fever|to see if i have a fever|to see if im sick|to see if i am sick|to see if im hot|to wake me up|to wake me for school|to tuck me in|to feel if i have a fever|to feel my forehead|to feel my head|to say goodnight|to say good night|to give me medicine|to give me my medicine|goodnight|good night|on the forehead|on the head';
-/**
- * Body-safety lesson phrasing ("never let anyone touch my private parts", "no one is allowed to").
- * Round 4 (lead policy: recall first): a first-person word nearer than the lesson word, or right
- * before it, is the child talking about themself ("I'm not ok, he touches my private parts", "I'm
- * not okay my uncle touches me at night"), so the guard does not apply (`stopAtFirstPerson`).
+/*
+ * Round 5 (CHK4-CS-7a, lead decision): the body-safety lesson guard (BODY_SAFETY_LESSON: "never",
+ * "nobody", "not", "ok", "safe", ... within four words before) is gone. It could not apply to a
+ * phrase that names the child, and every rule that used it names the child ("touches MY private
+ * parts", "touches ME at night", "I was touched by ..."), so it only ever cancelled reports ("Nobody
+ * knows he touches my private parts", "Not safe he touches me at night"). A lesson answer in the
+ * first person ("No one is allowed to touch my private parts") now escalates and a reviewer clears
+ * it (runbook 5.1); "if" (hypothetical) and a negation right before the verb still cancel.
  */
-const BODY_SAFETY_LESSON = {
-  words:
-    'never|nobody|no one|noone|allowed|okay|ok|not|should|shouldnt|if|rule|rules|let|safe|unsafe|say no|belongs',
-  within: 4,
-  stopAtFirstPerson: true,
-} as const;
 
 /**
  * Round 4: who may have touched the child in "I was touched by ..." (ABUSE_TOUCHED_BY): a person
@@ -266,33 +262,31 @@ const TOUCHED_BY_PERSONS = [
 ].join('|');
 
 /**
- * Round 4 (CHK3-CS-3): who holds the view in "... says touching private parts is a secret" /
- * "... sex is normal for kids" (SEXUAL_ABUSE_ENDORSED, SEXUAL_GROOMING_GAME). A body-safety lesson
- * ("if", "should", "rules", "unsafe", "a lie", "true or false", "don't let anyone ...") or a third
- * person that is not someone the child reports about ("some people", "the villain", "the
- * character", "the book", "a bully") within six words before, in the same sentence, holds it.
- * Caregivers, "he", "she", "someone" and "a man" are left out: they are how a child reports
- * grooming ("He says sex is our game", "Someone said touching private parts is our secret"), and
- * a first-person word nearer than the guard word keeps the rule firing ("My uncle says ..."), and so
- * does one later in the sentence ("Some people say sex is our secret but my uncle says it too").
- * A negation right before the phrase, or across "say" or "think" (NEGATION_BRIDGES: "Don't say
- * rape is ok"), cancels it; across any other word it negates that word ("He said it is not bad,
- * sex is our secret", "He said don't tell, sex is our secret"; round 4 lead policy). A negated
- * "say", "believe", "think" or "listen" and "not true" further back are lesson words here ("Do not
- * believe anyone who says sex is our secret"). When the phrase itself names the child ("our",
- * "me", "us"), only `quoteWords` hold it: a conditional, a negated "say", "not true", "unsafe",
- * "some people" or a story's character ("If someone tells you touching private parts is our
- * secret, tell"), never "rule", "allowed", "let" or a bare "people" ("He said it is a rule, sex is
- * our secret", "He says people would not understand, sex is our secret").
+ * Round 4 (CHK3-CS-3): who holds the view in "... says touching private parts is a game" / "...
+ * rape is ok" (SEXUAL_ABUSE_ENDORSED, SEXUAL_GROOMING_GAME) when the phrase does not name the child.
+ * A body-safety lesson ("if", "rules", "unsafe", "a lie", "true or false", "don't let anyone ...")
+ * or a third person that is not someone the child reports about ("some people", "the villain", "the
+ * character", "a bully") within six words before, in the same sentence, holds it. Caregivers, "he",
+ * "she", "someone" and "a man" are left out: they are how a child reports grooming, and a
+ * first-person word nearer than the guard word keeps the rule firing ("My uncle says ..."), and so
+ * does one later in the sentence ("Some people say child abuse is ok but my uncle says it too"). A
+ * negated "say", "believe", "think" or "listen" and "not true" further back are lesson words here
+ * ("Do not believe anyone who says rape is ok"). Round 5 (CHK4-CS-1, lead decision): a phrase that
+ * names the child ("sex is OUR secret", "sex with ME") is never held by any of these words (the
+ * round-4 quote words are gone): "He says if anyone asks, sex is our secret", "He said never say
+ * sex is our secret" and "My coach is a bully and says touching private parts is our secret" are
+ * reports; only a negation right before the phrase cancels it. The round-5 sweep also took
+ * "should", "shouldnt", "book" and "books" out of the words: they cancelled reports that round 3
+ * caught ("He says you should never tell because touching private parts is a game", "He says the
+ * book says sex is normal for kids"). A lesson answer that now escalates is cleared by a reviewer.
  */
 const ENDORSED_NEGATED_LESSON =
   'never say|never says|dont say|do not say|not say|never believe|dont believe|do not believe|never think|dont think|do not think|never listen|dont listen|do not listen|not true|isnt true|never true';
 const ENDORSED_LESSON_GUARD = {
-  words: `if|should|shouldnt|allowed|rule|rules|let|unsafe|say no|belongs|lie|lies|true|false|trick|tricks|people|some people|bad people|bad person|villain|villains|character|characters|story|book|books|author|narrator|bully|bullies|${ENDORSED_NEGATED_LESSON}`,
+  words: `if|allowed|rule|rules|let|unsafe|say no|belongs|lie|lies|true|false|trick|tricks|people|some people|bad people|bad person|villain|villains|character|characters|story|author|narrator|bully|bullies|${ENDORSED_NEGATED_LESSON}`,
   within: 6,
   stopAtFirstPerson: true,
   firstPersonAfter: true,
-  quoteWords: `if|unsafe|true or false|some people|bad people|villain|villains|character|characters|story|book|books|author|narrator|bully|bullies|${ENDORSED_NEGATED_LESSON}`,
 } as const;
 
 /**
@@ -351,13 +345,6 @@ const ACCIDENT_TAILS =
   'on the monkey bars|on the playground|on the bars|at recess|at practice|at soccer|at football|at basketball|at the park|playing sports|playing soccer|playing football|playing basketball|playing baseball|playing hockey|playing tag|playing dodgeball|playing outside|playing on the playground|playing at recess|in gym|in pe|by accident|on accident|when i fall|when i fell|falling|on my bike|on the trampoline|on the stairs|on paper|on the paper|on the stove|skateboarding|climbing|running|jumping|at dance|at gymnastics|in sports|in soccer|when i skate|when i skateboard|when i ride|when i ride my bike|when i bike|when i run|when i climb|when i jump|when i dance|when i swim|when i ski|when i snowboard|when i surf|when i do gymnastics|when i play sports|when i play soccer|when i play football|when i play basketball|when i play outside|when i play tag|when i play dodgeball|when i practice soccer|when i practice gymnastics|when i practice karate|when i practice dance|when i practice skateboarding|when i practice sports|when i practice football|when i practice basketball|while skating|while skateboarding|while riding|while running|while climbing|while jumping|skating|biking|riding my bike|at the skate park|at the skatepark|with the paper|with paper|with a paper|' +
   // CHK2-CS-5: wheels and play equipment.
   'on my scooter|on the scooter|on my skateboard|on the skateboard|on my skates|on my rollerblades|on my hoverboard|on the slide|on the swings|on the swing';
-/**
- * Round 4 (CHK3-CS-4): a wrist is not cut in an activity or a room, so SELF_HARM_WRISTS has its own
- * short list: an object that cuts by accident (paper, glass, a fence, a can) or "by accident"
- * itself. "with scissors", "in the kitchen", "at the park" and "running" are not in it.
- */
-const WRIST_ACCIDENT_TAILS =
-  'by accident|on accident|with the paper by accident|with paper by accident|on a piece of paper|on the paper|on paper|on a piece of glass|on glass|on broken glass|on the glass|on a nail|on the fence|on a fence|on the edge of the table|on the sharp edge of the table|on the corner of the table|opening a can|on a can|on the can|on the lid';
 /** A band or a watch after "my wrist" is the object, not the wrist ("I cut my wrist band off"). */
 const WRIST_OBJECT_TAILS =
   'band|bands|wristband|bracelet|bracelets|watch|tag|brace|guard|guards|strap|cast|sweatband';
@@ -525,10 +512,10 @@ export const RULES: readonly RuleDef[] = [
     category: 'self_harm',
     sources: BOTH,
     pattern:
-      'dont think|do not think|dont know if|do not know if|not sure if|not sure +0 i +0 want to live anymore|want to live any more|wanna live anymore|want to be alive|wanna be alive|want to stay alive|wanna stay alive|want to exist|wanna exist|want to keep living|wanna keep living|want to go on living|want to be here anymore|can keep living|can go on living|can live anymore|can live any more|can be alive anymore|can stay alive anymore|should live|should be alive|should keep living|should exist|deserve to live|deserve to be alive',
+      'dont think|do not think|dont know if|do not know if|not sure if|not sure +0 i +0 want to live anymore|want to live any more|wanna live anymore|want to be alive|wanna be alive|want to stay alive|wanna stay alive|want to exist|wanna exist|want to keep living|wanna keep living|want to go on living|want to be here anymore|can keep living|can go on living|can live anymore|can live any more|can stay alive much longer|can stay alive any longer|can stay alive another day|can stay alive another night|can stay alive anymore|can stay alive any more|can stay alive after|can stay alive like this|can stay alive for long|can stay alive for much longer|can stay alive through this|can stay alive through the night|can stay alive tonight|can stay alive past tonight|can be alive much longer|can be alive any longer|can be alive another day|can be alive another night|can be alive anymore|can be alive any more|can be alive after|can be alive like this|can be alive for long|can be alive for much longer|can be alive through this|can be alive through the night|can be alive tonight|can be alive past tonight|should live|should be alive|should keep living|should exist|deserve to live|deserve to be alive',
     notFollowedBy: GAME_CONTEXT_TAILS,
     unlessAfter: SELF_HARM_DELIBERATE,
-    doc: 'Round 3: not wanting to live, framed as doubt ("I don\'t think I want to live anymore", "I\'m not sure I can keep living"); SELF_HARM_NOT_LIVE needs the negation next to "want". A game ("stay alive in the game") is excluded. Round 4 (CHK3-CS-6): only doubt about wanting, deserving or going on living; surviving is not ("I don\'t think I can stay alive without water for a week", "... without my phone").',
+    doc: 'Round 3: not wanting to live, framed as doubt ("I don\'t think I want to live anymore", "I\'m not sure I can keep living"); SELF_HARM_NOT_LIVE needs the negation next to "want". A game ("stay alive in the game") is excluded. Round 4 (CHK3-CS-6): doubt about wanting, deserving or going on living. Round 5 (CHK4-CS-3): doubt about staying alive is read again, with a duration or an event after it ("I don\'t think I can stay alive much longer", "... another day", "I\'m not sure I can stay alive after what he did"); the bare "can stay alive" also ended survival answers in the everyday corpus ("... without water for a week", "If I were Brian in Hatchet, I don\'t think I can stay alive"), so the phrase itself was narrowed rather than given an exclusion.',
   },
   {
     id: 'SELF_HARM_WISH_DEAD',
@@ -570,18 +557,18 @@ export const RULES: readonly RuleDef[] = [
     kind: 'severe',
     category: 'self_harm',
     sources: BOTH,
-    pattern: `${I} +2 ${SELF_INTENT} +1 hurt|cut|harm|burn|starve|punish|kill|hang|poison|drown|stab|shoot|choke|suffocate|smother|slit|slash|slice|destroy|end|hurting|cutting|harming|burning|starving +0 ${SELF}|my wrist|my wrists|my own wrist|my own wrists|both my wrists|both wrists`,
+    pattern: `${I} +2 ${SELF_INTENT} +0 ?try to|try and +1 hurt|cut|harm|burn|starve|punish|kill|hang|poison|drown|stab|shoot|choke|suffocate|smother|slit|slash|slice|destroy|end|hurting|cutting|harming|burning|starving +0 ${SELF}|my wrist|my wrists|my own wrist|my own wrists|both my wrists|both wrists`,
     negatable: true,
     notFollowedBy: `a slice|a piece|slices|a snack|a sandwich|a bite|a break|some slack|a haircut|some cake|some bread|some pie|some pizza|some cheese|some fruit|a cookie|loose|free|${WRIST_OBJECT_TAILS}`,
-    doc: 'First-person intent to injure oneself or one\'s wrists ("I want to hurt myself", "I tried to hurt myself", "I want to cut my wrists with scissors", "I will slit my wrists", "I want to keep hurting myself"; round 4: "ill destroy myself", "I want to end myself"; not "off", which is "of" once repeats collapse: "I want to think of myself as a leader"); an accident ("I fell and hurt myself") has no intent word and does not match, nor does food ("I\'m going to cut myself a slice of cake") or a band ("I\'m going to cut my wrist band off"). Round 4 (CHK3-CS-4): no accident tail applies after an intent word, and the wrists are covered here.',
+    doc: 'First-person intent to injure oneself or one\'s wrists ("I want to hurt myself", "I tried to hurt myself", "I want to cut my wrists with scissors", "I will slit my wrists", "I want to keep hurting myself"; round 4: "ill destroy myself", "I want to end myself"; not "off", which is "of" once repeats collapse: "I want to think of myself as a leader"); an accident ("I fell and hurt myself") has no intent word and does not match, nor does food ("I\'m going to cut myself a slice of cake") or a band ("I\'m going to cut my wrist band off"). Round 4 (CHK3-CS-4): no accident tail applies after an intent word, and the wrists are covered here. Round 5 (CHK4-CS-6): "try to" may follow the intent word ("I will try to cut myself", "I\'m going to try to cut myself at recess").',
   },
   {
     id: 'SELF_HARM_HABIT',
     kind: 'severe',
     category: 'self_harm',
     sources: BOTH,
-    pattern: `${I} +2 cut|cuts|cutting|hurt|hurting|harm|harming|burn|burning|starve|starving|scratch|scratching|hit|hitting|punch|punching +0 ${SELF} +3 on purpose|every day|everyday|every night|again and again|sometimes|a lot|alot|to feel|to make|so i can feel|when im sad|when i am sad|when im upset|when i feel|all the time|at night`,
-    doc: 'First-person repeated or deliberate self-injury ("I cut myself on purpose"); "I cut myself on a piece of paper" has no marker and does not match. Round 4 (CHK3-CS-4): up to three words may come before the marker ("I cut myself with scissors on purpose").',
+    pattern: `${I} +2 cut|cuts|cutting|hurt|hurting|harm|harming|burn|burning|starve|starving|scratch|scratching|hit|hitting|punch|punching +0 ${SELF} +3 on purpose|every day|everyday|every night|again and again|sometimes|a lot|alot|to feel|to make|so i can feel|when im sad|when i am sad|when im upset|when i feel|all the time|at night|because i hate myself|because i hate my body|because i deserve it|because i deserve to|to punish myself|so no one sees|so nobody sees|so no one can see|so nobody can see|where no one can see|where nobody can see|with a lighter|with a razor|with a razor blade|with a blade|with matches|with a match|with a cigarette`,
+    doc: 'First-person repeated or deliberate self-injury ("I cut myself on purpose"). Round 4 (CHK3-CS-4): up to three words may come before the marker ("I cut myself with scissors on purpose"). Round 5 (CHK4-CS-8): a reason or a hidden place is a marker too ("I cut myself because I hate myself", "... so no one sees"), and so is a lighter, a razor, a blade or matches ("I burn myself with a lighter"). A plain "I cut myself" at the end of a sentence is SELF_HARM_CUT_SELF_END.',
   },
   {
     id: 'SELF_HARM_STARVE',
@@ -642,9 +629,9 @@ export const RULES: readonly RuleDef[] = [
     sources: BOTH,
     pattern: 'cut|cuts|cutting|slice|slicing|cut open +0 my|my own +0 wrist|wrists',
     negatable: true,
-    notFollowedBy: `${WRIST_ACCIDENT_TAILS}|${WRIST_OBJECT_TAILS}`,
+    notFollowedBy: WRIST_OBJECT_TAILS,
     unlessAfter: SELF_HARM_DELIBERATE,
-    doc: 'Cutting one\'s own wrists ("i cut my wrists last night", "I cut my wrists with scissors", "I cut my wrists in the kitchen"); an accident with an object that cuts by accident ("I cut my wrist on a piece of glass", "... opening a can") or a band ("I cut my wrist band off") is excluded unless a deliberate word follows. Round 3: the bare "on a", "on the" and "off" are gone ("I cut my wrists off"). Round 4 (CHK3-CS-4): activities, rooms and blades are no longer accidents here, a plan ("I want to cut my wrists ...") is SELF_HARM_INTENT, and "slit" or "slash" is SELF_HARM_WRISTS_SLIT.',
+    doc: 'Cutting one\'s own wrists ("i cut my wrists last night", "I cut my wrists with scissors", "I cut my wrists on broken glass"); only a band ("I cut my wrist band off") is excluded, unless a deliberate word follows. Round 3: the bare "on a", "on the" and "off" are gone ("I cut my wrists off"). Round 4 (CHK3-CS-4): a plan ("I want to cut my wrists ...") is SELF_HARM_INTENT, and "slit" or "slash" is SELF_HARM_WRISTS_SLIT. Round 5 (CHK4-CS-6): no accident tail at all; a genuine accident ("I cut my wrist on a piece of paper", "... opening a can") escalates and a reviewer clears it.',
   },
   {
     id: 'SELF_HARM_WRISTS_SLIT',
@@ -790,17 +777,198 @@ export const RULES: readonly RuleDef[] = [
     answerOnly: true,
     guard: {
       words:
-        'he|she|they|him|them|character|characters|narrator|romeo|juliet|hamlet|king|queen|people|person|persons|someone|somebody|teen|teens|teenager|teenagers|kid|kids|child|children|student|students|soldier|soldiers|others|author|poem|poet|story|book|novel|play|some|many|most|thinks|believes|believed|felt|feels|said|says|decided|think|believe|feel|thought|' +
-        // Round 4 (CHK3-CS-6): a third person's decision, writing or choice, a question, and the
-        // historical and literary figures K-8 lessons discuss ("Antony wrote that ...", "Brutus
-        // decides ...", "Socrates chooses death because ...", "whether suicide is the answer").
-        // Not "knows" or "knew": "Everyone knows suicide is the only way out" is the child's claim.
-        'decides|decide|chooses|choose|chose|wrote|writes|argues|argued|claims|claimed|whether|cleopatra|brutus|antony|othello|ophelia|macbeth|socrates|cassius',
-      within: 8,
+        // Round 5 (CHK4-CS-2): the round-4 holders ("whether", "decide", "decides", "chooses",
+        // "wrote", "claims", the historical and literary names, ...) are gone: guardedBefore looks
+        // back only two words for the child's "I", so they cancelled "I don't know whether dying is
+        // the only way out" and "I can't decide whether ...". A third-person lesson with them
+        // ("Brutus decides suicide is the right choice") escalates and a reviewer clears it.
+        'he|she|they|him|them|character|characters|narrator|romeo|juliet|hamlet|king|queen|people|person|persons|someone|somebody|teen|teens|teenager|teenagers|kid|kids|child|children|student|students|soldier|soldiers|others|author|poem|poet|story|book|novel|play|some|many|most|thinks|believes|believed|felt|feels|said|says|decided|think|believe|feel|thought',
+      within: 7,
       stopAtFirstPerson: true,
       holderTo: true,
     },
-    doc: 'Suicide as the only way out, or endorsed ("... is the answer", "... is the way to go"), with no third person holding the view ("I think suicide is the only way out" in a reading answer): an opinion frame is not a first person (CHK-CS-3), so this ideation shape has its own rule. A third person within eight words holds the view unless a first-person word is nearer or right before the verb ("Romeo thinks ...", "Teens may think ...", "A person might feel ...", "To Cleopatra, ..."; but "I think ..." and "We believe ..."), and a negation cancels it ("I don\'t think suicide is the answer"); "Suicide is never the only way out" does not match. Round 3 (CHK2-CS-4): the child\'s answer only, never the printed prompt ("Why might a teen think suicide is the only way out?").',
+    doc: 'Suicide as the only way out, or endorsed ("... is the answer", "... is the way to go"), with no third person holding the view ("I think suicide is the only way out" in a reading answer): an opinion frame is not a first person (CHK-CS-3), so this ideation shape has its own rule. A third person within seven words holds the view unless a first-person word is nearer or right before the verb ("Romeo thinks ...", "Teens may think ...", "A person might feel ...", "To Cleopatra, ..."; but "I think ..." and "We believe ..."), a phrase that names the child ("suicide is my only way out") is never held (round 5), and a negation right before the phrase cancels it; "Suicide is never the only way out" does not match. Round 3 (CHK2-CS-4): the child\'s answer only, never the printed prompt ("Why might a teen think suicide is the only way out?"). Round 5 (CHK4-CS-2, CHK4-CS-7b): no round-4 holders, and a negation across "think" or "believe" no longer cancels it, so "I don\'t know whether dying is the only way out" is severe and so is "I don\'t think dying is the only way out" (a reviewer clears the second). The round-5 sweep cut the reach from eight words to seven: "she" eight words back held the child\'s own "I argue with my mom and she claims dying is not the answer but dying is the only way out" (severe in round 2).',
+  },
+
+  // ---- Round 5 (CHK4-CS-8): canonical first-person disclosures no earlier rule read -----------
+  // Plain phrases without exclusion tails (lead decision: recall first). An everyday use of the
+  // same words escalates and a reviewer clears it (runbook 5.1; index.ts KNOWN LIMITS). Where a
+  // phrase also ended an everyday or bank sentence, the phrase itself was narrowed (a duration, the
+  // end of the sentence, a plural body part), never given an exclusion.
+  {
+    id: 'SELF_HARM_NOT_HERE',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 dont|do not|dont really|do not really|dont even|no longer +1 want to|wanna|want|wish to|feel like +0 be here anymore|be here any more|be here no more|be around anymore|be around any more`,
+    doc: 'Round 5 (CHK4-CS-8): not wanting to be here anymore ("I don\'t want to be here anymore", "I dont wanna be here anymore"); "anymore" is part of the phrase, so "I don\'t want to be here at recess" does not match.',
+  },
+  {
+    id: 'SELF_HARM_NEVER_WAKE',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +3 want to|wanna|want|wish i could|wish|hope|hope to|would like to|just want to|pray +3 sleep and never wake up|sleep and not wake up|sleep and never wake|sleep forever and never wake up|sleep and never ever wake up|never wake up again|not wake up again`,
+    doc: 'Round 5 (CHK4-CS-8): a wish to go to sleep and never wake up ("I wish I could go to sleep and never wake up", "I want to go to sleep and never wake up").',
+  },
+  {
+    id: 'SELF_HARM_NOT_WAKE',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 dont|do not|dont ever|never|dont even +1 want to|wanna|want +0 wake up tomorrow|wake up ever again|wake up again|ever wake up|wake up anymore|wake up any more`,
+    doc: 'Round 5 (CHK4-CS-8): not wanting to wake up ("I don\'t want to wake up tomorrow"); a school-day complaint in the same words escalates and a reviewer clears it.',
+  },
+  {
+    id: 'SELF_HARM_STOP_LIVING',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 want to|wanna|want|just want to|am going to|going to|gonna|will|plan to|wish i could|would like to|need to|should +0 stop living|quit living|stop being alive|not live anymore`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): a wish or plan to stop living ("I want to stop living").',
+  },
+  {
+    id: 'SELF_HARM_NOT_LIVING',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 dont|do not|dont even|dont really|no longer|do not really +1 feel like|want to keep|wanna keep|see the point in|see the point of|see a point in|see any point in +0 living|being alive|existing`,
+    doc: 'Round 5 (CHK4-CS-8): no wish to go on living ("I don\'t feel like living anymore", "I don\'t see the point in living").',
+  },
+  {
+    id: 'SELF_HARM_NOT_WORTH_LIVING',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern:
+      'life is not worth living|life isnt worth living|no point in living|no point living|no point in being alive|no reason to live|no reason to be alive|no reason for me to live|nothing to live for|nothing left to live for|not worth living anymore',
+    doc: 'Round 5 (CHK4-CS-8): life called not worth living ("My life is not worth living", "There is no point in living", "There\'s no reason to live", "I have nothing to live for"). A story or history answer in the same words escalates and a reviewer clears it.',
+  },
+  {
+    id: 'SELF_HARM_BURDEN',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern:
+      'better|happier|better off +0 without me|if i was dead|if i were dead|if i died|if i was gone|if i were gone|if i wasnt here|if i wasnt alive|if i was never born|if i never existed|if i disappeared|if i wasnt around',
+    doc: 'Round 5 (CHK4-CS-8): others better or happier without the child ("Everyone would be better without me", "The world would be better without me", "Everyone would be happier if I was dead"); SELF_HARM_BETTER_OFF needs "better off".',
+  },
+  {
+    id: 'SELF_HARM_WANT_END',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 want|wanna|just want|wish|need|just wish +0 it all to end|it all to be over|it all to stop|everything to end|everything to be over|everything to stop|it to end|it to be over|it to stop|the pain to stop|the pain to end|my life to end|my life to be over|life to be over`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): a wish for it all to end ("I just want it all to end", "I want it to be over"); the same words about a long day or a boring class escalate and a reviewer clears them.',
+  },
+  {
+    id: 'SELF_HARM_CANT_GO_ON',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 cant|cannot|can not|cant even|really cant|just cant +0 do this anymore|do this any more|take it anymore|take it any more|take this anymore|take this any more|go on anymore|go on any more|go on like this|keep living like this|live like this|handle it anymore|handle this anymore|take the pain anymore`,
+    doc: 'Round 5 (CHK4-CS-8): not being able to go on ("I can\'t do this anymore", "I can\'t take it anymore"). Homework frustration in the same words ("I can\'t do this anymore, fractions are too hard") escalates and a reviewer clears it.',
+  },
+  {
+    id: 'SELF_HARM_DONE_WITH_LIFE',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 am|m|feel|am so|m so|am just|m just|am really|m really|get|have been|been|was|feel so +0 done with life|done with living|done with my life|done with being alive|tired of living|tired of life|tired of being alive|sick of living|sick of life|sick of being alive`,
+    doc: 'Round 5 (CHK4-CS-8): being done with or tired of living ("I\'m done with life", "I\'m tired of living"); "I\'m tired of my life" and "I hate my life" (moderate distress) are left out as before.',
+  },
+  {
+    id: 'SELF_HARM_HATE_ALIVE',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 hate|really hate|just hate|hate hate +0 being alive|that i am alive|that im alive|that i exist|existing|that i was born|being born|my existence`,
+    doc: 'Round 5 (CHK4-CS-8): hating being alive ("I hate being alive"); "I hate living in the city" does not match.',
+  },
+  {
+    id: 'SELF_HARM_END_IT_SOON',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 ${SELF_INTENT}|might|may|could +0 end it|end things|end everything +0 tonight|today|now|soon|forever|for good|once and for all|this week|tomorrow|right now|this weekend`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): a plan to "end it" with a time ("I\'m going to end it tonight", "I\'m done with this ill end it tonight"); "end it all ..." is SELF_HARM_END_LIFE.',
+  },
+  {
+    id: 'SELF_HARM_END_IT',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 ${SELF_INTENT}|might|may|could +0 end it|end things|end everything`,
+    negatable: true,
+    sentenceEnd: true,
+    doc: 'Round 5 (CHK4-CS-8): a wish or plan to "end it" that ends the sentence ("I want to end it"); the phrase ends there, so "I want to end it with a joke" (a story) and "I will end it all with a big finale" do not match.',
+  },
+  {
+    id: 'SELF_HARM_OVERDOSE_TOOK',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 took|swallowed|ate|downed|popped|have taken|had taken|just took|drank +1 a bunch of|too many|a handful of|handful of|a whole bottle of|the whole bottle of|a bottle of|lots of|a lot of|so many|all the|all of the|all my|all of my|a ton of|tons of +0 pills|sleeping pills|tablets|painkillers|pain pills|pain killers|tylenol|advil|meds`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): having taken pills in quantity ("I took a bunch of pills", "I swallowed a bunch of pills", "I took too many pills on purpose", "I took all my pills"). A child who took all of today\'s pills in the same words escalates and a reviewer clears it; "medicine" is left out ("I took all my medicine").',
+  },
+  {
+    id: 'SELF_HARM_OVERDOSE_TOOK_OTHERS',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 took|swallowed|ate|downed|stole|popped|have taken|had taken|just took +1 all|a lot of|lots of|a bunch of|the whole|every|too many|a handful of|all of +0 my moms|my dads|my mom s|my dad s|my parents|my grandmas|my grandpas|my sisters|my brothers|moms|dads|mommys|daddys|grandmas|grandpas|her|his|their|someones|somebodys +1 pills|medicine|meds|tablets|sleeping pills|pill bottle`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): having taken someone else\'s pills in quantity ("I took all my mom\'s pills").',
+  },
+  {
+    id: 'SELF_HARM_OVERDOSE_TONIGHT',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 ${OVERDOSE_INTENT} +1 take|swallow|eat|overdose on +0 all my|all of my|every one of my|all the +0 pills|meds|medicine|tablets|sleeping pills +0 tonight|at once|all at once|together|at the same time|right now|to die|and die|so i die|so i never wake up`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): a plan to take all of one\'s pills at once or tonight ("I\'m going to take all my pills tonight"); SELF_HARM_OVERDOSE_PLAN needs "the pills" after "all". The time is part of the phrase, so "I will take all my medicine with breakfast" does not match.',
+  },
+  {
+    id: 'SELF_HARM_CUT_SELF_END',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 cut|cuts|burn|burns|burned|burnt|cutting|burning +0 ${SELF}`,
+    negatable: true,
+    sentenceEnd: true,
+    doc: 'Round 5 (CHK4-CS-8): a plain "I cut myself" / "I burn myself" that ends the sentence; an accident told the same way ("When I was cooking I cut myself.") escalates and a reviewer clears it. With more words after it ("I cut myself on a piece of paper") only SELF_HARM_HABIT or SELF_HARM_AGAIN read it.',
+  },
+  {
+    id: 'SELF_HARM_CUTTING_BARE',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 have been|been|keep|kept|started|start|am|m|was|still +0 cutting|self harming|selfharming`,
+    negatable: true,
+    sentenceEnd: true,
+    doc: 'Round 5 (CHK4-CS-8): "I\'ve been cutting" with nothing after it ("I\'ve been cutting paper" does not match).',
+  },
+  {
+    id: 'SELF_HARM_CUT_BODY',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +2 cut|cuts|cutting|slice|sliced|slicing|carve|carved|carving +0 my|my own|into my +0 arms|legs|thighs|thigh|skin|stomach|forearms|forearm|hips`,
+    negatable: true,
+    doc: 'Round 5 (CHK4-CS-8): cutting one\'s arms, legs or thighs ("I cut my arms", "I\'ve been cutting my arms", "I cut my thighs so no one sees"). Plural limbs only, so "I cut my leg on a rock" does not match; "I cut my legs shaving" escalates and a reviewer clears it.',
+  },
+  {
+    id: 'SELF_HARM_CUTTER',
+    kind: 'severe',
+    category: 'self_harm',
+    sources: CHILD,
+    pattern: `${I} +1 am|m|was|have been|been +0 a cutter|a self harmer|a selfharmer`,
+    doc: 'Round 5 (CHK4-CS-8): "I am a cutter".',
   },
 
   // ---- Abuse or neglect disclosure ----------------------------------------------------------
@@ -855,7 +1023,6 @@ export const RULES: readonly RuleDef[] = [
     pattern: `${I} +1 was|am|m|got|get|gets|have been|been|keep getting|kept getting|was being|am being|m being +0 touched|groped|fondled +0 by +0 ${TOUCHED_BY_PERSONS}`,
     negatable: true,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     doc: 'Round 4: first-person disclosure of being touched by a person ("I was touched by my coach", "At St. Mary\'s I was touched by the priest"), which ABUSE_BEING_ABUSED ("being touched") did not read. Only a person noun or "him" after "by", so "touched by the story" and "touched by my teacher\'s words" do not match; a doctor or nurse is left out (a check-up). "I was touched by my teacher" said of a kind gesture escalates and a reviewer clears it.',
   },
   {
@@ -898,7 +1065,6 @@ export const RULES: readonly RuleDef[] = [
     negatable: true,
     hypothetical: true,
     notPrecededBy: 'let|should|shouldnt|not|never|dont|allowed|ok|okay|can',
-    guard: BODY_SAFETY_LESSON,
     doc: 'Disclosure of sexual touching ("he touches my private parts"); body-safety lesson answers ("if someone touches my private parts I say no", "never let anyone touch my private parts", "no one is allowed to ...") are excluded by the hypothetical, negation and lesson-phrasing guards (four words back, same sentence).',
   },
   {
@@ -910,7 +1076,6 @@ export const RULES: readonly RuleDef[] = [
       'touch|touches|touched|touching +0 me +1 in a|in the|where|in places|in ways +1 bad|wrong|weird|private|uncomfortable|not ok|secret|i dont like|that i dont like|places',
     negatable: true,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     doc: 'Disclosure of unwanted touching ("my uncle touched me in a bad way").',
   },
   {
@@ -1055,7 +1220,6 @@ export const RULES: readonly RuleDef[] = [
     sources: CHILD,
     pattern: `${ABUSERS} +2 has sex with|had sex with|does sex with|did sex with|wants to have sex with|tried to have sex with|does sexual abuse to|did sexual abuse to|does sexual things to|did sexual things to|does sex stuff with|did sex stuff with|does sex stuff to|did sex stuff to +0 me|us|my sister|my brother`,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     doc: 'Disclosure of sexual abuse in plain words ("my cousin has sex with me", "my stepdad does sexual abuse to me").',
   },
   {
@@ -1065,7 +1229,6 @@ export const RULES: readonly RuleDef[] = [
     sources: CHILD,
     pattern: `${ABUSERS} +2 makes|made|forces|forced|tries to make|tried to make|wants|wanted +0 me|us +1 have sex|do sex|do sexual things|do sex stuff|to have sex|to do sex`,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     doc: 'Being made to have sex ("he makes me have sex").',
   },
   {
@@ -1075,7 +1238,6 @@ export const RULES: readonly RuleDef[] = [
     sources: CHILD,
     pattern: `${ABUSERS} +2 sleeps in my bed|sleeps in bed with me|gets in my bed|gets into my bed|comes in my bed|comes into my bed|climbs in my bed|climbs into my bed|lays in my bed|lies in my bed|lays down with me|gets in bed with me|comes into my room at night|comes in my room at night +4 touches|touched|touching|rubs|rubbed|feels|felt +0 me`,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     notFollowedBy: CARING_TOUCH_TAILS,
     doc: 'Touching after a caregiver gets into the child\'s bed or room ("my dad sleeps in my bed and touches me").',
   },
@@ -1127,7 +1289,6 @@ export const RULES: readonly RuleDef[] = [
     pattern: `${ABUSERS} +2 touches|touched|keeps touching|kept touching|is touching|rubs|rubbed|feels|felt +0 me +1 at night|in bed|in my bed|when no one|when nobody|when mom is|when dad is|when im alone|when i am alone|when we are alone|when were alone|and i dont like it|and i dont like|in the bath|in the shower|under the covers|under my covers|every night|in my room|all over|when i sleep|while i sleep|when im sleeping|when i am sleeping|while im sleeping|while i am sleeping|in a way i dont like|and it feels bad|and it feels weird|weird`,
     negatable: true,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     notFollowedBy: CARING_TOUCH_TAILS,
     doc: 'Touching in a secret or night-time context ("my uncle touches me at night"); caring touch ("Mom touches me at night to check if I have a fever") excluded.',
   },
@@ -1138,7 +1299,6 @@ export const RULES: readonly RuleDef[] = [
     sources: BOTH,
     pattern: `${ABUSERS} +2 makes|made|make|forces|forced|tells|told|wants|wanted|tries to make|tried to make|asks|asked|keeps making +0 me +1 touch|to touch|rub|to rub|lick|to lick|feel|to feel +0 him|his body|her body|his thing|his wiener|him down there|her down there`,
     hypothetical: true,
-    guard: BODY_SAFETY_LESSON,
     notFollowedBy:
       'to see if he has a fever|to check if he has a fever|to check his fever|to feel his forehead|to feel if he has a fever|to wake him up|to help him up|when he was sick|on the arm|on the shoulder|on the hand|on the back|on the head|hand|arm|head|back|shoulder|face|cast|muscle|muscles|beard|hair',
     doc: 'Being made to touch a person ("my uncle makes me touch him"). "her" and "them" are too often objects ("she made me touch her slime", "made me touch them" about worms) and are left to ABUSE_MADE_ME_UNDRESS, which needs a private-parts word.',
@@ -1162,6 +1322,135 @@ export const RULES: readonly RuleDef[] = [
     pattern:
       'if i tell|if you tell|or else|if i told|if anyone finds out|if i say anything|if i talk +3 he|she|they|someone|dad|mom|he said he|she said she +1 will|would|is going to|gonna|said he would|said she would|said they would|says he will|says she will +1 hurt|kill|beat|hit|punish|send me away|hurt my|kill my|leave|hurt you|kill you',
     doc: 'Threats that keep a child silent ("he said if I tell he will hurt me").',
+  },
+
+  // ---- Round 5 (CHK4-CS-8): canonical abuse disclosures no earlier rule read ------------------
+  {
+    id: 'ABUSE_THROWS_AT_ME',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +2 throws|threw|throw|keeps throwing|kept throwing|throwing +1 things|stuff|bottles|a bottle|plates|a plate|dishes|a dish|shoes|a shoe|chairs|a chair|a knife|knives|glasses|a glass|a lamp|his belt|her belt|a belt|a remote|the remote|objects|a book|books|cans|a can +0 at me|at us|at my head|at my face`,
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): things thrown at the child ("My dad throws things at me"); a ball or snowballs are not in the list.',
+  },
+  {
+    id: 'ABUSE_PULLS_HAIR',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +2 pulls|pulled|yanks|yanked|keeps pulling|drags|dragged +0 my hair|me by my hair|me by the hair|me across the floor|me down the stairs`,
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): hair pulling or dragging ("My mom pulls my hair"); a sibling or a parent braiding hair in the same words escalates and a reviewer clears it.',
+  },
+  {
+    id: 'ABUSE_LEFT_MARKS',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +2 left|leaves|gave|gives +1 bruises|a bruise|welts|a welt|a black eye|black eyes|scars|a scar|burns|a burn +1 ?on me|on my|all over me|on us|on my body`,
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): a person who leaves bruises or marks ("My dad left bruises on me", "He gave me a black eye").',
+  },
+  {
+    id: 'ABUSE_BRUISES_FROM',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${I} +2 have|got|get|had|always have|always get +1 bruises|a bruise|welts|a welt|a black eye|black eyes|marks|scars|a scar|burns|cuts +1 from|because of|cause of|cuz of +0 my dad|my mom|my stepdad|my stepmom|my stepfather|my stepmother|my parents|my father|my mother|my uncle|my aunt|my brother|my sister|my grandpa|my grandma|my babysitter|my coach|my teacher|my cousin|dad|mom|him|her|them|his belt|her belt|the belt|a belt|being hit|getting hit|being beaten|getting beaten`,
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): injuries from a person ("I have bruises from my dad"); "bruises from soccer" does not match.',
+  },
+  {
+    id: 'ABUSE_HIT_INJURY',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +2 hit|hits|beat|beats|punched|punches|kicked|kicks|slapped|slaps|choked|chokes|hurt|hurts|pushed|pushes|threw|throws|smacked|smacks|whipped|whips|strangled|shoved +0 me|us +3 i bled|i was bleeding|i started bleeding|made me bleed|until i bled|till i bled|i passed out|i blacked out|i couldnt breathe|i could not breathe|i got a bruise|i had a bruise|it left a bruise|it left a mark|i had to go to the hospital|i went to the hospital`,
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): being hit with an injury ("He hit me so hard I bled"); a past-tense hit by a peer counts here because of the injury.',
+  },
+  {
+    id: 'ABUSE_HIT_WITH_OBJECT',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +2 hit|hits|beat|beats|whipped|whips|smacked|smacks|spanked|spanks|hitting|beating|whooped|whoops +0 me|us +0 with a belt|with his belt|with her belt|with the belt|with a belt buckle|with a cord|with an extension cord|with a wire|with a switch|with a hanger|with a coat hanger|with a paddle|with a wooden spoon|with a spoon|with a bat|with a chain|with a whip|with his fist|with her fist|with a hose|with a shoe|with her shoe|with his shoe|with a stick`,
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): being hit with an object ("She hit me with a belt"); ABUSE_PHYSICAL_ADULT_PAST reads a past hit by an adult noun only.',
+  },
+  {
+    id: 'ABUSE_TOUCHED_ME_END',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +1 touched|touches|touch|keeps touching|kept touching|was touching|is touching|always touches|has touched|has been touching +0 me|us`,
+    negatable: true,
+    hypothetical: true,
+    sentenceEnd: true,
+    doc: 'Round 5 (CHK4-CS-8): "My uncle touched me" / "My uncle touches me" as a whole statement; with words after it ("He touched me on the shoulder") the touch rules with a place read it. A game told the same way ("In tag he touched me.") escalates and a reviewer clears it.',
+  },
+  {
+    id: 'ABUSE_TOUCHED_WHERE',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern:
+      'touch|touches|touched|touching|keeps touching|kept touching +0 me|us +0 in bad places|in bad spots|in my bad places|in private places|in my private places|in private spots|in weird places|in wrong places|in the wrong places|in wrong spots|in places i dont like|in places that i dont like|where i dont like|where i dont want|where i didnt want|where i did not want|where i didnt like|where i did not like|where i do not like|where he shouldnt|where she shouldnt|where they shouldnt|where he should not|where she should not|in places he shouldnt|in places she shouldnt|where nobody should|where no one should',
+    negatable: true,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): touching in bad places or where the child did not want ("My uncle touches me in bad places", "He touched me where I didn\'t want him to").',
+  },
+  {
+    id: 'ABUSE_MAKES_ME_DO_THINGS',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${ABUSERS} +2 makes|made|forces|forced|tries to make|tried to make|wants|wanted|keeps making +0 me|us +1 do things i dont like|do things i do not like|do things i didnt like|do things i dont want to|do things i didnt want to|do things that i dont like|do stuff i dont like|do stuff i dont want to|do bad things|do weird things|do gross things|do nasty things|do sexual things|do sex things|do private things|do secret things|do things to him|do things to her|do things with him|do stuff to him|do stuff with him`,
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): being made to do things the child does not like ("He makes me do things I don\'t like"); chores in the same words escalate and a reviewer clears them.',
+  },
+  {
+    id: 'ABUSE_MADE_ME_UNDRESS_OFF',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern:
+      'makes|made|make|tells|told|asked|asks|forces|forced|wants|wanted|tries to make|tried to make +0 me|us +1 take|to take|pull|to pull +0 my|our|all my|off my|off all my +0 clothes|pants|underwear|swimsuit|bathing suit|bra|panties',
+    hypothetical: true,
+    doc: 'Round 5 (CHK4-CS-8): being made to take one\'s clothes off ("He made me take my clothes off"); ABUSE_MADE_ME_UNDRESS reads "take off" only.',
+  },
+  {
+    id: 'ABUSE_SENT_PRIVATE_PICTURES',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern:
+      'showed|shows|show|sent|sends|send|texts|texted|snapchats|snapchatted|shares|shared +0 me|us +0 pictures|pics|photos|videos|a picture|a pic|a photo|a video|selfies|a selfie +0 of +0 his|her|their|him|himself|herself +0 private parts|privates|private part|private|wiener|penis|butt|boobs|naked|nude|body naked|naked body|underwear|without clothes',
+    doc: 'Round 5 (CHK4-CS-8): someone sending the child pictures of their private parts ("He sends me pictures of his private parts"); ABUSE_SHOWED_SEXUAL needs the adjective before "pictures".',
+  },
+  {
+    id: 'ABUSE_NO_FOOD_HOME',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern: `${I}|we +1 dont|do not|never|didnt|did not|havent|have not|cant|can not +1 have|get|got|ever have|ever get +1 food|any food|anything to eat|enough food|enough to eat|real food +1 at home|in my house|at my house|in the house|at our house|in our house|for days|all day|since yesterday|for two days|for 2 days|for a long time|most days|all weekend|at my moms|at my dads`,
+    doc: 'Round 5 (CHK4-CS-8): no food at home ("I don\'t have food at home", "We don\'t have food for days").',
+  },
+  {
+    id: 'ABUSE_LOCKED_OUT',
+    kind: 'severe',
+    category: 'abuse',
+    sources: CHILD,
+    pattern:
+      'lock|locks|locked|locking +0 me|us +0 out of the house|outside|out of the house at night|out at night|outside at night|out all night|outside all night|out in the cold|outside in the cold|out in the snow|outside in the snow|out in the rain|outside in the rain|out overnight|outside overnight',
+    doc: 'Round 5 (CHK4-CS-8): being locked out of the house ("My parents lock me out of the house at night"); ABUSE_LOCKED_IN reads a room or a closet.',
   },
 
   // ---- Threats of violence ------------------------------------------------------------------
@@ -1428,10 +1717,9 @@ export const RULES: readonly RuleDef[] = [
     pattern:
       'rape|raping|molesting|sexual abuse|child abuse|sex with kids|sex with children|sex with a kid|sex with a child|sex with me|sex with us|touching private parts|touching privates +0 is ok|is okay|is fine|is good|is normal|is allowed|is our secret|is a secret|is our game|is a game|is fun|is not bad|isnt bad|is not wrong|isnt wrong',
     negatable: true,
-    answerOnly: true,
     notPrecededBy: 'about',
     guard: ENDORSED_LESSON_GUARD,
-    doc: 'Round 3 (CHK2-CS-7): sexual abuse called acceptable ("My teacher said sex with kids is ok", "My mom says rape is ok", "He says touching private parts is our secret"); a frame or an educational subject never softens it. Round 4 (CHK3-CS-3): the child\'s answer only, never a printed prompt; "if", a negated "say" or "believe" and the body-safety lesson guard apply ("If someone says touching private parts is a secret, tell a trusted adult", "No one should ever say rape is ok", "Don\'t say rape is ok"), and so does a third person who holds the view ("Some bad people say child abuse is normal", "the villain thinks rape is ok") unless a first-person word is nearer ("My uncle says ...") or later in the sentence. A negation across another word negates that word, so a report stays severe ("He said it is not bad, sex with me is fine"; NEGATION_BRIDGES), and a phrase that names the child ("our secret", "with me") is held only by a quote word (ENDORSED_LESSON_GUARD). Prevention wording ("Rape is never okay") does not match.',
+    doc: 'Round 3 (CHK2-CS-7): sexual abuse called acceptable ("My teacher said sex with kids is ok", "My mom says rape is ok", "He says touching private parts is our secret"); a frame or an educational subject never softens it. Round 4 (CHK3-CS-3): when the phrase does not name the child, a lesson word or a third person who holds the view ("If someone says touching private parts is a game, tell a trusted adult", "Some bad people say child abuse is normal", "the villain thinks rape is ok", "Don\'t say rape is ok") holds it unless a first-person word is nearer ("My uncle says ...") or later in the sentence (ENDORSED_LESSON_GUARD). Round 5 (CHK4-CS-1): a phrase that names the child ("sex is our secret", "sex with me is ok") is held by nothing; only a negation right before it cancels it ("He says if anyone asks, touching private parts is our secret" is a report). It is a held category, so it never reads a printed prompt (screen.ts scan). Prevention wording ("Rape is never okay") does not match.',
   },
   {
     id: 'SEXUAL_GROOMING_GAME',
@@ -1441,10 +1729,9 @@ export const RULES: readonly RuleDef[] = [
     pattern:
       'sex +0 is our game|is our little game|is our secret|is our little secret|is a secret|is a game|is normal for kids|is ok for kids|is okay for kids|is fine for kids|is good for kids',
     negatable: true,
-    answerOnly: true,
     notPrecededBy: 'about',
     guard: ENDORSED_LESSON_GUARD,
-    doc: 'Round 3: sex framed as a game, a secret or normal for children ("My uncle says sex is our game"), a grooming phrase. Round 4 (CHK3-CS-3): the child\'s answer only; "if", a negated "say" or "believe", the body-safety lesson guard and a third-person holder apply as for SEXUAL_ABUSE_ENDORSED ("He said don\'t tell, sex is our secret" is a report), and talking or learning about sex is a health topic ("Being curious about sex is normal for kids").',
+    doc: 'Round 3: sex framed as a game, a secret or normal for children ("My uncle says sex is our game"), a grooming phrase. Round 4 (CHK3-CS-3): ENDORSED_LESSON_GUARD holds a phrase that does not name the child as for SEXUAL_ABUSE_ENDORSED, and talking or learning about sex is a health topic ("Being curious about sex is normal for kids"). Round 5 (CHK4-CS-1): "sex is our secret" / "our game" names the child, so no guard word holds it ("He says don\'t listen to your mom, sex is our secret", "He made me promise to never say sex is our secret").',
   },
 
   // ---- Secrecy ------------------------------------------------------------------------------
@@ -1569,6 +1856,36 @@ export const RULES: readonly RuleDef[] = [
     pattern: `${I} +1 am not allowed to|m not allowed to|not allowed to|am not supposed to|m not supposed to|not supposed to|cant|cannot|can not +0 tell +0 anyone|anybody|my mom|my dad|my parents|mom|dad|my teacher|nobody|a grown up|about him|about her|what he|what she|what happens|what happened`,
     notFollowedBy: SURPRISE_TAILS,
     doc: 'A child saying they are not allowed to tell ("I\'m not allowed to tell anyone what happens"); passwords and surprises excluded.',
+  },
+
+  // ---- Round 5 (CHK4-CS-8): canonical secrecy disclosures no earlier rule read ----------------
+  {
+    id: 'SECRECY_SAYS_OUR_SECRET_END',
+    kind: 'severe',
+    category: 'secrecy',
+    sources: CHILD,
+    pattern:
+      'says|said|tells me|told me|always says|keeps saying|tells us|told us +1 its|it is|it s|this is|thats|that is|it was|this was|that was +0 our secret|our secrets|our special secret|our little secret|a secret between us|just between us|between us',
+    sentenceEnd: true,
+    doc: 'Round 5 (CHK4-CS-8): "... says it\'s our secret" ending the sentence, with the speaker further back ("He kisses me and touches me and says it\'s our secret"); SECRECY_OUR_SECRET_REPORTED needs the speaker right before "says". "It\'s our secret club" does not end there.',
+  },
+  {
+    id: 'SECRECY_MEET_NOT_TELL',
+    kind: 'severe',
+    category: 'secrecy',
+    sources: CHILD,
+    pattern:
+      'asked|asks|wants|wanted|told|tells|keeps asking|kept asking +0 me|us +1 to meet|meet|to meet up|meet up|to come over|to come to his house|to come to her house|to go to his house|to go to her house|to get in his car|to get in her car|to come to his car|to video chat|to facetime +3 and not tell|and not to tell|and to not tell|and never tell|and dont tell|and do not tell|without telling|but not tell|but not to tell|but dont tell|and keep it secret|and keep it a secret|and to keep it secret|and to keep it a secret',
+    doc: 'Round 5 (CHK4-CS-8): a request to meet and keep it from the family ("He asked me to meet him and not tell my parents").',
+  },
+  {
+    id: 'SECRECY_MATURE_SECRET',
+    kind: 'severe',
+    category: 'secrecy',
+    sources: CHILD,
+    pattern:
+      'mature for my age|mature for your age|grown up for my age|more mature than other kids|older than my age +3 and to keep it secret|and to keep it a secret|and keep it secret|and keep it a secret|and to keep this secret|and not to tell|and not tell|and to not tell|and dont tell|to keep it secret|to keep it a secret|keep it secret|keep it a secret|not to tell anyone|and to keep it between us|and keep it between us',
+    doc: 'Round 5 (CHK4-CS-8): grooming flattery with secrecy ("He said I\'m mature for my age and to keep it secret").',
   },
 
   // ---- Personal contact ---------------------------------------------------------------------
@@ -2289,14 +2606,15 @@ export const NEGATORS =
   'not|dont|doesnt|didnt|never|wont|wouldnt|cant|cannot|isnt|arent|wasnt|werent|shouldnt';
 /**
  * Round 4 (lead policy: recall first). A negation two words before a match counts only across one
- * of these words, "to", an adverb or an opinion or speech verb ("Be careful not to hurt yourself",
- * "I don't really want to ...", "I don't think suicide is the answer", "Don't say rape is ok").
- * Across any other word it negates that word, not the match: "I'm not ok, dying is the only way
- * out", "I'm not fine I will hurt myself", "He said it is not bad, sex is our secret", "He said
- * don't tell, sex is our secret". A negation right before the match always counts.
+ * of these words: "to" or an adverb ("Be careful not to hurt yourself", "I don't really want to
+ * ..."). Across any other word it negates that word, not the match: "I'm not ok, dying is the only
+ * way out", "I'm not fine I will hurt myself", "He said it is not bad, sex is our secret". A
+ * negation right before the match always counts. Round 5 (CHK4-CS-7b, lead decision): opinion and
+ * speech verbs (think, believe, feel, say, said, mean, agree) are no longer bridges: "My mom doesn't
+ * believe he hits me" and "He said never say sex is our secret" are reports, and "I don't think
+ * dying is the only way out" escalates and a reviewer clears it.
  */
-export const NEGATION_BRIDGES =
-  'to|really|even|ever|actually|truly|always|just|think|thinks|believe|believes|feel|feels|say|says|said|mean|agree';
+export const NEGATION_BRIDGES = 'to|really|even|ever|actually|truly|always|just';
 
 /** Hypothetical markers that cancel a `hypothetical` rule. */
 export const HYPOTHETICALS = 'if|whether|pretend|imagine';

@@ -25,6 +25,7 @@ import {
   type CompactStream,
   type NormalizedText,
 } from './normalize.ts';
+import { heldFromFamily } from './templates.ts';
 import {
   SENSITIVE_TOPICS,
   SEVERE_SAFETY_CATEGORIES,
@@ -39,7 +40,7 @@ import {
 } from './types.ts';
 
 /** Bumped whenever a rule, a signature or the normalization changes. */
-export const SAFETY_SCREEN_VERSION = 'safety-screen.v3';
+export const SAFETY_SCREEN_VERSION = 'safety-screen.v4';
 
 // ---------------------------------------------------------------------------------------------
 // Compilation (once, at module load)
@@ -69,11 +70,12 @@ interface CompiledGuard {
   readonly stopAtFirstPerson: boolean;
   readonly holderTo: boolean;
   readonly firstPersonAfter: boolean;
-  readonly quoteWords: Slot | null;
 }
 
 interface CompiledRule {
   readonly def: RuleDef;
+  /** Its category starts a system report held from the family (FAMILY_HOLD_CATEGORIES). */
+  readonly held: boolean;
   readonly sources: ReadonlySet<ScreenSource>;
   readonly slots: readonly Slot[];
   readonly notFollowedBy: Slot | null;
@@ -98,6 +100,7 @@ interface SignaturePhrase {
 
 interface CompiledSignature {
   readonly def: SignatureDef;
+  readonly held: boolean;
   readonly sources: ReadonlySet<ScreenSource>;
   readonly phrases: readonly SignaturePhrase[];
   readonly exempt: Exemption | null;
@@ -180,6 +183,7 @@ function compileRule(def: RuleDef): CompiledRule {
   }
   return {
     def,
+    held: def.category !== undefined && heldFromFamily([def.category]),
     sources: new Set(def.sources),
     slots,
     notFollowedBy: def.notFollowedBy ? compileSlot(def.notFollowedBy, 0, false) : null,
@@ -193,7 +197,6 @@ function compileRule(def: RuleDef): CompiledRule {
           stopAtFirstPerson: def.guard.stopAtFirstPerson ?? false,
           holderTo: def.guard.holderTo ?? false,
           firstPersonAfter: def.guard.firstPersonAfter ?? false,
-          quoteWords: def.guard.quoteWords ? compileSlot(def.guard.quoteWords, 0, false) : null,
         }
       : null,
     gapStop: def.gapStop ? compileTokens(def.gapStop) : null,
@@ -219,6 +222,7 @@ function compileSignature(def: SignatureDef): CompiledSignature {
   }
   return {
     def,
+    held: heldFromFamily([def.category]),
     sources: new Set(def.sources),
     phrases: [...phrases.values()],
     exempt: compileExemption(def.exempt),
@@ -254,7 +258,6 @@ const VOCABULARY: ReadonlySet<string> = (() => {
     addSlot(rule.notFollowedBy);
     addSlot(rule.unlessAfter);
     addSlot(rule.guard?.words);
-    addSlot(rule.guard?.quoteWords);
     addSet(rule.notPrecededBy);
     addSet(rule.gapStop);
     addSet(rule.exempt?.cues);
@@ -405,22 +408,15 @@ function firstPersonAfter(tokens: readonly string[], pos: number): boolean {
 }
 
 /**
- * Whether the child's own first person voids a `firstPersonAfter` guard that matched before
- * tokens[start, pos): a first-person word after the phrase, or one inside it ("sex is OUR secret",
- * "sex with ME") unless one of the guard's `quoteWords` holds the view ("If someone tells you
- * touching private parts is our secret, tell"; round 4 lead policy).
+ * Whether the matched phrase tokens[start, pos) names the child: a first-person word inside it
+ * ("sex is OUR secret", "sex with ME", "touches MY private parts", "touches ME at night", "suicide
+ * is MY only way out"). Round 5 (CHK4-CS-1, CHK4-CS-7; lead decision: recall first): no guard
+ * holds such a phrase, whatever word comes before it; only a negation right before or inside it
+ * cancels it.
  */
-function childVoidsGuard(
-  tokens: readonly string[],
-  start: number,
-  pos: number,
-  guard: CompiledGuard,
-): boolean {
-  if (firstPersonAfter(tokens, pos)) return true;
-  if (guard.quoteWords === null) return false;
-  let inPhrase = false;
-  for (let p = start; p < pos && !inPhrase; p += 1) inPhrase = FIRST_PERSON_SET.has(tokens[p]!);
-  return inPhrase && !guardedBefore(tokens, start, { ...guard, words: guard.quoteWords });
+function namesChild(tokens: readonly string[], start: number, pos: number): boolean {
+  for (let p = start; p < pos; p += 1) if (FIRST_PERSON_SET.has(tokens[p]!)) return true;
+  return false;
 }
 
 /**
@@ -459,7 +455,6 @@ function matchAt(tokens: readonly string[], start: number, rule: CompiledRule): 
   if (def.hypothetical && anyBefore(tokens, start, 3, HYPOTHETICAL_SET)) return false;
   const guard = rule.guard;
   const guarded = guard !== null && guardedBefore(tokens, start, guard);
-  if (guarded && !guard.firstPersonAfter) return false;
   if (def.sentenceStart && start > 0 && tokens[start - 1] !== BOUNDARY) return false;
   if (def.alone && !onlyBoundaries(tokens, 0, start)) return false;
   let pos = matchSlot(tokens, start, rule.slots[0]!);
@@ -487,7 +482,15 @@ function matchAt(tokens: readonly string[], start: number, rule: CompiledRule): 
   }
   if (def.alone && !onlyBoundaries(tokens, pos, tokens.length)) return false;
   if (def.sentenceEnd && pos < tokens.length && tokens[pos] !== BOUNDARY) return false;
-  if (guarded && !childVoidsGuard(tokens, start, pos, guard)) return false;
+  // A guard holds the view unless the phrase names the child, or (`firstPersonAfter`) a first
+  // person follows it in the sentence ("Some people say sex is ok but my uncle says it too").
+  if (
+    guarded &&
+    !namesChild(tokens, start, pos) &&
+    !(guard.firstPersonAfter && firstPersonAfter(tokens, pos))
+  ) {
+    return false;
+  }
   return !excludedAfter(tokens, pos, rule);
 }
 
@@ -572,11 +575,26 @@ interface Hits {
 }
 
 /**
- * `firstPerson`: whether a first-person sentence keeps a tier-B word from being exempt. True for
- * the child's own text; false for the printed prompt, which is not the child's statement
- * (CHK-CS-2: "In our unit we discuss child abuse." is a worksheet's words).
+ * What a scan reads:
+ * - `own`: the writer's own words (the child's answer, a model's output). A first-person sentence
+ *   keeps a tier-B word in a child's text from being exempt.
+ * - `printed`: the printed prompt, screened for codes. It is the worksheet's text, not the child's
+ *   statement: its first person never makes a tier-B word severe (CHK-CS-2: "In our unit we discuss
+ *   child abuse."), answer-only rules skip it, and no rule or signature whose category is held from
+ *   the family (abuse, sexual, secrecy: heldFromFamily) runs on it. Round 5 (CHK4-CS-4/5, lead
+ *   decision): a body-safety or reading worksheet quotes exactly the words a disclosure uses ("Don't
+ *   tell anyone, it's our secret", "I was touched by my coach at the award dinner", "My dad hits
+ *   me," whispered the girl), so a held code, which starts the authorities-first review, never comes
+ *   from a printed prompt. Self-harm, violence and contact rules still read it.
+ * - `context`: the printed prompt read only for the topics it raises (model-output grounding); no
+ *   code comes from it, so every rule but the answer-only ones runs.
  */
-function scan(norm: NormalizedText, source: ScreenSource, firstPerson: boolean): Hits {
+type Reader = 'own' | 'printed' | 'context';
+
+function scan(norm: NormalizedText, source: ScreenSource, reader: Reader): Hits {
+  const firstPerson = reader === 'own';
+  // The one place held codes are kept off a printed prompt (rules and signatures alike).
+  const skipHeld = (compiled: { readonly held: boolean }) => reader === 'printed' && compiled.held;
   const rules = new Set<CompiledRule>();
   const personal = new Set<CompiledRule | CompiledSignature>();
   let sentences: ReadonlySet<number> | null = null;
@@ -593,7 +611,7 @@ function scan(norm: NormalizedText, source: ScreenSource, firstPerson: boolean):
       const candidates = INDEX.get(token);
       if (candidates === undefined) continue;
       for (const rule of candidates) {
-        if (!rule.sources.has(source)) continue;
+        if (!rule.sources.has(source) || skipHeld(rule)) continue;
         // A rule about the child's own answer never reads the printed prompt (CHK2-CS-4).
         if (rule.def.answerOnly && !firstPerson) continue;
         // A tier-B rule on a child's text keeps looking (still bounded: one check per position)
@@ -608,7 +626,7 @@ function scan(norm: NormalizedText, source: ScreenSource, firstPerson: boolean):
   }
   const signatures = new Set<CompiledSignature>();
   for (const sig of COMPILED_SIGNATURES) {
-    if (!sig.sources.has(source)) continue;
+    if (!sig.sources.has(source) || skipHeld(sig)) continue;
     if (norm.compacts.some((c) => sig.phrases.some((phrase) => anchored(c, phrase)))) {
       signatures.add(sig);
       if (
@@ -646,7 +664,7 @@ function contextInfo(context: ScreenContext | undefined): ContextInfo {
   const prompt = context?.prompt ?? null;
   if (prompt === null || prompt.trim().length === 0) return { ...EMPTY_CONTEXT, subject };
   const norm = normalizeForScreen(prompt, VOCABULARY, true);
-  const hits = scan(norm, 'child', false);
+  const hits = scan(norm, 'child', 'context');
   const promptTopics = new Set<SensitiveTopic>();
   for (const rule of hits.rules) if (rule.def.topic !== undefined) promptTopics.add(rule.def.topic);
   for (const sig of hits.signatures)
@@ -699,7 +717,7 @@ function screenWith(
 ): SafetyScreen {
   // A printed prompt is the worksheet's text: "World War I" there is a numeral (normalize.ts).
   const norm = normalizeForScreen(text, VOCABULARY, !childStatement);
-  const hits = scan(norm, source, childStatement);
+  const hits = scan(norm, source, childStatement ? 'own' : 'printed');
   const categories = new Set<SevereSafetyCategory>();
   const topics = new Set<SensitiveTopic>();
   const codes = new Set<string>();
@@ -786,9 +804,11 @@ export function screenText(text: string, options: ScreenOptions): SafetyScreen {
 /**
  * The scan pipeline's input screen for one extracted question: the child's answer (in the context
  * of the printed question and subject) and the printed prompt itself (a child may have written in
- * it, or the extraction may have merged a margin note into it). Every rule reads the prompt, but
- * its first person does not make a tier-B word severe: a worksheet's "our class" or "we discuss"
- * is not the child's statement (CHK-CS-2), so a tier-B word in it is judged by subject and cues.
+ * it, or the extraction may have merged a margin note into it). The prompt's first person does not
+ * make a tier-B word severe: a worksheet's "our class" or "we discuss" is not the child's statement
+ * (CHK-CS-2), so a tier-B word in it is judged by subject and cues. Round 5 (CHK4-CS-4/5): no held
+ * code (abuse, sexual, secrecy) comes from the prompt; its self-harm, violence and contact rules
+ * still apply, so a margin note "i want to die" merged into it is still severe (see scan).
  */
 export function screenQuestion(input: {
   readonly prompt: string | null;
@@ -797,17 +817,15 @@ export function screenQuestion(input: {
   readonly ageBand: SafetyAgeBand | null;
 }): SafetyScreen {
   const screens: SafetyScreen[] = [];
+  const withPrompt = contextInfo({ prompt: input.prompt, subject: input.subject });
   if (input.answer !== null && input.answer.trim().length > 0) {
-    screens.push(
-      screenWith(
-        input.answer,
-        'child',
-        contextInfo({ prompt: input.prompt, subject: input.subject }),
-      ),
-    );
+    screens.push(screenWith(input.answer, 'child', withPrompt));
   }
   if (input.prompt !== null && input.prompt.trim().length > 0) {
     screens.push(screenWith(input.prompt, 'child', contextInfo({ subject: input.subject }), false));
+    // The prompt still reports every topic it raises, a held rule's tier-B word included ("child
+    // abuse" in a rights lesson is `sexual_violence_topic`), though no held code comes from it.
+    screens.push(finish(new Set(), withPrompt.promptTopics, new Set(), false));
   }
   return mergeScreens(screens);
 }

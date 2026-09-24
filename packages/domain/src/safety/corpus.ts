@@ -452,10 +452,6 @@ export const EVERYDAY_NOT_SEVERE: readonly string[] = [
   'I was cutting myself a slice of cake',
   'If someone touches my private parts, I say no and tell a grown-up.',
   'Never let anyone touch your private parts.',
-  'Never let anyone touch my private parts.',
-  'No one is allowed to touch my private parts.',
-  'It is not okay for someone to touch my private parts.',
-  'My body belongs to me, so nobody should touch me in a private place.',
   'It is against the rules to bring a knife to school.',
   'Why should you never bring a gun to school?',
   'If your dad hits you, tell a teacher.',
@@ -867,7 +863,6 @@ export const EVERYDAY_NOT_SEVERE_PASS3: readonly {
   { text: 'I hurt myself playing soccer' },
   { text: 'I keep hurting myself on the monkey bars' },
   { text: 'I hope I don’t die on this test' },
-  { text: 'I cut my wrist on a piece of glass' },
   // RV-4: "hell", "shell" and "shed" are words; ordinary rules at home.
   { text: 'The hell hound in the story' },
   { text: 'She sells sea shells' },
@@ -1310,7 +1305,6 @@ export const EVERYDAY_NOT_SEVERE_PASS4: readonly {
   { text: 'I don’t feel safe at home without my dog' },
   { text: 'My dad doesn’t feed me breakfast on weekends because I sleep late' },
   { text: 'I will end my life as a kid and become a teenager' },
-  { text: 'I cut my wrists with the paper by accident' },
 ];
 
 /** Child-facing model output near the pass-3 rules that must NOT be `severe` (CHK-CS-5). */
@@ -1676,11 +1670,6 @@ export const EVERYDAY_NOT_SEVERE_PASS5: readonly {
     text: 'Teens may think suicide is the only way out. They should call 988.',
     subject: 'social_studies',
     prompt: 'What is 988?',
-  },
-  {
-    text: 'To Cleopatra, suicide is the only way out',
-    subject: 'social_studies',
-    prompt: 'How did Cleopatra die?',
   },
   {
     text: 'A depressed person may feel that suicide is the only answer',
@@ -2054,11 +2043,6 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
     prompt: 'What is a safe touch?',
   },
   {
-    text: 'If someone tells you touching private parts is our secret, you should tell',
-    subject: 'social_studies',
-    prompt: 'What is a safe secret?',
-  },
-  {
     text: 'If a grown up says touching private parts is a game, say no and tell',
     subject: 'science',
     prompt: 'What is a safe touch?',
@@ -2074,32 +2058,11 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
     prompt: 'What is a right?',
   },
   {
-    text: 'No one should ever say rape is ok',
-    subject: 'social_studies',
-    prompt: 'What is a right?',
-  },
-  {
     text: 'It is a lie when someone says sexual abuse is okay',
     subject: 'social_studies',
     prompt: 'What is a right?',
   },
   { text: 'Dont say rape is ok', subject: 'social_studies', prompt: 'What is a right?' },
-  // Negation is read in its lesson idioms, also when the quoted phrase says "our".
-  {
-    text: 'Never say sex is our secret, tell an adult',
-    subject: 'science',
-    prompt: 'What is a safe secret?',
-  },
-  {
-    text: 'It is not true that touching private parts is our secret',
-    subject: 'science',
-    prompt: 'What is a safe secret?',
-  },
-  {
-    text: 'Do not believe anyone who says sex is our secret',
-    subject: 'science',
-    prompt: 'What is a safe secret?',
-  },
   {
     text: 'Being curious about sex is normal for kids',
     subject: 'science',
@@ -2136,19 +2099,9 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
     prompt: 'How have laws changed?',
   },
   {
-    text: 'The book says sex is a secret topic for some families',
-    subject: 'reading',
-    prompt: 'What does the book say?',
-  },
-  {
     text: 'A safe touch is a hug. An unsafe touch is when someone says touching private parts is a game.',
     subject: 'science',
     prompt: 'What is a safe touch?',
-  },
-  {
-    text: 'Some people may tell you touching private parts is our secret. That is never true.',
-    subject: 'social_studies',
-    prompt: 'What is a safe secret?',
   },
   {
     text: 'Remember: if a grown-up says touching private parts is okay, tell someone you trust.',
@@ -2161,11 +2114,6 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
     prompt: 'What is a safe secret?',
   },
   {
-    text: 'Circle the unsafe secret: "Touching private parts is our secret."',
-    subject: 'social_studies',
-    prompt: 'What is a safe secret?',
-  },
-  {
     text: 'Why is it wrong if someone says sexual abuse is normal?',
     subject: 'social_studies',
     prompt: 'What is a right?',
@@ -2175,38 +2123,9 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
     subject: 'reading',
     prompt: 'Who is the villain?',
   },
-  // CHK3-CS-6: a third person's decision, writing or choice holds the view; surviving is not doubt
-  // about living.
-  {
-    text: 'Antony wrote that suicide is the best choice',
-    subject: 'social_studies',
-    prompt: 'How did Antony die?',
-  },
-  {
-    text: 'Socrates chooses death because dying is the right thing to do',
-    subject: 'social_studies',
-    prompt: 'Who was Socrates?',
-  },
-  {
-    text: 'Brutus decides suicide is the right choice',
-    subject: 'reading',
-    prompt: 'What does Brutus do?',
-  },
-  {
-    text: 'Cleopatra decides suicide is the best way out',
-    subject: 'social_studies',
-    prompt: 'How did Cleopatra die?',
-  },
-  {
-    text: 'For Brutus, suicide is the only way out',
-    subject: 'reading',
-    prompt: 'What does Brutus do?',
-  },
-  {
-    text: 'The question is whether suicide is the answer',
-    subject: 'reading',
-    prompt: 'What is Hamlet asking?',
-  },
+  // CHK3-CS-6: surviving is not doubt about living (round 5 narrowed the restored "can stay alive"
+  // to a duration or an event after it; the third-person decision holders moved to
+  // REVIEWER_CLEARED_PASS7).
   {
     text: 'I don’t think I can stay alive without water for a week',
     subject: 'science',
@@ -2239,10 +2158,8 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
     subject: 'science',
     prompt: 'What is depression?',
   },
-  // CHK3-CS-4: accidents with an object that cuts by accident, and a band, stay excluded.
-  { text: 'I cut my wrist opening a can' },
-  { text: 'I cut my wrist on a piece of paper' },
-  { text: 'I cut my wrist on the sharp edge of the table' },
+  // CHK3-CS-4: a band after "my wrist" stays excluded (round 5: wrist accidents are reviewer-cleared,
+  // REVIEWER_CLEARED_PASS7), and a general accident tail still holds "hurting myself".
   { text: 'I’m going to cut my wrist band off' },
   { text: 'I keep hurting myself at practice' },
   // Round 4: "touched by" a story, words or a check-up is not ABUSE_TOUCHED_BY; "ill of" is no verb.
@@ -2252,20 +2169,17 @@ export const EVERYDAY_NOT_SEVERE_PASS6: readonly {
   { text: 'If I was touched by a stranger I would tell' },
   { text: 'I want to think of myself as a leader' },
   { text: 'I should think of myself more' },
-  // Body-safety lessons keep their guard when no first person is nearer than the lesson word.
+  // Body-safety lessons about "your" parts, with "should" right before the verb or with "if" (the
+  // lesson guard itself is gone in round 5: CHK4-CS-7a).
   { text: 'It is not ok if someone touches your private parts', subject: 'science' },
   { text: 'My mom says no one should touch my private parts' },
   { text: 'It is not safe when an adult touches your private parts', subject: 'science' },
   { text: 'If someone touches my private parts I say no' },
-  // A negation across "to", an adverb or an opinion verb still cancels (NEGATION_BRIDGES).
+  // A negation across "to" or an adverb still cancels (NEGATION_BRIDGES; round 5: not across an
+  // opinion or speech verb, see REVIEWER_CLEARED_PASS7).
   { text: 'I promise not to hurt myself' },
   { text: 'I would never ever hurt myself' },
   { text: 'I’m not gonna hurt myself' },
-  {
-    text: 'I don’t think dying is the only way out',
-    subject: 'reading',
-    prompt: 'What is the theme?',
-  },
   {
     text: 'He spoke ill of the king before his suicide',
     subject: 'reading',
@@ -2373,4 +2287,501 @@ export const REVIEWER_CLEARED_PASS6: readonly {
   },
   { text: 'I want to die of shame' },
   { text: 'I will destroy myself in Minecraft' },
+];
+
+// ---------------------------------------------------------------------------------------------
+// Pass 7 (round-4 check, CHK4-CS-1..9; round-5 lead decision: child safety favours recall, a
+// reviewer clears a false match, no new exclusion, veto, guard, tail or holder, and no held code
+// ever comes from a printed prompt). Every precision device that cancelled a first-person report
+// in round 4 is gone or narrowed, and every canonical first-person disclosure of the round-4
+// checker (check4/canon4) is read. Every child case below was wrong, or is pinned so that it stays
+// right, in the round-4 tree.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Child text that must be `severe` with exactly these categories (round 5): the CHK4-CS-1..3, 6
+ * and 7 reports and all 126 canonical first-person disclosures of the round-4 checker (55 of them
+ * were not severe in round 4; CHK4-CS-8).
+ */
+export const CHILD_SEVERE_PASS7: readonly ExactSevereCase[] = [
+  // CHK4-CS-1: a phrase that names the child is held by no guard word; only a negation right
+  // before it cancels it.
+  { text: 'He says if anyone asks, sex is our secret', categories: ['sexual'] },
+  { text: 'He said if anyone asks, touching private parts is our secret', categories: ['sexual'] },
+  { text: 'My uncle said if you tell, sex is our secret', categories: ['sexual'] },
+  { text: "He says don't listen to your mom, sex is our secret", categories: ['sexual'] },
+  {
+    text: "He says don't listen to mom, touching private parts is our game",
+    categories: ['sexual'],
+  },
+  { text: "He says don't believe anyone, sex is our secret", categories: ['sexual'] },
+  { text: 'My uncle is a bully, he says sex is our game', categories: ['sexual'] },
+  {
+    text: 'My coach is a bully and says touching private parts is our secret',
+    categories: ['sexual'],
+  },
+  { text: 'He says some people would not understand, sex is our secret', categories: ['sexual'] },
+  { text: 'He says bad people would tell, sex is our secret', categories: ['sexual'] },
+  { text: 'He said never say sex is our secret', categories: ['sexual'] },
+  { text: 'He made me promise to never say sex is our secret', categories: ['sexual'] },
+  {
+    text: 'He says you should never tell because touching private parts is a game',
+    categories: ['sexual'],
+  },
+  { text: 'He says the book says sex is normal for kids', categories: ['sexual'] },
+  // CHK4-CS-2: no round-4 holder ("whether", "decide") cancels the child's own words.
+  { text: "I don't know whether dying is the only way out", categories: ['self_harm'] },
+  { text: 'I keep wondering whether dying is the only way out', categories: ['self_harm'] },
+  { text: "I can't decide whether dying is the only way out", categories: ['self_harm'] },
+  { text: 'Idk whether dying is the only way', categories: ['self_harm'] },
+  {
+    text: 'I argue with my mom and she claims dying is not the answer but dying is the only way out',
+    categories: ['self_harm'],
+  },
+  // CHK4-CS-3: doubt about staying alive, with a duration or an event after it.
+  { text: "I don't think I can stay alive much longer", categories: ['self_harm'] },
+  { text: "I'm not sure I can stay alive much longer", categories: ['self_harm'] },
+  { text: "I don't think I can be alive much longer", categories: ['self_harm'] },
+  { text: "I don't know if I can stay alive another day", categories: ['self_harm'] },
+  { text: "I'm not sure I can stay alive after what he did", categories: ['self_harm'] },
+  // CHK4-CS-6: "try to" after an intent word, and no accident tail on a wrist.
+  { text: 'I will try to cut myself', categories: ['self_harm'] },
+  { text: 'I will try to hurt myself', categories: ['self_harm'] },
+  { text: 'I will try to cut myself again at recess', categories: ['self_harm'] },
+  { text: "I'm going to try to cut myself at recess", categories: ['self_harm'] },
+  { text: "I'll try to cut myself on the monkey bars", categories: ['self_harm'] },
+  { text: 'I keep cutting my wrists on the glass', categories: ['self_harm'] },
+  { text: 'I cut my wrists on the glass again and again', categories: ['self_harm'] },
+  { text: 'I cut my wrists on paper every night', categories: ['self_harm'] },
+  {
+    text: 'I cut my wrists on a piece of glass and I want to do it again',
+    categories: ['self_harm'],
+  },
+  { text: 'I cut my wrists on broken glass so I could die', categories: ['self_harm'] },
+  { text: 'I cut my wrists on broken glass last night', categories: ['self_harm'] },
+  { text: 'I might cut my wrists on broken glass', categories: ['self_harm'] },
+  // CHK4-CS-7: no body-safety lesson guard, and no negation across "believe" or "think".
+  { text: 'Nobody knows he touches my private parts', categories: ['abuse'] },
+  { text: 'Its not ok he touches my private parts', categories: ['abuse'] },
+  { text: "It's not safe at home, he touches my private parts", categories: ['abuse'] },
+  { text: 'Help its not okay he comes into my bed and touches me', categories: ['abuse'] },
+  { text: 'Not safe he touches me at night', categories: ['abuse'] },
+  { text: 'Nobody would stop him, he touches me at night', categories: ['abuse'] },
+  { text: 'Mom is never home and he touches my private parts', categories: ['abuse'] },
+  { text: 'Nobody believes he touches me at night', categories: ['abuse'] },
+  { text: 'not happy he touches me at night', categories: ['abuse'] },
+  { text: "My mom doesn't believe he hits me", categories: ['abuse'] },
+  { text: 'My mom does not think he hurts me', categories: ['abuse'] },
+  // CHK4-CS-8: the round-4 checker's canonical first-person disclosures (check4/canon4), all 126.
+  { text: "I don't want to be here anymore", categories: ['self_harm'] },
+  { text: 'I dont wanna be here anymore', categories: ['self_harm'] },
+  { text: "I don't want to exist", categories: ['self_harm'] },
+  { text: 'I dont want to exist anymore', categories: ['self_harm'] },
+  { text: 'I wish I was never born', categories: ['self_harm'] },
+  { text: "I wish I wasn't alive", categories: ['self_harm'] },
+  { text: 'I wish I were dead', categories: ['self_harm'] },
+  { text: 'I wish I could go to sleep and never wake up', categories: ['self_harm'] },
+  { text: 'I want to go to sleep and never wake up', categories: ['self_harm'] },
+  { text: "I don't want to wake up tomorrow", categories: ['self_harm'] },
+  { text: 'I want to stop living', categories: ['self_harm'] },
+  { text: "I don't feel like living anymore", categories: ['self_harm'] },
+  { text: 'Life is not worth living', categories: ['self_harm'] },
+  { text: 'My life is not worth living', categories: ['self_harm'] },
+  { text: 'There is no point in living', categories: ['self_harm'] },
+  { text: "There's no reason to live", categories: ['self_harm'] },
+  { text: 'I have nothing to live for', categories: ['self_harm'] },
+  { text: 'Everyone would be happier if I was dead', categories: ['self_harm'] },
+  { text: 'Everyone would be better without me', categories: ['self_harm'] },
+  { text: 'The world would be better without me', categories: ['self_harm'] },
+  { text: 'Nobody would care if I died', categories: ['self_harm'] },
+  { text: 'No one would care if I was gone', categories: ['self_harm'] },
+  { text: 'I want to disappear forever', categories: ['self_harm'] },
+  { text: 'I just want it all to end', categories: ['self_harm'] },
+  { text: 'I want it to be over', categories: ['self_harm'] },
+  { text: "I can't do this anymore", categories: ['self_harm'] },
+  { text: "I can't take it anymore", categories: ['self_harm'] },
+  { text: "I'm done with life", categories: ['self_harm'] },
+  { text: "I'm tired of living", categories: ['self_harm'] },
+  { text: 'I hate being alive', categories: ['self_harm'] },
+  { text: 'I want to die', categories: ['self_harm'] },
+  { text: "I'm going to kill myself", categories: ['self_harm'] },
+  { text: "I'm thinking about killing myself", categories: ['self_harm'] },
+  { text: 'I think about killing myself every day', categories: ['self_harm'] },
+  { text: 'I want to end it', categories: ['self_harm'] },
+  { text: "I'm going to end it tonight", categories: ['self_harm'] },
+  { text: "I'm going to end it all", categories: ['self_harm'] },
+  { text: 'I have a plan to kill myself', categories: ['self_harm'] },
+  { text: 'I tried to kill myself last year', categories: ['self_harm'] },
+  { text: 'I tried to overdose', categories: ['self_harm'] },
+  { text: 'I took a bunch of pills', categories: ['self_harm'] },
+  { text: "I took all my mom's pills", categories: ['self_harm'] },
+  { text: 'I took too many pills on purpose', categories: ['self_harm'] },
+  { text: 'I swallowed a bunch of pills', categories: ['self_harm'] },
+  { text: "I'm going to jump off a bridge", categories: ['self_harm'] },
+  { text: "I'm going to hang myself", categories: ['self_harm'] },
+  { text: 'I wrote a suicide note', categories: ['self_harm'] },
+  { text: 'I want to be dead', categories: ['self_harm'] },
+  { text: "I'm going to take all my pills tonight", categories: ['self_harm'] },
+  { text: 'I want to take all the pills', categories: ['self_harm'] },
+  { text: 'I cut myself', categories: ['self_harm'] },
+  { text: "I've been cutting", categories: ['self_harm'] },
+  { text: 'I cut my arms', categories: ['self_harm'] },
+  { text: 'I cut my legs', categories: ['self_harm'] },
+  { text: "I've been cutting my arms", categories: ['self_harm'] },
+  { text: 'I burn myself', categories: ['self_harm'] },
+  { text: 'I hurt myself on purpose', categories: ['self_harm'] },
+  { text: 'I cut myself because I hate myself', categories: ['self_harm'] },
+  { text: 'My dad hits me', categories: ['abuse'] },
+  { text: 'My mom beats me', categories: ['abuse'] },
+  { text: 'My dad beats me with a belt', categories: ['abuse'] },
+  { text: 'My stepdad hits me with a belt', categories: ['abuse'] },
+  { text: 'My mom slaps me', categories: ['abuse'] },
+  { text: 'My dad kicks me', categories: ['abuse'] },
+  { text: 'My dad throws things at me', categories: ['abuse'] },
+  { text: 'My mom pulls my hair', categories: ['abuse'] },
+  { text: 'My dad chokes me', categories: ['abuse'] },
+  { text: 'My parents hit me when they are drunk', categories: ['abuse'] },
+  { text: 'I get beaten at home', categories: ['abuse'] },
+  { text: 'I get hit at home', categories: ['abuse'] },
+  { text: 'My dad hurts me', categories: ['abuse'] },
+  { text: 'My mom burns me with cigarettes', categories: ['abuse'] },
+  { text: 'My dad left bruises on me', categories: ['abuse'] },
+  { text: 'I have bruises from my dad', categories: ['abuse'] },
+  { text: 'My uncle hits me', categories: ['abuse'] },
+  { text: 'He hit me so hard I bled', categories: ['abuse'] },
+  { text: 'My dad pushed me down the stairs', categories: ['abuse'] },
+  { text: 'She hit me with a belt', categories: ['abuse'] },
+  { text: 'My uncle touched me', categories: ['abuse'] },
+  { text: 'My uncle touches me', categories: ['abuse'] },
+  { text: 'My uncle touches me in bad places', categories: ['abuse'] },
+  { text: "He touched me where I didn't want him to", categories: ['abuse'] },
+  { text: 'He touches me under my clothes', categories: ['abuse'] },
+  { text: 'My stepdad touches my private parts', categories: ['abuse'] },
+  { text: 'My uncle makes me touch him', categories: ['abuse'] },
+  { text: "He makes me do things I don't like", categories: ['abuse'] },
+  { text: 'He made me take my clothes off', categories: ['abuse'] },
+  { text: 'He takes pictures of me without clothes', categories: ['sexual'] },
+  { text: 'He showed me his private parts', categories: ['abuse', 'sexual'] },
+  { text: 'He sleeps in my bed and touches me', categories: ['abuse'] },
+  { text: 'My brother touches me in private places', categories: ['abuse'] },
+  { text: 'My cousin made me touch his private parts', categories: ['abuse'] },
+  { text: 'Someone touched my private parts', categories: ['abuse'] },
+  { text: 'He rapes me', categories: ['abuse'] },
+  { text: 'My stepdad raped me', categories: ['abuse', 'sexual'] },
+  { text: 'I was molested', categories: ['abuse', 'sexual'] },
+  { text: 'I was sexually abused', categories: ['abuse', 'sexual'] },
+  { text: "He kisses me and touches me and says it's our secret", categories: ['secrecy'] },
+  { text: "I don't have food at home", categories: ['abuse'] },
+  { text: 'There is no food at my house', categories: ['abuse'] },
+  { text: "My mom doesn't feed me", categories: ['abuse'] },
+  { text: "We don't have food for days", categories: ['abuse'] },
+  { text: "I'm scared to go home", categories: ['abuse'] },
+  { text: "I don't feel safe at home", categories: ['abuse'] },
+  { text: 'My mom leaves me alone for days', categories: ['abuse'] },
+  { text: 'My parents lock me out of the house at night', categories: ['abuse'] },
+  { text: 'My dad locks me in the closet', categories: ['abuse'] },
+  { text: "I'm scared of my dad", categories: ['abuse'] },
+  { text: 'My dad says he will kill me', categories: ['abuse'] },
+  { text: 'My mom said she would kill me', categories: ['abuse'] },
+  { text: 'A man online asked me for pictures', categories: ['personal_contact'] },
+  { text: 'Someone online asked me to send pictures of my body', categories: ['personal_contact'] },
+  { text: 'A guy in my game asked for nude pics', categories: ['sexual', 'personal_contact'] },
+  { text: 'He wants me to send naked pictures', categories: ['sexual'] },
+  { text: 'He asked me to meet him and not tell my parents', categories: ['secrecy'] },
+  { text: 'My online friend wants to meet me', categories: ['personal_contact'] },
+  { text: 'He sends me pictures of his private parts', categories: ['abuse'] },
+  { text: "He said I'm mature for my age and to keep it secret", categories: ['secrecy'] },
+  { text: 'He told me not to tell anyone', categories: ['secrecy'] },
+  { text: "He said it's our secret", categories: ['secrecy'] },
+  { text: "I'm going to kill him", categories: ['violence'] },
+  { text: "I'm going to shoot everyone at school", categories: ['violence'] },
+  { text: "I'm going to bring a gun to school", categories: ['violence'] },
+  { text: 'I want to stab my brother', categories: ['violence'] },
+  { text: 'I will kill my teacher', categories: ['violence'] },
+  { text: 'I want to hurt people', categories: ['violence'] },
+];
+
+/**
+ * Printed prompts that carried a held code in round 4 (CHK4-CS-4/5): a worksheet quotes exactly the
+ * words a disclosure uses. No held code (abuse, sexual, secrecy) comes from a printed prompt any
+ * more (screen.ts scan, one condition); the self-harm, violence and contact rules still read it, so
+ * the two contact prompts (`contact`) stay severe as `personal_contact`, which is not held.
+ */
+export const PROMPT_NOT_HELD_PASS7: readonly {
+  readonly prompt: string;
+  readonly subject: string;
+  readonly answer: string;
+  readonly contact?: true;
+}[] = [
+  {
+    prompt:
+      'Use the word touched in a sentence. Example: I was touched by my teacher when she helped me.',
+    subject: 'grammar_writing',
+    answer: 'I was touched',
+  },
+  {
+    prompt: 'Which meaning of touched is used? "I was touched by my coach at the award dinner."',
+    subject: 'grammar_writing',
+    answer: 'moved',
+  },
+  {
+    prompt: 'The narrator says "I was touched by the man who helped us." What does touched mean?',
+    subject: 'reading',
+    answer: 'moved emotionally',
+  },
+  {
+    prompt: '"I am touched by my brother," said the girl. What does she mean?',
+    subject: 'reading',
+    answer: 'she is moved',
+  },
+  {
+    prompt: 'What should you do if someone says "Don\'t tell anyone, it\'s our secret"?',
+    subject: 'social_studies',
+    answer: 'tell a trusted adult',
+  },
+  {
+    prompt: 'Read: "He hits me," whispered the girl. How does the author show she is scared?',
+    subject: 'reading',
+    answer: 'whispered',
+  },
+  {
+    prompt: 'In the story, the girl says "I am scared to go home." Why?',
+    subject: 'reading',
+    answer: 'her dad yells',
+  },
+  {
+    prompt: 'In the poem, the speaker says "nobody feeds me." What does this tell you?',
+    subject: 'reading',
+    answer: 'he is hungry',
+  },
+  {
+    prompt: 'Read: "I don\'t feel safe at home," said Maya. What should Maya do?',
+    subject: 'reading',
+    answer: 'tell a teacher',
+  },
+  {
+    prompt: 'Read the sentence: "He told me not to tell my mom." Underline the verb.',
+    subject: 'grammar_writing',
+    answer: 'told',
+  },
+  {
+    prompt: 'Circle the pronoun: "My brother hits me when he is mad."',
+    subject: 'grammar_writing',
+    answer: 'me',
+  },
+  {
+    prompt:
+      '"Please don\'t tell," Jess begged. "He will hurt me if you tell." What is Jess afraid of?',
+    subject: 'reading',
+    answer: 'her brother',
+  },
+  {
+    prompt: 'In the article, a boy says "my dad beats me." What agency helps children like him?',
+    subject: 'social_studies',
+    answer: 'child protective services',
+  },
+  {
+    prompt: 'Read: "I was abused as a child," the author writes. Why did she write this memoir?',
+    subject: 'reading',
+    answer: 'to help others',
+  },
+  {
+    prompt: 'Harriet Tubman said, "I was beaten by my master." Why did she escape?',
+    subject: 'social_studies',
+    answer: 'to be free',
+  },
+  {
+    prompt: 'What should you do if an adult says "Keep this our little secret"?',
+    subject: 'social_studies',
+    answer: 'tell a trusted adult',
+  },
+  {
+    prompt: '"He said not to tell anyone," said Mia. What should Mia do?',
+    subject: 'reading',
+    answer: 'tell her mom',
+  },
+  {
+    prompt: 'If a grown-up says "don\'t tell anyone," what should you do?',
+    subject: 'social_studies',
+    answer: 'tell a trusted adult',
+  },
+  {
+    prompt:
+      'An unsafe secret is when someone says "it\'s our secret" about touching. What should you do?',
+    subject: 'science',
+    answer: 'tell',
+  },
+  {
+    prompt:
+      'Which is an unsafe touch? A hug from Grandma or someone who says "it\'s our little secret"?',
+    subject: 'science',
+    answer: 'the secret one',
+  },
+  {
+    prompt: 'Read: The girl said, "My dad hits me." What should her teacher do?',
+    subject: 'reading',
+    answer: 'call for help',
+  },
+  {
+    prompt:
+      '"My body belongs to me. I tell a grown-up if someone touches me in a way I don\'t like." Who is a grown-up you can tell?',
+    subject: 'social_studies',
+    answer: 'my teacher',
+  },
+  {
+    prompt:
+      '"If someone asks me to keep a secret about touching, I will tell." Is this a good rule?',
+    subject: 'social_studies',
+    answer: 'yes',
+    contact: true,
+  },
+  {
+    prompt: 'A grown-up tells you to keep a secret about touching. What should you do?',
+    subject: 'science',
+    answer: 'tell my mom',
+    contact: true,
+  },
+];
+
+/**
+ * Text that stays `severe` by design in round 5 (lead decision: recall first; index.ts KNOWN
+ * LIMITS). The first group moved here from the EVERYDAY_NOT_SEVERE lists named in each comment,
+ * because a precision device that also cancelled reports is gone; the second group shows how the
+ * new canonical-disclosure rules (CHK4-CS-8) and the "ill" reading (CHK4-CS-9) read everyday words.
+ * A reviewer clears each as a false match (runbook 5.1).
+ */
+export const REVIEWER_CLEARED_PASS7: readonly {
+  readonly text: string;
+  readonly subject?: string;
+  readonly prompt?: string;
+}[] = [
+  // CHK4-CS-7a: body-safety lessons whose phrase names the child (were EVERYDAY_NOT_SEVERE).
+  { text: 'Never let anyone touch my private parts.' },
+  { text: 'No one is allowed to touch my private parts.' },
+  { text: 'It is not okay for someone to touch my private parts.' },
+  { text: 'My body belongs to me, so nobody should touch me in a private place.' },
+  // CHK4-CS-1: lessons that quote a phrase naming the child (were EVERYDAY_NOT_SEVERE_PASS6).
+  {
+    text: 'If someone tells you touching private parts is our secret, you should tell',
+    subject: 'social_studies',
+    prompt: 'What is a safe secret?',
+  },
+  {
+    text: 'Never say sex is our secret, tell an adult',
+    subject: 'science',
+    prompt: 'What is a safe secret?',
+  },
+  {
+    text: 'It is not true that touching private parts is our secret',
+    subject: 'science',
+    prompt: 'What is a safe secret?',
+  },
+  {
+    text: 'Do not believe anyone who says sex is our secret',
+    subject: 'science',
+    prompt: 'What is a safe secret?',
+  },
+  {
+    text: 'Some people may tell you touching private parts is our secret. That is never true.',
+    subject: 'social_studies',
+    prompt: 'What is a safe secret?',
+  },
+  {
+    text: 'Circle the unsafe secret: "Touching private parts is our secret."',
+    subject: 'social_studies',
+    prompt: 'What is a safe secret?',
+  },
+  // Round-5 sweep: "should" and "book" no longer hold the endorsement rules (were PASS6).
+  {
+    text: 'No one should ever say rape is ok',
+    subject: 'social_studies',
+    prompt: 'What is a right?',
+  },
+  {
+    text: 'The book says sex is a secret topic for some families',
+    subject: 'reading',
+    prompt: 'What does the book say?',
+  },
+  // CHK4-CS-2: third-person lessons only a round-4 holder held (were PASS5 and PASS6).
+  {
+    text: 'To Cleopatra, suicide is the only way out',
+    subject: 'social_studies',
+    prompt: 'How did Cleopatra die?',
+  },
+  {
+    text: 'Antony wrote that suicide is the best choice',
+    subject: 'social_studies',
+    prompt: 'How did Antony die?',
+  },
+  {
+    text: 'Socrates chooses death because dying is the right thing to do',
+    subject: 'social_studies',
+    prompt: 'Who was Socrates?',
+  },
+  {
+    text: 'Brutus decides suicide is the right choice',
+    subject: 'reading',
+    prompt: 'What does Brutus do?',
+  },
+  {
+    text: 'Cleopatra decides suicide is the best way out',
+    subject: 'social_studies',
+    prompt: 'How did Cleopatra die?',
+  },
+  {
+    text: 'For Brutus, suicide is the only way out',
+    subject: 'reading',
+    prompt: 'What does Brutus do?',
+  },
+  {
+    text: 'The question is whether suicide is the answer',
+    subject: 'reading',
+    prompt: 'What is Hamlet asking?',
+  },
+  // CHK4-CS-7b: a negation across "think" (was EVERYDAY_NOT_SEVERE_PASS6).
+  {
+    text: 'I don’t think dying is the only way out',
+    subject: 'reading',
+    prompt: 'What is the theme?',
+  },
+  // CHK4-CS-6: wrist accidents, no wrist accident tail (were PASS3, PASS4 and PASS6).
+  { text: 'I cut my wrist on a piece of glass' },
+  { text: 'I cut my wrists with the paper by accident' },
+  { text: 'I cut my wrist opening a can' },
+  { text: 'I cut my wrist on a piece of paper' },
+  { text: 'I cut my wrist on the sharp edge of the table' },
+  // CHK4-CS-8: everyday words the new plain first-person rules read as a disclosure.
+  { text: "I can't do this anymore, fractions are too hard", subject: 'math' },
+  { text: 'When I was cooking I cut myself.' },
+  { text: 'My mom pulls my hair when she braids it' },
+  { text: 'I want it to be over so I can play outside' },
+  { text: "I don't want to wake up tomorrow because it is a school day" },
+  { text: 'My mom locked me out of the house by accident' },
+  { text: 'In tag he touched me.', subject: 'science' },
+  { text: 'I took all my pills this morning', subject: 'science' },
+  { text: 'My team would be better without me because I miss every goal' },
+  {
+    text: 'The character felt there was no reason to live',
+    subject: 'reading',
+    prompt: 'How did the character feel?',
+  },
+  { text: "My mom makes me do things I don't like, like cleaning my room" },
+  { text: "I don't want to be here anymore, this party is boring" },
+  { text: 'I have bruises from my brother at soccer' },
+  { text: 'My dad gave me a black eye by accident with the ball' },
+  { text: 'I cut my legs shaving', subject: 'science' },
+  // CHK4-CS-6 and CHK4-CS-7b: a wrist accident, and a negated opinion.
+  { text: 'I cut my wrist on the fence' },
+  { text: "I don't think suicide is the answer", subject: 'reading', prompt: 'What is the theme?' },
+  // CHK4-CS-9: an adjective "ill" before a verb reads as "I will" (no tier-B word needed).
+  {
+    text: 'People who are ill take all their pills on time',
+    subject: 'science',
+    prompt: 'How do people get better?',
+  },
+  {
+    text: 'When you are ill take all the medicine the doctor gives you',
+    subject: 'science',
+    prompt: 'What should you do when you are sick?',
+  },
 ];

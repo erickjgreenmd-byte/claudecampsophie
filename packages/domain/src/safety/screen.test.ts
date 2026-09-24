@@ -15,6 +15,7 @@ import {
   CHILD_SEVERE_PASS4,
   CHILD_SEVERE_PASS5,
   CHILD_SEVERE_PASS6,
+  CHILD_SEVERE_PASS7,
   EDUCATIONAL,
   EVERYDAY_NONE,
   EVERYDAY_NOT_SEVERE,
@@ -25,9 +26,11 @@ import {
   EVERYDAY_NOT_SEVERE_PASS6,
   PROMPT_NOT_SEVERE_PASS4,
   PROMPT_NOT_SEVERE_PASS5,
+  PROMPT_NOT_HELD_PASS7,
   PROMPT_NOT_SEVERE_PASS6,
   REVIEWER_CLEARED_PASS5,
   REVIEWER_CLEARED_PASS6,
+  REVIEWER_CLEARED_PASS7,
 } from './corpus.ts';
 import * as lexicon from './lexicon.ts';
 import { NORMALIZATION_TABLES } from './normalize.ts';
@@ -36,6 +39,7 @@ import {
   SAFETY_RULES,
   SAFETY_SCREEN_VERSION,
   SEVERE_SAFETY_CATEGORIES,
+  heldFromFamily,
   normalizeForScreen,
   screenModelOutput,
   screenQuestion,
@@ -490,14 +494,131 @@ describe('pass 6: recall first (a lone "I", "ill", wrists, notes, endorsement gu
     ).not.toContain('ABUSE_VICTIM_OF');
     // A margin note in capitals or after a saint's name keeps its first person in a prompt too.
     for (const prompt of [
-      'PART I WAS RAPED',
-      'At St. Mary I was abused',
+      'PART I WANT TO DIE',
+      'At St. Mary I want to die',
       'Prince George I will kill you',
     ]) {
       expect(
         screenQuestion({ prompt, answer: 'ok', subject: 'reading', ageBand: '8-10' }).level,
       ).toBe('severe');
     }
+    // Round 5 (CHK4-CS-4/5): an abuse note merged into the printed prompt is not read for a held
+    // code (index.ts KNOWN LIMITS); the same words as the child's answer are.
+    for (const note of ['PART I WAS RAPED', 'At St. Mary I was abused']) {
+      const asPrompt = screenQuestion({
+        prompt: note,
+        answer: 'ok',
+        subject: 'reading',
+        ageBand: '8-10',
+      });
+      expect(heldFromFamily(asPrompt.categories)).toBe(false);
+      const asAnswer = screenQuestion({
+        prompt: 'Why?',
+        answer: note,
+        subject: 'reading',
+        ageBand: '8-10',
+      });
+      expect(asAnswer.level).toBe('severe');
+      expect(heldFromFamily(asAnswer.categories)).toBe(true);
+    }
+  });
+});
+
+describe('pass 7: recall first, no held code from a printed prompt (round 5, CHK4-CS-1..9)', () => {
+  const screen = (c: { text: string; subject?: string; prompt?: string }) =>
+    screenQuestion({
+      prompt: c.prompt ?? null,
+      answer: c.text,
+      subject: c.subject ?? null,
+      ageBand: '8-10',
+    });
+  for (const c of CHILD_SEVERE_PASS7) {
+    it(`${c.categories.join('+')}: ${describeCase(c.text)}${c.subject ? ` (${c.subject})` : ''}`, () => {
+      const result = screen(c);
+      expect(result.level).toBe('severe');
+      expect(result.categories).toEqual([...c.categories].sort(byCategory));
+    });
+  }
+  for (const c of PROMPT_NOT_HELD_PASS7) {
+    it(`printed prompt carries no held code: ${describeCase(c.prompt)} (${c.subject})`, () => {
+      const result = screenQuestion({
+        prompt: c.prompt,
+        answer: c.answer,
+        subject: c.subject,
+        ageBand: '8-10',
+      });
+      expect(heldFromFamily(result.categories)).toBe(false);
+      if (c.contact) expect(result.categories).toEqual(['personal_contact']);
+      else expect(result.level).not.toBe('severe');
+    });
+  }
+  for (const c of REVIEWER_CLEARED_PASS7) {
+    // Documented over-escalation (index.ts KNOWN LIMITS): a reviewer clears it (runbook 5.1).
+    it(`stays severe until a reviewer clears it: ${describeCase(c.text)}`, () => {
+      expect(screen(c).level).toBe('severe');
+    });
+  }
+
+  it('no held category ever comes from a printed prompt; self-harm, violence and contact still do', () => {
+    // One sentence per held category, and the same words as the child's own answer.
+    const held = [
+      'My dad hits me',
+      'He touches my private parts',
+      'He told me not to tell anyone',
+      'He says sex is our game',
+      'I was raped',
+      'Our little secret',
+    ];
+    for (const sentence of held) {
+      const asPrompt = screenQuestion({
+        prompt: `Read: "${sentence}." Why?`,
+        answer: 'ok',
+        subject: 'reading',
+        ageBand: '8-10',
+      });
+      expect(heldFromFamily(asPrompt.categories)).toBe(false);
+      const asAnswer = screenQuestion({
+        prompt: 'Why?',
+        answer: sentence,
+        subject: 'reading',
+        ageBand: '8-10',
+      });
+      expect(heldFromFamily(asAnswer.categories)).toBe(true);
+    }
+    for (const [prompt, category] of [
+      ['Read: "I want to die," said the boy. Why?', 'self_harm'],
+      ['Read: "I will kill you," said the boy. Why?', 'violence'],
+    ] as const) {
+      const result = screenQuestion({ prompt, answer: 'ok', subject: 'reading', ageBand: '8-10' });
+      expect(result.categories).toEqual([category]);
+    }
+    // The prompt's held tier-B word is still reported as a topic ("child abuse" in a rights lesson).
+    const rights = screenQuestion({
+      prompt: 'Why is child abuse against the law?',
+      answer: 'it hurts kids',
+      subject: 'math',
+      ageBand: '8-10',
+    });
+    expect(rights.level).toBe('sensitive_educational');
+    expect(rights.topics).toContain('sexual_violence_topic');
+  });
+
+  it('a phrase that names the child is held by no guard; a negation right before it cancels it', () => {
+    for (const text of [
+      'He says if anyone asks, sex is our secret',
+      'My coach is a bully and says touching private parts is our secret',
+      'Nobody knows he touches my private parts',
+      'Not safe he touches me at night',
+    ]) {
+      expect(screen({ text }).level).toBe('severe');
+    }
+    // The same lesson words hold a phrase that does not name the child.
+    expect(
+      screen({ text: 'If someone says touching private parts is a game, tell' }).level,
+    ).not.toBe('severe');
+    expect(screen({ text: 'He said sex is not our secret' }).level).not.toBe('severe');
+    expect(screen({ text: 'I would never cut myself.' }).level).not.toBe('severe');
+    expect(screen({ text: 'I will try not to cut myself' }).level).not.toBe('severe');
   });
 });
 
@@ -665,6 +786,7 @@ describe('rules are documented and stable', () => {
       'I ate poison berries in Minecraft to die. To Cleopatra, suicide is the answer. I wonder if.',
       'In St. Louis I was abused. I hate you ill kill you. To Mom, suicide is the answer. He says sex is our game. I will slit my wrists in the kitchen.',
       'Im not ok, dying is the only way out. He said it is a rule, sex is our secret. Im not ok, he touches my private parts. Be careful not to hurt yourself.',
+      'He says if anyone asks, sex is our secret. I will try to cut myself. I cut my wrist on paper. I dont think I can stay alive much longer. Read: "My dad hits me." I cant take it anymore.',
     ];
     // Rule rationale (`doc`) is left out: rewording an explanation does not change what fires.
     const withoutDocs = (value: unknown): unknown =>
@@ -688,12 +810,15 @@ describe('rules are documented and stable', () => {
     const digest = createHash('sha256').update(material).digest('hex');
     // A new version adds a line here (never edit an existing one).
     const PINNED: Readonly<Record<string, string>> = {
-      // v3 was re-pinned before its first commit (round-2 check CHK-CS-2..8; round-3 check
-      // CHK2-CS-1..7: whole-idiom exclusions, Roman numerals, "ill", holders, frames; round-4
-      // check CHK3-CS-1..7: a lone "I", "ill" without a veto, wrists, notes, endorsement guards,
-      // quote words, negation only across NEGATION_BRIDGES, the body-safety guard stops at a
-      // first person, "destroy/end myself").
+      // v3 as committed in 441eb6a (rounds 1-4: whole-idiom exclusions, Roman numerals, "ill",
+      // holders, frames, a lone "I", wrists, notes, endorsement guards, quote words, negation only
+      // across NEGATION_BRIDGES, the body-safety guard stops at a first person).
       'safety-screen.v3': '37bf323ff22cb481404fb4c1d7ce74285543ef7dcdb973c73c1f803943df7a42',
+      // v4, round 5 (CHK4-CS-1..9): no held code from a printed prompt, no guard on a phrase that
+      // names the child, no quote words, round-4 holders, wrist accident tails or body-safety
+      // guard, bridges only "to" and adverbs, "try to", restored "can stay alive", canonical
+      // first-person rules.
+      'safety-screen.v4': '3d033122878f9b97710466c3c3bc2e2b8786db7a5ab96ce77536f68cb2b36a35',
     };
     expect({ version: SAFETY_SCREEN_VERSION, digest }).toEqual({
       version: SAFETY_SCREEN_VERSION,

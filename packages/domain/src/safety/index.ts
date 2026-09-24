@@ -3,9 +3,11 @@
 //
 // WHAT IT IS. A first layer, not a classifier: fixed word and phrase rules (lexicon.ts, each with
 // its rationale) over normalized text. It errs toward sending a first-person risk statement to a
-// person; it never decides anything about a child on its own. The provider moderation endpoint
-// (OpenAI moderation) is the intended second layer and is NOT wired: no API key is available in
-// this build, so this screen is the only automated check today.
+// person; it never decides anything about a child on its own. Provider moderation (OpenAI
+// omni-moderation, `@pencillift/ai` moderation.ts) is the second layer: the scan sends the child's
+// answers to it before grading and model output after generation, and fails closed. It runs only
+// against a labeled mock until the owner supplies the key and ZDR approval, so in this build this
+// screen is the only automated check on real text.
 //
 // LEVELS. `severe` (a category below), `sensitive_educational` (a sensitive topic word with no
 // risk statement; never blocks tutoring), `none`.
@@ -65,23 +67,30 @@
 // fever" and "spoke ill of" have no verb after it. A Roman numeral of two or more letters is a
 // number ("World War II", "Act III", "Pope John Paul II"; CHK2-CS-2); a lone "I" in the child's
 // words is always the pronoun (round 4, CHK3-CS-1: "In St. Louis I was abused", "LAST SEASON I
-// WAS ABUSED"). The printed prompt is screened by every rule except SELF_HARM_ONLY_WAY_OUT and the
-// endorsement rules (SEXUAL_ABUSE_ENDORSED, SEXUAL_GROOMING_GAME), its first person is a
-// worksheet's words, not the child's, so it never makes a tier-B word severe (CHK-CS-2: "In our
-// unit we discuss child abuse."), and it reads a lone "I" as a numeral in three exact idioms
-// ("World War I", "Act I", "Queen Elizabeth I"). First-person rules ("I want to die", "I was
-// raped") never have an exemption at all; "suicide is the only way out" or endorsed ("... is the
-// answer", "... is the way to go") is severe in the child's answer unless a third person holds the
-// view ("Teens may think ...", "Brutus decides ...", "According to Cleopatra, ..."; CHK2-CS-4,
-// CHK3-CS-6; a "To ..." that opens the sentence is a note's salutation, never a holder: CHK3-CS-5),
-// and sexual abuse called acceptable ("My teacher said sex with kids is ok", "He says sex is our
-// game") is severe unless a body-safety lesson or a third person that is not reported about holds
-// it ("If someone says touching private parts is a secret, tell ...", "the villain thinks ...",
-// "Don't say rape is ok"; CHK3-CS-3) and no first person is in the sentence around it; a
-// negation across another word is a report ("He said it is not bad, ..."), and a phrase that
-// names the child ("sex is our secret") is held only by a conditional, a negated "say" or a
-// quoted third person. A first-person sexual-violence word inside an abuse disclosure is reported
-// as `abuse` only. For model output a tier-B word is exempt only when the printed question itself
+// WAS ABUSED"). The printed prompt is the worksheet's words, not the child's: its first person
+// never makes a tier-B word severe (CHK-CS-2: "In our unit we discuss child abuse."), it reads a
+// lone "I" as a numeral in three exact idioms ("World War I", "Act I", "Queen Elizabeth I"),
+// SELF_HARM_ONLY_WAY_OUT does not read it, and (round 5, CHK4-CS-4/5, lead decision) no rule or
+// signature whose category is held from the family (abuse, sexual, secrecy) runs on it: one
+// condition in screen.ts scan. A body-safety or reading worksheet quotes exactly the words a
+// disclosure uses ("Don't tell anyone, it's our secret", "\"My dad hits me,\" whispered the girl", "I
+// was touched by my coach at the award dinner"), and a held code starts the authorities-first
+// review. Its self-harm, violence and contact rules still apply, and its held tier-B words are
+// still reported as topics. First-person rules ("I want to die", "I was raped") never have an
+// exemption at all; "suicide is the only way out" or endorsed ("... is the answer", "... is the way
+// to go") is severe in the child's answer unless a third person within seven words holds the view
+// ("Teens may think ...", "Romeo thinks ...", "According to Cleopatra, ..."; CHK2-CS-4; a "To ..."
+// that opens the sentence is a note's salutation, never a holder: CHK3-CS-5; round 5, CHK4-CS-2:
+// the round-4 holders such as "whether", "decides", "wrote" and historical names are gone), and
+// sexual abuse called acceptable ("My teacher said sex with kids is ok", "He says sex is our game")
+// is severe unless a lesson word or a third person that is not reported about holds it ("If
+// someone says touching private parts is a game, tell ...", "the villain thinks rape is ok";
+// CHK3-CS-3) and no first person is in the sentence around it. Round 5 (CHK4-CS-1, CHK4-CS-7; lead
+// decision): no guard of any rule holds a phrase that names the child ("sex is OUR secret", "touches
+// MY private parts", "touches ME at night", "suicide is MY only way out"); only a negation right
+// before it cancels it ("He says if anyone asks, sex is our secret", "Nobody knows he touches my
+// private parts" are reports). A first-person sexual-violence word inside an abuse disclosure is
+// reported as `abuse` only. For model output a tier-B word is exempt only when the printed question itself
 // raised the same topic; the subject alone is not enough.
 //
 // EXCLUSIONS (round 3, CHK2-CS-1; round 4 lead policy: recall first). The first layer leans toward
@@ -93,15 +102,20 @@
 // deliberate or distress word later in the same sentence voids a self-harm, neglect or unsafe-home
 // exclusion (`unlessAfter`: "on purpose", "to die", "pills", "starving", "hits me"). An intent word
 // never meets an accident tail (SELF_HARM_INTENT has none: "I want to cut my wrists with
-// scissors"), a slit or slashed wrist has no accident tail at all, and a blade or a room is not an
-// accident ("with scissors", "in the kitchen"; round 4, CHK3-CS-4). A negation cancels a
-// `negatable` rule right before the match, or one word earlier across "to", an adverb or an opinion
-// or speech verb ("Be careful not to hurt yourself", "I don't really want to die", "Don't say rape
-// is ok"; NEGATION_BRIDGES); across any other word it negates that word, not the disclosure after
-// it ("I'm not ok, dying is the only way out", "I'm not fine I will hurt myself"; round 4). The
-// body-safety lesson guard stops at a nearer first person like the other holder guards ("I'm not
-// ok, he touches my private parts" is a report; "It is not ok if someone touches your private
-// parts" is a lesson).
+// scissors", round 5: "I will try to cut myself on the monkey bars"), a blade or a room is not an
+// accident ("with scissors", "in the kitchen"; round 4, CHK3-CS-4), and (round 5, CHK4-CS-6) a
+// wrist cut has no accident tail at all ("I cut my wrists on broken glass last night"). A negation
+// cancels a `negatable` rule right before the match, or one word earlier across "to" or an adverb
+// ("Be careful not to hurt yourself", "I don't really want to die"; NEGATION_BRIDGES); across any
+// other word it negates that word, not the disclosure after it ("I'm not ok, dying is the only way
+// out", "My mom doesn't believe he hits me"; round 5, CHK4-CS-7: no bridge across "think",
+// "believe", "say" or other opinion and speech verbs). The body-safety lesson guard is gone (round
+// 5, CHK4-CS-7): every rule that used it names the child. Round 5 (lead decision) adds no
+// exclusion, veto, guard, tail or holder: where a restored or new phrase also read everyday or bank
+// text, the phrase itself was narrowed (a duration after "can stay alive", the end of the sentence
+// after "I cut myself", plural limbs), and the round-5 sweep removed guard words and reach that
+// cancelled earlier catches ("should" and "book" from the endorsement guard, the only-way-out
+// reach from eight words to seven).
 //
 // PRECEDENCE. A report's categories may combine; abuse-type codes (abuse, sexual, secrecy) take
 // precedence: the child's template leaves out the anger message meant for a child who threatens
@@ -140,7 +154,8 @@
 //     reported, "he said he would kill me", attempted or threatened, or conditioned on telling).
 //   - Sibling and playground fights in the present tense ("my brother hits me", "my sister hits me
 //     in the arm when we play", "my brother hits me when we wrestle") are escalated; past-tense
-//     peer incidents are not. Bullying ("I'm being bullied") is not a severe category. Games and
+//     peer incidents are not, unless an injury or an object is named (round 5: "He hit me so hard I
+//     bled", "She hit me with a stick", "I have bruises from my brother at soccer"). Bullying ("I'm being bullied") is not a severe category. Games and
 //     play are recognised by listed phrases only ("beats me at chess", "pushes me on the swing");
 //     other play wording escalates.
 //   - An educational answer with a tier-B word and a first-person word outside the listed frames
@@ -150,8 +165,8 @@
 //     educational in an educational context ("I would tell my mom about the rape" in social
 //     studies, "In my class there is sexual abuse"); "... is the only way out / is the answer / is
 //     the way to go" has its own rule (SELF_HARM_ONLY_WAY_OUT) and is severe unless a third person
-//     within eight words holds the view ("Romeo thinks ...", "Kids who are bullied may feel ...",
-//     "To Cleopatra, ..."). That rule reads the answer only, and any "... suicide is the answer"
+//     within seven words holds the view ("Romeo thinks ...", "Kids who are bullied may feel ...",
+//     "According to Cleopatra, ..."). That rule reads the answer only, and any "... suicide is the answer"
 //     in the child's own words escalates ("maybe suicide is the answer" in reading or math).
 //   - A bare "ill" before a verb is always "I'll" (round 4, CHK3-CS-2), so an adjective "ill"
 //     before a verb reads as the child's first person and escalates with a tier-B word ("People
@@ -163,11 +178,16 @@
 //     committed suicide", "In World War I, many soldiers were victims of abuse" as an answer is a
 //     held abuse flag); a reviewer clears it. A printed prompt reads a lone "I" as a numeral only
 //     after "World War", a Titlecase section word ("Act I", not "PART I") or a monarch's or pope's
-//     title and a name ("Queen Elizabeth I", not "St. Louis I"), so its worksheet text is not a
-//     held first-person flag.
-//   - A printed prompt's first person never makes its tier-B word severe, so a child's note that
-//     the extraction merged into the prompt ("... suicide is my plan") is judged by subject and
-//     cues; the prompt's first-person rules ("I want to die") still apply.
+//     title and a name ("Queen Elizabeth I", not "St. Louis I").
+//   - A printed prompt never yields a held code (round 5, CHK4-CS-4/5; screen.ts scan): a
+//     disclosure the extraction model misplaces into the prompt field ("Why do plants need
+//     sunlight? My dad hits me", "PART I WAS RAPED") is not read for abuse, sexual or secrecy
+//     codes, and a sexual-violence or sexual-health word in a prompt is a topic only. The
+//     prompt's self-harm, violence and contact rules still apply ("... i want to die" merged into a
+//     prompt is severe), so a worksheet can still carry a contact code ("A grown-up tells you to keep
+//     a secret about touching. What should you do?" is `personal_contact`, which is not held). A
+//     prompt's first person never makes its tier-B word severe, so a child's note merged into the
+//     prompt ("... suicide is my plan") is judged by subject and cues.
 //   - A threat or death wish against someone named ("I want to kill Sam") is read from the word
 //     after the verb: a pronoun, determiner, number, day, school subject or a listed object, game
 //     or story villain ("kill it", "kill time", "kill some zombies", "shoot pool", "kill Bowser",
@@ -195,9 +215,9 @@
 //     text outside math and science; a bare "kms" in a math answer is read as kilometres.
 //   - A secrecy request in model output is severe even when well meant ("never tell anyone your
 //     password"): the reviewed template is shown instead, which is the intended trade-off.
-//   - A printed question that itself uses a tier-B word outside a listed subject or cue ("Why do
-//     people commit suicide?" or "What is an overdose?" filed under `other` or with no subject) is
-//     flagged even if the answer is benign; so is a third-person answer with a tier-B word and no
+//   - A printed question that itself uses a self-harm tier-B word outside a listed subject or cue
+//     ("Why do people commit suicide?" or "What is an overdose?" filed under `other` or with no
+//     subject) is flagged even if the answer is benign; so is a third-person answer with a tier-B word and no
 //     subject ("She committed suicide with a snake").
 //   - A reason for fear of going home that is ordinary ("I was scared to go home because I got a
 //     bad grade") is still escalated: fear of a caregiver's reaction is left to a person.
@@ -234,21 +254,44 @@
 //     mom", a held sexual flag). A body-safety lesson that names no lesson word or third person
 //     ("Someone said touching private parts is a game. That is wrong.", "We learned it is not ok
 //     when someone says rape is ok") also escalates, as does a game after "destroy myself" ("I will
-//     destroy myself in Minecraft"). A child's report is read even with a negation or a lesson word
-//     before the phrase when the phrase or the words after it name the child ("He said it is
-//     not bad, sex is our secret", "He said it is a rule, sex is our secret"); only a conditional,
-//     a negated "say" or "believe", "not true", "unsafe", "some people" or a story's character
-//     still holds such a phrase ("If someone tells you touching private parts is our secret, tell").
-//     A report that names no first person and has a lesson word before the phrase is still read as
-//     a lesson and missed ("He says you should never tell because touching private parts is a
-//     game").
-//   - Not read by any rule (round 4; first-person wording a new rule would need, with game and
-//     hyperbole uses to separate): "ill off myself" and "I'm going to off myself" ("off" is "of"
-//     once repeats collapse, as in "think of myself"), "I'll bleed out tonight", "I'll sleep forever
-//     and never wake up", "I'll disappear forever", "I'll end it tonight" (without "all" or "my
-//     life") and "Every season I cut myself" (the habit marker before the verb). A report with a
-//     lesson word ("not", "ok", "safe") in the four words before it and no first person nearer is
-//     read as a body-safety lesson ("not happy he touches me at night").
+//     destroy myself in Minecraft").
+//   - Reviewer-cleared by the round-5 recall decision (corpus.ts REVIEWER_CLEARED_PASS7; lead
+//     decision: a precision device that cancelled a report is gone, and a canonical disclosure has a
+//     plain rule): a body-safety lesson whose phrase names the child ("No one is allowed to touch my
+//     private parts", "Never let anyone touch my private parts"; a held abuse flag); a lesson that
+//     quotes a phrase naming the child ("If someone tells you touching private parts is our secret,
+//     you should tell", "Never say sex is our secret", "Circle the unsafe secret: 'Touching private
+//     parts is our secret.'"; a held sexual flag) or has "should" or "book" before an endorsement
+//     phrase ("No one should ever say rape is ok", "The book says sex is a secret topic for some
+//     families"); a third-person lesson that only a round-4 holder held ("Brutus decides suicide is
+//     the right choice", "The question is whether suicide is the answer", "To Cleopatra, suicide is
+//     the only way out"); a negated opinion ("I don't think dying is the only way out", "I don't
+//     think suicide is the answer"); a wrist cut in an accident ("I cut my wrist on a piece of
+//     paper", "... opening a can", "... on the fence"); and everyday words the plain round-5 rules
+//     read as a disclosure: homework frustration ("I can't do this anymore, fractions are too
+//     hard"), "When I was cooking I cut myself.", "I cut my legs shaving", "I took all my pills this
+//     morning", "I want it to be over so I can play outside", "I don't want to wake up tomorrow
+//     because it is a school day", "I don't want to be here anymore, this party is boring", "My team
+//     would be better without me", "The character felt there was no reason to live", and held abuse
+//     flags for "My mom pulls my hair when she braids it", "My mom locked me out of the house by
+//     accident", "In tag he touched me.", "My mom makes me do things I don't like, like cleaning my
+//     room", "I have bruises from my brother at soccer" and "My dad gave me a black eye by accident
+//     with the ball".
+//   - An adjective "ill" before a verb reads as "I'll" (above), so the first-person overdose rules
+//     read everyday health answers without any tier-B word ("People who are ill take all their pills
+//     on time", "When you are ill take all the medicine the doctor gives you" in science;
+//     CHK4-CS-9); the code is self_harm, not held, and a reviewer clears it.
+//   - The endorsement rules' lesson guard (ENDORSED_LESSON_GUARD) still holds a phrase that does
+//     not name the child when a lesson word or a third person ("if", "rule", "people", "story", "a
+//     bully", a negated "say") is within six words before it and no first person is in the
+//     sentence, so a report worded that way is read as a lesson and missed ("He says if you tell,
+//     touching private parts is a game"); the same words that name the child ("... is our game")
+//     are severe.
+//   - Not read by any rule (first-person wording a new rule would need, with game and hyperbole
+//     uses to separate): "ill off myself" and "I'm going to off myself" ("off" is "of" once repeats
+//     collapse, as in "think of myself"), "I'll bleed out tonight", "I'll sleep forever and never
+//     wake up", "I'll disappear forever" ("will" is not an intent word before "disappear forever" or
+//     "sleep"), "I don't see the point anymore", "I don't feel like I want to live anymore".
 //   - Model-output rules exclude story questions only by listed phrases ("Is everything okay at
 //     home for the character?", "Are you sad that the story ended?"); other wording is severe.
 //   - Only the first MAX_SCREEN_CHARS characters are screened; callers pass bounded fields.
