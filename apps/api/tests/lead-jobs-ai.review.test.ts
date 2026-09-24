@@ -765,6 +765,17 @@ describe('scan processing races and answer protection (spec P4, P5, P6)', () => 
     await grantAdultUnlock(e.api.db, scan.fam.ownerId, session, 3600);
     const token = await parentToken(scan.fam.ownerId, { sessionId: session });
 
+    // Lead fixture update (coverage pass): a correction queues a paid recheck, so since b0496a8 it
+    // needs what any real scan implies — the child holds a paid slot. queuedScan inserts the scan
+    // directly and skipped that precondition; the assertions below are unchanged.
+    await e.api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${scan.fam.familyId}, 1, 'app_store')
+      on conflict (family_id) do update set paid_slots = 1`;
+    await e.api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id)
+      values (${scan.fam.familyId}, ${scan.fam.children[0]!.id})`;
+
     // The parent accepts the child's spelling (the teacher did) ...
     const overridden = await e.api.request(`/v1/questions/${q!.id}/override`, {
       method: 'POST',
