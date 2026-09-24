@@ -34,11 +34,11 @@ Worker **secrets** (`wrangler secret put <NAME> --env <env>`):
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Optional web billing (only with `OPTIONAL_STRIPE_WEB_BILLING_ENABLED=true`) |
 | `OPENAI_API_KEY`, `OPENAI_PROJECT` | Server-only AI; without a key scans stay queued and readiness reports AI blocked |
 | `ZDR_APPROVAL_EVIDENCE_REFERENCE`, `ZDR_APPROVAL_VERIFIED_AT` | Documented zero-data-retention approval (a boolean is rejected) |
-| `CONSENT_PROVIDER` | Selected verifiable-consent provider adapter |
+| `CONSENT_PROVIDER` | Reserved for the consent adapter the owner selects (owner action #7). No adapter exists yet: leave unset — an unknown value fails configuration on purpose |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Private homework storage adapter (`providers/supabase-storage.ts`) |
 
 Worker **vars** (`wrangler.toml`): `APP_ENV`, `PROGRAM_TIMEZONE` (donation month zone, default UTC),
-`PAYOUT_TRANSFERS_ENABLED` (keep `false` until owner action #12).
+`PAYOUT_TRANSFERS_ENABLED` (keep `false` until owner action #12), `INACTIVITY_DELETION_ENABLED` (keep `false` until owner action #13; `INACTIVITY_MONTHS`/`INACTIVITY_NOTICE_DAYS` default 12/30).
 Bindings: `HYPERDRIVE` (the three ids in `apps/api/wrangler.toml` are placeholders named
 `OWNER_ACTION_HYPERDRIVE_ID_*`; `wrangler deploy` fails until real ids replace them — intentionally).
 Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public by design).
@@ -68,7 +68,7 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 
 One Cron Trigger calls `runScheduledTick` (`apps/api/src/jobs/dispatcher.ts`): monthly promo generation
 (and next month within 5 days of month end), donation accrual for the previous and current program month,
-expiry of unsubmitted promo reservations (30 min), raw scan retention purge (30 days), then due jobs from
+expiry of unsubmitted promo reservations (30 min), raw scan retention purge (30 days), spend alerts at the owner's thresholds, re-sync of stale/lapsed entitlements (lost-webhook safety net), the daily inactivity sweep (03:00 UTC, only when enabled), then due jobs from
 `public.jobs` claimed with `FOR UPDATE SKIP LOCKED`. Every step is idempotent; overlapping ticks are safe.
 
 Dead letters: `select id, kind, attempts, last_error_code, updated_at from public.jobs where status = 'dead_letter'`.

@@ -1,10 +1,50 @@
-import { createBrowserRouter, Link, Outlet, RouterProvider } from 'react-router';
+import {
+  createBrowserRouter,
+  Link,
+  NavLink,
+  Outlet,
+  RouterProvider,
+  useLocation,
+} from 'react-router';
 import { Logo } from './components/Logo.tsx';
 import { routes } from './routes.tsx';
 import { unconfiguredAuth } from './lib/auth.ts';
 import { readWebConfig } from './lib/config.ts';
 import { createDefaultSession, SessionProvider } from './lib/session.tsx';
 import { createSupabaseAuth } from './lib/supabase-auth.ts';
+
+const PARENT_LINKS: readonly (readonly [string, string])[] = [
+  ['/app', 'Family'],
+  ['/app/children', 'Children'],
+  ['/app/homework', 'Homework'],
+  ['/app/learning', 'Learning'],
+  ['/app/rewards', 'Rewards'],
+  ['/app/school', 'School & codes'],
+  ['/app/subscription', 'Subscription'],
+  ['/app/resources', 'Resources'],
+  ['/app/devices', 'Devices'],
+  ['/app/guardians', 'Guardians'],
+  ['/app/security', 'Security'],
+  ['/app/privacy', 'Privacy & data'],
+];
+
+/** Parent-portal navigation, shown only inside /app (never on public pages). */
+function ParentNav() {
+  const { pathname } = useLocation();
+  if (!pathname.startsWith('/app')) return null;
+  return (
+    <nav aria-label="Parent portal" className="container" style={{ fontSize: '0.95rem' }}>
+      {PARENT_LINKS.map(([to, label], i) => (
+        <span key={to}>
+          {i > 0 ? ' · ' : null}
+          <NavLink to={to} end={to === '/app'}>
+            {label}
+          </NavLink>
+        </span>
+      ))}
+    </nav>
+  );
+}
 
 function Shell() {
   return (
@@ -24,6 +64,7 @@ function Shell() {
           <Link to="/support">Support</Link> · <Link to="/app">Parent portal</Link>
         </nav>
       </header>
+      <ParentNav />
       <main id="main" className="container">
         <Outlet />
       </main>
