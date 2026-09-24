@@ -27,6 +27,7 @@ dir_for() {
   esac
 }
 
+echo "▶ secrets"; node scripts/scan-secrets.mjs
 if [ -z "$ONLY" ]; then
   echo "▶ format"; pnpm -s format:check
   echo "▶ lint"; pnpm -s lint

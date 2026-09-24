@@ -43,6 +43,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Format
         run: pnpm format:check
+      - name: Secret scan
+        run: node scripts/scan-secrets.mjs
       - name: Lint
         run: pnpm lint
       - name: Typecheck
