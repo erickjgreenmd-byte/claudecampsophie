@@ -22,6 +22,11 @@ had never executed (it triggered only on pull requests and `main`).
 
 ## Local full gate
 
+`scripts/verify.sh` on the round-5 tree (committed as 8a84780..5f02621), 2026-09-24 ~21:45 UTC, exit 0: api 845,
+domain 3,610, db 255, web 406, mobile 400, ai 49, contracts 14, ui-tokens 4 (5,583; 0 failed, 0 skipped); gate
+audit; finance; release-artifact scan with negative control (69 files, 12.0 MiB). Floors raised to ~95% (api 800,
+domain 3,430, ai 46).
+
 `scripts/verify.sh` on the round-4 tree (committed as 1231198..e123e5c), 2026-09-24 ~19:05 UTC, exit 0: secret scan,
 format, lint, typecheck, all tests (api 805, domain 3392, db 255, web 406, mobile 400, ai 18, contracts 14,
 ui-tokens 4 — 5,294, 0 failed, 0 skipped), gate audit (every package at or above its floor), finance arithmetic,

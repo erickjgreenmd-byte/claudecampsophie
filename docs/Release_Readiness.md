@@ -31,7 +31,7 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 | No AI spend cap for the launch month | Readiness blocks without this month's `spend_budgets` row; without it there is no application ceiling | Owner action #19 |
 | AI quality, latency and cost unmeasured | Cost analysis is modelled, not measured; educator evaluation absent | Live AI access + evaluation set |
 | Child-safety package unapproved | The child safety messages, parent wording, family-hold default and runbook 5.1 escalation steps are drafts; readiness reports `safety_templates` blocked | Owner action #24 (owner, educator, counsel) |
-| No provider moderation | Only the deterministic first-layer screen runs (English plus a few Spanish phrases); the OpenAI moderation endpoint is not wired; readiness reports `ai_moderation` blocked | OpenAI key + ZDR (Owner action #6) + wiring |
+| Provider moderation not live | Built and wired (OpenAI omni-moderation before grading on the child's answers, after generation on coaching, rubric criteria and practice text; fails closed) but exercised only against a labeled mock; readiness keeps `ai_moderation` blocked until a real client is configured. Until then only the deterministic word-list screen reads real text (English plus a few Spanish phrases; misses paraphrases) | OpenAI key + ZDR approval (Owner action #6); confirm the outage rule (Owner action #26) |
 | Database not marked production | The fixture/fake catalog guard activates only once the deployed database is marked; readiness reports `database_environment` blocked | Owner action #21 |
 | Family read access to held safety flags undecided | The child's answer and safety message stay readable to family members through the Data API while a report is held | Owner action #25 (COPPA decision) |
 
@@ -59,10 +59,12 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 - A restated computation is never graded correct; keys that disagree fall back to reviewed templates
   (`scan-process.test.ts`).
 - The pre-commit gate typechecks and secret-scans exactly the staged tree (BUG-034).
-- Child safety (BUG-084): every child answer and printed prompt is screened before coaching, and child-facing model
-  output after generation; a severe answer gets no AI call, a reviewed message with US resources and an escalated
-  report without homework text; abuse-type reports are held from the family (`safety-screening.test.ts`,
-  `packages/domain/src/safety`).
+- Child safety (BUG-084, BUG-107..111): every child answer and printed prompt is screened **before grading** (a
+  severe question gets no model call), and child-facing model output after generation; a severe answer gets a
+  reviewed message with US resources and an escalated report without homework text; abuse-type reports are held
+  from the family and never come from a printed prompt; a reviewer can clear a false match; provider moderation is
+  wired and fails closed (labeled mock until the key exists) (`safety-screening.test.ts`,
+  `provider-moderation.test.ts`, `packages/domain/src/safety`).
 - Answer guard reads arithmetic expressions by default; only problem statements opt out (BUG-076,
   `guard-call-sites.test.ts`).
 - Spend ceiling never lets a stage overshoot the owner's cap (BUG-064).

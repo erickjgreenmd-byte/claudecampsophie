@@ -214,8 +214,14 @@ grown-up" card sends nothing, and PencilLift sends no automatic parent alert; ne
 was sent.
 
 System reports (migration 0760). The scan job screens every extracted answer and printed prompt with the
-deterministic first-layer screen (`@pencillift/domain/safety`, version `SAFETY_SCREEN_VERSION`; the OpenAI
-moderation endpoint is not wired) BEFORE any grading call. On a severe-risk result that question gets no
+deterministic first-layer screen (`@pencillift/domain/safety`, version `SAFETY_SCREEN_VERSION`) and sends
+the child's answers (never the printed prompt) to provider moderation (OpenAI omni-moderation; labeled mock
+until the key and ZDR approval exist) BEFORE any grading call. Audit rows of system reports carry `source`
+(`safety_screen`, `provider_moderation` or both), `providerCodes` (`PROVIDER_*`) and
+`providerModeration: 'unavailable'` when a word-list flag was held because moderation failed. A provider
+violence flag on the child's own words arrives as a held abuse+violence report: the model cannot tell a
+victim's report from a threat, so the reviewer decides. If moderation fails (outage, timeout) no model call
+runs; a retryable failure retries, a final one ends the scan as MODERATION_NOT_AVAILABLE. On a severe-risk result that question gets no
 model call at all (no grading, verification or coaching; it gets no verdict and no worked solution), the
 child is shown the reviewed safety template (feedback kind `safety`: talk to a trusted grown-up; 988 for
 self-harm; Childhelp 1-800-422-4453 for abuse, secrecy, sexual content or stranger contact; 911 for
@@ -235,8 +241,13 @@ corrected text screens severe again; the queue marks the original report `transc
 clears it, a flagged question stays unchecked (a parent's verdict override answers "No result to
 override") and keeps its template even after a correction. The screen leans toward escalation for a
 child's first-person words (a missed disclosure is worse than a false flag), so false matches are
-expected and are cleared by a person (below; the documented ones are listed in the screen's KNOWN LIMITS). The screen reads the printed prompt with every rule except the one for a child's own "suicide is the only way out", but
-a first person in the prompt ("In our unit we discuss ...") is the worksheet's, never the child's. The family
+expected and are cleared by a person (below; the documented ones are listed in the screen's KNOWN LIMITS). The screen also reads the printed prompt,
+but never for a held category (round 5): an `abuse`, `sexual` or `secrecy` flag always comes from the
+child's own answer, while a `self_harm`, `violence` or `personal_contact` flag can come from the printed
+prompt (a worksheet that quotes "I want to die" or asks what to do when a grown-up wants a secret kept), so
+check the prompt first when reviewing one of those. A first person in the prompt ("In our unit we discuss
+...") is the worksheet's, never the child's, and a child's disclosure that the extraction put into the
+prompt field is not read for the held categories (KNOWN LIMITS). The family
 sees a visible report in its report list as "Answer flagged for a grown-up", "Flagged by PencilLift", with a
 note that PencilLift sent no automatic alert and the same resources; the family never sees the category
 codes. Family hold (proposed default; owner and counsel to approve): a report whose codes include `abuse`,
@@ -311,7 +322,9 @@ clearance answers with its own `recheck` value (below); the one for the last rep
   match in the note so the rules can be tuned in a new `SAFETY_SCREEN_VERSION` if the same false match
   recurs; the screen's KNOWN LIMITS (`packages/domain/src/safety/index.ts`) list the expected ones (for
   example "World War I" or "Act I" next to a sensitive word, an adjective "ill" before a verb, a blade or a
-  room in an accident, a note about a lesson written in the first person).
+  room in an accident, a note about a lesson written in the first person; since round 5 also a wrist cut in
+  an accident, a body-safety lesson that says "my private parts", a lesson that quotes "our secret",
+  homework frustration such as "I can't do this anymore", and "I don't think ... is the only way out").
 
 | Status | Meaning | Allowed next |
 |---|---|---|
