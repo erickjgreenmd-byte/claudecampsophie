@@ -1,8 +1,42 @@
+import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { router } from 'expo-router';
 import { colors, minTouchTarget, spacing, typography } from '@pencillift/ui-tokens';
+import { childSession } from '../src/family/runtime.ts';
+import { entryRoute } from '../src/lib/entry.ts';
+import { currentMode } from '../src/lib/mode.ts';
+import { parentAuth } from '../src/lib/parent-auth.ts';
+import { secureStorage } from '../src/lib/secure-storage.ts';
 
 /** Entry: choose the parent area or connect a child device. No child data is shown here. */
 export default function Welcome() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.all([currentMode(secureStorage), childSession.isPaired()]).then(
+      ([mode, paired]) => {
+        if (!active) return;
+        const route = entryRoute(mode, paired, false, null);
+        if (route) router.replace(route);
+        else setReady(true);
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function choose(choice: 'parent' | 'child') {
+    const [mode, paired, email] = await Promise.all([
+      currentMode(secureStorage),
+      childSession.isPaired(),
+      parentAuth.email(),
+    ]);
+    const route = entryRoute(mode, paired, email !== null, choice);
+    if (route) router.push(route);
+  }
+
   return (
     <View style={styles.screen} accessibilityRole="summary">
       <Text style={styles.wordmark} accessibilityRole="header">
@@ -10,10 +44,22 @@ export default function Welcome() {
         <Text style={{ color: colors.tealText }}>Lift</Text>
       </Text>
       <Text style={styles.tagline}>Turn homework into progress.</Text>
-      <Pressable accessibilityRole="button" style={styles.button}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ disabled: !ready }}
+        disabled={!ready}
+        style={styles.button}
+        onPress={() => void choose('parent')}
+      >
         <Text style={styles.buttonText}>I’m a parent</Text>
       </Pressable>
-      <Pressable accessibilityRole="button" style={[styles.button, styles.secondary]}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ disabled: !ready }}
+        disabled={!ready}
+        style={[styles.button, styles.secondary]}
+        onPress={() => void choose('child')}
+      >
         <Text style={[styles.buttonText, { color: colors.tealText }]}>
           Connect a child’s device
         </Text>

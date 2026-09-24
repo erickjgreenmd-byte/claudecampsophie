@@ -1,7 +1,1285 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
+import {
+  CANCELLABLE_ASSIGNMENT_STATUSES,
+  CORRECTABLE_ASSIGNMENT_STATUSES,
+  DEFAULT_HOMEWORK_PAGE_ALLOWANCE_PER_CHILD,
+  DEFAULT_HOMEWORK_UPLOAD_LIMITS,
+  correctTranscriptionRequestSchema,
+  createAssignmentRequestSchema,
+  finalizeAssignmentRequestSchema,
+  overrideResultRequestSchema,
+  uploadPagesRequestSchema,
+  uuidSchema,
+  type AssignmentDetailResponse,
+  type AssignmentListResponse,
+  type AssignmentSolutionsResponse,
+  type AssignmentState,
+  type AssignmentStateResponse,
+  type AssignmentStatus,
+  type AssignmentSummary,
+  type ChildAssignmentDetailResponse,
+  type ChildAssignmentListResponse,
+  type ChildAssignmentSummary,
+  type CorrectTranscriptionResponse,
+  type GradedVerdict,
+  type HomeworkMimeType,
+  type HomeworkUploadLimits,
+  type OverrideResultResponse,
+  type PageAllowance,
+  type ParentQuestion,
+  type ParentQuestionResult,
+  type UploadLimitsResponse,
+  type UploadPage,
+  type UploadPagesResponse,
+  type UploadTarget,
+} from '@pencillift/contracts';
+import { calendarMonthOf, isValidIanaZone } from '@pencillift/domain';
+import { readJson } from '../app.ts';
+import { verifyChildAccessToken } from '../auth/child.ts';
+import type { ChildPrincipal, ParentPrincipal, Tx } from '../db.ts';
+import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
+import {
+  assertRecentUnlock,
+  currentFamilyId,
+  requireChild,
+  requireParent,
+} from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
+import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
+import { hasVerifiedConsent } from '../services/consent.ts';
 
-/** Placeholder router for the homework vertical (filled in by its owner). */
-export function homeworkRoutes(): Hono<AppEnv> {
-  return new Hono<AppEnv>();
+/**
+ * Homework capture, processing status, child results and parent solutions (spec P5, P6, P3 step-up,
+ * P11 page allowance, P13 "uploads/create/finalize/cancel; scan status; child results; parent
+ * solutions/regrade/override"). Extraction and grading are later jobs: this module registers pages,
+ * reserves allowance, enqueues one durable `scan_process` job and serves what those jobs write.
+ *
+ * Authorization layers:
+ * - Parent reads run as `authenticated` and child reads as `pl_child`, so RLS and column grants are an
+ *   independent second layer (docs/Architecture.md §3). Child queries name allowlisted columns only.
+ * - Writes need the service role (clients have no insert/update grants on these tables). Every
+ *   service-role statement is scoped explicitly by the caller's verified family (and child).
+ * - Parent solutions and overrides go through the SECURITY DEFINER RPCs of migration 0100, which
+ *   re-check membership and the recent adult unlock inside the database.
+ */
+
+// ---------------------------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------------------------
+
+export interface HomeworkConfig {
+  readonly limits: HomeworkUploadLimits;
+  /** Pages per paid child per period (spec P11 prototype allowance). */
+  readonly pageAllowancePerChild: number;
+  /** Lifetime requested for signed upload URLs. */
+  readonly uploadUrlTtlSeconds: number;
+}
+
+/** Hard ceilings from migration 0100 (source_pages checks and the `homework` bucket limit). */
+const DB_MAX_PAGES = 50;
+const DB_MAX_PAGE_BYTES = 15 * 1024 * 1024;
+
+export const DEFAULT_HOMEWORK_CONFIG: HomeworkConfig = {
+  limits: DEFAULT_HOMEWORK_UPLOAD_LIMITS,
+  pageAllowancePerChild: DEFAULT_HOMEWORK_PAGE_ALLOWANCE_PER_CHILD,
+  // Decision: 15 minutes is enough for 10 pages on a slow connection; resume re-issues URLs.
+  uploadUrlTtlSeconds: 15 * 60,
+};
+
+/**
+ * Decision: configured limits may only tighten the database ceilings (50 pages, 15 MB per page), so a
+ * misconfiguration can never turn a limit error into a database 500.
+ */
+function resolveConfig(overrides: Partial<HomeworkConfig>): HomeworkConfig {
+  const merged = { ...DEFAULT_HOMEWORK_CONFIG, ...overrides };
+  return {
+    ...merged,
+    limits: {
+      maxPages: Math.max(1, Math.min(merged.limits.maxPages, DB_MAX_PAGES)),
+      maxPageBytes: Math.max(1, Math.min(merged.limits.maxPageBytes, DB_MAX_PAGE_BYTES)),
+      allowedMimeTypes: merged.limits.allowedMimeTypes,
+    },
+  };
+}
+
+/**
+ * Decision: creation is rate limited per caller so a stuck button or script cannot flood the family
+ * with drafts, and a child cannot use up the parent's budget (separate keys).
+ */
+const CHILD_CREATE_RULE: RateRule = { limit: 30, windowSeconds: 3600 };
+const PARENT_CREATE_RULE: RateRule = { limit: 120, windowSeconds: 3600 };
+const CORRECTION_RULE: RateRule = { limit: 120, windowSeconds: 3600 };
+
+const LIST_LIMIT = 100;
+const CHILD_LIST_LIMIT = 50;
+
+const EXTENSIONS: Record<HomeworkMimeType, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/heic': 'heic',
+  'application/pdf': 'pdf',
+};
+
+/** Once finalized, repeating finalize returns the current state (AC_CAPTURE_06). */
+const FINALIZED_STATUSES: readonly AssignmentStatus[] = [
+  'queued',
+  'extracting',
+  'checking',
+  'verifying',
+  'ready',
+  'needs_rescan',
+  'needs_parent_review',
+  'failed_retryable',
+  'failed_final',
+];
+
+/** Child verdicts are shown only once checking has finished (no interim results). */
+const RESULT_VISIBLE_STATUSES: readonly AssignmentStatus[] = ['ready', 'needs_parent_review'];
+
+// ---------------------------------------------------------------------------------------------
+// Callers
+// ---------------------------------------------------------------------------------------------
+
+type Caller =
+  | { readonly kind: 'parent'; readonly parent: ParentPrincipal; readonly familyId: string }
+  | {
+      readonly kind: 'child';
+      readonly child: ChildPrincipal;
+      readonly familyId: string;
+      readonly childId: string;
+    };
+
+function bearerToken(c: Context<AppEnv>): string | null {
+  const header = c.req.header('authorization');
+  if (!header?.startsWith('Bearer ')) return null;
+  const token = header.slice(7).trim();
+  return token.length > 0 && token.length < 8192 ? token : null;
+}
+
+/**
+ * Capture routes accept a parent or a paired child. A child token only verifies with the API-only
+ * child key (issuer/audience `pencillift-child`) and a parent token only with Supabase keys, so the
+ * two can never be confused; the child session is then re-checked in the database exactly as
+ * `requireChild` does, and the parent's family comes from active membership, never the body.
+ */
+async function resolveCaller(c: Context<AppEnv>): Promise<Caller> {
+  const token = bearerToken(c);
+  if (!token) throw new ApiError('UNAUTHENTICATED', 'Sign in to continue');
+  const { deps } = c.var;
+  const child = await verifyChildAccessToken(deps.config, token, deps.clock()).catch(() => null);
+  if (child) {
+    const [row] = await deps.db.asChild(
+      child,
+      (tx) => tx<{ id: string | null }[]>`select app.current_child_id() as id`,
+    );
+    if (!row?.id)
+      throw new ApiError('UNAUTHENTICATED', 'Ask a grown-up to connect this device again');
+    c.set('child', child);
+    return { kind: 'child', child, familyId: child.familyId, childId: child.childId };
+  }
+  const parent = await deps.verifyParentToken(token);
+  c.set('parent', parent);
+  return { kind: 'parent', parent, familyId: await currentFamilyId(c) };
+}
+
+/** Error copy differs by audience: children get calm, blame-free words (spec P6, P14). */
+function say(caller: Caller, parentText: string, childText: string): string {
+  return caller.kind === 'child' ? childText : parentText;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rows and DTO mappers (explicit columns only)
+// ---------------------------------------------------------------------------------------------
+
+interface AssignmentRow {
+  id: string;
+  family_id: string;
+  child_id: string;
+  subject_id: string | null;
+  status: AssignmentStatus;
+  page_count: number;
+  created_by_kind: 'parent' | 'child';
+  error_code: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+interface PageRow {
+  id: string;
+  page_number: number;
+  mime_type: HomeworkMimeType;
+  byte_size: number;
+  sha256: string;
+  storage_path: string;
+}
+
+interface ParentQuestionRow {
+  id: string;
+  page_number: number;
+  question_number: string;
+  prompt_text: string;
+  student_answer_text: string | null;
+  corrected_prompt_text: string | null;
+  corrected_student_answer_text: string | null;
+  corrected_at: Date | null;
+  answer_kind: ParentQuestion['answerKind'];
+  subject_key: string;
+  skill: string;
+  uncertainty: 'low' | 'medium' | 'high' | null;
+  verdict: GradedVerdict | null;
+  route: ParentQuestionResult['route'] | null;
+  disagreement: boolean | null;
+  graded_at: Date | null;
+  parent_override_verdict: 'correct' | 'incorrect' | 'unresolved' | null;
+  override_reason: string | null;
+  overridden_at: Date | null;
+}
+
+/** Selected via postgres.js's escaped-identifier helper (never string-built SQL). */
+const ASSIGNMENT_COLUMNS: string[] = [
+  'id',
+  'family_id',
+  'child_id',
+  'subject_id',
+  'status',
+  'page_count',
+  'created_by_kind',
+  'error_code',
+  'created_at',
+  'updated_at',
+];
+
+function toState(row: AssignmentRow): AssignmentState {
+  return {
+    id: row.id,
+    subjectId: row.subject_id,
+    status: row.status,
+    pageCount: row.page_count,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function toSummary(row: AssignmentRow): AssignmentSummary {
+  return {
+    ...toState(row),
+    childId: row.child_id,
+    createdByKind: row.created_by_kind,
+    errorCode: row.error_code,
+  };
+}
+
+function toParentResult(row: ParentQuestionRow): ParentQuestionResult | null {
+  if (row.verdict === null || row.route === null || row.graded_at === null) return null;
+  const override =
+    row.parent_override_verdict !== null && row.overridden_at !== null
+      ? {
+          verdict: row.parent_override_verdict,
+          reason: row.override_reason,
+          at: row.overridden_at.toISOString(),
+        }
+      : null;
+  return {
+    verdict: override?.verdict ?? row.verdict,
+    gradedVerdict: row.verdict,
+    route: row.route,
+    disagreement: row.disagreement ?? false,
+    gradedAt: row.graded_at.toISOString(),
+    override,
+  };
+}
+
+function toParentQuestion(row: ParentQuestionRow): ParentQuestion {
+  return {
+    id: row.id,
+    pageNumber: row.page_number,
+    questionNumber: row.question_number,
+    promptText: row.prompt_text,
+    studentAnswerText: row.student_answer_text,
+    correctedPromptText: row.corrected_prompt_text,
+    correctedStudentAnswerText: row.corrected_student_answer_text,
+    correctedAt: row.corrected_at?.toISOString() ?? null,
+    answerKind: row.answer_kind,
+    subjectKey: row.subject_key,
+    skill: row.skill,
+    uncertainty: row.uncertainty,
+    result: toParentResult(row),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared queries
+// ---------------------------------------------------------------------------------------------
+
+function paramUuid(c: Context<AppEnv>, name: string, notFound: string): string {
+  const parsed = uuidSchema.safeParse(c.req.param(name));
+  if (!parsed.success) throw new ApiError('NOT_FOUND', notFound);
+  return parsed.data;
+}
+
+/**
+ * Locks one assignment the caller may act on (service role, so the scope is explicit): same family,
+ * and for a child also the same child. Deleted work is invisible.
+ */
+async function lockAssignment(tx: Tx, caller: Caller, id: string): Promise<AssignmentRow | null> {
+  const isParent = caller.kind === 'parent';
+  const childId = caller.kind === 'child' ? caller.childId : null;
+  const [row] = await tx<AssignmentRow[]>`
+    select ${tx(ASSIGNMENT_COLUMNS)} from public.assignments
+     where id = ${id} and family_id = ${caller.familyId} and status <> 'deleted'
+       and (${isParent}::boolean or child_id = ${childId}::uuid)
+     for update`;
+  return row ?? null;
+}
+
+async function readPages(tx: Tx, familyId: string, assignmentId: string): Promise<PageRow[]> {
+  return tx<PageRow[]>`
+    select id, page_number, mime_type, byte_size, sha256, storage_path from public.source_pages
+     where assignment_id = ${assignmentId} and family_id = ${familyId} and deleted_at is null
+     order by page_number`;
+}
+
+/** Consent (spec P3) and an active paid profile (spec P11) gate every capture step. */
+async function assertCanCollect(
+  c: Context<AppEnv>,
+  tx: Tx,
+  caller: Caller,
+  childId: string,
+): Promise<void> {
+  const allowTestProvider = c.var.deps.config.environment !== 'production';
+  if (!(await hasVerifiedConsent(tx, caller.familyId, { allowTestProvider }))) {
+    throw businessRule(
+      'CONSENT_REQUIRED',
+      say(
+        caller,
+        'Parental consent must be verified before homework can be scanned',
+        'A grown-up needs to finish setting up PencilLift before you can scan.',
+      ),
+    );
+  }
+  const [child] = await tx<{ status: string }[]>`
+    select status from public.child_profiles where id = ${childId} and family_id = ${caller.familyId}`;
+  if (child?.status !== 'active') {
+    throw businessRule(
+      'CHILD_NOT_ACTIVE',
+      say(
+        caller,
+        'Assign a paid slot to this child before scanning homework',
+        'Ask a grown-up to help with scanning right now.',
+      ),
+    );
+  }
+}
+
+/**
+ * Period key for the page allowance. Decision (placeholder): the calendar month in the family's time
+ * zone, namespaced `pages:` so other usage kinds can share the ledger. Provider billing periods
+ * (spec P11/Architecture §5) must replace this once entitlement periods are reconciled.
+ */
+async function pagePeriodKey(tx: Tx, familyId: string, now: Date): Promise<string> {
+  const [family] = await tx<{ timezone: string }[]>`
+    select timezone from public.families where id = ${familyId}`;
+  const zone = family && isValidIanaZone(family.timezone) ? family.timezone : 'UTC';
+  return `pages:${calendarMonthOf(now, zone)}`;
+}
+
+interface Usage {
+  childUsed: number;
+  familyUsed: number;
+  paidSlots: number;
+}
+
+/** In-flight (`reserved`) and `committed` pages both count (AC_SECURITY_06); released never does. */
+async function pageUsage(
+  tx: Tx,
+  familyId: string,
+  childId: string,
+  periodKey: string,
+): Promise<Usage> {
+  const [row] = await tx<{ child_used: number; family_used: number; paid_slots: number }[]>`
+    select coalesce(sum(units) filter (where child_id = ${childId}), 0)::int as child_used,
+           coalesce(sum(units), 0)::int as family_used,
+           coalesce((select paid_slots from public.family_capacity where family_id = ${familyId}), 0)::int as paid_slots
+      from public.usage_reservations
+     where family_id = ${familyId} and period_key = ${periodKey} and status in ('reserved', 'committed')`;
+  return {
+    childUsed: row?.child_used ?? 0,
+    familyUsed: row?.family_used ?? 0,
+    paidSlots: row?.paid_slots ?? 0,
+  };
+}
+
+function toAllowance(periodKey: string, usage: Usage, perChild: number): PageAllowance {
+  return {
+    periodKey,
+    childPagesUsed: usage.childUsed,
+    childPagesAllowed: perChild,
+    familyPagesUsed: usage.familyUsed,
+    familyPagesAllowed: usage.paidSlots * perChild,
+  };
+}
+
+function assertWithinAllowance(caller: Caller, usage: Usage, units: number, perChild: number) {
+  const childOver = usage.childUsed + units > perChild;
+  const familyOver = usage.familyUsed + units > usage.paidSlots * perChild;
+  if (childOver || familyOver) {
+    throw businessRule(
+      'QUOTA_EXCEEDED',
+      say(
+        caller,
+        'This month’s homework page allowance is used up. Existing homework, results and practice stay available.',
+        'That’s a lot of scanning this month! Ask a grown-up to help with this one.',
+      ),
+    );
+  }
+}
+
+/** Expected trigger/constraint outcomes → stable API errors (never raw SQL text). */
+function mapDbError(error: unknown, caller: Caller | null): never {
+  const code = pgErrorCode(error);
+  const message = error instanceof Error ? error.message : '';
+  if (code === 'P0001' && message.includes('invalid assignment transition')) {
+    throw businessRule(
+      'INVALID_TRANSITION',
+      caller?.kind === 'child'
+        ? 'This scan can’t change right now.'
+        : 'This scan can’t move to that state from where it is now',
+    );
+  }
+  if (code === 'P0001' && message.includes('is deleted')) {
+    throw new ApiError('NOT_FOUND', 'Not found');
+  }
+  throw error;
+}
+
+async function audit(
+  tx: Tx,
+  caller: Caller,
+  action: string,
+  targetType: string,
+  targetId: string,
+): Promise<void> {
+  // Pseudonymous ids only; never homework text (spec P4).
+  await tx`
+    insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id)
+    values (${caller.familyId}, ${caller.kind === 'parent' ? caller.parent.userId : null},
+            ${caller.kind}, ${action}, ${targetType}, ${targetId})`;
+}
+
+async function readParentQuestions(
+  tx: Tx,
+  familyId: string,
+  assignmentId: string,
+  questionId: string | null,
+): Promise<ParentQuestionRow[]> {
+  return tx<ParentQuestionRow[]>`
+    select q.id, p.page_number, q.question_number, q.prompt_text, q.student_answer_text,
+           q.corrected_prompt_text, q.corrected_student_answer_text, q.corrected_at, q.answer_kind,
+           q.subject_key, q.skill, q.uncertainty,
+           r.verdict, r.route, r.disagreement, r.graded_at, r.parent_override_verdict,
+           r.override_reason, r.overridden_at
+      from public.extracted_questions q
+      join public.source_pages p on p.id = q.page_id
+      left join public.question_results r on r.question_id = q.id
+     where q.assignment_id = ${assignmentId} and q.family_id = ${familyId}
+       and (${questionId}::uuid is null or q.id = ${questionId}::uuid)
+     order by p.page_number, length(q.question_number), q.question_number`;
+}
+
+/** Validates page numbering and the configured limits before touching the database. */
+function validatePages(pages: readonly UploadPage[], config: HomeworkConfig): void {
+  const numbers = pages.map((p) => p.pageNumber).sort((a, b) => a - b);
+  if (numbers.some((n, i) => n !== i + 1)) {
+    throw new ApiError('VALIDATION_FAILED', 'Invalid request: pages must be numbered 1, 2, 3, …');
+  }
+  const { limits } = config;
+  if (pages.length > limits.maxPages) {
+    throw businessRule('TOO_MANY_PAGES', `A scan can have at most ${limits.maxPages} pages`);
+  }
+  const allowed: readonly string[] = limits.allowedMimeTypes;
+  if (pages.some((p) => !allowed.includes(p.mimeType))) {
+    throw businessRule('UNSUPPORTED_FILE_TYPE', 'Only JPEG, PNG, HEIC photos and PDF files work');
+  }
+  if (pages.some((p) => p.byteSize > limits.maxPageBytes)) {
+    const mb = Math.floor(limits.maxPageBytes / (1024 * 1024));
+    throw businessRule('PAGE_TOO_LARGE', `Each page must be ${mb} MB or smaller`);
+  }
+}
+
+function samePages(existing: readonly PageRow[], requested: readonly UploadPage[]): boolean {
+  if (existing.length !== requested.length) return false;
+  const byNumber = new Map(requested.map((p) => [p.pageNumber, p]));
+  return existing.every((row) => {
+    const p = byNumber.get(row.page_number);
+    return (
+      p !== undefined &&
+      p.mimeType === row.mime_type &&
+      p.byteSize === row.byte_size &&
+      p.sha256 === row.sha256
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------------------------
+
+/** Homework routes. Mounted at /v1: /assignments*, /child/assignments*, /questions*. */
+export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<AppEnv> {
+  const config = resolveConfig(overrides);
+  const r = new Hono<AppEnv>();
+  // Middleware is attached per route (never `use('*')`): this router shares the /v1 prefix.
+
+  // Registered before `/assignments/:id` so the static path wins.
+  r.get('/assignments/limits', async (c) => {
+    await resolveCaller(c);
+    const body: UploadLimitsResponse = {
+      limits: {
+        maxPages: config.limits.maxPages,
+        maxPageBytes: config.limits.maxPageBytes,
+        allowedMimeTypes: [...config.limits.allowedMimeTypes],
+      },
+    };
+    return c.json(body);
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // Capture (parent or child)
+  // -------------------------------------------------------------------------------------------
+
+  r.post('/assignments', async (c) => {
+    const caller = await resolveCaller(c);
+    const { deps } = c.var;
+    const body = await readJson(c, createAssignmentRequestSchema);
+    if (caller.kind === 'child' && body.childId !== undefined) {
+      throw new ApiError('VALIDATION_FAILED', 'Invalid request: childId');
+    }
+    if (caller.kind === 'parent' && body.childId === undefined) {
+      throw new ApiError('VALIDATION_FAILED', 'Invalid request: childId');
+    }
+    const childId = caller.kind === 'child' ? caller.childId : body.childId!;
+    if (body.pageCount > config.limits.maxPages) {
+      throw businessRule(
+        'TOO_MANY_PAGES',
+        `A scan can have at most ${config.limits.maxPages} pages`,
+      );
+    }
+    const now = deps.clock();
+    await enforceRateLimit(
+      deps.rateLimiter,
+      caller.kind === 'child'
+        ? `homework-create:child:${caller.childId}`
+        : `homework-create:parent:${caller.familyId}`,
+      caller.kind === 'child' ? CHILD_CREATE_RULE : PARENT_CREATE_RULE,
+      now,
+    );
+    // Decision: client keys are namespaced by family so one family's key can never collide with,
+    // or reveal, another family's (the column is globally unique).
+    const scopedKey = `${caller.familyId}:${body.idempotencyKey}`;
+
+    const outcome = await deps.db
+      .asService(async (tx) => {
+        const [child] = await tx<{ id: string }[]>`
+          select id from public.child_profiles where id = ${childId} and family_id = ${caller.familyId}`;
+        if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
+        const existing = async () => {
+          const [row] = await tx<AssignmentRow[]>`
+            select ${tx(ASSIGNMENT_COLUMNS)} from public.assignments
+             where family_id = ${caller.familyId} and idempotency_key = ${scopedKey}`;
+          if (!row) return null;
+          if (row.child_id !== childId || row.status === 'deleted') {
+            throw new ApiError('CONFLICT', 'This request key was already used for another scan');
+          }
+          return row;
+        };
+        const prior = await existing();
+        if (prior) return { row: prior, created: false };
+        await assertCanCollect(c, tx, caller, childId);
+        if (body.subjectId !== undefined) {
+          const [subject] = await tx<{ id: string }[]>`
+            select id from public.child_subjects
+             where id = ${body.subjectId} and child_id = ${childId} and family_id = ${caller.familyId}
+               and enabled`;
+          if (!subject) throw new ApiError('NOT_FOUND', 'Subject not found');
+        }
+        // Advisory early check so nobody uploads pages that cannot be processed; finalize is the
+        // authoritative, atomic reservation.
+        const periodKey = await pagePeriodKey(tx, caller.familyId, now);
+        const usage = await pageUsage(tx, caller.familyId, childId, periodKey);
+        assertWithinAllowance(caller, usage, body.pageCount, config.pageAllowancePerChild);
+        const [row] = await tx<AssignmentRow[]>`
+          insert into public.assignments (family_id, child_id, subject_id, idempotency_key, created_by_kind, page_count)
+          values (${caller.familyId}, ${childId}, ${body.subjectId ?? null}, ${scopedKey}, ${caller.kind}, ${body.pageCount})
+          on conflict (idempotency_key) do nothing
+          returning ${tx(ASSIGNMENT_COLUMNS)}`;
+        if (row) {
+          await audit(tx, caller, 'homework.created', 'assignment', row.id);
+          return { row, created: true };
+        }
+        // A concurrent request with the same key won the insert.
+        const raced = await existing();
+        if (!raced) throw new ApiError('CONFLICT', 'Please try again');
+        return { row: raced, created: false };
+      })
+      .catch((error: unknown) => mapDbError(error, caller));
+    const response: AssignmentStateResponse = { assignment: toState(outcome.row) };
+    return c.json(response, outcome.created ? 201 : 200);
+  });
+
+  r.post('/assignments/:id/uploads', async (c) => {
+    const caller = await resolveCaller(c);
+    const { deps } = c.var;
+    const id = paramUuid(c, 'id', 'Scan not found');
+    const { pages } = await readJson(c, uploadPagesRequestSchema);
+    validatePages(pages, config);
+
+    const registered = await deps.db
+      .asService(async (tx) => {
+        const assignment = await lockAssignment(tx, caller, id);
+        if (!assignment) throw new ApiError('NOT_FOUND', 'Scan not found');
+        if (assignment.status === 'uploading') {
+          // Resume after an interrupted upload: the same pages get fresh URLs; changed pages would
+          // silently alter what was already sent, so they need a new scan.
+          const existing = await readPages(tx, caller.familyId, id);
+          if (!samePages(existing, pages)) {
+            throw new ApiError(
+              'CONFLICT',
+              say(
+                caller,
+                'These pages differ from the ones already added. Start a new scan to change pages.',
+                'These pages are different. Let’s start a new scan.',
+              ),
+            );
+          }
+          return { assignment, pages: existing };
+        }
+        if (assignment.status === 'needs_rescan') {
+          // Decision: a rescan is a new scan so the unreadable pages and their evidence stay intact.
+          throw businessRule(
+            'START_NEW_SCAN',
+            say(
+              caller,
+              'Start a new scan with clearer pictures',
+              'Let’s get a clearer picture with a new scan.',
+            ),
+          );
+        }
+        if (assignment.status !== 'draft') {
+          throw businessRule(
+            'INVALID_TRANSITION',
+            say(
+              caller,
+              'Pages can only be added before a scan is sent',
+              'This scan was already sent.',
+            ),
+          );
+        }
+        await assertCanCollect(c, tx, caller, assignment.child_id);
+        if (pages.length !== assignment.page_count) {
+          throw businessRule(
+            'PAGE_COUNT_MISMATCH',
+            `This scan was started with ${assignment.page_count} page(s)`,
+          );
+        }
+        const inserted: PageRow[] = [];
+        for (const page of [...pages].sort((a, b) => a.pageNumber - b.pageNumber)) {
+          const mime = page.mimeType as HomeworkMimeType;
+          const pageId = crypto.randomUUID();
+          const path = `${caller.familyId}/${assignment.child_id}/${id}/${pageId}.${EXTENSIONS[mime]}`;
+          const [row] = await tx<PageRow[]>`
+            insert into public.source_pages
+              (id, assignment_id, family_id, child_id, page_number, storage_path, mime_type, byte_size, sha256)
+            values (${pageId}, ${id}, ${caller.familyId}, ${assignment.child_id}, ${page.pageNumber},
+                    ${path}, ${mime}, ${page.byteSize}, ${page.sha256})
+            returning id, page_number, mime_type, byte_size, sha256, storage_path`;
+          inserted.push(row!);
+        }
+        const [updated] = await tx<AssignmentRow[]>`
+          update public.assignments set status = 'uploading'
+           where id = ${id} and family_id = ${caller.familyId}
+          returning ${tx(ASSIGNMENT_COLUMNS)}`;
+        return { assignment: updated!, pages: inserted };
+      })
+      .catch((error: unknown) => mapDbError(error, caller));
+
+    // Signing happens after commit: network I/O never holds row locks, and a storage outage leaves
+    // the registered pages in place so the same request can simply be retried (resume).
+    let uploads: UploadTarget[];
+    try {
+      uploads = await Promise.all(
+        registered.pages.map(async (page) => {
+          const [signed, present] = await Promise.all([
+            deps.providers.storage.createSignedUploadUrl(
+              page.storage_path,
+              config.uploadUrlTtlSeconds,
+            ),
+            deps.providers.storage.exists(page.storage_path),
+          ]);
+          return {
+            pageId: page.id,
+            pageNumber: page.page_number,
+            uploadUrl: signed.url,
+            method: 'PUT' as const,
+            expiresAt: signed.expiresAt.toISOString(),
+            alreadyUploaded: present,
+          };
+        }),
+      );
+    } catch {
+      deps.log({
+        level: 'warn',
+        event: 'homework_storage_unavailable',
+        requestId: c.var.requestId,
+      });
+      throw new ApiError(
+        'PROVIDER_UNAVAILABLE',
+        say(
+          caller,
+          'Homework storage is not reachable right now. Your pages are saved; please try again.',
+          'We couldn’t reach the internet helper. Let’s try again in a moment.',
+        ),
+      );
+    }
+    const response: UploadPagesResponse = { assignment: toState(registered.assignment), uploads };
+    return c.json(response);
+  });
+
+  r.post('/assignments/:id/finalize', async (c) => {
+    const caller = await resolveCaller(c);
+    const { deps } = c.var;
+    const id = paramUuid(c, 'id', 'Scan not found');
+    // Decision: the client key is required for retry semantics, but deduplication is keyed by the
+    // assignment itself (one live reservation and one job per scan version), which is stronger than
+    // trusting a client-chosen key.
+    await readJson(c, finalizeAssignmentRequestSchema);
+
+    // Storage checks run outside the transaction (network I/O must not hold row locks).
+    const pre = await deps.db.asService(async (tx) => {
+      const [row] = await tx<{ status: AssignmentStatus }[]>`
+        select status from public.assignments
+         where id = ${id} and family_id = ${caller.familyId} and status <> 'deleted'
+           and (${caller.kind === 'parent'}::boolean or child_id = ${caller.kind === 'child' ? caller.childId : null}::uuid)`;
+      if (!row) return null;
+      return { status: row.status, pages: await readPages(tx, caller.familyId, id) };
+    });
+    if (!pre) throw new ApiError('NOT_FOUND', 'Scan not found');
+    let verified = false;
+    if (pre.status === 'uploading') {
+      let present: boolean[];
+      try {
+        present = await Promise.all(
+          pre.pages.map((p) => deps.providers.storage.exists(p.storage_path)),
+        );
+      } catch {
+        throw new ApiError('PROVIDER_UNAVAILABLE', 'Homework storage is not reachable right now');
+      }
+      if (pre.pages.length === 0 || present.includes(false)) {
+        throw businessRule(
+          'UPLOAD_INCOMPLETE',
+          say(
+            caller,
+            'Some pages have not finished uploading. Resume the upload, then send the scan.',
+            'Some pages didn’t finish sending. Let’s try sending them again.',
+          ),
+        );
+      }
+      verified = true;
+    }
+
+    const now = deps.clock();
+    const result = await deps.db
+      .asService(async (tx) => {
+        const assignment = await lockAssignment(tx, caller, id);
+        if (!assignment) throw new ApiError('NOT_FOUND', 'Scan not found');
+        if (FINALIZED_STATUSES.includes(assignment.status)) return assignment;
+        if (assignment.status === 'draft') {
+          throw businessRule(
+            'NO_PAGES',
+            say(caller, 'Add pages before sending the scan', 'Add a page first.'),
+          );
+        }
+        if (assignment.status !== 'uploading') {
+          throw businessRule(
+            'INVALID_TRANSITION',
+            say(caller, 'This scan was cancelled', 'This scan was stopped.'),
+          );
+        }
+        if (!verified) {
+          throw businessRule('UPLOAD_INCOMPLETE', 'Please send the scan again');
+        }
+        await assertCanCollect(c, tx, caller, assignment.child_id);
+        // Serialize reservations for one family (two guardians, several devices).
+        await tx`select id from public.families where id = ${caller.familyId} for update`;
+        const pages = await readPages(tx, caller.familyId, id);
+        const units = pages.length;
+        const periodKey = await pagePeriodKey(tx, caller.familyId, now);
+        const reservations = await tx<{ id: string; status: string }[]>`
+          select id, status from public.usage_reservations
+           where family_id = ${caller.familyId} and idempotency_key like ${`scan-usage:${id}:v%`}`;
+        let reservationId = reservations.find((r) => r.status !== 'released')?.id;
+        if (!reservationId) {
+          const usage = await pageUsage(tx, caller.familyId, assignment.child_id, periodKey);
+          assertWithinAllowance(caller, usage, units, config.pageAllowancePerChild);
+          const [created] = await tx<{ id: string }[]>`
+            insert into public.usage_reservations (family_id, child_id, period_key, units, idempotency_key)
+            values (${caller.familyId}, ${assignment.child_id}, ${periodKey}, ${units},
+                    ${`scan-usage:${id}:v${reservations.length + 1}`})
+            returning id`;
+          reservationId = created!.id;
+        }
+        const [jobs] = await tx<{ n: number }[]>`
+          select count(*)::int as n from public.jobs
+           where family_id = ${caller.familyId} and idempotency_key like ${`scan:${id}:v%`}`;
+        // Payload holds references only, never homework content (migration 0600).
+        await tx`
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+          values ('scan_process', ${`scan:${id}:v${(jobs?.n ?? 0) + 1}`}, ${caller.familyId},
+                  ${assignment.child_id},
+                  ${tx.json({ assignmentId: id, mode: 'initial', reservationId })})
+          on conflict (idempotency_key) do nothing`;
+        const [updated] = await tx<AssignmentRow[]>`
+          update public.assignments set status = 'queued'
+           where id = ${id} and family_id = ${caller.familyId}
+          returning ${tx(ASSIGNMENT_COLUMNS)}`;
+        await audit(tx, caller, 'homework.finalized', 'assignment', id);
+        return updated!;
+      })
+      .catch((error: unknown) => mapDbError(error, caller));
+    const response: AssignmentStateResponse = { assignment: toState(result) };
+    return c.json(response);
+  });
+
+  r.post('/assignments/:id/cancel', async (c) => {
+    const caller = await resolveCaller(c);
+    const { deps } = c.var;
+    const id = paramUuid(c, 'id', 'Scan not found');
+    const outcome = await deps.db
+      .asService(async (tx) => {
+        const assignment = await lockAssignment(tx, caller, id);
+        if (!assignment) throw new ApiError('NOT_FOUND', 'Scan not found');
+        if (assignment.status === 'cancelled') return { row: assignment, paths: [] as string[] };
+        if (!CANCELLABLE_ASSIGNMENT_STATUSES.includes(assignment.status)) {
+          throw businessRule(
+            'INVALID_TRANSITION',
+            say(
+              caller,
+              'Finished or in-progress scans can’t be cancelled',
+              'This scan is already being checked.',
+            ),
+          );
+        }
+        const [updated] = await tx<AssignmentRow[]>`
+          update public.assignments set status = 'cancelled'
+           where id = ${id} and family_id = ${caller.familyId}
+          returning ${tx(ASSIGNMENT_COLUMNS)}`;
+        await tx`
+          update public.usage_reservations set status = 'released', release_reason = 'cancelled'
+           where family_id = ${caller.familyId} and status = 'reserved'
+             and idempotency_key like ${`scan-usage:${id}:v%`}`;
+        await tx`
+          update public.jobs set status = 'cancelled'
+           where family_id = ${caller.familyId} and status in ('queued', 'failed_retryable')
+             and idempotency_key like ${`scan:${id}:v%`}`;
+        const removed = await tx<{ storage_path: string }[]>`
+          update public.source_pages set deleted_at = now()
+           where assignment_id = ${id} and family_id = ${caller.familyId} and deleted_at is null
+          returning storage_path`;
+        await audit(tx, caller, 'homework.cancelled', 'assignment', id);
+        return { row: updated!, paths: removed.map((p) => p.storage_path) };
+      })
+      .catch((error: unknown) => mapDbError(error, caller));
+    if (outcome.paths.length > 0) {
+      // Decision: cancelled pages are deleted from storage right away (data minimization); a failure
+      // is logged by code only and the retention purge job removes anything left behind.
+      await deps.providers.storage.remove(outcome.paths).catch(() => {
+        deps.log({
+          level: 'warn',
+          event: 'homework_storage_remove_failed',
+          requestId: c.var.requestId,
+        });
+      });
+    }
+    const response: AssignmentStateResponse = { assignment: toState(outcome.row) };
+    return c.json(response);
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // Parent views
+  // -------------------------------------------------------------------------------------------
+
+  r.get('/assignments', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const familyId = await currentFamilyId(c);
+    const rawChild = c.req.query('childId');
+    let childId: string | null = null;
+    if (rawChild !== undefined) {
+      const parsed = uuidSchema.safeParse(rawChild);
+      if (!parsed.success) throw new ApiError('NOT_FOUND', 'Child not found');
+      childId = parsed.data;
+    }
+    const now = deps.clock();
+    const data = await deps.db.asParent(parent, async (tx) => {
+      if (childId !== null) {
+        const [child] = await tx<{ id: string }[]>`
+          select id from public.child_profiles where id = ${childId} and family_id = ${familyId}`;
+        if (!child) return null;
+      }
+      const rows = await tx<AssignmentRow[]>`
+        select ${tx(ASSIGNMENT_COLUMNS)} from public.assignments
+         where family_id = ${familyId} and status <> 'deleted'
+           and (${childId}::uuid is null or child_id = ${childId}::uuid)
+         order by created_at desc
+         limit ${LIST_LIMIT}`;
+      let allowance: PageAllowance | null = null;
+      if (childId !== null) {
+        const periodKey = await pagePeriodKey(tx, familyId, now);
+        const usage = await pageUsage(tx, familyId, childId, periodKey);
+        allowance = toAllowance(periodKey, usage, config.pageAllowancePerChild);
+      }
+      return { rows, allowance };
+    });
+    if (!data) throw new ApiError('NOT_FOUND', 'Child not found');
+    const response: AssignmentListResponse = {
+      assignments: data.rows.map(toSummary),
+      allowance: data.allowance,
+    };
+    return c.json(response);
+  });
+
+  r.get('/assignments/:id', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const id = paramUuid(c, 'id', 'Scan not found');
+    const familyId = await currentFamilyId(c);
+    const data = await deps.db.asParent(parent, async (tx) => {
+      const [assignment] = await tx<AssignmentRow[]>`
+        select ${tx(ASSIGNMENT_COLUMNS)} from public.assignments
+         where id = ${id} and family_id = ${familyId} and status <> 'deleted'`;
+      if (!assignment) return null;
+      const pages = await tx<{ id: string; page_number: number; mime_type: HomeworkMimeType }[]>`
+        select id, page_number, mime_type from public.source_pages
+         where assignment_id = ${id} and family_id = ${familyId} and deleted_at is null
+         order by page_number`;
+      const questions = await readParentQuestions(tx, familyId, id, null);
+      return { assignment, pages, questions };
+    });
+    if (!data) throw new ApiError('NOT_FOUND', 'Scan not found');
+    const response: AssignmentDetailResponse = {
+      assignment: toSummary(data.assignment),
+      pages: data.pages.map((p) => ({
+        id: p.id,
+        pageNumber: p.page_number,
+        mimeType: p.mime_type,
+      })),
+      questions: data.questions.map(toParentQuestion),
+    };
+    return c.json(response);
+  });
+
+  // Complete solutions: parent + server-verified recent step-up (AC_GRADING_05).
+  r.get('/assignments/:id/solutions', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const id = paramUuid(c, 'id', 'Scan not found');
+    const familyId = await currentFamilyId(c);
+    const [visible] = await deps.db.asParent(
+      parent,
+      (tx) => tx<{ id: string }[]>`
+        select id from public.assignments
+         where id = ${id} and family_id = ${familyId} and status <> 'deleted'`,
+    );
+    if (!visible) throw new ApiError('NOT_FOUND', 'Scan not found');
+    await assertRecentUnlock(c);
+    const rows = await deps.db
+      .asParent(
+        parent,
+        (tx) => tx<
+          {
+            question_id: string;
+            question_number: string;
+            correct_answer: string;
+            worked_solution: string;
+            rubric: unknown;
+            misconception: string | null;
+          }[]
+        >`
+          select question_id, question_number, correct_answer, worked_solution, rubric, misconception
+            from public.parent_assignment_solutions(${id})`,
+      )
+      .catch((error: unknown) => {
+        const code = pgErrorCode(error);
+        if (code === 'P0002') throw new ApiError('NOT_FOUND', 'Scan not found');
+        if (code === '42501') {
+          throw new ApiError('STEP_UP_REQUIRED', 'Enter your parent PIN to see solutions');
+        }
+        throw error;
+      });
+    const response: AssignmentSolutionsResponse = {
+      assignmentId: id,
+      solutions: rows.map((row) => ({
+        questionId: row.question_id,
+        questionNumber: row.question_number,
+        correctAnswer: row.correct_answer,
+        workedSolution: row.worked_solution,
+        rubric: (row.rubric ?? null) as AssignmentSolutionsResponse['solutions'][number]['rubric'],
+        misconception: row.misconception,
+      })),
+    };
+    return c.json(response);
+  });
+
+  // Parent override with audit (migration RPC) + learning-evidence correction (AC_GRADING_10).
+  r.post('/questions/:id/override', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const questionId = paramUuid(c, 'id', 'Question not found');
+    const familyId = await currentFamilyId(c);
+    const body = await readJson(c, overrideResultRequestSchema);
+    await assertRecentUnlock(c);
+    const [row] = await deps.db
+      .asParent(
+        parent,
+        (tx) => tx<
+          {
+            family_id: string;
+            verdict: GradedVerdict;
+            route: ParentQuestionResult['route'];
+            disagreement: boolean;
+            graded_at: Date;
+            parent_override_verdict: 'correct' | 'incorrect' | 'unresolved';
+            override_reason: string | null;
+            overridden_at: Date;
+          }[]
+        >`
+          select family_id, verdict, route, disagreement, graded_at, parent_override_verdict,
+                 override_reason, overridden_at
+            from public.parent_override_result(${questionId}, ${body.verdict}, ${body.reason})`,
+      )
+      .catch((error: unknown) => {
+        const code = pgErrorCode(error);
+        if (code === 'P0002') throw new ApiError('NOT_FOUND', 'No result to override');
+        if (code === '42501') throw new ApiError('STEP_UP_REQUIRED', 'Enter your parent PIN');
+        if (code === '22023') throw new ApiError('VALIDATION_FAILED', 'Invalid request: reason');
+        throw error;
+      });
+    if (!row || row.family_id !== familyId)
+      throw new ApiError('NOT_FOUND', 'No result to override');
+    // Decision: the override corrects the evidence of the latest homework attempt on this question
+    // (append-only attempt_overrides). Points are never touched here, so an override cannot claw
+    // back rewards the child already earned.
+    await deps.db.asService(
+      (tx) => tx`
+        insert into public.attempt_overrides (attempt_id, family_id, correctness, reason, overridden_by)
+        select a.id, a.family_id, ${body.verdict}, ${body.reason}, ${parent.userId}
+          from public.attempts a
+         where a.question_instance_id = ${questionId} and a.family_id = ${familyId}
+           and a.source = 'homework'
+         order by a.attempt_number desc
+         limit 1`,
+    );
+    const response: OverrideResultResponse = {
+      questionId,
+      result: {
+        verdict: row.parent_override_verdict,
+        gradedVerdict: row.verdict,
+        route: row.route,
+        disagreement: row.disagreement,
+        gradedAt: row.graded_at.toISOString(),
+        override: {
+          verdict: row.parent_override_verdict,
+          reason: row.override_reason,
+          at: row.overridden_at.toISOString(),
+        },
+      },
+    };
+    return c.json(response);
+  });
+
+  // Transcription correction: originals kept, correction recorded, re-check queued (spec P5).
+  r.post('/questions/:id/correction', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const questionId = paramUuid(c, 'id', 'Question not found');
+    const familyId = await currentFamilyId(c);
+    const body = await readJson(c, correctTranscriptionRequestSchema);
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `homework-correction:${familyId}`,
+      CORRECTION_RULE,
+      deps.clock(),
+    );
+    const caller: Caller = { kind: 'parent', parent, familyId };
+    const outcome = await deps.db
+      .asService(async (tx) => {
+        // Service role: ownership is checked explicitly against the caller's family.
+        const [question] = await tx<{ assignment_id: string }[]>`
+          select assignment_id from public.extracted_questions
+           where id = ${questionId} and family_id = ${familyId}`;
+        if (!question) throw new ApiError('NOT_FOUND', 'Question not found');
+        const assignment = await lockAssignment(tx, caller, question.assignment_id);
+        if (!assignment) throw new ApiError('NOT_FOUND', 'Question not found');
+        if (!CORRECTABLE_ASSIGNMENT_STATUSES.includes(assignment.status)) {
+          throw businessRule(
+            'INVALID_TRANSITION',
+            'This scan is still being checked. Try again when it is ready.',
+          );
+        }
+        const hasPrompt = body.promptText !== undefined;
+        const hasAnswer = body.studentAnswerText !== undefined;
+        await tx`
+          update public.extracted_questions
+             set corrected_prompt_text = case when ${hasPrompt}::boolean then ${body.promptText ?? null} else corrected_prompt_text end,
+                 corrected_student_answer_text = case when ${hasAnswer}::boolean then ${body.studentAnswerText ?? null} else corrected_student_answer_text end,
+                 corrected_by = ${parent.userId},
+                 corrected_at = now(),
+                 transcription_version = transcription_version + 1
+           where id = ${questionId} and family_id = ${familyId}`;
+        const [updated] = await tx<AssignmentRow[]>`
+          update public.assignments set status = 'checking'
+           where id = ${assignment.id} and family_id = ${familyId}
+          returning ${tx(ASSIGNMENT_COLUMNS)}`;
+        const [jobs] = await tx<{ n: number }[]>`
+          select count(*)::int as n from public.jobs
+           where family_id = ${familyId} and idempotency_key like ${`scan:${assignment.id}:v%`}`;
+        await tx`
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+          values ('scan_process', ${`scan:${assignment.id}:v${(jobs?.n ?? 0) + 1}`}, ${familyId},
+                  ${assignment.child_id},
+                  ${tx.json({ assignmentId: assignment.id, mode: 'recheck', questionIds: [questionId] })})`;
+        await audit(tx, caller, 'homework.transcription_corrected', 'question', questionId);
+        const [row] = await readParentQuestions(tx, familyId, assignment.id, questionId);
+        return { assignment: updated!, question: row! };
+      })
+      .catch((error: unknown) => mapDbError(error, caller));
+    const response: CorrectTranscriptionResponse = {
+      assignment: toState(outcome.assignment),
+      question: toParentQuestion(outcome.question),
+    };
+    return c.json(response);
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // Child views (pl_child role, allowlisted columns; lesson L-003)
+  // -------------------------------------------------------------------------------------------
+
+  r.get('/child/assignments', requireChild, async (c) => {
+    const { deps, child } = c.var;
+    const rows = await deps.db.asChild(
+      child,
+      (tx) => tx<ChildAssignmentRow[]>`
+        select id, subject_id, status, page_count, created_at, updated_at from public.assignments
+         where child_id = ${child.childId}
+         order by created_at desc
+         limit ${CHILD_LIST_LIMIT}`,
+    );
+    const response: ChildAssignmentListResponse = { assignments: rows.map(toChildSummary) };
+    return c.json(response);
+  });
+
+  r.get('/child/assignments/:id', requireChild, async (c) => {
+    const { deps, child } = c.var;
+    const id = paramUuid(c, 'id', 'We couldn’t find that scan.');
+    const data = await deps.db.asChild(child, async (tx) => {
+      const [assignment] = await tx<ChildAssignmentRow[]>`
+        select id, subject_id, status, page_count, created_at, updated_at from public.assignments
+         where id = ${id} and child_id = ${child.childId}`;
+      if (!assignment) return null;
+      const questions = await tx<
+        {
+          id: string;
+          question_number: string;
+          prompt_text: string;
+          student_answer_text: string | null;
+          verdict: GradedVerdict | null;
+        }[]
+      >`
+        select q.id, q.question_number, q.prompt_text, q.student_answer_text, r.verdict
+          from public.extracted_questions q
+          left join public.question_results r on r.question_id = q.id
+         where q.assignment_id = ${id} and q.child_id = ${child.childId}
+         order by length(q.question_number), q.question_number`;
+      const ids = questions.map((q) => q.id);
+      const feedback =
+        ids.length === 0
+          ? []
+          : await tx<
+              {
+                id: string;
+                question_id: string;
+                kind: ChildAssignmentDetailResponse['questions'][number]['feedback'][number]['kind'];
+                body: string;
+              }[]
+            >`
+              select id, question_id, kind, body from public.child_feedback
+               where child_id = ${child.childId} and question_id = any(${ids}::uuid[])
+               order by created_at`;
+      return { assignment, questions, feedback };
+    });
+    if (!data) throw new ApiError('NOT_FOUND', 'We couldn’t find that scan.');
+    // Decision: pl_child has no column grant for parent overrides or corrected transcriptions, so
+    // this one narrowly scoped service read applies them (the child must not be told "Try again"
+    // after a grown-up confirmed the answer). Only these three columns are read, scoped to the
+    // child's own questions; see schemaRequests for the grant that would move it under pl_child.
+    const corrections =
+      data.questions.length === 0
+        ? []
+        : await deps.db.asService(
+            (tx) => tx<
+              {
+                id: string;
+                corrected_prompt_text: string | null;
+                corrected_student_answer_text: string | null;
+                parent_override_verdict: GradedVerdict | null;
+              }[]
+            >`
+              select q.id, q.corrected_prompt_text, q.corrected_student_answer_text, r.parent_override_verdict
+                from public.extracted_questions q
+                left join public.question_results r on r.question_id = q.id
+               where q.assignment_id = ${id} and q.child_id = ${child.childId}
+                 and q.family_id = ${child.familyId}`,
+          );
+    const byId = new Map(corrections.map((row) => [row.id, row]));
+    const showResults = RESULT_VISIBLE_STATUSES.includes(data.assignment.status);
+    const response: ChildAssignmentDetailResponse = {
+      assignment: toChildSummary(data.assignment),
+      questions: data.questions.map((q) => {
+        const fix = byId.get(q.id);
+        return {
+          id: q.id,
+          questionNumber: q.question_number,
+          promptText: fix?.corrected_prompt_text ?? q.prompt_text,
+          studentAnswerText:
+            fix?.corrected_student_answer_text !== undefined &&
+            fix.corrected_student_answer_text !== null
+              ? fix.corrected_student_answer_text
+              : q.student_answer_text,
+          verdict: showResults ? (fix?.parent_override_verdict ?? q.verdict) : null,
+          feedback: showResults
+            ? data.feedback
+                .filter((f) => f.question_id === q.id)
+                .map((f) => ({ id: f.id, kind: f.kind, body: f.body }))
+            : [],
+        };
+      }),
+    };
+    return c.json(response);
+  });
+
+  return r;
+}
+
+interface ChildAssignmentRow {
+  id: string;
+  subject_id: string | null;
+  status: AssignmentStatus;
+  page_count: number;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function toChildSummary(row: ChildAssignmentRow): ChildAssignmentSummary {
+  return {
+    id: row.id,
+    subjectId: row.subject_id,
+    status: row.status,
+    pageCount: row.page_count,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+  };
 }

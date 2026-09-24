@@ -1,2 +1,271 @@
-// Contracts for the rewards vertical. Owned by the rewards feature agent.
-export {};
+// Contracts for the rewards vertical (spec P9, P16.4). Owned by the rewards feature agent.
+// Points are a family motivational ledger, not money: no contract here moves value, and there is
+// deliberately no request shape that awards points for ads, sponsor/affiliate clicks, purchases or
+// referrals (AC_MON_13).
+import { z } from 'zod';
+import { isoDateTimeSchema, uuidSchema } from './common.ts';
+
+// ---------------------------------------------------------------------------------------------
+// Limits (mirror migration 0400 and @pencillift/domain/rewards)
+// ---------------------------------------------------------------------------------------------
+
+export const REWARD_TITLE_MAX_LENGTH = 80;
+export const REWARD_INSTRUCTIONS_MAX_LENGTH = 500;
+/** Decision: the domain cap (100,000) is tighter than the DB check (1,000,000); the API uses it. */
+export const REWARD_POINT_COST_MAX = 100_000;
+/** Decision: one adjustment moves at most 10,000 points either way (domain MAX_ADJUSTMENT_POINTS). */
+export const POINTS_ADJUSTMENT_MAX = 10_000;
+/** points_ledger.reason is limited to 300 characters by the database. */
+export const POINTS_REASON_MAX_LENGTH = 300;
+
+/** Stable `rule` codes returned with 422 BUSINESS_RULE by the rewards API. */
+export const REWARD_BUSINESS_RULES = ['INSUFFICIENT_POINTS', 'INVALID_TRANSITION'] as const;
+export type RewardBusinessRule = (typeof REWARD_BUSINESS_RULES)[number];
+
+/**
+ * Decision: reward text is shown to children and P16.3/P16.4 keep learning rewards independent of
+ * monetization, so titles and instructions may not contain links (URL scheme, `www.`, or a bare host
+ * with a common public suffix such as amzn.to). Mirrors @pencillift/domain/rewards catalog rules.
+ */
+const LINK_PATTERN =
+  /[a-z][a-z0-9+.-]*:\/\/|\bwww\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|co|io|app|shop|store|ly|me|to|us|uk|ca|au|de|in|biz|info|link|gl|gd|site|online|xyz)\b/i;
+const MEANINGFUL_PATTERN = /[\p{L}\p{N}]/u;
+
+export function rewardTextContainsLink(text: string): boolean {
+  return LINK_PATTERN.test(text);
+}
+
+const noLinks = (text: string) => !rewardTextContainsLink(text);
+const LINK_MESSAGE = 'Links are not allowed in rewards';
+
+// ---------------------------------------------------------------------------------------------
+// Shared fields
+// ---------------------------------------------------------------------------------------------
+
+export const rewardTitleSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(REWARD_TITLE_MAX_LENGTH)
+  .refine((t) => MEANINGFUL_PATTERN.test(t), 'Give the reward a name')
+  .refine(noLinks, LINK_MESSAGE);
+
+export const rewardInstructionsSchema = z
+  .string()
+  .trim()
+  .max(REWARD_INSTRUCTIONS_MAX_LENGTH)
+  .refine(noLinks, LINK_MESSAGE);
+
+export const rewardPointCostSchema = z.number().int().min(1).max(REWARD_POINT_COST_MAX);
+
+export const rewardRequestStateSchema = z.enum([
+  'pending',
+  'approved',
+  'fulfilled',
+  'declined',
+  'cancelled',
+]);
+export type RewardRequestState = z.infer<typeof rewardRequestStateSchema>;
+
+export const rewardDecisionActionSchema = z.enum(['approve', 'decline', 'fulfill', 'cancel']);
+export type RewardDecisionAction = z.infer<typeof rewardDecisionActionSchema>;
+
+export const pointsLedgerKindSchema = z.enum([
+  'award',
+  'adjustment',
+  'redemption_reserve',
+  'redemption_release',
+]);
+export type PointsLedgerKind = z.infer<typeof pointsLedgerKindSchema>;
+
+const balanceSchema = z.number().int().min(0);
+
+// ---------------------------------------------------------------------------------------------
+// Parent: reward definitions
+// ---------------------------------------------------------------------------------------------
+
+export const rewardSchema = z.strictObject({
+  id: uuidSchema,
+  title: z.string(),
+  pointCost: z.number().int().min(1),
+  instructions: z.string().nullable(),
+  /** Null = offered to every child in the family. */
+  childId: uuidSchema.nullable(),
+  active: z.boolean(),
+  createdAt: isoDateTimeSchema,
+  updatedAt: isoDateTimeSchema,
+});
+export type Reward = z.infer<typeof rewardSchema>;
+
+export const createRewardRequestSchema = z.strictObject({
+  title: rewardTitleSchema,
+  pointCost: rewardPointCostSchema,
+  /** Null offers the reward to every child; a child id limits it to that child. */
+  childId: uuidSchema.nullable(),
+  instructions: rewardInstructionsSchema.optional(),
+});
+export type CreateRewardRequest = z.infer<typeof createRewardRequestSchema>;
+
+export const updateRewardRequestSchema = z
+  .strictObject({
+    title: rewardTitleSchema.optional(),
+    pointCost: rewardPointCostSchema.optional(),
+    /** Null or an empty string clears the instructions. */
+    instructions: rewardInstructionsSchema.nullable().optional(),
+    active: z.boolean().optional(),
+  })
+  .refine((v) => Object.values(v).some((x) => x !== undefined), 'Nothing to update');
+export type UpdateRewardRequest = z.infer<typeof updateRewardRequestSchema>;
+
+export const rewardResponseSchema = z.strictObject({ reward: rewardSchema });
+
+// ---------------------------------------------------------------------------------------------
+// Parent: requests, balances, decisions
+// ---------------------------------------------------------------------------------------------
+
+export const parentRewardRequestSchema = z.strictObject({
+  id: uuidSchema,
+  childId: uuidSchema,
+  childNickname: z.string(),
+  rewardId: uuidSchema,
+  rewardTitle: z.string(),
+  /** Cost captured when the child asked; later price edits never change it. */
+  pointCost: z.number().int().min(1),
+  state: rewardRequestStateSchema,
+  requestedAt: isoDateTimeSchema,
+  decidedAt: isoDateTimeSchema.nullable(),
+  fulfilledAt: isoDateTimeSchema.nullable(),
+  cancelledBy: z.enum(['child', 'parent']).nullable(),
+});
+export type ParentRewardRequest = z.infer<typeof parentRewardRequestSchema>;
+
+export const rewardChildBalanceSchema = z.strictObject({
+  childId: uuidSchema,
+  nickname: z.string(),
+  balance: balanceSchema,
+});
+export type RewardChildBalance = z.infer<typeof rewardChildBalanceSchema>;
+
+export const rewardsOverviewResponseSchema = z.strictObject({
+  rewards: z.array(rewardSchema),
+  children: z.array(rewardChildBalanceSchema),
+  /** Pending and approved requests, oldest first (the parent's to-do list). */
+  openRequests: z.array(parentRewardRequestSchema),
+  /** The most recent fulfilled, declined or cancelled requests (at most 20). */
+  recentRequests: z.array(parentRewardRequestSchema),
+});
+export type RewardsOverview = z.infer<typeof rewardsOverviewResponseSchema>;
+
+export const rewardDecisionRequestSchema = z.strictObject({ action: rewardDecisionActionSchema });
+
+export const rewardDecisionResponseSchema = z.strictObject({
+  request: parentRewardRequestSchema,
+  /** The child's balance after the decision. */
+  balance: balanceSchema,
+});
+export type RewardDecisionResponse = z.infer<typeof rewardDecisionResponseSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// Parent: adjustments and history
+// ---------------------------------------------------------------------------------------------
+
+export const pointsAdjustmentRequestSchema = z.strictObject({
+  childId: uuidSchema,
+  points: z
+    .number()
+    .int()
+    .min(-POINTS_ADJUSTMENT_MAX)
+    .max(POINTS_ADJUSTMENT_MAX)
+    .refine((p) => p !== 0, 'An adjustment must change the balance'),
+  reason: z
+    .string()
+    .trim()
+    .min(1)
+    .max(POINTS_REASON_MAX_LENGTH)
+    .refine((r) => MEANINGFUL_PATTERN.test(r), 'Explain why the points are being adjusted'),
+  /** Client-generated; retrying with the same id never applies the adjustment twice. */
+  adjustmentId: uuidSchema,
+});
+export type PointsAdjustmentRequest = z.infer<typeof pointsAdjustmentRequestSchema>;
+
+export const pointsAdjustmentResponseSchema = z.strictObject({
+  childId: uuidSchema,
+  balance: balanceSchema,
+  /** False when this adjustmentId was already recorded (idempotent retry; nothing changed). */
+  applied: z.boolean(),
+});
+export type PointsAdjustmentResponse = z.infer<typeof pointsAdjustmentResponseSchema>;
+
+export const pointsHistoryEntrySchema = z.strictObject({
+  /** Ledger sequence number (bigint as a decimal string). */
+  id: z.string().regex(/^\d+$/),
+  kind: pointsLedgerKindSchema,
+  points: z.number().int(),
+  reason: z.string().nullable(),
+  actor: z.enum(['system', 'parent', 'child']),
+  redemptionId: uuidSchema.nullable(),
+  rewardTitle: z.string().nullable(),
+  createdAt: isoDateTimeSchema,
+});
+export type PointsHistoryEntry = z.infer<typeof pointsHistoryEntrySchema>;
+
+export const pointsHistoryResponseSchema = z.strictObject({
+  childId: uuidSchema,
+  balance: balanceSchema,
+  /** Newest first; at most 100 entries. */
+  entries: z.array(pointsHistoryEntrySchema),
+  hasMore: z.boolean(),
+  /** Sums over the child's whole ledger; `net` always equals `balance` (P9 reconciliation). */
+  totals: z.strictObject({
+    awarded: z.number().int(),
+    adjustments: z.number().int(),
+    reserved: z.number().int(),
+    released: z.number().int(),
+    net: z.number().int(),
+  }),
+});
+export type PointsHistory = z.infer<typeof pointsHistoryResponseSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// Child: explicit allowlisted fields only (no family ids, creators, reasons or sibling data)
+// ---------------------------------------------------------------------------------------------
+
+export const childRewardSchema = z.strictObject({
+  id: uuidSchema,
+  title: z.string(),
+  pointCost: z.number().int().min(1),
+  instructions: z.string().nullable(),
+});
+export type ChildReward = z.infer<typeof childRewardSchema>;
+
+export const childRewardRequestSchema = z.strictObject({
+  id: uuidSchema,
+  rewardId: uuidSchema,
+  /** Null when the reward is no longer offered. */
+  rewardTitle: z.string().nullable(),
+  pointCost: z.number().int().min(1),
+  state: rewardRequestStateSchema,
+  requestedAt: isoDateTimeSchema,
+  decidedAt: isoDateTimeSchema.nullable(),
+  fulfilledAt: isoDateTimeSchema.nullable(),
+});
+export type ChildRewardRequest = z.infer<typeof childRewardRequestSchema>;
+
+export const childRewardsResponseSchema = z.strictObject({
+  balance: balanceSchema,
+  rewards: z.array(childRewardSchema),
+  /** Open requests first, then the most recent (at most 50). */
+  requests: z.array(childRewardRequestSchema),
+});
+export type ChildRewards = z.infer<typeof childRewardsResponseSchema>;
+
+export const childRewardRequestBodySchema = z.strictObject({
+  /** Client-generated; a retried request with the same id never reserves points twice. */
+  requestId: uuidSchema,
+});
+
+export const childRewardRequestResponseSchema = z.strictObject({
+  request: childRewardRequestSchema,
+  balance: balanceSchema,
+});
+export type ChildRewardRequestResponse = z.infer<typeof childRewardRequestResponseSchema>;

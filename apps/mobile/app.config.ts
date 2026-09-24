@@ -11,6 +11,15 @@ const apiBaseUrl =
     ? rawApiBaseUrl
     : 'http://localhost:8787';
 
+function publicEnv(name: string): string | null {
+  const value: unknown = process.env[name];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+// Supabase URL + publishable key are public by design; every decision is re-made by the API.
+const supabaseUrl = publicEnv('EXPO_PUBLIC_SUPABASE_URL');
+const supabasePublishableKey = publicEnv('EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY');
+const portalUrl = publicEnv('EXPO_PUBLIC_PORTAL_URL');
+
 const config: ExpoConfig = {
   name: 'PencilLift',
   slug: 'pencillift',
@@ -73,7 +82,7 @@ const config: ExpoConfig = {
     'expo-notifications',
   ],
   experiments: { typedRoutes: true },
-  extra: { apiBaseUrl },
+  extra: { apiBaseUrl, supabaseUrl, supabasePublishableKey, portalUrl },
 };
 
 export default config;
