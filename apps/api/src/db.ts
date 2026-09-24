@@ -16,6 +16,8 @@ export interface ParentPrincipal {
   readonly userId: string;
   readonly sessionId: string;
   readonly aal: 'aal1' | 'aal2';
+  /** Latest sign-in/re-authentication instant from the token's `amr` claims, if present. */
+  readonly authenticatedAt?: Date;
 }
 
 export interface ChildPrincipal {

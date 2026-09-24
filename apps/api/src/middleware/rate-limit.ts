@@ -48,6 +48,7 @@ export async function enforceRateLimit(
 /** Named rules so limits are reviewed in one place. */
 export const RATE_RULES = {
   pinAttemptPerSession: { limit: 10, windowSeconds: 15 * 60 },
+  pinResetPerUser: { limit: 5, windowSeconds: 24 * 3600 },
   pairingRedeemPerIp: { limit: 20, windowSeconds: 15 * 60 },
   pairingCreatePerFamily: { limit: 20, windowSeconds: 3600 },
   childRefreshPerSession: { limit: 60, windowSeconds: 3600 },

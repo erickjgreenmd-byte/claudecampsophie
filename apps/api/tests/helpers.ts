@@ -109,6 +109,8 @@ export async function parentToken(
     expiresInSeconds?: number;
     secret?: string;
     role?: string;
+    /** Supabase authentication method references, e.g. [{ method: 'password', timestamp }]. */
+    amr?: { method: string; timestamp: number }[];
   } = {},
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
@@ -116,6 +118,7 @@ export async function parentToken(
     role: options.role ?? 'authenticated',
     session_id: options.sessionId ?? '11111111-1111-4111-8111-111111111111',
     aal: options.aal ?? 'aal1',
+    ...(options.amr ? { amr: options.amr } : {}),
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuer(TEST_ISSUER)

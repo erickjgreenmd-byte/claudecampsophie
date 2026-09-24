@@ -4,7 +4,9 @@ import { isValidIanaZone } from '@pencillift/domain';
 import { uuidSchema } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
 import { generatePairingCode, pairingCodeHash } from '../auth/pairing.ts';
-import { ApiError } from '../errors.ts';
+import type { Tx } from '../db.ts';
+import { ApiError, businessRule } from '../errors.ts';
+import { hasVerifiedConsent } from '../services/consent.ts';
 import { assertRecentUnlock, currentFamilyId, requireParent } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
 import { enforceRateLimit, RATE_RULES } from '../middleware/rate-limit.ts';
@@ -151,6 +153,84 @@ export function familyRoutes(): Hono<AppEnv> {
     );
   });
 
+  // Activation assigns one verified paid slot (spec P11: a draft is free; activation never buys).
+  r.post('/children/:childId/activate', async (c) => {
+    const { deps, parent } = c.var;
+    const childId = uuidSchema.safeParse(c.req.param('childId'));
+    if (!childId.success) throw new ApiError('NOT_FOUND', 'Child not found');
+    const familyId = await currentFamilyId(c);
+    await assertRecentUnlock(c);
+    const allowTestProvider = deps.config.environment !== 'production';
+    const result = await deps.db.asService(async (tx) => {
+      // Serialize with other slot changes for this family (two guardians, two devices).
+      await tx`select 1 from public.families where id = ${familyId} for update`;
+      // Service role bypasses RLS, so ownership is checked explicitly (spec E4).
+      const [child] = await tx<{ status: string }[]>`
+        select status from public.child_profiles where id = ${childId.data} and family_id = ${familyId}`;
+      if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
+      if (child.status === 'active') return slotSummary(tx, familyId, 'active');
+      if (!(await hasVerifiedConsent(tx, familyId, { allowTestProvider }))) {
+        throw businessRule(
+          'CONSENT_REQUIRED',
+          'Parental consent is needed before a child can start',
+        );
+      }
+      const [capacity] = await tx<{ paid_slots: number; open: number }[]>`
+        select coalesce((select paid_slots from public.family_capacity where family_id = ${familyId}), 0)::int as paid_slots,
+               (select count(*)::int from public.child_slot_assignments
+                 where family_id = ${familyId} and released_at is null) as open`;
+      if (capacity!.open >= capacity!.paid_slots) {
+        throw businessRule(
+          'NEEDS_PAID_SLOT',
+          `All ${capacity!.paid_slots} paid child slots are in use. Add a child slot to your plan first.`,
+        );
+      }
+      await tx`insert into public.child_slot_assignments (family_id, child_id) values (${familyId}, ${childId.data})`;
+      await tx`update public.child_profiles set status = 'active', archived_at = null
+                where id = ${childId.data} and family_id = ${familyId}`;
+      await tx`
+        insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id)
+        values (${familyId}, ${parent.userId}, 'parent', 'child.activated', 'child', ${childId.data})`;
+      return slotSummary(tx, familyId, 'active');
+    });
+    return c.json({ childId: childId.data, ...result });
+  });
+
+  // Archiving frees the slot and ends the child's sessions but keeps history (spec P11, AC_CAPACITY_08).
+  // It never claims to cancel or lower a store subscription.
+  r.post('/children/:childId/archive', async (c) => {
+    const { deps, parent } = c.var;
+    const childId = uuidSchema.safeParse(c.req.param('childId'));
+    if (!childId.success) throw new ApiError('NOT_FOUND', 'Child not found');
+    const familyId = await currentFamilyId(c);
+    await assertRecentUnlock(c);
+    const result = await deps.db.asService(async (tx) => {
+      await tx`select 1 from public.families where id = ${familyId} for update`;
+      const [child] = await tx<{ status: string }[]>`
+        select status from public.child_profiles where id = ${childId.data} and family_id = ${familyId}`;
+      if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
+      if (child.status !== 'archived') {
+        await tx`update public.child_slot_assignments set released_at = now(), release_reason = 'archived'
+                  where family_id = ${familyId} and child_id = ${childId.data} and released_at is null`;
+        await tx`update public.child_profiles set status = 'archived', archived_at = now()
+                  where id = ${childId.data} and family_id = ${familyId}`;
+        await tx`update public.child_sessions set revoked_at = now(), revoke_reason = 'child_archived'
+                  where family_id = ${familyId} and child_id = ${childId.data} and revoked_at is null`;
+        await tx`update public.child_devices set revoked_at = now()
+                  where family_id = ${familyId} and child_id = ${childId.data} and revoked_at is null`;
+        await tx`
+          insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id)
+          values (${familyId}, ${parent.userId}, 'parent', 'child.archived', 'child', ${childId.data})`;
+      }
+      return slotSummary(tx, familyId, 'archived');
+    });
+    return c.json({
+      childId: childId.data,
+      ...result,
+      note: 'Your store subscription is unchanged. Change the plan in the store to lower the price.',
+    });
+  });
+
   r.get('/devices', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
@@ -202,4 +282,16 @@ export function familyRoutes(): Hono<AppEnv> {
   });
 
   return r;
+}
+
+async function slotSummary(
+  tx: Tx,
+  familyId: string,
+  status: 'active' | 'archived',
+): Promise<{ status: 'active' | 'archived'; paidSlots: number; assignedSlots: number }> {
+  const [row] = await tx<{ paid_slots: number; open: number }[]>`
+    select coalesce((select paid_slots from public.family_capacity where family_id = ${familyId}), 0)::int as paid_slots,
+           (select count(*)::int from public.child_slot_assignments
+             where family_id = ${familyId} and released_at is null) as open`;
+  return { status, paidSlots: row!.paid_slots, assignedSlots: row!.open };
 }
