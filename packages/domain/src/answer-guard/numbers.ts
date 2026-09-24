@@ -46,8 +46,19 @@ export interface ExtractResult {
   readonly mentions: readonly NumericMention[];
   /** Canonical text with structural list-marker digits replaced by spaces (same offsets). */
   readonly masked: string;
+  /**
+   * Spans of numerals with more than MAX_DIGITS significant digits. They cannot be compared
+   * exactly within the arithmetic bound, so the numeric detector fails closed on them.
+   */
+  readonly overlong: readonly Span[];
 }
 
+interface Span {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** Maximum significant digits of one numeral compared exactly (bounds BigInt work). */
 const MAX_DIGITS = 40;
 
 /**
@@ -64,17 +75,37 @@ interface Literal {
   readonly places: number;
 }
 
-/** Parses an English-style numeric literal ("1,500.25", ".5", "12"). */
-function parseLiteral(raw: string): Literal | null {
+/**
+ * Parses an English-style numeric literal ("1,500.25", ".5", "12").
+ *
+ * Decision (regression RV-answer-guard-1): leading zeros of the integer part and trailing zeros
+ * of the fraction do not change the value, so they are dropped before the digit bound applies;
+ * zero padding ("000...0042", "7.000...0") can no longer push a value past the bound. A numeral
+ * that still has more than MAX_DIGITS significant digits returns 'overlong' so the caller fails
+ * closed instead of silently dropping it.
+ */
+function parseLiteral(raw: string): Literal | 'overlong' | null {
   const cleaned = raw.replace(/,/g, '');
   const m = /^(\d*)(?:\.(\d+))?$/.exec(cleaned);
   if (m === null) return null;
   const intPart = m[1] ?? '';
   const fracPart = m[2] ?? '';
   if (intPart === '' && fracPart === '') return null;
-  if (intPart.length + fracPart.length > MAX_DIGITS) return null;
-  const num = BigInt(`${intPart === '' ? '0' : intPart}${fracPart}`);
-  return { value: rational(num, pow10(fracPart.length)), places: fracPart.length };
+  const intDigits = intPart.replace(/^0+/u, '');
+  const fracDigits = fracPart.replace(/0+$/u, '');
+  const significant = `${intDigits}${fracDigits}`.replace(/^0+/u, '');
+  if (significant.length > MAX_DIGITS) return 'overlong';
+  return {
+    value: rational(BigInt(significant === '' ? '0' : significant), pow10(fracDigits.length)),
+    // Written places (for rounding comparison), capped: beyond the bound only tolerance grows.
+    places: Math.min(fracPart.length, MAX_DIGITS),
+  };
+}
+
+/** parseLiteral for callers that only need an exact value (the overlong case is reported apart). */
+function exactLiteral(raw: string): Literal | null {
+  const lit = parseLiteral(raw);
+  return lit === 'overlong' ? null : lit;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -95,11 +126,38 @@ const MARKER_WORDS: Readonly<Record<string, string>> = {
 const MARKER_RE =
   /^(?:[-*\u2022\u00B7>]\s*)?(?:(step|paso|part|parte|question|pregunta|problem|problema)\s*#?\s*(\d{1,2})\s*(?:[:.)-]|$)|\((\d{1,2})\)|(\d{1,2})([.)])(?=\s|$))/u;
 
+/** Line-start sequencing adverbs: "First, ...", "Third: ...", "Tercero, ...". */
+const ORDINAL_MARKER_RE =
+  /^((?:[-*\u2022\u00B7>]\s*)?)(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|primero|segundo|tercero|cuarto|quinto|sexto|septimo|octavo|noveno|decimo)(?=\s*[,:])/u;
+const SEQUENCE_ORDINALS: Readonly<Record<string, number>> = {
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+  primero: 1,
+  segundo: 2,
+  tercero: 3,
+  cuarto: 4,
+  quinto: 5,
+  sexto: 6,
+  septimo: 7,
+  octavo: 8,
+  noveno: 9,
+  decimo: 10,
+};
+
 /**
- * Decision: a line-start marker ("1.", "1)", "(1)", "Step 1:", "Paso 1:", "Question 1:") is
- * structural only when it continues a sequence: its number is 1, or one more than the previous
- * marker of the same style. A lone "7." or "Step 7:" is therefore still treated as a number, so a
- * list marker cannot be used to smuggle the value. Numbers inside a sentence are never structural.
+ * Decision: a line-start marker ("1.", "1)", "(1)", "Step 1:", "Paso 1:", "Question 1:", and the
+ * sequencing adverbs "First,", "Second,", "Third," ...) is structural only when it continues a
+ * sequence: its number is 1, or one more than the previous marker of the same style. A lone "7.",
+ * "Step 7:" or "Third," is therefore still treated as a number, so a list marker cannot be used
+ * to smuggle the value. Numbers inside a sentence are never structural.
  */
 function maskStructuralMarkers(text: string, state: MarkerState): string {
   const lines = text.split('\n');
@@ -107,7 +165,17 @@ function maskStructuralMarkers(text: string, state: MarkerState): string {
   for (const line of lines) {
     const m = MARKER_RE.exec(line);
     if (m === null) {
-      out.push(line);
+      const o = ORDINAL_MARKER_RE.exec(line);
+      const word = o?.[2];
+      const n = lookup(SEQUENCE_ORDINALS, word);
+      const previous = state.get('ordinal') ?? 0;
+      if (o !== null && word !== undefined && n !== undefined && (n === 1 || n === previous + 1)) {
+        state.set('ordinal', n);
+        const at = (o[1] ?? '').length;
+        out.push(line.slice(0, at) + ' '.repeat(word.length) + line.slice(at + word.length));
+      } else {
+        out.push(line);
+      }
       continue;
     }
     const word = m[1];
@@ -152,14 +220,24 @@ function fractionOf(n: Literal | null, d: Literal | null): Rational | null {
   return divide(n.value, d.value);
 }
 
+/**
+ * \frac and its KaTeX/MathJax/amsmath variants (\dfrac, \tfrac, \cfrac with an optional [l|r]
+ * alignment argument, \sfrac, \nicefrac, \xfrac): all render as the same fraction.
+ */
 const LATEX_FRAC_RE = new RegExp(
-  String.raw`(?<!\d)(?:(\d+)\s*)?\\[dt]?frac\s*(?:\{\s*(${NUM})\s*\}|(\d))\s*(?:\{\s*(${NUM})\s*\}|(\d))`,
+  String.raw`(?<!\d)(?:(\d+)\s*)?\\(?:[dtcs]|nice|x)?frac\s*(?:\[\s*[a-z]\s*\]\s*)?(?:\{\s*(${NUM})\s*\}|(\d))\s*(?:\{\s*(${NUM})\s*\}|(\d))`,
   'gu',
 );
 const OVER_RE = new RegExp(
   String.raw`(?<![\d.])(${NUM})\s*(?:\\over|over|out of|de cada|sobre)\s*(${NUM})(?!\d)`,
   'gu',
 );
+/**
+ * English "a in b" ("a 1 in 2 chance", "3 in 4 marbles"), the counterpart of "a de cada b".
+ * Decision: read only when a <= b, the ratio sense of the idiom; "put 12 in 3 rows" restates a
+ * division problem and is not read as 12/3.
+ */
+const IN_RE = new RegExp(String.raw`(?<![\d.])(${NUM})\s+in\s+(${NUM})(?!\d)`, 'gu');
 const MIXED_RE = /(?<![\d.,/])(\d+)(?:\s+|-|\s+(?:and|y)\s+)(\d+)\s*\/\s*(\d+)(?![\d/])/gu;
 const FRACTION_RE = new RegExp(String.raw`(?<![\d.])(${NUM})\s*\/\s*(${NUM})(?!\d)`, 'gu');
 const PERCENT_RE = new RegExp(
@@ -174,7 +252,7 @@ const EN_THOUSANDS_RE = /(?<![\d.,])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)/gu;
 const ES_THOUSANDS_RE = /(?<![\d.,])(\d{1,3}(?:\.\d{3})+)(?:,(\d+))?(?!\d)/gu;
 const SPACE_THOUSANDS_RE = /(?<![\d.,])(\d{1,3}(?: \d{3})+)(?:[.,](\d+))?(?![\d]| \d)/gu;
 const DECIMAL_COMMA_RE = /(?<![\d.,])(\d+),(\d+)(?!\d|,\d)/gu;
-const DECIMAL_RE = /(?<![\d.])(\d*\.\d+)(?!\d)(\s*(?:\.\.\.|\u2026|repeating\b|periodico\b))?/gu;
+const DECIMAL_RE = /(?<![\d.])(\d*\.\d+)(?!\d)(\s*(?:\.\.\.|…|repeating\b|periodico\b))?/gu;
 const INTEGER_RE = /(?<!\d)(?<!\d\.)\d+(?!\d)(?!\.\d)/gu;
 
 const SCALE_VALUES: Readonly<Record<string, bigint>> = {
@@ -193,7 +271,7 @@ const SCALE_VALUES: Readonly<Record<string, bigint>> = {
 function repeatingReadings(literal: string, out: NumericMention[], start: number, end: number) {
   const fracPart = literal.split('.')[1] ?? '';
   if (fracPart.length === 0 || fracPart.length > 20) return;
-  const base = parseLiteral(literal);
+  const base = exactLiteral(literal);
   if (base === null) return;
   for (let m = 1; m <= Math.min(fracPart.length, 6); m++) {
     const repetend = BigInt(fracPart.slice(-m));
@@ -202,95 +280,112 @@ function repeatingReadings(literal: string, out: NumericMention[], start: number
   }
 }
 
-function extractDigitNotations(t: string, out: NumericMention[]): void {
+function extractDigitNotations(t: string, out: NumericMention[], overlong: Span[]): void {
+  /** parseLiteral that records an over-long numeral's span (fail closed) instead of losing it. */
+  const lit = (raw: string, start: number, end: number): Literal | null => {
+    const parsed = parseLiteral(raw);
+    if (parsed !== 'overlong') return parsed;
+    if (!overlong.some((s) => s.start === start && s.end === end)) overlong.push({ start, end });
+    return null;
+  };
   for (const m of t.matchAll(LATEX_FRAC_RE)) {
+    const end = m.index + m[0].length;
     const whole = m[1];
-    const n = parseLiteral(m[2] ?? m[3] ?? '');
-    const d = parseLiteral(m[4] ?? m[5] ?? '');
+    const n = lit(m[2] ?? m[3] ?? '', m.index, end);
+    const d = lit(m[4] ?? m[5] ?? '', m.index, end);
     const frac = fractionOf(n, d);
     const fracStart = m.index + (whole === undefined ? 0 : m[0].indexOf('\\'));
-    push(out, frac, fracStart, m.index + m[0].length, 'latex');
+    push(out, frac, fracStart, end, 'latex');
     if (whole !== undefined && frac !== null) {
-      const w = parseLiteral(whole);
-      if (w !== null) push(out, add(w.value, frac), m.index, m.index + m[0].length, 'mixed');
+      const w = lit(whole, m.index, end);
+      if (w !== null) push(out, add(w.value, frac), m.index, end, 'mixed');
     }
   }
   for (const m of t.matchAll(OVER_RE)) {
+    const end = m.index + m[0].length;
     push(
       out,
-      fractionOf(parseLiteral(m[1] ?? ''), parseLiteral(m[2] ?? '')),
+      fractionOf(lit(m[1] ?? '', m.index, end), lit(m[2] ?? '', m.index, end)),
       m.index,
-      m.index + m[0].length,
+      end,
       'over',
     );
   }
+  for (const m of t.matchAll(IN_RE)) {
+    const end = m.index + m[0].length;
+    const n = lit(m[1] ?? '', m.index, end);
+    const d = lit(m[2] ?? '', m.index, end);
+    if (n === null || d === null || n.value.num * d.value.den > d.value.num * n.value.den) continue;
+    push(out, fractionOf(n, d), m.index, end, 'over');
+  }
   for (const m of t.matchAll(MIXED_RE)) {
-    const w = parseLiteral(m[1] ?? '');
-    const frac = fractionOf(parseLiteral(m[2] ?? ''), parseLiteral(m[3] ?? ''));
-    if (w !== null && frac !== null) {
-      push(out, add(w.value, frac), m.index, m.index + m[0].length, 'mixed');
-    }
+    const end = m.index + m[0].length;
+    const w = lit(m[1] ?? '', m.index, end);
+    const frac = fractionOf(lit(m[2] ?? '', m.index, end), lit(m[3] ?? '', m.index, end));
+    if (w !== null && frac !== null) push(out, add(w.value, frac), m.index, end, 'mixed');
   }
   for (const m of t.matchAll(FRACTION_RE)) {
+    const end = m.index + m[0].length;
     push(
       out,
-      fractionOf(parseLiteral(m[1] ?? ''), parseLiteral(m[2] ?? '')),
+      fractionOf(lit(m[1] ?? '', m.index, end), lit(m[2] ?? '', m.index, end)),
       m.index,
-      m.index + m[0].length,
+      end,
       'fraction',
     );
   }
   for (const m of t.matchAll(PERCENT_RE)) {
-    const lit = parseLiteral(m[1] ?? '');
-    if (lit === null) continue;
-    push(
-      out,
-      divide(lit.value, rational(100n)),
-      m.index,
-      m.index + m[0].length,
-      'percent',
-      lit.places + 2,
-    );
+    const end = m.index + m[0].length;
+    const value = lit(m[1] ?? '', m.index, end);
+    if (value === null) continue;
+    push(out, divide(value.value, rational(100n)), m.index, end, 'percent', value.places + 2);
   }
   for (const m of t.matchAll(SCALE_RE)) {
-    const lit = parseLiteral(m[1] ?? '');
+    const end = m.index + m[0].length;
+    const value = lit(m[1] ?? '', m.index, end);
     const scale = lookup(SCALE_VALUES, m[2]);
-    if (lit === null || scale === undefined) continue;
-    push(out, multiply(lit.value, rational(scale)), m.index, m.index + m[0].length, 'scaled');
+    if (value === null || scale === undefined) continue;
+    push(out, multiply(value.value, rational(scale)), m.index, end, 'scaled');
   }
   for (const m of t.matchAll(EN_THOUSANDS_RE)) {
-    const lit = parseLiteral(m[0]);
-    if (lit !== null) push(out, lit.value, m.index, m.index + m[0].length, 'thousands', lit.places);
+    const end = m.index + m[0].length;
+    const value = lit(m[0], m.index, end);
+    if (value !== null) push(out, value.value, m.index, end, 'thousands', value.places);
   }
   for (const m of t.matchAll(ES_THOUSANDS_RE)) {
-    const lit = parseLiteral(
+    const end = m.index + m[0].length;
+    const value = lit(
       `${(m[1] ?? '').replace(/\./g, '')}${m[2] === undefined ? '' : `.${m[2]}`}`,
+      m.index,
+      end,
     );
-    if (lit !== null)
-      push(out, lit.value, m.index, m.index + m[0].length, 'alt_locale', lit.places);
+    if (value !== null) push(out, value.value, m.index, end, 'alt_locale', value.places);
   }
   for (const m of t.matchAll(SPACE_THOUSANDS_RE)) {
-    const lit = parseLiteral(
+    const end = m.index + m[0].length;
+    const value = lit(
       `${(m[1] ?? '').replace(/ /g, '')}${m[2] === undefined ? '' : `.${m[2]}`}`,
+      m.index,
+      end,
     );
-    if (lit !== null)
-      push(out, lit.value, m.index, m.index + m[0].length, 'alt_locale', lit.places);
+    if (value !== null) push(out, value.value, m.index, end, 'alt_locale', value.places);
   }
   for (const m of t.matchAll(DECIMAL_COMMA_RE)) {
-    const lit = parseLiteral(`${m[1] ?? ''}.${m[2] ?? ''}`);
-    if (lit !== null)
-      push(out, lit.value, m.index, m.index + m[0].length, 'alt_locale', lit.places);
+    const end = m.index + m[0].length;
+    const value = lit(`${m[1] ?? ''}.${m[2] ?? ''}`, m.index, end);
+    if (value !== null) push(out, value.value, m.index, end, 'alt_locale', value.places);
   }
   for (const m of t.matchAll(DECIMAL_RE)) {
     const literal = m[1] ?? '';
-    const lit = parseLiteral(literal);
     const end = m.index + literal.length;
-    if (lit !== null) push(out, lit.value, m.index, end, 'decimal', lit.places);
+    const value = lit(literal, m.index, end);
+    if (value !== null) push(out, value.value, m.index, end, 'decimal', value.places);
     if (m[2] !== undefined) repeatingReadings(literal, out, m.index, m.index + m[0].length);
   }
   for (const m of t.matchAll(INTEGER_RE)) {
-    const lit = parseLiteral(m[0]);
-    if (lit !== null) push(out, lit.value, m.index, m.index + m[0].length, 'integer', 0);
+    const end = m.index + m[0].length;
+    const value = lit(m[0], m.index, end);
+    if (value !== null) push(out, value.value, m.index, end, 'integer', 0);
   }
 }
 
@@ -478,6 +573,23 @@ const DENOMINATORS: Readonly<Record<string, number>> = {
   centesimos: 100,
   milesimo: 1000,
   milesimos: 1000,
+  // Spanish feminine forms, as in "tres cuartas partes", "una tercera parte"
+  tercera: 3,
+  terceras: 3,
+  cuarta: 4,
+  cuartas: 4,
+  quinta: 5,
+  quintas: 5,
+  sexta: 6,
+  sextas: 6,
+  septima: 7,
+  septimas: 7,
+  octava: 8,
+  octavas: 8,
+  novena: 9,
+  novenas: 9,
+  decima: 10,
+  decimas: 10,
 };
 /** Unit ordinals usable after a tens word ("twenty-fifths"). */
 const UNIT_ORDINALS: Readonly<Record<string, number>> = {
@@ -495,6 +607,76 @@ const UNIT_ORDINALS: Readonly<Record<string, number>> = {
   eighths: 8,
   ninth: 9,
   ninths: 9,
+};
+/**
+ * Ordinal words read as their value, like "5th" (regression RV-answer-guard-15): "Sam finished
+ * fifth" discloses 5. Plurals ("fifths") are fraction units and are not listed.
+ *
+ * Decision: bare "first"/"second" (and "primero"/"segundo") are not read; in method hints they
+ * are sequencing and time words ("First, line up the digits", "wait a second"), comparable to
+ * structural list markers. Spanish "cuarto" is also a room, so only feminine "cuarta" is read.
+ * Documented limitation: "Sam came first" is not read as 1. Compound ordinals ("twenty-first")
+ * are always read.
+ */
+const ORDINAL_VALUES: Readonly<Record<string, number>> = {
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+  eleventh: 11,
+  twelfth: 12,
+  thirteenth: 13,
+  fourteenth: 14,
+  fifteenth: 15,
+  sixteenth: 16,
+  seventeenth: 17,
+  eighteenth: 18,
+  nineteenth: 19,
+  twentieth: 20,
+  thirtieth: 30,
+  fortieth: 40,
+  fiftieth: 50,
+  sixtieth: 60,
+  seventieth: 70,
+  eightieth: 80,
+  ninetieth: 90,
+  hundredth: 100,
+  thousandth: 1000,
+  millionth: 1_000_000,
+  tercer: 3,
+  tercero: 3,
+  tercera: 3,
+  cuarta: 4,
+  quinto: 5,
+  quinta: 5,
+  sexto: 6,
+  sexta: 6,
+  septimo: 7,
+  septima: 7,
+  setimo: 7,
+  setima: 7,
+  octavo: 8,
+  octava: 8,
+  noveno: 9,
+  novena: 9,
+  decimo: 10,
+  decima: 10,
+};
+/** Unit ordinals after a tens word ("twenty-first" .. "ninety-ninth"). */
+const COMPOUND_UNIT_ORDINALS: Readonly<Record<string, number>> = {
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
 };
 const ONE_ARTICLES = new Set(['a', 'an', 'un', 'una']);
 const DIGIT_WORDS: Readonly<Record<string, string>> = {
@@ -745,8 +927,34 @@ class WordNumberParser {
     return { digits: two.value.num.toString(), next: two.next };
   }
 
-  /** Longest number phrase starting at token i, plus component readings. */
+  /** Ordinal word at token i ("fifth", "twenty-first", "quinto"). */
+  private ordinal(i: number): Parsed | null {
+    const word = this.first(i);
+    const tens = lookup(EN_TENS, word);
+    if (tens !== undefined) {
+      const unit = lookup(COMPOUND_UNIT_ORDINALS, this.at(i + 1));
+      return unit === undefined ? null : { value: rational(BigInt(tens + unit)), next: i + 2 };
+    }
+    const value = lookup(ORDINAL_VALUES, word);
+    if (value === undefined) return null;
+    // Spanish "la cuarta parte" is the fraction 1/4, not the position 4.
+    const part = this.at(i + 1);
+    if (part === 'parte' || part === 'partes') {
+      return { value: rational(1n, BigInt(value)), next: i + 2 };
+    }
+    return { value: rational(BigInt(value)), next: i + 1 };
+  }
+
+  /** Longest number phrase starting at token i, plus component and ordinal readings. */
   phraseAt(i: number): { readings: Parsed[]; next: number } | null {
+    const core = this.phraseCore(i);
+    const ordinal = this.ordinal(i);
+    if (ordinal === null) return core;
+    if (core === null) return { readings: [ordinal], next: ordinal.next };
+    return { readings: [...core.readings, ordinal], next: Math.max(core.next, ordinal.next) };
+  }
+
+  private phraseCore(i: number): { readings: Parsed[]; next: number } | null {
     const word = this.first(i);
     if (word === undefined) return null;
     const tok = this.toks[i];
@@ -791,8 +999,9 @@ class WordNumberParser {
       if (frac !== null)
         readings.push({ value: add(numerator.value, frac.value), next: frac.next });
     }
-    // "three over four", "three out of four"
-    const overAt = next === 'over' || next === 'sobre' ? numerator.next + 1 : null;
+    // "three over four", "three out of four", "one in two" (ratio sense only: a <= b)
+    const ratioOnly = next === 'in';
+    const overAt = next === 'over' || next === 'sobre' || ratioOnly ? numerator.next + 1 : null;
     const outOfAt =
       (next === 'out' && this.at(numerator.next + 1) === 'of') ||
       (next === 'de' && this.at(numerator.next + 1) === 'cada')
@@ -806,7 +1015,8 @@ class WordNumberParser {
           : this.cardinal(denomStart);
       if (den !== null) {
         const v = divide(numerator.value, den.value);
-        if (v !== null) readings.push({ value: v, next: den.next });
+        if (v !== null && (!ratioOnly || v.num <= v.den))
+          readings.push({ value: v, next: den.next });
       }
     }
     // "two point five", "dos punto cinco", "cero coma cinco"
@@ -924,8 +1134,12 @@ function extractPlaceValues(
 function extractWordNumbers(t: string, out: NumericMention[]): void {
   const toks: Token[] = [];
   for (const m of t.matchAll(/[a-z]+|\d+/gu)) {
-    if (m[0].length > MAX_DIGITS) continue;
-    toks.push({ text: m[0], start: m.index, end: m.index + m[0].length, digit: /^\d/u.test(m[0]) });
+    const digit = /^\d/u.test(m[0]);
+    // Leading zeros never change a digit token's value; over-long digit runs are reported by
+    // the digit pass (fail closed), so they are skipped here.
+    const text = digit ? m[0].replace(/^0+(?=\d)/u, '') : m[0];
+    if (text.length > MAX_DIGITS) continue;
+    toks.push({ text, start: m.index, end: m.index + m[0].length, digit });
   }
   const parser = new WordNumberParser(toks, t, SPANISH_MARKER_RE.test(t));
   let i = 0;
@@ -958,9 +1172,10 @@ export function extractNumericMentionsDetailed(
       ? canonicalText
       : maskStructuralMarkers(canonicalText, options.markerState ?? new Map<string, number>());
   const out: NumericMention[] = [];
-  extractDigitNotations(masked, out);
+  const overlong: Span[] = [];
+  extractDigitNotations(masked, out, overlong);
   extractWordNumbers(masked, out);
-  return { mentions: out, masked };
+  return { mentions: out, masked, overlong };
 }
 
 /** Every numeric mention in canonical lowercase text, as exact rationals. */

@@ -161,6 +161,42 @@ const DASH_RE = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/gu;
 const LINE_BREAK_RE = /\r\n?|[\u2028\u2029\u0085\v\f]/gu;
 const HORIZONTAL_SPACE_RE = /[^\S\n]+/gu;
 
+const NON_ASCII_DIGIT_RE = /(?![0-9])\p{Nd}/gu;
+const DECIMAL_DIGIT_RE = /^\p{Nd}$/u;
+
+/**
+ * ASCII value of a decimal digit from any script ("\u0664" Arabic-Indic, "\u096a" Devanagari).
+ * NFKC folds fullwidth and mathematical digits but not these (regression RV-answer-guard-11).
+ * Every Unicode \p{Nd} run is a whole number of consecutive 0..9 sequences (verified for all 72
+ * runs), so the value is the distance from the start of the run, modulo 10. No table needed.
+ */
+function asciiDigit(c: string): string {
+  let cp = c.codePointAt(0) ?? 0;
+  let offset = 0;
+  while (offset < 100 && DECIMAL_DIGIT_RE.test(String.fromCodePoint(cp - 1))) {
+    cp -= 1;
+    offset += 1;
+  }
+  return String(offset % 10);
+}
+
+/**
+ * Rendered-math digit grouping (regression RV-answer-guard-3): "1{,}500" and "4{,}2" render as
+ * "1,500" and "4,2"; "1\,500" (thin space) renders as "1 500". Applied until stable so nested
+ * braces cannot hide the separator.
+ */
+const LATEX_GROUPING_RE = /\{\s*([,.])\s*\}/gu;
+const LATEX_DIGIT_SPACE_RE = /(?<=\d)[ \t]*\\[,;:! ][ \t]*(?=\d)/gu;
+
+function replaceUntilStable(input: string, re: RegExp, replacement: string): string {
+  let current = input;
+  for (;;) {
+    const next = current.replace(re, replacement);
+    if (next === current) return next;
+    current = next;
+  }
+}
+
 function singlePass(input: string): string {
   let s = input.replace(SCRIPT_FRACTION_RE, (_m, n: string, d: string) => {
     return ` ${scriptDigits(n, SUPERSCRIPT_DIGITS)}/${scriptDigits(d, SUBSCRIPT_DIGITS)} `;
@@ -171,6 +207,9 @@ function singlePass(input: string): string {
   );
   s = s.normalize('NFKC');
   s = s.replace(INVISIBLE_RE, '');
+  s = s.replace(NON_ASCII_DIGIT_RE, asciiDigit);
+  s = replaceUntilStable(s, LATEX_GROUPING_RE, '$1');
+  s = s.replace(LATEX_DIGIT_SPACE_RE, ' ');
   s = s.normalize('NFD').replace(COMBINING_MARK_RE, '').normalize('NFC');
   s = s.replace(FRACTION_SLASH_RE, '/').replace(DASH_RE, '-');
   s = s.replace(HOMOGLYPH_RE, (c) => (Object.hasOwn(HOMOGLYPHS, c) ? (HOMOGLYPHS[c] ?? c) : c));

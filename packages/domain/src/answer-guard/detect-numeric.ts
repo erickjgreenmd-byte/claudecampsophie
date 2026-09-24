@@ -44,8 +44,18 @@ export function detectNumeric(
   markerState: MarkerState,
 ): RawFinding[] {
   if (!answers.some((a) => a.numeric.length > 0)) return [];
-  const { mentions, masked } = extractNumericMentionsDetailed(view.lower, { markerState });
-  const findings: RawFinding[] = [];
+  const { mentions, masked, overlong } = extractNumericMentionsDetailed(view.lower, {
+    markerState,
+  });
+  // Decision (regression RV-answer-guard-1): a numeral too long to compare exactly is a
+  // fail-closed finding, never a silent pass.
+  const findings: RawFinding[] = overlong.map((span) => ({
+    detector: 'fail_closed',
+    answerIndex: null,
+    technique: 'numeral_too_long',
+    start: span.start,
+    end: span.end,
+  }));
   for (const answer of answers) {
     for (const target of answer.numeric) {
       for (const mention of mentions) {

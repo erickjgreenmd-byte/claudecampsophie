@@ -5,10 +5,17 @@
 // - Semantic paraphrase ("the number of legs on a spider" for 8), riddles, rhymes, hints that let
 //   the child infer the value, and arithmetic expressions that evaluate to it ("6 x 7") are NOT
 //   detected; expressions are never evaluated (numbers are data, never code).
-// - Translation beyond English/Spanish number words (e.g. French, "aprender" for "learn") is not
-//   detected; Spanish number words above 100 other than "ciento"/"mil" are not read.
+// - Translation beyond English/Spanish number words (e.g. French, CJK numerals, "aprender" for
+//   "learn") is not detected; Spanish number words above 100 other than "ciento"/"mil" are not
+//   read. Decimal digits of every script are read (canonicalize maps them to ASCII).
 // - Unit conversions ("120 mm" for 12 cm), Roman numerals, ratios written "3:4", scientific
-//   notation and repeating-decimal overlines are not read.
+//   notation and repeating-decimal overlines are not read. "a in b" is read only when a <= b.
+// - Bare "first"/"second" ("primero"/"segundo") are sequencing/time words and are not read as
+//   1/2; other ordinals are ("fifth" -> 5). Numerals with more than 40 significant digits are
+//   not compared; they fail closed when a numeric answer is protected.
+// - Encoded bytes that are not clean text are recovered only within bounds (at most 1/4 junk
+//   bytes, a 4-character clean run; word-shaped base64 tokens only when clean); heavier padding
+//   is not decoded.
 // - Letters that are not in the homoglyph table, leetspeak beyond the basic substitutions,
 //   repeated letters ("leeearn"), last-letter acrostics and cross-field splits other than the
 //   joined-packet scan are not detected.

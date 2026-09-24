@@ -49,20 +49,19 @@ function ownString(source: object, field: string): unknown {
 }
 
 /**
- * Numeric readings that cover the answer: mentions not strictly contained in a longer mention,
- * preferring the English reading when a locale-ambiguous reading has the same span.
+ * Numeric readings that cover the answer: mentions not strictly contained in a longer mention.
+ *
+ * Decision (regression RV-answer-guard-4): every reading of the full span is protected,
+ * including locale-ambiguous ones. A key written "1.500" protects 1500 (Spanish thousands) and
+ * 1.5; "1,500" protects 1500 and 1.5 (Spanish decimal comma). The key's locale is unknown, so
+ * both readings are withheld, the same fail-closed rule applied to child text.
  */
 function maximalMentions(mentions: readonly NumericMention[]): NumericMention[] {
-  const maximal = mentions.filter(
+  return mentions.filter(
     (m) =>
       !mentions.some(
         (o) => o.start <= m.start && o.end >= m.end && o.end - o.start > m.end - m.start,
       ),
-  );
-  return maximal.filter(
-    (m) =>
-      m.reading !== 'alt_locale' ||
-      !maximal.some((o) => o.start === m.start && o.end === m.end && o.reading !== 'alt_locale'),
   );
 }
 

@@ -19,8 +19,12 @@ const BEFORE = `(?<![${WORD_CHARS}])`;
 const AFTER = `(?![${WORD_CHARS}])`;
 /** 1-6 non-word characters between single letters: "l-e-a-r-n", "**l**-**e**", newlines. */
 const LETTER_SEPARATOR = `[^${WORD_CHARS}]{1,6}`;
-/** Between the words of a phrase. */
-const WORD_SEPARATOR = `[^${WORD_CHARS}]{1,16}`;
+/**
+ * Between the words of a phrase. Zero characters are allowed (regression RV-answer-guard-16): a
+ * target's words written together still spell it, e.g. "dont" for "don't", "icecream" for "ice
+ * cream". Consequence (accepted, fail closed): "its" matches the target "it's".
+ */
+const WORD_SEPARATOR = `[^${WORD_CHARS}]{0,16}`;
 
 /** Minimum target length (letters) for each letter-level technique; see the Decision below. */
 const MIN_SEPARATED = 3;

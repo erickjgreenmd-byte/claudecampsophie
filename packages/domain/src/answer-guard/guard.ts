@@ -3,7 +3,7 @@
 // output"; P12 "validate role-safe payloads and output leakage; fail closed").
 
 import { normalizeProtectedAnswers } from './answers.ts';
-import { scanChildPacket, scanForbiddenFields } from './packet.ts';
+import { scanChildPacketDetailed } from './packet.ts';
 import { scanForLeaks } from './scan.ts';
 import type {
   GuardDecision,
@@ -22,6 +22,7 @@ const LIMIT_TECHNIQUES = new Set([
   'decode_budget_exceeded',
   'encoding_depth_exceeded',
   'findings_limit',
+  'numeral_too_long',
 ]);
 const UNSUPPORTED_TECHNIQUES = new Set([
   'cycle',
@@ -69,10 +70,12 @@ export function guardChildContent(input: GuardInput): GuardDecision {
     if (normalized.value.length === 0 && input.allowNoProtectedAnswers !== true) {
       reasons.push(reason('NO_PROTECTED_ANSWERS', '$', 'no protected answers supplied'));
     }
-    for (const path of scanForbiddenFields(input.packet, options).forbidden) {
+    // One walk yields both the leak findings and the forbidden-key paths, so both use the same
+    // path redaction and no reason repeats a key that carries the answer (RV-answer-guard-13).
+    const scan = scanChildPacketDetailed(input.packet, input.answers, options);
+    for (const path of scan.forbidden) {
       reasons.push(reason('FORBIDDEN_FIELD', path, 'forbidden key'));
     }
-    const scan = scanChildPacket(input.packet, input.answers, options);
     for (const f of scan.findings) {
       const via = f.via.length > 0 ? ` via ${f.via.join('>')}` : '';
       reasons.push(

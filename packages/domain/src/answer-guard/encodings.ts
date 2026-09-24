@@ -61,66 +61,191 @@ export function encodeUtf8(text: string): Uint8Array {
   return Uint8Array.from(bytes);
 }
 
-/** Strict UTF-8 decoding (no overlongs, surrogates or truncation); null on any error. */
-export function decodeUtf8Strict(bytes: Uint8Array): string | null {
-  let out = '';
-  let i = 0;
+/** One UTF-8 code point at `i` (no overlongs, surrogates or truncation), or null if invalid. */
+function decodeUtf8At(bytes: Uint8Array, i: number): { cp: number; length: number } | null {
   const cont = (k: number): number | null => {
     const b = bytes[k];
     return b !== undefined && (b & 0xc0) === 0x80 ? b & 0x3f : null;
   };
+  const b0 = bytes[i] ?? 0;
+  if (b0 < 0x80) return { cp: b0, length: 1 };
+  if (b0 >= 0xc2 && b0 <= 0xdf) {
+    const c1 = cont(i + 1);
+    return c1 === null ? null : { cp: ((b0 & 0x1f) << 6) | c1, length: 2 };
+  }
+  if (b0 >= 0xe0 && b0 <= 0xef) {
+    const c1 = cont(i + 1);
+    const c2 = cont(i + 2);
+    if (c1 === null || c2 === null) return null;
+    const cp = ((b0 & 0x0f) << 12) | (c1 << 6) | c2;
+    return cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff) ? null : { cp, length: 3 };
+  }
+  if (b0 >= 0xf0 && b0 <= 0xf4) {
+    const c1 = cont(i + 1);
+    const c2 = cont(i + 2);
+    const c3 = cont(i + 3);
+    if (c1 === null || c2 === null || c3 === null) return null;
+    const cp = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+    return cp < 0x10000 || cp > 0x10ffff ? null : { cp, length: 4 };
+  }
+  return null;
+}
+
+/** Strict UTF-8 decoding (no overlongs, surrogates or truncation); null on any error. */
+export function decodeUtf8Strict(bytes: Uint8Array): string | null {
+  let out = '';
+  let i = 0;
   while (i < bytes.length) {
-    const b0 = bytes[i] ?? 0;
-    let cp: number;
-    if (b0 < 0x80) {
-      cp = b0;
-      i += 1;
-    } else if (b0 >= 0xc2 && b0 <= 0xdf) {
-      const c1 = cont(i + 1);
-      if (c1 === null) return null;
-      cp = ((b0 & 0x1f) << 6) | c1;
-      i += 2;
-    } else if (b0 >= 0xe0 && b0 <= 0xef) {
-      const c1 = cont(i + 1);
-      const c2 = cont(i + 2);
-      if (c1 === null || c2 === null) return null;
-      cp = ((b0 & 0x0f) << 12) | (c1 << 6) | c2;
-      if (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff)) return null;
-      i += 3;
-    } else if (b0 >= 0xf0 && b0 <= 0xf4) {
-      const c1 = cont(i + 1);
-      const c2 = cont(i + 2);
-      const c3 = cont(i + 3);
-      if (c1 === null || c2 === null || c3 === null) return null;
-      cp = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
-      if (cp < 0x10000 || cp > 0x10ffff) return null;
-      i += 4;
-    } else {
-      return null;
-    }
-    out += String.fromCodePoint(cp);
+    const next = decodeUtf8At(bytes, i);
+    if (next === null) return null;
+    out += String.fromCodePoint(next.cp);
+    i += next.length;
   }
   return out;
 }
 
 /** C0/C1 controls (except tab, LF, CR) or U+FFFD mean the bytes were not text. */
+function isControl(cp: number): boolean {
+  return (
+    (cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) ||
+    (cp >= 0x7f && cp <= 0x9f) ||
+    cp === 0xfffd
+  );
+}
+
 function hasControl(text: string): boolean {
-  for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0;
-    if ((cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) || (cp >= 0x7f && cp <= 0x9f)) {
-      return true;
-    }
-    if (cp === 0xfffd) return true;
-  }
+  for (const ch of text) if (isControl(ch.codePointAt(0) ?? 0)) return true;
   return false;
 }
 
-/** Decoded bytes count as text only if valid UTF-8, free of control characters, and wordy. */
-function asText(bytes: Uint8Array | null): string | null {
+/** Text recovered from bytes that are not clean text, with the non-text bytes counted. */
+interface RecoveredText {
+  readonly text: string;
+  /** Bytes dropped: invalid sequences, controls, lone surrogates. */
+  readonly junkBytes: number;
+  /** Longest run of kept characters with no dropped byte inside it. */
+  readonly longestRun: number;
+}
+
+class TextCollector {
+  private text = '';
+  private junk = 0;
+  private run = 0;
+  private longest = 0;
+
+  keep(cp: number, byteLength: number): void {
+    if (isControl(cp)) {
+      this.drop(byteLength);
+      return;
+    }
+    this.text += String.fromCodePoint(cp);
+    this.run += 1;
+    this.longest = Math.max(this.longest, this.run);
+  }
+
+  drop(byteLength: number): void {
+    this.junk += byteLength;
+    this.run = 0;
+  }
+
+  result(): RecoveredText {
+    return { text: this.text, junkBytes: this.junk, longestRun: this.longest };
+  }
+}
+
+/** UTF-8 with every invalid byte and control character dropped (and counted). */
+function decodeUtf8Lenient(bytes: Uint8Array): RecoveredText {
+  const out = new TextCollector();
+  let i = 0;
+  while (i < bytes.length) {
+    const next = decodeUtf8At(bytes, i);
+    if (next === null) {
+      out.drop(1);
+      i += 1;
+    } else {
+      out.keep(next.cp, next.length);
+      i += next.length;
+    }
+  }
+  return out.result();
+}
+
+/**
+ * UTF-16 (LE or BE), only when the bytes look like UTF-16 text in a supported language: at least
+ * 3/4 of the code units in the Latin-1 range. Random bytes almost never pass that (1/256 per
+ * unit), so ordinary words that happen to be valid base64 are not read as CJK text.
+ */
+function decodeUtf16(bytes: Uint8Array, littleEndian: boolean): RecoveredText | null {
+  if (bytes.length < 4 || bytes.length % 2 !== 0) return null;
+  const units: number[] = [];
+  for (let i = 0; i + 1 < bytes.length; i += 2) {
+    const a = bytes[i] ?? 0;
+    const b = bytes[i + 1] ?? 0;
+    units.push(littleEndian ? a | (b << 8) : (a << 8) | b);
+  }
+  if (units.filter((u) => u < 0x100).length * 4 < units.length * 3) return null;
+  const out = new TextCollector();
+  for (let k = 0; k < units.length; k++) {
+    const u = units[k] ?? 0;
+    const low = units[k + 1] ?? 0;
+    if (u >= 0xd800 && u <= 0xdbff && low >= 0xdc00 && low <= 0xdfff) {
+      out.keep(0x10000 + ((u - 0xd800) << 10) + (low - 0xdc00), 4);
+      k += 1;
+    } else if (u >= 0xd800 && u <= 0xdfff) {
+      out.drop(2);
+    } else {
+      out.keep(u, 2);
+    }
+  }
+  return out.result();
+}
+
+const WORDY_RE = /[\p{L}\p{N}]/u;
+/** Minimum kept run for recovered (non-clean) text: "learn", "is 42" pass; noise rarely does. */
+const MIN_RECOVERED_RUN = 4;
+
+/**
+ * How much non-text a decoded candidate may contain: 'strict' (clean text only), 'recover'
+ * (bounded recovery, see asText) or 'explicit' (percent-escapes are never accidental, so any
+ * recoverable text is scanned).
+ */
+type DecodePolicy = 'strict' | 'recover' | 'explicit';
+
+/**
+ * Tokens shaped like ordinary words ("Migrations", "passthrough", "forward-only",
+ * "billed/estimated", "NASA") are valid base64 by accident and decode to random bytes; they get
+ * strict decoding only. Measured on the project's own prose (1 523 sentences): without this,
+ * bounded recovery of such words added spurious digit and letter findings; with it, none.
+ */
+const NATURAL_WORD_RE = /^(?:[A-Z]?[a-z]+|[A-Z]+)(?:[-_/+](?:[A-Z]?[a-z]+|[A-Z]+))*$/u;
+
+/**
+ * Decoded bytes as text for re-scanning.
+ *
+ * Clean text (strict UTF-8, no controls) is always used. Decision (regression
+ * RV-answer-guard-2): otherwise the bytes are not discarded. Invalid bytes and control characters
+ * are dropped and the rest is re-scanned, via UTF-8 or UTF-16, when it is still plausibly text:
+ * at most 1/4 of the bytes dropped and a run of at least MIN_RECOVERED_RUN kept characters. So
+ * one appended 0xFF, a NUL terminator or UTF-16 encoding no longer hides the answer, while
+ * ordinary words that happen to decode to random bytes stay ignored. Documented limitation:
+ * payloads padded with more junk than that are not recovered.
+ */
+function asText(bytes: Uint8Array | null, policy: DecodePolicy): string | null {
   if (bytes === null || bytes.length < 2) return null;
-  const text = decodeUtf8Strict(bytes);
-  if (text === null || hasControl(text) || !/[\p{L}\p{N}]/u.test(text)) return null;
-  return text;
+  const strict = decodeUtf8Strict(bytes);
+  if (strict !== null && !hasControl(strict)) return WORDY_RE.test(strict) ? strict : null;
+  if (policy === 'strict') return null;
+  const explicit = policy === 'explicit';
+  const recovered = [
+    decodeUtf8Lenient(bytes),
+    decodeUtf16(bytes, true),
+    decodeUtf16(bytes, false),
+  ].filter((r): r is RecoveredText => r !== null && WORDY_RE.test(r.text));
+  recovered.sort((a, b) => a.junkBytes - b.junkBytes);
+  const best = recovered.find(
+    (r) => explicit || (r.junkBytes * 4 <= bytes.length && r.longestRun >= MIN_RECOVERED_RUN),
+  );
+  return best === undefined ? null : best.text;
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -167,7 +292,8 @@ const PERCENT_RE =
 export function findEncodedSpans(view: TextView): DecodedCandidate[] {
   const out: DecodedCandidate[] = [];
   for (const m of view.text.matchAll(BASE64_RE)) {
-    const decoded = asText(decodeBase64(m[0]));
+    const policy: DecodePolicy = NATURAL_WORD_RE.test(m[0]) ? 'strict' : 'recover';
+    const decoded = asText(decodeBase64(m[0]), policy);
     if (decoded !== null) {
       out.push({
         kind: 'base64',
@@ -179,7 +305,7 @@ export function findEncodedSpans(view: TextView): DecodedCandidate[] {
     }
   }
   for (const m of view.lower.matchAll(HEX_RE)) {
-    const decoded = asText(hexToBytes(m[1] ?? ''));
+    const decoded = asText(hexToBytes(m[1] ?? ''), 'recover');
     if (decoded !== null) {
       out.push({
         kind: 'hex',
@@ -192,7 +318,7 @@ export function findEncodedSpans(view: TextView): DecodedCandidate[] {
   }
   for (const m of view.lower.matchAll(HEX_BYTES_RE)) {
     const hex = m[0].replace(/\\x|0x|[\s:,-]/gu, '');
-    const decoded = asText(hexToBytes(hex));
+    const decoded = asText(hexToBytes(hex), 'recover');
     if (decoded !== null) {
       out.push({
         kind: 'hex',
@@ -205,7 +331,7 @@ export function findEncodedSpans(view: TextView): DecodedCandidate[] {
   }
   if (!view.lower.includes('%')) return out;
   for (const m of view.lower.matchAll(PERCENT_RE)) {
-    const decoded = asText(percentToBytes(m[0]));
+    const decoded = asText(percentToBytes(m[0]), 'explicit');
     if (decoded !== null && decoded !== m[0]) {
       out.push({
         kind: 'percent',

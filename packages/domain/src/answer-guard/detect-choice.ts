@@ -16,9 +16,17 @@ const CONJUNCTION_LETTERS = new Set(['e', 'o', 'u', 'y']);
 
 const CUE_NOUNS = String.raw`(?:answer|answer['\u2019]s|respuesta|option|choice|opcion|letter|letra|inciso)`;
 const CUE_ADJECTIVES = String.raw`(?:correct[ao]?|right|best|final|buena)`;
-const CUE_VERBS = String.raw`(?:is|was|would\s+be|will\s+be|should\s+be|must\s+be|es|seria|sera)`;
-/** "the correct choice is", "la opcion correcta es", "answer:", "pick", "it's", "definitely". */
-const CUE = String.raw`(?:(?:(?:the|la|el)\s+)?(?:${CUE_ADJECTIVES}\s+)?${CUE_NOUNS}(?:\s+${CUE_ADJECTIVES})?(?:\s+${CUE_VERBS})?|pick|select|choose|circle|mark|go\s+with|it['\u2019]s|it\s+is|definitely|probably|elige|escoge|selecciona|marca)`;
+/** Spanish modal "ser" forms; Spanish drops the subject, so they also cue on their own. */
+const ES_MODAL_SER = String.raw`(?:debe|deberia|tiene\s+que|tendria\s+que)\s+ser`;
+/** Modal "be" forms: "must be", "would be", "has to be", "debe ser", "tiene que ser". */
+const MODAL_BE = String.raw`(?:(?:would|will|should|must|could|might|has\s+to|had\s+to|has\s+got\s+to)\s+be|${ES_MODAL_SER})`;
+const CUE_VERBS = String.raw`(?:is|was|${MODAL_BE}|es|seria|sera)`;
+/**
+ * "the correct choice is", "la opcion correcta es", "answer:", "correct: B", "pick", "it's",
+ * "it must be", "definitely". A bare adjective ("Correct:", "Right =") counts only before a
+ * colon, equals sign or dash, the answer-key label form (regression RV-answer-guard-5).
+ */
+const CUE = String.raw`(?:(?:(?:the|la|el)\s+)?(?:${CUE_ADJECTIVES}\s+)?${CUE_NOUNS}(?:\s+${CUE_ADJECTIVES})?(?:\s+${CUE_VERBS})?|${CUE_ADJECTIVES}(?=\s*[:=-])|pick|select|choose|circle|mark|go\s+with|it['\u2019]s|it\s+(?:is|was|${MODAL_BE})|${ES_MODAL_SER}|definitely|probably|elige|escoge|selecciona|marca)`;
 const OPEN = String.raw`["'\u201C\u2018(\[*_]*`;
 const CLOSE = String.raw`["'\u201D\u2019)\]*_]*`;
 const TERMINATOR_RE = /^[ \t]*(?:[.,;:!?)\]"'\u201D\u2019\n]|$)/u;
@@ -110,7 +118,7 @@ function patternsFor(letter: string): ChoicePatterns {
     bracketed: new RegExp(String.raw`(?<![\p{L}\p{N}])[(\[]\s*${L}\s*[)\]]`, 'giu'),
     closeParen: new RegExp(String.raw`(?<![\p{L}\p{N}(\[])${L}\)`, 'giu'),
     declared: new RegExp(
-      String.raw`(?<![\p{L}\p{N}])(${OPEN})(${L})(${CLOSE})\s+(?:is|es)\s+(?:(?:the|la|el)\s+)?(?:correct|right|true|best|answer|respuesta|correcta|correcto|buena)(?![\p{L}\p{N}])`,
+      String.raw`(?<![\p{L}\p{N}])(${OPEN})(${L})(${CLOSE})(?:['\u2019]s|\s+(is|es|was|seria|sera|${MODAL_BE}))\s+(?:(?:the|la|el)\s+)?(?:correct|right|true|best|answer|respuesta|correcta|correcto|buena)(?![\p{L}\p{N}])`,
       'giu',
     ),
     position,
@@ -156,7 +164,11 @@ export function detectChoice(view: TextView, answers: readonly NormalizedAnswer[
       for (const m of text.matchAll(p.declared)) {
         const wrapped = (m[1] ?? '').length > 0 || (m[3] ?? '').length > 0;
         const found = m[2] ?? '';
+        const verb = (m[4] ?? '').toLowerCase();
         if (CONJUNCTION_LETTERS.has(letter) && !wrapped && !isUpper(found)) continue;
+        // English "I would be right" / "I'm..." is the pronoun: an unwrapped "I" counts only with
+        // the copula forms "is"/"es", which the pronoun never takes.
+        if (letter === 'i' && !wrapped && verb !== 'is' && verb !== 'es') continue;
         add('declared_correct', m.index, m.index + m[0].length);
       }
       // A line that is only the letter (optionally bracketed, emphasized or punctuated).

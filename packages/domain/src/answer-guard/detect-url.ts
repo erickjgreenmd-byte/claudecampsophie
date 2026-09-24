@@ -115,6 +115,24 @@ const SHORTENERS = [
   'dlvr\\.it',
   'trib\\.al',
   'discord\\.gg',
+  // Shorteners and link hubs on TLDs outside TLDS (regression RV-answer-guard-10).
+  'bit\\.do',
+  'linktr\\.ee',
+  'shorte\\.st',
+  'adf\\.ly',
+  'bc\\.vc',
+  'qr\\.ae',
+  'po\\.st',
+  'u\\.to',
+  'v\\.ht',
+  'soo\\.gd',
+  'clck\\.ru',
+  'cutt\\.us',
+  'tiny\\.one',
+  'shor\\.by',
+  'ouo\\.io',
+  'lnk\\.bio',
+  'hyperurl\\.co',
 ];
 
 const URL_PATTERNS: readonly (readonly [string, RegExp])[] = [
@@ -136,6 +154,15 @@ const URL_PATTERNS: readonly (readonly [string, RegExp])[] = [
     new RegExp(String.raw`(?<![\p{L}\p{N}.-])(?:${SHORTENERS.join('|')})(?![\p{L}\p{N}-])`, 'gu'),
   ],
   ['shortener', /(?<![\p{L}\p{N}.-])[\p{L}\p{N}-]+\.ly\//gu],
+  /*
+   * Decision (regression RV-answer-guard-10): a dotted host followed by a path is URL-shaped on
+   * any TLD ("bit.do/xyz1", "linktr.ee/helper"), so this rule does not depend on the TLD list.
+   * The last label must be 2-24 letters, so decimals and fractions ("3.5/7") never match.
+   */
+  [
+    'host_path',
+    /(?<![\p{L}\p{N}.@-])(?:[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,62}[\p{L}\p{N}])?\.){1,8}\p{L}{2,24}\/[\p{L}\p{N}_~%-]/gu,
+  ],
   [
     'domain',
     new RegExp(
@@ -145,10 +172,18 @@ const URL_PATTERNS: readonly (readonly [string, RegExp])[] = [
   ],
 ];
 
+/**
+ * IDNA label separators that NFKC leaves alone: WHATWG URL parsing maps U+3002 (and U+FF61,
+ * U+FE12, which NFKC folds to U+3002) to '.', so "bit\u3002ly/x" is a working bit.ly link
+ * (regression RV-answer-guard-9). One code unit each, so offsets are unchanged.
+ */
+const IDEOGRAPHIC_STOP_RE = /[\u3002\uFF61\uFE12]/gu;
+
 export function detectUrls(view: TextView): RawFinding[] {
   const findings: RawFinding[] = [];
+  const text = view.lower.replace(IDEOGRAPHIC_STOP_RE, '.');
   for (const [technique, re] of URL_PATTERNS) {
-    for (const m of view.lower.matchAll(re)) {
+    for (const m of text.matchAll(re)) {
       findings.push({
         detector: 'url',
         answerIndex: null,

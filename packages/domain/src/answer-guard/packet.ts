@@ -62,11 +62,23 @@ function limitsFrom(options: PacketScanOptions): WalkLimits {
   };
 }
 
+const ARRAY_INDEX_RE = /^(?:0|[1-9]\d*)$/u;
+
+function hasOwnToJson(proto: object): boolean {
+  return Object.hasOwn(proto, 'toJSON');
+}
+
 /**
- * JSON-semantics walk: own enumerable string keys of plain objects and array elements. Getters
- * are reported, never invoked. Values JSON cannot carry faithfully (functions, symbols, class
- * instances such as Date/Map, boxed primitives) are reported as unsupported (fail closed).
- * Proxies may still run code; callers catch and fail closed.
+ * JSON-semantics walk: own enumerable string keys of plain objects and arrays. Getters are
+ * reported, never invoked. Values JSON cannot carry faithfully (functions, symbols, class
+ * instances such as Date/Map, boxed primitives, array subclasses, a toJSON reachable through the
+ * prototype) are reported as unsupported (fail closed). Proxies may still run code; callers catch
+ * and fail closed.
+ *
+ * Decision (regression RV-answer-guard-12): arrays are walked by index AND by any other own
+ * enumerable key. JSON.stringify drops extra array properties but calls an own `toJSON`, and
+ * other serializers (structured clone, custom encoders) keep them, so an extra key is scanned
+ * like an object key and a function value there (e.g. `toJSON`) fails closed.
  */
 function walk(root: unknown, limits: WalkLimits, hooks: WalkHooks): void {
   let nodes = 0;
@@ -81,6 +93,27 @@ function walk(root: unknown, limits: WalkLimits, hooks: WalkHooks): void {
       stopped = true;
       return false;
     }
+    return true;
+  };
+
+  /** Visits own property `key` of `obj` as an object member (key hook, then its value). */
+  const visitMember = (
+    obj: object,
+    key: string,
+    index: number,
+    path: string,
+    depth: number,
+  ): boolean => {
+    if (!countChars(key.length, path)) return false;
+    const redact = hooks.key(key, index, path);
+    const childPath = `${path}${segment(key, index, redact)}`;
+    const descriptor = Object.getOwnPropertyDescriptor(obj, key);
+    if (descriptor === undefined) return true;
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      hooks.problem('accessor_property', childPath);
+      return true;
+    }
+    visit(descriptor.value, childPath, depth + 1);
     return true;
   };
 
@@ -124,7 +157,12 @@ function walk(root: unknown, limits: WalkLimits, hooks: WalkHooks): void {
     }
     ancestors.add(obj);
     try {
+      const proto: unknown = Object.getPrototypeOf(obj);
       if (Array.isArray(obj)) {
+        if (proto !== Array.prototype || hasOwnToJson(Array.prototype)) {
+          hooks.problem('unsupported_value', path);
+          return;
+        }
         if (obj.length > limits.maxNodes) {
           hooks.problem('node_limit', path);
           stopped = true;
@@ -140,26 +178,25 @@ function walk(root: unknown, limits: WalkLimits, hooks: WalkHooks): void {
           }
           visit(descriptor.value, childPath, depth + 1);
         }
+        let extra = 0;
+        for (const key of Object.keys(obj)) {
+          if (stopped) return;
+          if (ARRAY_INDEX_RE.test(key) && Number(key) < obj.length) continue;
+          if (!visitMember(obj, key, extra, path, depth)) return;
+          extra += 1;
+        }
         return;
       }
-      const proto: unknown = Object.getPrototypeOf(obj);
-      if (proto !== Object.prototype && proto !== null) {
+      if (
+        (proto !== Object.prototype && proto !== null) ||
+        (proto === Object.prototype && hasOwnToJson(Object.prototype))
+      ) {
         hooks.problem('unsupported_value', path);
         return;
       }
       const keys = Object.keys(obj);
       for (let i = 0; i < keys.length && !stopped; i++) {
-        const key = keys[i] ?? '';
-        if (!countChars(key.length, path)) return;
-        const redact = hooks.key(key, i, path);
-        const childPath = `${path}${segment(key, i, redact)}`;
-        const descriptor = Object.getOwnPropertyDescriptor(obj, key);
-        if (descriptor === undefined) continue;
-        if (descriptor.get !== undefined || descriptor.set !== undefined) {
-          hooks.problem('accessor_property', childPath);
-          continue;
-        }
-        visit(descriptor.value, childPath, depth + 1);
+        if (!visitMember(obj, keys[i] ?? '', i, path, depth)) return;
       }
     } finally {
       ancestors.delete(obj);
@@ -184,26 +221,35 @@ function packetFinding(
   return { ...toLeakFinding(f), path, location };
 }
 
+/** Result of one packet walk: leak findings plus forbidden-key paths. */
+export interface PacketScanDetail extends PacketScanResult {
+  /**
+   * JSON paths of forbidden keys. Built from the same walk as the findings, so a key that
+   * discloses a protected answer is redacted (`[#i]`) here too (regression RV-answer-guard-13).
+   */
+  readonly forbidden: readonly string[];
+}
+
 /**
- * Scans every string value, number value and key of a child-facing packet, then the joined text
- * of all values (catches acrostics and splits across fields such as hint steps). Findings carry
- * JSON paths. Invalid answers, limits, cycles and unsupported values fail closed.
+ * scanChildPacket plus forbidden-key paths from the same walk. Used by the release gate so that
+ * every path it reports follows the same redaction rule (reasons stay payload-free, spec P4).
  */
-export function scanChildPacket(
+export function scanChildPacketDetailed(
   packet: unknown,
   answers: readonly ProtectedAnswer[],
   options: PacketScanOptions = {},
-): PacketScanResult {
+): PacketScanDetail {
   const normalized = normalizeProtectedAnswers(answers);
   if (!normalized.ok) {
     const f = failClosed(`invalid_answer:${normalized.error.code}`);
-    return { safe: false, findings: [packetFinding(f, '$', 'structure')] };
+    return { safe: false, findings: [packetFinding(f, '$', 'structure')], forbidden: [] };
   }
   const ctx = createScanContext(normalized.value, options);
   const limits = limitsFrom(options);
   const own = new Set(options.ownSubmissionPaths ?? []);
   const markerState = new Map<string, number>();
   const findings: PacketLeakFinding[] = [];
+  const forbidden: string[] = [];
   const joined: string[] = [];
 
   // Decision: an exception while walking (e.g. a throwing Proxy trap) is a fail-closed finding,
@@ -214,7 +260,9 @@ export function scanChildPacket(
         const keyFindings = scanTextWithContext(key, ctx);
         const path = `${parentPath}[#${index}]`;
         for (const f of keyFindings) findings.push(packetFinding(f, path, 'key'));
-        return keyFindings.length > 0;
+        const redact = keyFindings.length > 0;
+        if (isForbiddenKey(key)) forbidden.push(`${parentPath}${segment(key, index, redact)}`);
+        return redact;
       },
       value(value, path, isNumber) {
         const ownSubmission = own.has(path);
@@ -233,7 +281,7 @@ export function scanChildPacket(
     });
   } catch {
     findings.push(packetFinding(failClosed('scan_error'), '$', 'structure'));
-    return { safe: false, findings };
+    return { safe: false, findings, forbidden };
   }
 
   if (joined.length > 1) {
@@ -250,7 +298,21 @@ export function scanChildPacket(
       findings.push(packetFinding(f, '$', 'combined'));
     }
   }
-  return { safe: findings.length === 0, findings };
+  return { safe: findings.length === 0, findings, forbidden };
+}
+
+/**
+ * Scans every string value, number value and key of a child-facing packet, then the joined text
+ * of all values (catches acrostics and splits across fields such as hint steps). Findings carry
+ * JSON paths. Invalid answers, limits, cycles and unsupported values fail closed.
+ */
+export function scanChildPacket(
+  packet: unknown,
+  answers: readonly ProtectedAnswer[],
+  options: PacketScanOptions = {},
+): PacketScanResult {
+  const { safe, findings } = scanChildPacketDetailed(packet, answers, options);
+  return { safe, findings };
 }
 
 /**
@@ -260,7 +322,14 @@ export function scanChildPacket(
  *
  * Decision: substring matching is intentionally broad ("imageResolution" contains "solution",
  * "unexpected" contains "expected"); child DTO schemas must avoid such names rather than the guard
- * narrowing its net. "answer" alone is allowed so the child's own submitted answer can be shown.
+ * narrowing its net. "answer" alone is allowed so the child's own submitted answer can be shown,
+ * and "correct" alone so truthful correctness feedback can be shown (spec P6).
+ *
+ * Regressions: RV-answer-guard-6 (P5 private-result fields "misconception", "grading
+ * provenance", kept in step with contracts' CHILD_FORBIDDEN_HOMEWORK_KEYS), RV-answer-guard-7
+ * (a multiple-choice key stored as an index or option, e.g. `correctOptionIndex`) and
+ * RV-answer-guard-8 (the P16 sponsor-card and Amazon resource DTO fields: `serveToken`,
+ * `ctaLabel`, `destinationHost`, `whyShown`, `merchant`, `commercialHidden`).
  */
 export const FORBIDDEN_KEY_FRAGMENTS = [
   'solution',
@@ -296,11 +365,52 @@ export const FORBIDDEN_KEY_FRAGMENTS = [
   'monetiz',
   'coupon',
   'promocode',
+  // P5 private grading result (RV-answer-guard-6)
+  'misconception',
+  'provenance',
+  'uncertainty',
+  'disagreement',
+  'gradingroute',
+  // Answer keys stored by position or under another noun (RV-answer-guard-7)
+  'correctoption',
+  'correctchoice',
+  'correctindex',
+  'correctletter',
+  'correctvalue',
+  'correctresponse',
+  'correctkey',
+  'correctword',
+  'correctspelling',
+  'correcttext',
+  'rightoption',
+  'rightchoice',
+  // P16 commercial DTO fields (RV-answer-guard-8)
+  'servetoken',
+  'ctalabel',
+  'calltoaction',
+  'destinationhost',
+  'destinationurl',
+  'whyshown',
+  'merchant',
+  'commercial',
+  'impression',
+  'clickurl',
+  'trackingpixel',
+  'publishertag',
 ] as const;
+
+/**
+ * Normalized key names forbidden only as the whole key, because as substrings they are ordinary
+ * words: the contracts' CHILD_FORBIDDEN_HOMEWORK_KEYS lists grading `evidence` and `route`.
+ */
+export const FORBIDDEN_EXACT_KEYS = ['evidence', 'route'] as const;
 
 function isForbiddenKey(key: string): boolean {
   const normalized = canonicalize(key).replace(/[^a-z0-9]/gu, '');
-  return FORBIDDEN_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment));
+  return (
+    FORBIDDEN_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment)) ||
+    (FORBIDDEN_EXACT_KEYS as readonly string[]).includes(normalized)
+  );
 }
 
 export interface ForbiddenFieldScan {
@@ -335,7 +445,8 @@ export function scanForbiddenFields(
  * JSON paths of keys a child DTO must not carry (withheld solutions, grading internals, private
  * or parent-only data, commercial/sponsor/affiliate fields). A DTO that cannot be fully walked
  * (cycle, limits, unsupported values, getters) yields `"<path> [unscannable:<reason>]"` entries,
- * so the result is never empty for an unverifiable DTO.
+ * so the result is never empty for an unverifiable DTO. Paths use raw key names (developer
+ * diagnostics); the release gate reports redacted paths instead.
  */
 export function findForbiddenFields(dto: unknown, options: PacketScanOptions = {}): string[] {
   const { forbidden, problems } = scanForbiddenFields(dto, options);
