@@ -6,6 +6,7 @@ import { discountedCents, applePricePointProblem } from './admin-money.ts';
 import { buttonRow, FieldError } from './admin-ui.tsx';
 import {
   CHANNEL_LABEL,
+  MAX_BUDGET_CENTS,
   SUBSCRIBER_LABEL,
   TIERS,
   validateTemplateForm,
@@ -186,7 +187,9 @@ export function TemplateForm({
       />
       <FieldError id={errId('redemptionCap')} message={errors.redemptionCap} />
 
-      <label htmlFor={id('budgetDollars')}>Budget cap per month (USD discount)</label>
+      <label htmlFor={id('budgetDollars')}>
+        Budget cap per month (USD discount, up to {formatUsd(MAX_BUDGET_CENTS)})
+      </label>
       <input
         id={id('budgetDollars')}
         inputMode="decimal"
@@ -253,7 +256,7 @@ export function TemplateForm({
         <FieldError id={errId('windowEndDay')} message={errors.windowEndDay} />
       </fieldset>
 
-      <fieldset style={fieldsetStyle}>
+      <fieldset style={fieldsetStyle} aria-describedby={described('codeMode')}>
         <legend style={{ fontWeight: 700 }}>Codes</legend>
         {(['shared', 'individual'] as const).map((mode) => (
           <label key={mode} style={inlineLabel}>
@@ -267,6 +270,7 @@ export function TemplateForm({
             {mode === 'shared' ? 'One shared code for the audience' : 'Individual single-use codes'}
           </label>
         ))}
+        <FieldError id={errId('codeMode')} message={errors.codeMode} />
         {values.codeMode === 'individual' ? (
           <>
             <label htmlFor={id('individualCodeCount')}>Individual codes per month</label>

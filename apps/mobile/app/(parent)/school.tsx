@@ -105,7 +105,7 @@ function SchoolCard({ api }: { api: ApiClient }) {
   const choose = async (school: SchoolSummary) => {
     setBusy(true);
     setProblem(null);
-    const result = await chooseSchool(api, school);
+    const result = await chooseSchool(api, school, data ?? undefined);
     setBusy(false);
     if (result.ok) {
       setSaved(result.data);

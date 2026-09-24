@@ -72,7 +72,9 @@ export function PayoutsPanel({
   );
   const [month, setMonth] = useState(initialMonth);
   const [monthError, setMonthError] = useState<string | null>(null);
-  const [prepared, setPrepared] = useState<PrepareResult | null>(null);
+  // The result keeps the month the API evaluated (RV-p17-ui-6): editing the month field afterwards
+  // must not relabel a reconciliation statement that was made for another month.
+  const [prepared, setPrepared] = useState<{ result: PrepareResult; month: string } | null>(null);
   const { busy, feedback, run } = useAdminAction();
 
   const prepare = async (event: FormEvent) => {
@@ -83,14 +85,15 @@ export function PayoutsPanel({
     }
     setMonthError(null);
     setPrepared(null);
+    const throughMonth = month;
     await run('prepare', async () => {
       const result = await api.send(
         'POST',
         '/v1/admin/payouts/prepare',
-        { schoolId, throughMonth: month },
+        { schoolId, throughMonth },
         preparePayoutResponseSchema,
       );
-      setPrepared(result);
+      setPrepared({ result, month: throughMonth });
       setVersion((v) => v + 1);
       return '';
     });
@@ -125,18 +128,20 @@ export function PayoutsPanel({
         </div>
       </form>
       <AdminFeedback feedback={feedback} rules={PAYOUT_RULES} />
-      {prepared?.status === 'carried_forward' ? (
+      {prepared?.result.status === 'carried_forward' ? (
         <div className="notice" role="status">
           <p style={{ margin: 0 }}>
-            <strong>Carried forward.</strong> The net balance of {formatUsd(prepared.netCents)}{' '}
-            through {monthLabel(month)} is not a positive amount to pay, so it carries forward to a
-            later batch. No payout batch was created.
+            <strong>Carried forward.</strong> The net balance of{' '}
+            {formatUsd(prepared.result.netCents)} through {monthLabel(prepared.month)} is not a
+            positive amount to pay, so it carries forward to a later batch. No payout batch was
+            created.
           </p>
         </div>
       ) : null}
-      {prepared?.status === 'created' ? (
+      {prepared?.result.status === 'created' ? (
         <p role="status" style={{ color: 'var(--success)', fontWeight: 700 }}>
-          Batch ready: {formatUsd(prepared.payout.totalCents)} ({prepared.payout.batchKey}).
+          Batch ready through {monthLabel(prepared.month)}:{' '}
+          {formatUsd(prepared.result.payout.totalCents)} ({prepared.result.payout.batchKey}).
           Preparing again for the same month returns this same batch.
         </p>
       ) : null}

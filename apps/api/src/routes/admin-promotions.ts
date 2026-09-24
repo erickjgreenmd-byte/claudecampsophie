@@ -132,6 +132,7 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
     );
     const row = await c.var.deps.db.asService(async (tx) => {
       const current = await templateById(tx, id);
+      const codeSettingsSent = input.codeMode !== undefined;
       const merged = {
         name: input.name ?? current.name,
         school_id: input.schoolId === undefined ? current.school_id : input.schoolId,
@@ -155,8 +156,15 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
               ? 0
               : input.windowEndDay,
         code_mode: input.codeMode ?? current.code_mode,
-        individual_code_count: input.individualCodeCount ?? current.individual_code_count,
-        shared_code_usage_cap: input.sharedCodeUsageCap ?? current.shared_code_usage_cap,
+        // Code settings are one group: when the mode is sent, the count and cap are replaced with
+        // what was sent (absent = cleared), so switching modes or emptying the optional cap takes
+        // effect (RV-p17-ui-3). A PATCH without a mode (e.g. { paused }) keeps them.
+        individual_code_count: codeSettingsSent
+          ? (input.individualCodeCount ?? null)
+          : (input.individualCodeCount ?? current.individual_code_count),
+        shared_code_usage_cap: codeSettingsSent
+          ? (input.sharedCodeUsageCap ?? null)
+          : (input.sharedCodeUsageCap ?? current.shared_code_usage_cap),
         channels: input.channels ?? current.channels,
         paused: input.paused ?? current.paused,
       };

@@ -9,6 +9,7 @@ import { formatUsd } from '@pencillift/domain';
 import { useSession } from '../../../lib/session.tsx';
 import {
   AdminFeedback,
+  AdminProblem,
   buttonRow,
   ConfirmButton,
   sectionStyle,
@@ -20,7 +21,9 @@ import {
   CHANNEL_LABEL,
   emptyTemplateForm,
   SUBSCRIBER_LABEL,
+  TEMPLATE_SETTING_LABEL,
   templateToForm,
+  unsavedSettings,
   type PromoTemplate,
   type PromoTemplateInput,
 } from './template-form.ts';
@@ -53,6 +56,24 @@ export function TemplatesSection({
   const { feedback, run } = useAdminAction();
   const schoolName = new Map(schools.map((s) => [s.id, s.name]));
 
+  /**
+   * RV-p17-ui-3: an edit is reported as a success only when the stored template matches what the
+   * owner submitted (PATCH merges, so a left-out value can survive). Otherwise the list is
+   * refreshed to show what was actually stored and the difference is reported as a problem, never
+   * as "Template updated."
+   */
+  const checkSaved = (input: PromoTemplateInput, saved: PromoTemplate) => {
+    const differs = unsavedSettings(input, saved);
+    if (differs.length === 0) return;
+    setEditing(null);
+    onChanged();
+    throw new AdminProblem(
+      `The template was saved, but the server kept different values for: ${differs
+        .map((k) => TEMPLATE_SETTING_LABEL[k])
+        .join(', ')}. Check the template below before activating it.`,
+    );
+  };
+
   const save = async (input: PromoTemplateInput): Promise<boolean> => {
     const target = editing;
     const ok = await run('save', async () => {
@@ -66,6 +87,7 @@ export function TemplatesSection({
         input,
         promoTemplateSchema,
       );
+      checkSaved(input, saved);
       return saved.enabled || !target.enabled
         ? 'Template updated.'
         : 'Template updated. It no longer passes activation checks, so it was switched back to a draft.';

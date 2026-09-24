@@ -24,9 +24,9 @@ import {
 } from './admin-ui.tsx';
 import { OfferMappingEditor } from './OfferMappingEditor.tsx';
 import {
+  campaignRedeemability,
   cellLabel,
-  MAPPING_STATUS_LABEL,
-  readySummary,
+  mappingCellStatus,
   tierLabel,
   unsupportedReason,
   type Campaign,
@@ -120,7 +120,7 @@ function CampaignCard({
   const { busy, feedback, run } = useAdminAction();
   const [editing, setEditing] = useState<{ channel: Channel; paidSlots: number } | null>(null);
   const [showCodes, setShowCodes] = useState(false);
-  const ready = readySummary(c);
+  const availability = campaignRedeemability(c);
 
   const act = (action: CampaignAction) =>
     run(action, async () => {
@@ -165,11 +165,11 @@ function CampaignCard({
         {formatUsd(c.committedDiscountCents)} of {formatUsd(c.budgetCapCents)} discount budget
         committed{percentText(c.committedDiscountCents, c.budgetCapCents)}
       </p>
-      {ready.length > 0 ? (
-        <p style={{ margin: '4px 0' }}>Redeemable on: {ready.join(' · ')}</p>
+      {availability.redeemable ? (
+        <p style={{ margin: '4px 0' }}>Redeemable on: {availability.channels.join(' · ')}</p>
       ) : (
         <p className="notice" style={{ margin: '4px 0' }}>
-          Not redeemable on any store yet — don’t advertise this code until a mapping is ready.
+          {availability.notice}
         </p>
       )}
       <div style={buttonRow}>
@@ -276,7 +276,7 @@ function MappingGrid({
                 const blocked = unsupportedReason(channel, tier, c.percentOff);
                 return (
                   <td key={tier} style={cellStyle}>
-                    <div>{mapping ? MAPPING_STATUS_LABEL[mapping.status] : 'Not set up'}</div>
+                    <div>{mappingCellStatus(mapping, c)}</div>
                     {mapping?.providerOfferId ? (
                       <div style={{ color: 'var(--muted)' }}>Offer: {mapping.providerOfferId}</div>
                     ) : null}

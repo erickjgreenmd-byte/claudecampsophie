@@ -228,6 +228,50 @@ describe('SchoolAndPromotionsPage — school designation (spec P17, AC_PROMO_14)
     expect(await screen.findByText(/No schools match “zzz”/)).toBeTruthy();
   });
 
+  it('says a first school choice is now the family’s school, starting this month (RV-p17-ui-8)', async () => {
+    const { api } = fakeApi({
+      familySchool: school({ current: null }),
+      send: () => school({ current: cedar }),
+    });
+    renderPage(<SchoolAndPromotionsPage />, { api });
+    await userEvent.type(await screen.findByLabelText(/Find your school/i), 'cedar');
+    await userEvent.click(screen.getByRole('button', { name: /^Search$/ }));
+    const results = await screen.findByRole('list', { name: 'School search results' });
+    await userEvent.click(
+      within(results).getByRole('button', { name: /Choose Cedar Park Middle/ }),
+    );
+    expect(screen.getByText(/it applies from this month/)).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /Confirm Cedar Park Middle/ }));
+    expect(
+      await screen.findByText(
+        'Saved. Cedar Park Middle is now your school, starting this month (America/Chicago time).',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('explains a failed search or keep-current in terms of the school, not a code (RV-p17-ui-4)', async () => {
+    const { api } = fakeApi({
+      familySchool: school({ pending: { school: cedar, effectiveFromMonth: '2026-10' } }),
+      get: (path) =>
+        path.startsWith('/v1/schools')
+          ? new ApiRequestError('NOT_FOUND', 'Not found', 404)
+          : undefined,
+      send: () => new ApiRequestError('NOT_FOUND', 'School not found', 404),
+    });
+    renderPage(<SchoolAndPromotionsPage />, { api });
+    const yours = await screen.findByRole('region', { name: 'Your school' });
+    await userEvent.click(
+      await within(yours).findByRole('button', { name: /Keep Maple Grove Elementary/ }),
+    );
+    const message =
+      'That school isn’t available to choose anymore. Search again and pick a school from the list.';
+    expect(await within(yours).findByText(message)).toBeTruthy();
+    await userEvent.type(within(yours).getByLabelText(/Find your school/i), 'maple');
+    await userEvent.click(within(yours).getByRole('button', { name: /^Search$/ }));
+    await waitFor(() => expect(within(yours).getAllByText(message)).toHaveLength(2));
+    expect(within(yours).queryByText(/code/i)).toBeNull();
+  });
+
   it('asks the parent to create a family first when there is none', async () => {
     const { api } = fakeApi({
       get: (path) =>

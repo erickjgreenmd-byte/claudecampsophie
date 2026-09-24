@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
-import { chooseSchool, promoProblem, quotePromo, redeemPromo, searchSchools } from './actions.ts';
+import {
+  chooseSchool,
+  promoProblem,
+  quotePromo,
+  redeemPromo,
+  schoolProblem,
+  searchSchools,
+} from './actions.ts';
 
 const MAPLE = {
   id: '6f1c2f0e-1f4b-4c8e-9b3a-2d3e4f5a6b7c',
@@ -93,19 +100,71 @@ describe('school actions', () => {
   });
 
   it('sends only the school id and reports what the server saved', async () => {
-    const { api, calls } = fakeApi(() => ({
+    const saved = {
       current: MAPLE,
       pending: null,
       programTimezone: 'UTC',
-      contributionIsPencilLiftFunded: true,
-    }));
-    const result = await chooseSchool(api, MAPLE);
+      contributionIsPencilLiftFunded: true as const,
+    };
+    const { api, calls } = fakeApi(() => saved);
+    // Keeping the school the family already had (e.g. cancelling a pending change).
+    const result = await chooseSchool(api, MAPLE, saved);
     expect(calls[0]).toEqual({
       method: 'PUT',
       path: '/v1/family/school',
       body: { schoolId: MAPLE.id },
     });
     expect(result.ok && result.message).toMatch(/Maple Grove Elementary stays your school/);
+  });
+
+  it('says a first choice is now the family’s school, starting this month (RV-p17-ui-8)', async () => {
+    const { api } = fakeApi(() => ({
+      current: MAPLE,
+      pending: null,
+      programTimezone: 'UTC',
+      contributionIsPencilLiftFunded: true,
+    }));
+    const previous = {
+      current: null,
+      pending: null,
+      programTimezone: 'UTC',
+      contributionIsPencilLiftFunded: true as const,
+    };
+    const result = await chooseSchool(api, MAPLE, previous);
+    expect(result.ok && result.message).toBe(
+      'Saved. Maple Grove Elementary is now your school, starting this month (UTC time).',
+    );
+  });
+
+  it('explains a failed school change in terms of the school, never a code (RV-p17-ui-4)', async () => {
+    const { api } = fakeApi(() => new ApiRequestError('NOT_FOUND', 'School not found', 404));
+    const result = await chooseSchool(api, MAPLE);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? '' : result.problem.message).toBe(
+      'That school isn’t available to choose anymore. Search again and pick a school from the list.',
+    );
+    const search = await searchSchools(api, 'maple');
+    expect(search.ok ? '' : search.message).not.toMatch(/code/i);
+  });
+
+  it('maps the other school failures to school wording', () => {
+    const pin = schoolProblem(new ApiRequestError('STEP_UP_REQUIRED', 'x', 403));
+    expect(pin.needsPin).toBe(true);
+    expect(pin.message).toMatch(/change your school/);
+    expect(
+      schoolProblem(new ApiRequestError('BUSINESS_RULE', 'x', 422, 'INVALID_SCHOOL_ID')).message,
+    ).toBe('That school can’t be selected right now.');
+    expect(schoolProblem(new ApiRequestError('CHILD_MODE_FORBIDDEN', 'x', 403)).message).toBe(
+      'School settings can only be changed by a grown-up.',
+    );
+    for (const code of [
+      'NOT_FOUND',
+      'BUSINESS_RULE',
+      'CHILD_MODE_FORBIDDEN',
+      'INTERNAL',
+    ] as const) {
+      expect(schoolProblem(new ApiRequestError(code, 'x', 400)).message).not.toMatch(/code/i);
+    }
   });
 });
 

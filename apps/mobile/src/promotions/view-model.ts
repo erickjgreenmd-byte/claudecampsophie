@@ -121,12 +121,30 @@ export function chooseSchoolPrompt(data: FamilySchool, chosen: SchoolSummary): s
     : `Choose ${chosen.name}? If you haven’t chosen a school before, it applies from this month. Otherwise a change starts on the first day of next month.`;
 }
 
-export function savedSchoolMessage(next: FamilySchool, chosen: SchoolSummary): string {
+/**
+ * What the server saved (RV-p17-ui-8). With the designation shown before the choice, a school that
+ * was already current "stays", and one that becomes current immediately (a first choice applies
+ * from the current program month) "is now" the family's school. Without it, the message only states
+ * the saved result and never claims the school merely stayed.
+ */
+export function savedSchoolMessage(
+  next: FamilySchool,
+  chosen: SchoolSummary,
+  previous?: FamilySchool,
+): string {
   if (next.pending?.school.id === chosen.id) {
     return `Saved. ${chosen.name} becomes your school on ${monthStartLabel(next.pending.effectiveFromMonth)}.`;
   }
   if (next.current?.id === chosen.id) {
-    return `Saved. ${chosen.name} stays your school${next.pending ? '' : ' with no change pending'}.`;
+    if (previous?.current?.id === chosen.id) {
+      return previous.pending
+        ? `Saved. ${chosen.name} stays your school; the pending change was cancelled.`
+        : `Saved. ${chosen.name} stays your school with no change pending.`;
+    }
+    if (previous) {
+      return `Saved. ${chosen.name} is now your school, starting this month (${next.programTimezone} time).`;
+    }
+    return `Saved. ${chosen.name} is your school${next.pending ? '' : ' with no change pending'}.`;
   }
   return 'Saved.';
 }

@@ -9,6 +9,7 @@ import {
 } from './admin-ui.tsx';
 import {
   cellLabel,
+  initialMappingValues,
   MAPPING_STATUS_LABEL,
   unsupportedReason,
   validateMapping,
@@ -46,11 +47,9 @@ export function OfferMappingEditor({
   const { api } = useSession();
   const formId = useId();
   const blocked = unsupportedReason(channel, paidSlots, percentOff);
-  const [values, setValues] = useState<MappingFormValues>({
-    status: current?.status ?? (blocked ? 'unsupported' : 'pending'),
-    providerOfferId: current?.providerOfferId ?? '',
-    reason: current?.reason ?? '',
-  });
+  const [values, setValues] = useState<MappingFormValues>(() =>
+    initialMappingValues(channel, paidSlots, percentOff, current),
+  );
   const [errors, setErrors] = useState<MappingErrors>({});
   const { busy, feedback, run } = useAdminAction();
   const label = cellLabel(channel, paidSlots);
@@ -103,9 +102,9 @@ export function OfferMappingEditor({
         onChange={(e) => set('status', e.target.value as MappingStatus)}
       >
         {STATUSES.map((s) => (
-          <option key={s} value={s} disabled={s === 'ready' && blocked !== null}>
+          <option key={s} value={s} disabled={blocked !== null && s !== 'unsupported'}>
             {MAPPING_STATUS_LABEL[s]}
-            {s === 'ready' && blocked ? ' (not available for this amount)' : ''}
+            {blocked && s !== 'unsupported' ? ' (not available for this amount)' : ''}
           </option>
         ))}
       </select>

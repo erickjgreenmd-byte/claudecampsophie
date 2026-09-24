@@ -423,3 +423,85 @@ describe('PromotionsAdminPage — monthly generation and campaigns', () => {
     expect(within(card).getByText(/recorded in the audit log/)).toBeTruthy();
   });
 });
+
+describe('PromotionsAdminPage — review fixes (RV-p17-ui-3, RV-p17-ui-7)', () => {
+  async function openEdit() {
+    const card = await screen.findByRole('article', { name: 'Back to school' });
+    await userEvent.click(within(card).getByRole('button', { name: 'Edit' }));
+    return screen.findByRole('form', { name: 'Edit Back to school' });
+  }
+
+  it('switches a saved individual-code template to one shared code in place', async () => {
+    const { api, sends } = fakeApi({
+      templates: [template({ codeMode: 'individual', individualCodeCount: 100 })],
+    });
+    renderPage(<PromotionsAdminPage />, { api });
+    const form = await openEdit();
+    const w = within(form);
+    await userEvent.click(w.getByRole('radio', { name: 'One shared code for the audience' }));
+    await userEvent.click(w.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    const body = sends[0]!.body as { codeMode?: string; individualCodeCount?: number };
+    expect(sends[0]!.method).toBe('PATCH');
+    expect(body.codeMode).toBe('shared');
+    expect(body.individualCodeCount).toBeUndefined();
+  });
+
+  it('clears a saved shared-code usage cap in place', async () => {
+    const { api, sends } = fakeApi({ templates: [template({ sharedCodeUsageCap: 50 })] });
+    renderPage(<PromotionsAdminPage />, { api });
+    const form = await openEdit();
+    const w = within(form);
+    await userEvent.clear(w.getByLabelText(/Shared code usage cap/));
+    await userEvent.click(w.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    const body = sends[0]!.body as { codeMode?: string; sharedCodeUsageCap?: number };
+    expect(body.codeMode).toBe('shared');
+    expect(body.sharedCodeUsageCap).toBeUndefined();
+  });
+
+  it('reports a value the server kept instead of saying "Template updated."', async () => {
+    const { api, sends } = fakeApi({
+      templates: [template({ sharedCodeUsageCap: 50 })],
+      // The (synthetic) server stores the edit but keeps the old usage cap.
+      send: (call) => ({
+        ...template({ sharedCodeUsageCap: 50 }),
+        ...(call.body as object),
+        sharedCodeUsageCap: 50,
+      }),
+    });
+    renderPage(<PromotionsAdminPage />, { api });
+    const form = await openEdit();
+    const cap = within(form).getByLabelText(/Shared code usage cap/);
+    await userEvent.clear(cap);
+    await userEvent.type(cap, '75');
+    await userEvent.click(within(form).getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]!.method).toBe('PATCH');
+    expect((sends[0]!.body as { sharedCodeUsageCap?: number }).sharedCodeUsageCap).toBe(75);
+    expect(
+      await screen.findByText(/server kept different values for: shared code usage cap/),
+    ).toBeTruthy();
+    expect(screen.queryByText('Template updated.')).toBeNull();
+  });
+
+  it('returns focus to the action button when a confirmation is cancelled', async () => {
+    const { api, sends } = fakeApi();
+    renderPage(<PromotionsAdminPage />, { api });
+    await chooseMonth('2026-10');
+    const card = await screen.findByRole('article', { name: /Back to school · 5% off/ });
+    within(card).getByRole('button', { name: 'Pause campaign' }).focus();
+    await userEvent.keyboard('{Enter}');
+    const confirm = await within(card).findByRole('button', { name: /Yes, pause/ });
+    expect(document.activeElement).toBe(confirm);
+    await userEvent.tab();
+    expect(document.activeElement).toBe(within(card).getByRole('button', { name: 'Cancel' }));
+    await userEvent.keyboard('{Enter}');
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(card).getByRole('button', { name: 'Pause campaign' }),
+      ),
+    );
+    expect(sends).toHaveLength(0);
+  });
+});

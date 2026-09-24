@@ -112,6 +112,14 @@ export const familyPromotionsResponseSchema = z.strictObject({
 // Owner admin (spec P17 administration)
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * One bound for a campaign's monthly discount budget, used by the template input and by every
+ * campaign listing, so any budget the API accepts can be listed again (RV-p17-ui-2). $1,000,000 per
+ * month fits the integer budget columns with room for committed-discount totals.
+ */
+export const MAX_PROMO_BUDGET_CENTS = 100_000_000;
+const promoBudgetCentsSchema = z.number().int().min(0).max(MAX_PROMO_BUDGET_CENTS);
+
 export const promoTemplateInputSchema = z.strictObject({
   name: z.string().min(1).max(120),
   schoolId: uuidSchema.nullable(),
@@ -119,7 +127,7 @@ export const promoTemplateInputSchema = z.strictObject({
   eligibleTiers: z.array(z.number().int().min(1).max(12)).min(1),
   subscriberEligibility: z.array(z.enum(['new', 'existing', 'lapsed'])).min(1),
   redemptionCap: z.number().int().positive(),
-  budgetCapCents: z.number().int().positive(),
+  budgetCapCents: promoBudgetCentsSchema.min(1),
   calendarTimezone: z.string().min(1).max(64),
   timezoneConfirmed: z.boolean(),
   windowStartDay: z.number().int().min(1).max(28),
@@ -206,8 +214,8 @@ export const campaignSummarySchema = z.strictObject({
   redemptionCap: z.number().int(),
   liveRedemptions: z.number().int(),
   confirmedRedemptions: z.number().int(),
-  budgetCapCents: centsSchema,
-  committedDiscountCents: centsSchema,
+  budgetCapCents: promoBudgetCentsSchema,
+  committedDiscountCents: promoBudgetCentsSchema,
   offerMappings: z.array(
     z.strictObject({
       channel: channelSchema,

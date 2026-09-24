@@ -147,6 +147,27 @@ function PromoError({ error, action }: { error: ApiRequestError; action: string 
   return <ErrorState message={promoErrorMessage(error)} />;
 }
 
+/**
+ * Wording for a failed school search or school change (RV-p17-ui-4). Error mapping is keyed to the
+ * action: NOT_FOUND from PUT /v1/family/school means the school is no longer available to choose
+ * (e.g. deactivated after the search), never that a promo code is invalid.
+ */
+function schoolErrorMessage(error: ApiRequestError): string {
+  if (error.code === 'NOT_FOUND') {
+    return 'That school isn’t available to choose anymore. Search again and pick a school from the list.';
+  }
+  if (error.code === 'BUSINESS_RULE') return 'That school can’t be selected right now.';
+  if (error.code === 'CHILD_MODE_FORBIDDEN') {
+    return 'School settings can only be changed by a grown-up.';
+  }
+  return error.message;
+}
+
+function SchoolError({ error }: { error: ApiRequestError }) {
+  if (error.code === 'STEP_UP_REQUIRED') return <StepUpNotice action="Changing your school" />;
+  return <ErrorState message={schoolErrorMessage(error)} />;
+}
+
 // ---------------------------------------------------------------------------------------------
 // School designation
 // ---------------------------------------------------------------------------------------------
@@ -159,10 +180,13 @@ function SchoolSection() {
   const loaded = useLastGood(query);
   const data = saved ?? loaded;
 
-  const onSaved = useCallback((next: FamilySchool, chosen: SchoolSummary) => {
-    setSaved(next);
-    setMessage(savedMessage(next, chosen));
-  }, []);
+  const onSaved = useCallback(
+    (previous: FamilySchool, next: FamilySchool, chosen: SchoolSummary) => {
+      setSaved(next);
+      setMessage(savedMessage(previous, next, chosen));
+    },
+    [],
+  );
 
   return (
     <section className="card" style={sectionStyle} aria-labelledby={headingId}>
@@ -199,23 +223,29 @@ function SchoolSection() {
   );
 }
 
-function savedMessage(next: FamilySchool, chosen: SchoolSummary): string {
+/**
+ * What the server saved, relative to what the family had before (RV-p17-ui-8). A school that was
+ * already current "stays"; a school that becomes current immediately (a first choice applies from
+ * the current program month) "is now" the family's school; a change says the month it starts.
+ */
+function savedMessage(previous: FamilySchool, next: FamilySchool, chosen: SchoolSummary): string {
   if (next.pending?.school.id === chosen.id) {
     return `Saved. ${chosen.name} becomes your school on ${monthStartLabel(next.pending.effectiveFromMonth)}.`;
   }
   if (next.current?.id === chosen.id) {
-    return `Saved. ${chosen.name} stays your school${next.pending ? '' : ' with no change pending'}.`;
+    if (previous.current?.id !== chosen.id) {
+      return `Saved. ${chosen.name} is now your school, starting this month (${next.programTimezone} time).`;
+    }
+    return previous.pending
+      ? `Saved. ${chosen.name} stays your school; the pending change was cancelled.`
+      : `Saved. ${chosen.name} stays your school with no change pending.`;
   }
   return 'Saved.';
 }
 
-function Designation({
-  data,
-  onSaved,
-}: {
-  data: FamilySchool;
-  onSaved: (next: FamilySchool, chosen: SchoolSummary) => void;
-}) {
+type OnSchoolSaved = (previous: FamilySchool, next: FamilySchool, chosen: SchoolSummary) => void;
+
+function Designation({ data, onSaved }: { data: FamilySchool; onSaved: OnSchoolSaved }) {
   const { api } = useSession();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ApiRequestError | null>(null);
@@ -230,7 +260,7 @@ function Designation({
         { schoolId: current.id },
         familySchoolResponseSchema,
       );
-      onSaved(next, current);
+      onSaved(data, next, current);
     } catch (e) {
       setError(toApiError(e));
     } finally {
@@ -271,18 +301,12 @@ function Designation({
           ) : null}
         </div>
       ) : null}
-      {error ? <PromoError error={error} action="Changing your school" /> : null}
+      {error ? <SchoolError error={error} /> : null}
     </>
   );
 }
 
-function SchoolSearch({
-  data,
-  onSaved,
-}: {
-  data: FamilySchool;
-  onSaved: (next: FamilySchool, chosen: SchoolSummary) => void;
-}) {
+function SchoolSearch({ data, onSaved }: { data: FamilySchool; onSaved: OnSchoolSaved }) {
   const { api } = useSession();
   const inputId = useId();
   const [text, setText] = useState('');
@@ -330,7 +354,7 @@ function SchoolSearch({
       setChoosing(null);
       setResults(null);
       setText('');
-      onSaved(next, chosen);
+      onSaved(data, next, chosen);
     } catch (e) {
       setError(toApiError(e));
     } finally {
@@ -421,7 +445,7 @@ function SchoolSearch({
           </div>
         </div>
       ) : null}
-      {error ? <PromoError error={error} action="Changing your school" /> : null}
+      {error ? <SchoolError error={error} /> : null}
     </>
   );
 }

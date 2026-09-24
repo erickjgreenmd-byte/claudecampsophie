@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { z } from 'zod';
 import { ApiRequestError } from '@pencillift/contracts/client';
@@ -87,7 +87,15 @@ export function useLastGood<T>(query: QueryState<T>): T | null {
 }
 
 export type AdminFeedbackValue =
-  { kind: 'success'; message: string } | { kind: 'error'; error: ApiRequestError };
+  | { kind: 'success'; message: string }
+  | { kind: 'error'; error: ApiRequestError }
+  | { kind: 'problem'; message: string };
+
+/**
+ * Thrown inside a `useAdminAction` action when the request succeeded but its outcome is not what
+ * the owner asked for (e.g. the server kept a different value). Shown as an error, never a success.
+ */
+export class AdminProblem extends Error {}
 
 /** Runs one mutation at a time and records its outcome for display. */
 export function useAdminAction() {
@@ -101,7 +109,11 @@ export function useAdminAction() {
       setFeedback({ kind: 'success', message });
       return true;
     } catch (error) {
-      setFeedback({ kind: 'error', error: toApiError(error) });
+      setFeedback(
+        error instanceof AdminProblem
+          ? { kind: 'problem', message: error.message }
+          : { kind: 'error', error: toApiError(error) },
+      );
       return false;
     } finally {
       setBusy(null);
@@ -137,6 +149,7 @@ export function AdminFeedback({
       </p>
     );
   }
+  if (feedback.kind === 'problem') return <ErrorState message={feedback.message} />;
   return <ErrorState message={adminErrorMessage(feedback.error, rules)} />;
 }
 
@@ -152,6 +165,10 @@ export function FieldError({ id, message }: { id: string; message: string | null
 /**
  * A button that asks for an explicit second click before a consequential action (spec P17:
  * pause/revoke/generate/approve are never one accidental click).
+ *
+ * Focus (AC_UX_01, RV-p17-ui-7): opening the prompt replaces the focused button, so focus moves to
+ * the confirm button inside the prompt; Cancel returns it to the original button. Otherwise
+ * keyboard and screen-reader users would be dropped on <body> at the most consequential step.
  */
 export function ConfirmButton({
   label,
@@ -173,14 +190,39 @@ export function ConfirmButton({
   const [asking, setAsking] = useState(false);
   const [working, setWorking] = useState(false);
   const promptId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  // Where focus goes after the next render: into the prompt, back to the trigger, or nowhere.
+  const focusNext = useRef<'confirm' | 'trigger' | null>(null);
+  useEffect(() => {
+    const target = focusNext.current;
+    focusNext.current = null;
+    if (target === 'confirm') confirmRef.current?.focus();
+    // Only reclaim focus that the removed prompt dropped (a finished action may have moved it).
+    if (
+      target === 'trigger' &&
+      (document.activeElement === document.body || !document.activeElement)
+    ) {
+      triggerRef.current?.focus();
+    }
+  }, [asking]);
+  const open = () => {
+    focusNext.current = 'confirm';
+    setAsking(true);
+  };
+  const close = () => {
+    focusNext.current = 'trigger';
+    setAsking(false);
+  };
   if (!asking) {
     return (
       <button
+        ref={triggerRef}
         type="button"
         className={secondary ? 'btn secondary' : 'btn'}
         disabled={disabled}
         aria-label={accessibleLabel}
-        onClick={() => setAsking(true)}
+        onClick={open}
       >
         {label}
       </button>
@@ -193,6 +235,7 @@ export function ConfirmButton({
       </p>
       <div style={buttonRow}>
         <button
+          ref={confirmRef}
           type="button"
           className="btn"
           disabled={working || disabled}
@@ -200,18 +243,13 @@ export function ConfirmButton({
             setWorking(true);
             void onConfirm().finally(() => {
               setWorking(false);
-              setAsking(false);
+              close();
             });
           }}
         >
           {working ? 'Working…' : confirmLabel}
         </button>
-        <button
-          type="button"
-          className="btn secondary"
-          disabled={working}
-          onClick={() => setAsking(false)}
-        >
+        <button type="button" className="btn secondary" disabled={working} onClick={close}>
           Cancel
         </button>
       </div>

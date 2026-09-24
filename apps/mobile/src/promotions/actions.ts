@@ -93,6 +93,39 @@ export function promoProblem(error: unknown): PromoProblem {
   );
 }
 
+/**
+ * Problem for a school search or school change (RV-p17-ui-4). Mapping is keyed to the action:
+ * NOT_FOUND from PUT /v1/family/school means the school is no longer available to choose (e.g.
+ * deactivated after the search), never that a promo code is invalid.
+ */
+export function schoolProblem(error: unknown): PromoProblem {
+  const problem = (message: string, extra: Partial<PromoProblem> = {}): PromoProblem => ({
+    message,
+    needsPin: false,
+    noFamily: false,
+    ...extra,
+  });
+  if (!(error instanceof ApiRequestError))
+    return problem('Something went wrong. Please try again.');
+  if (error.code === 'STEP_UP_REQUIRED') {
+    return problem('Unlock with your parent PIN to change your school, then try again.', {
+      needsPin: true,
+    });
+  }
+  if (error.code === 'NOT_FOUND') {
+    return problem(
+      'That school isn’t available to choose anymore. Search again and pick a school from the list.',
+    );
+  }
+  if (error.code === 'BUSINESS_RULE') return problem('That school can’t be selected right now.');
+  if (error.code === 'CHILD_MODE_FORBIDDEN') {
+    return problem('School settings can only be changed by a grown-up.');
+  }
+  return problem(
+    SERVER_WORDED.has(error.code) ? error.message : 'Something went wrong. Please try again.',
+  );
+}
+
 /** Problem for the family-scoped loads, where NOT_FOUND means "no family yet". */
 export function loadProblem(error: unknown): PromoProblem {
   if (error instanceof ApiRequestError && error.code === 'NOT_FOUND') {
@@ -129,13 +162,15 @@ export async function searchSchools(
     );
     return { ok: true, query: q, schools: found.schools };
   } catch (error) {
-    return { ok: false, message: promoProblem(error).message };
+    return { ok: false, message: schoolProblem(error).message };
   }
 }
 
 export async function chooseSchool(
   api: ApiClient,
   school: SchoolSummary,
+  /** The designation shown before this choice, so the message can say what changed. */
+  previous?: FamilySchool,
 ): Promise<Outcome<{ data: FamilySchool; message: string }>> {
   try {
     const data = await api.send(
@@ -144,9 +179,9 @@ export async function chooseSchool(
       { schoolId: school.id },
       familySchoolResponseSchema,
     );
-    return { ok: true, data, message: savedSchoolMessage(data, school) };
+    return { ok: true, data, message: savedSchoolMessage(data, school, previous) };
   } catch (error) {
-    return { ok: false, problem: promoProblem(error) };
+    return { ok: false, problem: schoolProblem(error) };
   }
 }
 

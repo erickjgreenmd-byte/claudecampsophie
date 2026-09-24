@@ -1,10 +1,11 @@
 import type { z } from 'zod';
 import {
+  MAX_PROMO_BUDGET_CENTS,
   promoTemplateInputSchema,
   type channelSchema,
   type promoTemplateSchema,
 } from '@pencillift/contracts';
-import { DEFAULT_MAX_PAID_SLOTS } from '@pencillift/domain';
+import { DEFAULT_MAX_PAID_SLOTS, formatUsd } from '@pencillift/domain';
 import { centsToDollarsInput, parseDollarsToCents } from './admin-money.ts';
 
 /**
@@ -20,6 +21,13 @@ export type SubscriberClass = 'new' | 'existing' | 'lapsed';
 
 /** Mirrors the domain bound on individually issued codes per monthly campaign. */
 export const MAX_INDIVIDUAL_CODES = 100_000;
+
+/**
+ * Largest monthly budget cap the console accepts: the contract's shared promo budget bound, which
+ * the template input and every campaign listing use (RV-p17-ui-2), so an accepted budget always
+ * stays listable. template-form.test.ts asserts this.
+ */
+export const MAX_BUDGET_CENTS = MAX_PROMO_BUDGET_CENTS;
 
 export const CHANNEL_LABEL: Record<Channel, string> = {
   app_store: 'App Store',
@@ -151,6 +159,8 @@ export function validateTemplateForm(
   if (budget === null || budget < 1) {
     errors.budgetDollars =
       'Enter a positive dollar amount, like 2500 or 2500.50. Campaigns are never unlimited.';
+  } else if (budget > MAX_BUDGET_CENTS) {
+    errors.budgetDollars = `The monthly budget cap can be at most ${formatUsd(MAX_BUDGET_CENTS)}.`;
   }
   const zone = values.calendarTimezone.trim();
   if (!isKnownTimezone(zone)) {
@@ -209,6 +219,48 @@ export function validateTemplateForm(
   const parsed = promoTemplateInputSchema.safeParse(candidate);
   if (!parsed.success) return { ok: false, errors: { name: 'Some fields are not valid.' } };
   return { ok: true, input: parsed.data };
+}
+
+/** Owner-facing names of the template settings, for "not saved as entered" messages. */
+export const TEMPLATE_SETTING_LABEL: Readonly<Record<keyof PromoTemplateInput, string>> = {
+  name: 'name',
+  schoolId: 'school audience',
+  percentOff: 'discount percent',
+  eligibleTiers: 'plan sizes',
+  subscriberEligibility: 'who can redeem',
+  redemptionCap: 'redemption cap',
+  budgetCapCents: 'budget cap',
+  calendarTimezone: 'calendar timezone',
+  timezoneConfirmed: 'timezone confirmation',
+  windowStartDay: 'window start day',
+  windowEndDay: 'window end day',
+  codeMode: 'code mode',
+  individualCodeCount: 'individual code count',
+  sharedCodeUsageCap: 'shared code usage cap',
+  channels: 'billing channels',
+};
+
+function sameSetting(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    // Lists are sets here; the server may return them in its own order.
+    const left = a.map(String).sort();
+    const right = b.map(String).sort();
+    return left.length === right.length && left.every((v, i) => v === right[i]);
+  }
+  return a === b;
+}
+
+/**
+ * Settings the server did not store as submitted (RV-p17-ui-3: "compare the saved result"). An
+ * empty list means the saved template matches the form; otherwise the console reports the
+ * difference instead of a success message.
+ */
+export function unsavedSettings(
+  submitted: PromoTemplateInput,
+  saved: PromoTemplate,
+): (keyof PromoTemplateInput)[] {
+  const keys = Object.keys(TEMPLATE_SETTING_LABEL) as (keyof PromoTemplateInput)[];
+  return keys.filter((key) => !sameSetting(submitted[key], saved[key]));
 }
 
 /** Readable text for the domain's activation problem codes (validateTemplateForActivation). */

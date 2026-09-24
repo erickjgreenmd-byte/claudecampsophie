@@ -119,7 +119,28 @@ describe('school view (one school per family; change starts next month)', () => 
         CEDAR,
       ),
     ).toBe('Saved. Cedar Park Middle becomes your school on October 1, 2026.');
-    expect(savedSchoolMessage(school(), MAPLE)).toMatch(/Maple Grove Elementary stays your school/);
+    // Choosing the school the family already had keeps it.
+    expect(savedSchoolMessage(school(), MAPLE, school())).toBe(
+      'Saved. Maple Grove Elementary stays your school with no change pending.',
+    );
+    expect(
+      savedSchoolMessage(
+        school(),
+        MAPLE,
+        school({ pending: { school: CEDAR, effectiveFromMonth: '2026-10' } }),
+      ),
+    ).toBe('Saved. Maple Grove Elementary stays your school; the pending change was cancelled.');
+  });
+
+  it('says a first choice is now the family’s school from this month, never that it "stays" (RV-p17-ui-8)', () => {
+    const first = savedSchoolMessage(school({ current: CEDAR }), CEDAR, school({ current: null }));
+    expect(first).toBe(
+      'Saved. Cedar Park Middle is now your school, starting this month (America/Chicago time).',
+    );
+    // Without the earlier state the message states only what was saved.
+    expect(savedSchoolMessage(school({ current: CEDAR }), CEDAR)).toBe(
+      'Saved. Cedar Park Middle is your school with no change pending.',
+    );
   });
 
   it('states the PencilLift-funded contribution rule, including $0 for any discounted month', () => {

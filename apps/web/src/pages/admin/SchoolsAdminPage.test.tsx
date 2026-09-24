@@ -218,6 +218,24 @@ describe('SchoolsAdminPage — payouts', () => {
     expect(within(payouts).getByText(/No payout batch was created/)).toBeTruthy();
   });
 
+  it('names the prepared month in a created batch, even after the field changes (RV-p17-ui-6)', async () => {
+    const { api, sends } = fakeApi({
+      payouts: [],
+      send: () => ({ status: 'created', payout: payout() }),
+    });
+    renderPage(<SchoolsAdminPage />, { api });
+    const panel = await openSchool();
+    const payouts = within(panel).getByRole('region', { name: 'Payouts' });
+    const month = within(payouts).getByLabelText('Pay accruals through month');
+    fireEvent.change(month, { target: { value: '2026-09' } });
+    await userEvent.click(within(payouts).getByRole('button', { name: 'Prepare payout' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(await within(payouts).findByText(/Batch ready through September 2026/)).toBeTruthy();
+    fireEvent.change(month, { target: { value: '2026-11' } });
+    expect(within(payouts).getByText(/Batch ready through September 2026/)).toBeTruthy();
+    expect(within(payouts).queryByText(/November 2026/)).toBeNull();
+  });
+
   it('explains disabled transfers when preparing is blocked', async () => {
     const { api } = fakeApi({
       payouts: [],
