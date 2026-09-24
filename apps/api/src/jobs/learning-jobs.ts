@@ -2,10 +2,15 @@ import { z } from 'zod';
 import {
   checkChildDataGate,
   dataEnvelope,
+  MODERATION_TIMEOUT_MS,
+  moderationFlagged,
   PROMPTS,
   PROPOSED_STAGE_LIMITS,
+  providerModerationCodes,
   runStage,
   type AgeBand,
+  type ModerationClient,
+  type ModerationResultItem,
   type PracticePersonalization,
   type ResponsesClient,
 } from '@pencillift/ai';
@@ -91,7 +96,10 @@ import {
  * pass the child-safety screen for model output. A story is grounded in its own bank prompt and an
  * intro in nothing, so a story or intro that brings in any sensitive topic, a companion persona,
  * secrecy or contact request is refused and the reviewed bank item (or no intro) is used. Only a
- * code is logged.
+ * code is logged. What passes is then sent to provider moderation (the OpenAI moderation endpoint;
+ * the labeled mock in development/test) in one call: a flagged story or intro is refused the same
+ * way, and a moderation error or timeout keeps every bank item and no intro. The client must come
+ * with the AI client and pass the same child-data gate before the model is called.
  *
  * Logs carry ids and codes only: never questions, answers, child names or tokens.
  */
@@ -112,12 +120,21 @@ export const TOP_UP_MIN_QUESTIONS = 4;
 const DAY_MS = 86_400_000;
 const FALLBACK_ZONE = 'America/New_York';
 
-export interface LearningHandlerOptions {
-  /** Optional AI client for personalization; omitted = bank-only generation. */
-  readonly ai?: ResponsesClient;
+interface LearningHandlerBase {
   readonly rates?: typeof DEFAULT_RATE_TABLE_2026_09_18;
   readonly sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * Optional AI client for personalization (omitted = bank-only generation). A client always comes
+ * with provider moderation: every re-themed story and intro is model output a child reads, so it is
+ * moderated before it replaces a bank item (spec P4; AC_SECURITY_02).
+ */
+export type LearningHandlerOptions = LearningHandlerBase &
+  (
+    | { readonly ai?: undefined; readonly moderation?: ModerationClient }
+    | { readonly ai: ResponsesClient; readonly moderation: ModerationClient }
+  );
 
 // ---------------------------------------------------------------------------------------------
 // Shared data access (also used by routes/learning.ts)
@@ -539,10 +556,68 @@ function logSafetyBlock(deps: JobDeps, screen: SafetyScreen): void {
   });
 }
 
+/** Everything a child reads of a practice prompt, as one text for provider moderation. */
+function childPromptText(prompt: BankItem['prompt']): string {
+  return [
+    prompt.text,
+    ...(prompt.choices ?? []),
+    prompt.passage?.title ?? '',
+    prompt.passage?.text ?? '',
+    prompt.unitHint ?? '',
+  ]
+    .filter((part) => part.trim().length > 0)
+    .join('\n');
+}
+
+/**
+ * Provider moderation after generation (spec P4; AC_SECURITY_02): one call for every re-themed
+ * story and the intro. Null (keep the bank items and no intro) on any failure: a moderation error
+ * never lets model output through. Moderation is free (no spend hold); one payload-free count is
+ * logged per call.
+ */
+async function moderatePracticeOutput(
+  deps: JobDeps,
+  moderation: ModerationClient,
+  texts: readonly string[],
+  stage: 'daily_set' | 'thursday_bundle',
+): Promise<readonly ModerationResultItem[] | null> {
+  const result = await moderation.moderate(texts, {
+    timeoutMs: MODERATION_TIMEOUT_MS,
+    metadata: { stage: `moderation_${stage}` },
+  });
+  if (result.kind === 'error' || result.results.length !== texts.length) {
+    const code =
+      result.kind === 'ok'
+        ? 'MODERATION_FAILED'
+        : result.timedOut
+          ? 'MODERATION_TIMEOUT'
+          : result.retryable
+            ? 'MODERATION_FAILED'
+            : 'MODERATION_NOT_AVAILABLE';
+    deps.log({
+      level: 'warn',
+      event: 'practice_ai_moderation_failed',
+      code,
+      ...(result.kind === 'error' && result.status !== null ? { status: result.status } : {}),
+      durationMs: result.latencyMs,
+    });
+    return null;
+  }
+  deps.log({
+    level: 'info',
+    event: 'practice_ai_moderated',
+    code: 'PROVIDER_MODERATION',
+    count: texts.length,
+    durationMs: result.latencyMs,
+  });
+  return result.results;
+}
+
 /**
  * One bounded request that may re-theme word problems and add an intro line. Fails closed to the
- * unchanged bank items on no client, no consent, the ZDR gate, the spend ceiling, any provider or
- * validation failure. Exported for tests.
+ * unchanged bank items on no client, no moderation client, no consent, the ZDR gate (for the model
+ * and the moderation provider), the spend ceiling, any provider or validation failure, and any
+ * provider moderation flag or failure. Exported for tests.
  */
 export async function personalizeItems(
   deps: JobDeps,
@@ -555,6 +630,12 @@ export async function personalizeItems(
   const unchanged: Personalized = { items: [...items], intro: null, rethemed: 0 };
   const ai = options.ai;
   if (ai === undefined || items.length === 0) return unchanged;
+  const moderation = options.moderation;
+  if (moderation === undefined) {
+    // Model output a child reads is never shown unmoderated (an untyped caller without the client).
+    deps.log({ level: 'error', event: 'practice_ai_skipped', code: 'MODERATION_NOT_CONFIGURED' });
+    return unchanged;
+  }
   const consent = await deps.db.asService((tx) =>
     hasVerifiedConsent(tx, ctx.familyId, {
       allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
@@ -573,6 +654,12 @@ export async function personalizeItems(
   } as const;
   if (!checkChildDataGate({ ...gate, providerIsMock: ai.isMock }).ok) {
     deps.log({ level: 'info', event: 'practice_ai_skipped', code: 'AI_NOT_AVAILABLE' });
+    return unchanged;
+  }
+  // The moderation provider runs where the model may (same gate), or no model output is used, so
+  // nothing is spent on output that could not be moderated.
+  if (!checkChildDataGate({ ...gate, providerIsMock: moderation.isMock }).ok) {
+    deps.log({ level: 'info', event: 'practice_ai_skipped', code: 'MODERATION_NOT_AVAILABLE' });
     return unchanged;
   }
   // Admitted only when recorded spend + every live hold (scans included) + this stage's upper-bound
@@ -638,9 +725,8 @@ export async function personalizeItems(
     return unchanged;
   }
   const result: PracticePersonalization = out.result.value;
-  const next = [...items];
+  const candidates: { readonly index: number; readonly themed: BankItem }[] = [];
   const seen = new Set<string>();
-  let rethemed = 0;
   let rejected = 0;
   for (const proposal of result.items) {
     const index = refs.get(proposal.ref);
@@ -675,8 +761,7 @@ export async function personalizeItems(
       rejected += 1;
       continue;
     }
-    next[index] = themed;
-    rethemed += 1;
+    candidates.push({ index, themed });
   }
   // Content check first (charset + denylist: no credentials, grown-up roles, answers, contact
   // details or money; review finding RV-learning-api-7), then the child-safety screen (an intro has
@@ -707,9 +792,41 @@ export async function personalizeItems(
     intro = null;
     rejected += 1;
   }
+  // Provider moderation last (spec P4; AC_SECURITY_02): the stories and the intro that passed every
+  // local check, in one call. A flag keeps that bank item (or no intro); a moderation failure keeps
+  // every bank item and no intro, as the word-list screen does for a severe output.
+  let kept = candidates;
+  const texts = [
+    ...candidates.map((c) => childPromptText(c.themed.prompt)),
+    ...(intro === null ? [] : [intro]),
+  ];
+  if (texts.length > 0) {
+    const flags = await moderatePracticeOutput(deps, moderation, texts, stage);
+    if (flags === null) {
+      rejected += texts.length;
+      kept = [];
+      intro = null;
+    } else {
+      const blocked = (index: number): boolean => {
+        const item = flags[index]!;
+        if (!moderationFlagged(item)) return false;
+        deps.log({
+          level: 'warn',
+          event: 'practice_ai_blocked_by_safety',
+          code: `SAFETY_${providerModerationCodes(item)[0] ?? 'PROVIDER_FLAGGED'}`,
+        });
+        rejected += 1;
+        return true;
+      };
+      kept = candidates.filter((_, i) => !blocked(i));
+      if (intro !== null && blocked(candidates.length)) intro = null;
+    }
+  }
+  const next = [...items];
+  for (const { index, themed } of kept) next[index] = themed;
   if (rejected > 0)
     deps.log({ level: 'warn', event: 'practice_ai_output_rejected', code: 'FELL_BACK_TO_BANK' });
-  return { items: next, intro, rethemed };
+  return { items: next, intro, rethemed: kept.length };
 }
 
 // ---------------------------------------------------------------------------------------------

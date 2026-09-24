@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  createMockModerationClient,
   createMockResponsesClient,
   type ResponsesRequest,
   type ResponsesResult,
@@ -561,7 +562,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     });
     const out = await personalizeItems(
       deps,
-      { ai: client },
+      { ai: client, moderation: createMockModerationClient() },
       await context(fam),
       wordProblems,
       'daily_set',
@@ -595,7 +596,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     );
     const out = await personalizeItems(
       deps,
-      { ai: leaky },
+      { ai: leaky, moderation: createMockModerationClient() },
       await context(fam),
       wordProblems,
       'daily_set',
@@ -606,7 +607,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const broken = createMockResponsesClient(() => ({ ...ok({}), text: '{"intro": 5}' }));
     const out2 = await personalizeItems(
       deps,
-      { ai: broken, sleep: () => Promise.resolve() },
+      { ai: broken, moderation: createMockModerationClient(), sleep: () => Promise.resolve() },
       await context(fam),
       wordProblems,
       'daily_set',
@@ -647,9 +648,14 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     try {
       const ctx = await context(fam);
       const runs = [1, 2].map(() =>
-        personalizeItems(deps, { ai: client }, ctx, wordProblems, 'daily_set', [
-          'math.word_problems',
-        ]),
+        personalizeItems(
+          deps,
+          { ai: client, moderation: createMockModerationClient() },
+          ctx,
+          wordProblems,
+          'daily_set',
+          ['math.word_problems'],
+        ),
       );
       await new Promise((resolve) => setTimeout(resolve, 400));
       release();
@@ -678,7 +684,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     try {
       const out = await personalizeItems(
         deps,
-        { ai: client },
+        { ai: client, moderation: createMockModerationClient() },
         await context(fam),
         wordProblems,
         'daily_set',
@@ -717,7 +723,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     });
     const out = await personalizeItems(
       deps,
-      { ai: client },
+      { ai: client, moderation: createMockModerationClient() },
       await context(fam),
       wordProblems,
       'daily_set',
@@ -769,14 +775,28 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const client = createMockResponsesClient(() => ok({ intro: 'Let’s practice!', items: [] }));
     try {
       const ctx = await context(fam);
-      await personalizeItems(unmetered, { ai: client }, ctx, wordProblems, 'daily_set', []);
+      await personalizeItems(
+        unmetered,
+        { ai: client, moderation: createMockModerationClient() },
+        ctx,
+        wordProblems,
+        'daily_set',
+        [],
+      );
       expect(client.requests).toHaveLength(1);
       const [held] = await api.db.sql<{ micros: string }[]>`
         select coalesce(sum(micros), 0)::text as micros from private.ai_spend_holds
          where expires_at > ${api.now.value}`;
       expect(BigInt(held!.micros)).toBeGreaterThan(0n);
       // The provider already charged for the first call: a second one no longer fits the cap.
-      const out = await personalizeItems(deps, { ai: client }, ctx, wordProblems, 'daily_set', []);
+      const out = await personalizeItems(
+        deps,
+        { ai: client, moderation: createMockModerationClient() },
+        ctx,
+        wordProblems,
+        'daily_set',
+        [],
+      );
       expect(client.requests).toHaveLength(1);
       expect(out.items).toEqual(wordProblems);
     } finally {
@@ -799,7 +819,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const client = createMockResponsesClient(() => ok({ intro: 'Let’s practice!', items: [] }));
     const out = await personalizeItems(
       deps,
-      { ai: client },
+      { ai: client, moderation: createMockModerationClient() },
       await context(fam),
       oversized,
       'daily_set',
@@ -822,7 +842,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const client = createMockResponsesClient(() => ok({ intro: 'Hi', items: [] }));
     at('2026-09-24T22:00:00Z');
     await enqueueDueLearningJobs(deps, api.now.value);
-    await run({ ai: client });
+    await run({ ai: client, moderation: createMockModerationClient() });
     expect(client.requests).toHaveLength(0);
     const daily = (await sets(child)).filter((s) => s.kind === 'daily');
     expect(daily).toHaveLength(1);
@@ -857,7 +877,7 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     );
     at('2026-09-24T22:00:00Z');
     await enqueueDueLearningJobs(deps, api.now.value);
-    await run({ ai: client });
+    await run({ ai: client, moderation: createMockModerationClient() });
     const [daily] = (await sets(child)).filter((s) => s.kind === 'daily');
     expect(daily!.child_intro).toBe('Story problems are today’s focus. You can do this!');
     const items = await api.db.sql<

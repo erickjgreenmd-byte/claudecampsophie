@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createMockResponsesClient } from '@pencillift/ai';
+import { createMockModerationClient, createMockResponsesClient } from '@pencillift/ai';
 import { createTestDb, type TestDb } from '@pencillift/db/testing';
 import {
   grantAdultUnlock,
@@ -1022,7 +1022,7 @@ describe('staging never treats a development-mock consent record as verified con
       const from = api.logs.length;
       await personalizeItems(
         staging,
-        { ai: client, sleep: () => Promise.resolve() },
+        { ai: client, moderation: createMockModerationClient(), sleep: () => Promise.resolve() },
         ctx!,
         wordProblems,
         'daily_set',

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  createMockModerationClient,
   createMockResponsesClient,
   type ResponsesClient,
   type ResponsesRequest,
@@ -324,6 +325,7 @@ function handlers(client: ResponsesClient): Record<string, JobHandler> {
   return {
     scan_process: createScanProcessHandler({
       ai: client,
+      moderation: createMockModerationClient(),
       readObject: () => Promise.resolve(syntheticJpeg()),
       sleep: () => Promise.resolve(),
     }),
@@ -1158,9 +1160,14 @@ describe('moderation after generation', () => {
           latencyMs: 20,
         };
       });
-      const out = await personalizeItems(deps, { ai: client }, ctx!, wordProblems, 'daily_set', [
-        'math.word_problems',
-      ]);
+      const out = await personalizeItems(
+        deps,
+        { ai: client, moderation: createMockModerationClient() },
+        ctx!,
+        wordProblems,
+        'daily_set',
+        ['math.word_problems'],
+      );
       expect(client.requests).toHaveLength(1);
       expect(out.intro).toBeNull();
       expect(out.items[0]).toEqual(wordProblems[0]);

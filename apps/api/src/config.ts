@@ -63,6 +63,14 @@ export interface ApiConfig {
     /** Optional adult web billing client (Stripe, STRIPE_SECRET_KEY), same rule as `billing`. */
     readonly webBilling: 'development_mock' | 'unavailable' | 'stripe';
     readonly ai: 'development_mock' | 'openai';
+    /**
+     * Provider moderation (spec P4; AC_SECURITY_02), selected explicitly like billing:
+     * - `development_mock`: the labeled mock (flags only its test markers), only in development/test;
+     * - `unavailable`: staging/production without OPENAI_API_KEY; every call is refused, so nothing is
+     *   graded or shown unmoderated;
+     * - `openai`: the OpenAI moderation endpoint (same key as the AI provider).
+     */
+    readonly moderation: 'development_mock' | 'unavailable' | 'openai';
     readonly storage: 'development_mock' | 'supabase';
     /** No transactional email adapter exists yet; invitations go to a development outbox. */
     readonly email: 'development_mock';
@@ -193,6 +201,7 @@ export function loadConfig(
       billing: env.REVENUECAT_SECRET_API_KEY ? 'revenuecat' : mockOrUnavailable(environment),
       webBilling: env.STRIPE_SECRET_KEY ? 'stripe' : mockOrUnavailable(environment),
       ai: env.OPENAI_API_KEY ? 'openai' : 'development_mock',
+      moderation: env.OPENAI_API_KEY ? 'openai' : mockOrUnavailable(environment),
       storage: env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY ? 'supabase' : 'development_mock',
       email: 'development_mock',
     },
@@ -399,8 +408,10 @@ export function productionReadiness(
     ),
     item(
       'ai_moderation',
-      false,
-      'Provider moderation (OpenAI moderation endpoint) before and after generation is not wired; only the deterministic first-layer safety screen runs',
+      // Ready only with the real client: the labeled mock flags nothing but its test markers and the
+      // refusing client stops every scan (it runs under the same ZDR/consent gate as grading).
+      config.providers.moderation === 'openai',
+      'Provider moderation (OpenAI omni-moderation) of the child’s answers before grading and of coaching, rubric labels and practice text after generation: OPENAI_API_KEY and the ZDR approval above (the mock is development-only; without the key scans stop instead of grading unmoderated text)',
     ),
     item(
       'parent_jwt_keys',

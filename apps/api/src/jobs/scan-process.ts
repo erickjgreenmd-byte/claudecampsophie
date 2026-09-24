@@ -4,8 +4,12 @@ import {
   checkChildDataGate,
   dataEnvelope,
   imagePart,
+  MODERATION_TIMEOUT_MS,
+  moderationFlagged,
   PROMPTS,
   PROPOSED_STAGE_LIMITS,
+  providerModerationCodes,
+  providerSafetyScreen,
   runStage,
   type AgeBand,
   type AttemptRecord,
@@ -13,6 +17,8 @@ import {
   type ExtractionOutput,
   type GradingOutput,
   type InputPart,
+  type ModerationClient,
+  type ModerationResultItem,
   type PromptDefinition,
   type ResponsesClient,
   type VerificationOutput,
@@ -44,6 +50,7 @@ import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
 import {
   childSafetyMessage,
   heldFromFamily,
+  mergeScreens,
   SAFETY_SCREEN_VERSION,
   SAFETY_TEMPLATES_VERSION,
   screenModelOutput,
@@ -96,6 +103,23 @@ import { childRubricFeedback, exampleWordingSpans } from './rubric-feedback.ts';
  *   rubric label that screens severe is dropped. Only codes are logged.
  * - A report whose screen codes include abuse, sexual or secrecy starts held from the family's list
  *   (runbook 5.1: the concern may involve someone in the household); the owner releases it.
+ * - Provider moderation (round 5, lead decision: a word list is not the safety control) is the
+ *   second layer: the OpenAI moderation endpoint (@pencillift/ai moderation.ts), the labeled mock in
+ *   development/test and the refusing client in staging/production without a key. It sends the
+ *   child's words, so it runs only where grading may (assertActive and the same child-data gate).
+ *   Before grading, every child ANSWER goes in one call (never the printed prompt: worksheets quote
+ *   characters and lessons, and a held code on a printed prompt is a defect); a provider flag merges
+ *   with the word-list screen (the most serious level wins, categories join) and is answered the
+ *   same way, with PROVIDER_* codes in the logs and the report's audit row. A violence-type flag on
+ *   the child's words maps to abuse and violence, so the report is held (a model cannot tell a
+ *   victim's report from a threat); other flags on child input only log a code. After generation
+ *   the coaching packet and each rubric criterion are moderated before use: a flagged packet falls
+ *   back to the reviewed template and a flagged criterion is dropped before childRubricFeedback.
+ *   FAIL CLOSED: a moderation error or timeout before grading grades nothing in this attempt (a
+ *   retryable one retries the job; any other ends the scan failed_final like a missing provider),
+ *   and the word-list flags of that attempt are answered at once with the report held from the
+ *   family (the provider might have added a held category); after generation it means the template
+ *   and no rubric rows. Moderation is free: no spend hold, one payload-free count logged per call.
  * - A reviewer may clear a report as a false match (round 3, CHK2-CS-5; PATCH
  *   /v1/admin/safety-reports/:id). The clearance is that question's transcription: its re-check
  *   grades it normally (no new report, no notice), and a corrected transcription is screened afresh.
@@ -138,6 +162,12 @@ type ParentVerdict = 'correct' | 'incorrect' | 'unresolved';
 
 export interface ScanProcessOptions {
   readonly ai: ResponsesClient;
+  /**
+   * Provider moderation (spec P4; AC_SECURITY_02): the child's answers before grading, coaching and
+   * rubric criteria after it. Required: nothing is graded or shown without it (the labeled mock in
+   * development/test, the refusing client in staging/production without OPENAI_API_KEY).
+   */
+  readonly moderation: ModerationClient;
   /** Reads a private homework object; bytes are sent inline, never as a storage URL. */
   readonly readObject: (storagePath: string) => Promise<Uint8Array>;
   readonly rates?: RateTable;
@@ -498,6 +528,40 @@ function safetyCode(screen: SafetyScreen): string {
   return `SAFETY_${(screen.categories[0] ?? 'unknown').toUpperCase()}`;
 }
 
+/** Which layer found a question's severe categories (the report's audit row names it). */
+export type InputScreenSource =
+  'safety_screen' | 'provider_moderation' | 'safety_screen+provider_moderation';
+
+/** One question's input screen: the word-list screen merged with the provider's flag. */
+export interface InputScreen {
+  readonly screen: SafetyScreen;
+  /** Null when nothing is severe. */
+  readonly source: InputScreenSource | null;
+  /** PROVIDER_* codes of the child's answer (logged; never text). */
+  readonly providerCodes: readonly string[];
+}
+
+/**
+ * Merges the word-list screen of a question with the provider's result for the child's answer
+ * (null: no answer was sent, e.g. a blank one). The most serious level wins and categories and
+ * codes join (mergeScreens); a violence-type provider flag on the child's words adds abuse, so the
+ * report is held (moderation.ts providerSafetyCategories). Exported for tests.
+ */
+export function childInputScreen(
+  words: SafetyScreen,
+  provider: ModerationResultItem | null,
+): InputScreen {
+  const flagged = provider === null ? null : providerSafetyScreen(provider, 'child');
+  const layers: string[] = [];
+  if (words.level === 'severe') layers.push('safety_screen');
+  if (flagged?.level === 'severe') layers.push('provider_moderation');
+  return {
+    screen: flagged === null ? words : mergeScreens([words, flagged]),
+    source: layers.length > 0 ? (layers.join('+') as InputScreenSource) : null,
+    providerCodes: flagged?.codes ?? [],
+  };
+}
+
 const FEEDBACK_KIND: Readonly<
   Record<
     CoachingPacket['steps'][number]['kind'],
@@ -709,6 +773,11 @@ class ScanRun {
    * backstop must not flag them again.
    */
   private readonly clearedFlags = new Set<string>();
+  /**
+   * Each screened question's input screen (word list merged with provider moderation), kept from
+   * screenBeforeGrading for the post-grading backstop, so both decide on the same flags.
+   */
+  private readonly inputScreens = new Map<string, InputScreen>();
 
   constructor(
     private readonly deps: JobDeps,
@@ -914,6 +983,75 @@ class ScanRun {
       now: this.deps.clock(),
     });
     if (!gate.ok) throw new PermanentFailure('AI_NOT_AVAILABLE');
+  }
+
+  /**
+   * Provider moderation of `texts` for one step (spec P4; AC_SECURITY_02). It sends the child's words
+   * (or output that may quote them) to the provider, so it runs only where grading may: this run may
+   * still process the child's data (assertActive: deletion, archive, consent) and the moderation
+   * client passes the same child-data gate as the model (ZDR approval, no mock in production). Free:
+   * no spend hold; one payload-free count is logged per call. Any error, timeout or a result that
+   * does not match the texts one to one is returned as a failure: callers fail closed.
+   */
+  private async moderate(
+    texts: readonly string[],
+    step: 'child_answers' | 'coaching' | 'rubric_criteria',
+  ): Promise<
+    | { readonly ok: true; readonly results: readonly ModerationResultItem[] }
+    | { readonly ok: false; readonly code: string; readonly retryable: boolean }
+  > {
+    if (texts.length === 0) return { ok: true, results: [] };
+    await this.deps.db.asService((tx) => this.assertActive(tx, false));
+    const { config } = this.deps;
+    const gate = checkChildDataGate({
+      containsChildPersonalData: true,
+      ageBand: this.ctx.ageBand,
+      zdrEvidence: config.zdrEvidence,
+      environment: config.environment,
+      providerIsMock: this.options.moderation.isMock,
+      now: this.deps.clock(),
+    });
+    if (!gate.ok) {
+      this.deps.log({
+        level: 'error',
+        event: 'moderation_failed',
+        code: 'MODERATION_NOT_AVAILABLE',
+      });
+      return { ok: false, code: 'MODERATION_NOT_AVAILABLE', retryable: false };
+    }
+    const result = await this.options.moderation.moderate(texts, {
+      timeoutMs: MODERATION_TIMEOUT_MS,
+      metadata: { stage: `moderation_${step}` },
+    });
+    if (result.kind === 'error' || result.results.length !== texts.length) {
+      const failure =
+        result.kind === 'ok'
+          ? { code: 'MODERATION_FAILED', retryable: true }
+          : {
+              code: result.timedOut
+                ? 'MODERATION_TIMEOUT'
+                : result.retryable
+                  ? 'MODERATION_FAILED'
+                  : 'MODERATION_NOT_AVAILABLE',
+              retryable: result.retryable,
+            };
+      this.deps.log({
+        level: 'warn',
+        event: 'moderation_failed',
+        code: failure.code,
+        ...(result.kind === 'error' && result.status !== null ? { status: result.status } : {}),
+        durationMs: result.latencyMs,
+      });
+      return { ok: false, ...failure };
+    }
+    this.deps.log({
+      level: 'info',
+      event: 'moderation_checked',
+      code: step.toUpperCase(),
+      count: texts.length,
+      durationMs: result.latencyMs,
+    });
+    return { ok: true, results: result.results };
   }
 
   /**
@@ -1401,20 +1539,26 @@ class ScanRun {
 
     for (const g of graded) {
       // Moderation before generation: a severe-risk answer or prompt is never sent to the tutor.
-      // screenBeforeGrading already kept flagged questions out of grading; this is the backstop.
-      const screen = screenQuestion({
-        prompt: g.question.prompt,
-        answer: g.question.answer,
-        subject: g.question.subject_key,
-        ageBand: this.ctx.ageBand,
-      });
+      // screenBeforeGrading already kept flagged questions out of grading; this is the backstop, on
+      // the same word-list and provider flags (every graded question was screened in this run).
+      const input =
+        this.inputScreens.get(g.question.id) ??
+        childInputScreen(
+          screenQuestion({
+            prompt: g.question.prompt,
+            answer: g.question.answer,
+            subject: g.question.subject_key,
+            ageBand: this.ctx.ageBand,
+          }),
+          null,
+        );
       const step = feedbackStep({
-        severe: screen.level === 'severe' && !this.clearedFlags.has(g.question.id),
+        severe: input.screen.level === 'severe' && !this.clearedFlags.has(g.question.id),
         final: g.final,
         hasPrivate: g.private !== null,
         parentOverride: g.question.parent_override,
       });
-      if (step === 'safety') await this.safetyResponse(g.question, screen);
+      if (step === 'safety') await this.safetyResponse(g.question, input);
       else if (step === 'coach') await this.coach(g);
       else if (step === 'rubric') await this.rubricFeedback(g);
     }
@@ -1557,6 +1701,8 @@ class ScanRun {
           });
           return null;
         });
+        // Provider moderation after generation: the packet as the child would read it.
+        if (rows !== null) rows = await this.moderatedCoaching(rows);
       } catch (error) {
         if (error instanceof SpendCeilingReached) {
           // Coaching is optional: past the ceiling the child gets the reviewed template instead.
@@ -1579,6 +1725,68 @@ class ScanRun {
   }
 
   /**
+   * Provider moderation of a released coaching packet (spec P4; AC_SECURITY_02): the rows, or null
+   * (the reviewed template) when any text is flagged or moderation fails: exactly as a word-list
+   * severe output. Only codes are logged.
+   */
+  private async moderatedCoaching(
+    rows: { kind: string; body: string }[],
+  ): Promise<{ kind: string; body: string }[] | null> {
+    const checked = await this.moderate(
+      rows.map((r) => r.body),
+      'coaching',
+    );
+    if (!checked.ok) {
+      this.deps.log({ level: 'warn', event: 'coaching_blocked_by_moderation', code: checked.code });
+      return null;
+    }
+    const flagged = checked.results.find(moderationFlagged);
+    if (flagged !== undefined) {
+      this.deps.log({
+        level: 'warn',
+        event: 'coaching_blocked_by_safety',
+        code: `SAFETY_${providerModerationCodes(flagged)[0] ?? 'PROVIDER_FLAGGED'}`,
+      });
+      return null;
+    }
+    return rows;
+  }
+
+  /**
+   * The rubric criteria a child may be shown after provider moderation (spec P4; AC_SECURITY_02),
+   * checked BEFORE childRubricFeedback turns them into labels: a flagged criterion is dropped (a
+   * SAFETY_PROVIDER_* code is logged) and a moderation failure drops them all (null). Rubric labels
+   * fail closed: a dropped label costs only a missing row.
+   */
+  private async moderatedCriteria<T extends { readonly criterion: string }>(
+    rubric: readonly T[] | null,
+  ): Promise<readonly T[] | null> {
+    if (rubric === null || rubric.length === 0) return rubric;
+    const checked = await this.moderate(
+      rubric.map((r) => r.criterion),
+      'rubric_criteria',
+    );
+    if (!checked.ok) {
+      this.deps.log({
+        level: 'warn',
+        event: 'rubric_label_blocked_by_moderation',
+        code: checked.code,
+      });
+      return null;
+    }
+    return rubric.filter((_, i) => {
+      const item = checked.results[i]!;
+      if (!moderationFlagged(item)) return true;
+      this.deps.log({
+        level: 'warn',
+        event: 'rubric_label_blocked_by_safety',
+        code: `SAFETY_${providerModerationCodes(item)[0] ?? 'PROVIDER_FLAGGED'}`,
+      });
+      return false;
+    });
+  }
+
+  /**
    * Rubric feedback for written work: criterion labels in fixed wording, never the model's notes or
    * any example text (rubric-feedback.ts). No AI call; when no label is safe to show, the child app
    * asks the child to go over the writing with a grown-up.
@@ -1595,7 +1803,10 @@ class ScanRun {
       });
       return;
     }
-    const rows = childRubricFeedback(g.private?.rubric ?? null, {
+    // Provider moderation of the criteria first; the word-list screen and the leak guard follow.
+    const criteria = await this.moderatedCriteria(g.private?.rubric ?? null);
+    if (criteria === null) return;
+    const rows = childRubricFeedback(criteria, {
       ageBand: this.ctx.ageBand,
       context: { prompt: g.question.prompt, subject: g.question.subject_key },
       onSafetyReject: (code) =>
@@ -1635,7 +1846,9 @@ class ScanRun {
    * (CHK3-CS-8): a question is graded only once EVERY system report on it is cleared, so clearing
    * one of two reports (the original and a corrected transcription's) keeps the notice and grades
    * nothing: the child never gets hints next to a notice, and the child route shows the notice
-   * until the last report is cleared (homework.ts).
+   * until the last report is cleared (homework.ts). Round 5: the screen is the word list merged
+   * with provider moderation of the child's answers (one call per run; see `moderate`); when that
+   * call fails nothing is graded, the flags found are answered (held), and the run fails closed.
    */
   private async screenBeforeGrading(questions: readonly QuestionRow[]): Promise<QuestionRow[]> {
     const ids = questions.map((q) => q.id);
@@ -1670,16 +1883,38 @@ class ScanRun {
         )
       ).map((r) => [r.id, r] as const),
     );
+    // Provider moderation of the child's own words, all answers in one call. Never the printed
+    // prompt: worksheets quote characters and lessons, and a held code on a printed prompt is a
+    // defect (round 5, CHK4-CS-4/5). A blank answer has nothing to send.
+    const answered = questions.filter((q) => !isBlank(q.answer));
+    const moderated = await this.moderate(
+      answered.map((q) => q.answer ?? ''),
+      'child_answers',
+    );
+    const flags = new Map<string, ModerationResultItem>(
+      moderated.ok ? answered.map((q, i) => [q.id, moderated.results[i]!] as const) : [],
+    );
     const toGrade: QuestionRow[] = [];
     for (const question of questions) {
       const known = state.get(question.id);
-      const screen = screenQuestion({
-        prompt: question.prompt,
-        answer: question.answer,
-        subject: question.subject_key,
-        ageBand: this.ctx.ageBand,
-      });
+      const input = childInputScreen(
+        screenQuestion({
+          prompt: question.prompt,
+          answer: question.answer,
+          subject: question.subject_key,
+          ageBand: this.ctx.ageBand,
+        }),
+        flags.get(question.id) ?? null,
+      );
+      this.inputScreens.set(question.id, input);
+      // Every provider flag on the child's words is logged as a code, including those without a
+      // PencilLift category (harassment, hate, illicit), which only log.
+      for (const code of input.providerCodes) {
+        this.deps.log({ level: 'warn', event: 'moderation_flag_child_input', code });
+      }
+      const screen = input.screen;
       if (screen.level === 'severe' && known?.cleared_now && known.all_cleared) {
+        if (!moderated.ok) continue; // cleared, but nothing is graded unmoderated
         this.clearedFlags.add(question.id);
         this.deps.log({
           level: 'info',
@@ -1688,12 +1923,21 @@ class ScanRun {
         });
         toGrade.push(question);
       } else if (screen.level === 'severe') {
-        await this.safetyResponse(question, screen);
+        // Without the provider's answer the word-list flag is still answered at once, held from
+        // the family: the provider might have added a held category the report cannot get later.
+        await this.safetyResponse(question, input, !moderated.ok);
       } else if (known?.flagged && !known.all_cleared) {
         await this.keepSafetyNotice(question);
       } else {
         toGrade.push(question);
       }
+    }
+    if (!moderated.ok) {
+      // FAIL CLOSED: no model call and no model output in this attempt. A retryable failure retries
+      // the job (the stored questions are screened again); any other ends it like a missing provider.
+      throw moderated.retryable
+        ? new RetryableFailure(moderated.code)
+        : new PermanentFailure(moderated.code);
     }
     return toGrade;
   }
@@ -1736,14 +1980,23 @@ class ScanRun {
    * A severe-risk answer (spec P4; AC_SECURITY_02): the reviewed safety template for the child and
    * an escalated system report for the owner's queue, in one transaction, once per question per
    * transcription (a replay finds both and adds nothing). No model call is made for the question.
-   * The report holds ids, the screen's category codes and versions: never homework text.
+   * The report holds ids, the screen's category codes and versions: never homework text. Its audit
+   * row names the layer that flagged it (word list, provider moderation or both) and the PROVIDER_*
+   * codes.
    */
-  private async safetyResponse(question: QuestionRow, screen: SafetyScreen): Promise<void> {
+  private async safetyResponse(
+    question: QuestionRow,
+    input: InputScreen,
+    moderationUnavailable = false,
+  ): Promise<void> {
+    const screen = input.screen;
     const categories = screen.categories.filter(isReportCategory);
     // Runbook 5.1: abuse-type codes may involve someone in the household, so the report starts
     // held from the family's list and its audit row carries no family_id (family members can read
-    // their family's audit log) until the owner releases it.
-    const held = heldFromFamily(screen.categories);
+    // their family's audit log) until the owner releases it. A word-list flag answered while
+    // provider moderation failed is held too (fail closed): the provider's categories might have
+    // been held ones, and a report is filed once per transcription.
+    const held = heldFromFamily(screen.categories) || moderationUnavailable;
     const body = childSafetyMessage(screen.categories, this.ctx.ageBand);
     const filed = await this.guardedWrite(async (tx) => {
       const [current] = await tx<{ corrected_at: Date | null }[]>`
@@ -1782,7 +2035,14 @@ class ScanRun {
       await tx`
         insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
         values (${held ? null : this.ctx.familyId}, 'system', 'safety_report.created', 'safety_report', ${report.id},
-                ${JSON.stringify({ category: 'severe_risk', source: 'safety_screen', screenVersion: SAFETY_SCREEN_VERSION })}::text::jsonb)`;
+                ${JSON.stringify({
+                  category: 'severe_risk',
+                  // Which layer flagged it, so reviewers see the source (PROVIDER_* codes).
+                  source: input.source ?? 'safety_screen',
+                  screenVersion: SAFETY_SCREEN_VERSION,
+                  ...(input.providerCodes.length > 0 ? { providerCodes: input.providerCodes } : {}),
+                  ...(moderationUnavailable ? { providerModeration: 'unavailable' } : {}),
+                })}::text::jsonb)`;
       return true;
     });
     if (filed) {
@@ -1792,6 +2052,9 @@ class ScanRun {
           event: 'safety_screen_severe',
           code: `SAFETY_${category.toUpperCase()}`,
         });
+      }
+      for (const code of input.providerCodes) {
+        this.deps.log({ level: 'warn', event: 'safety_screen_severe', code });
       }
     }
   }

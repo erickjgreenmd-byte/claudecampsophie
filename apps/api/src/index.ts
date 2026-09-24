@@ -4,7 +4,13 @@ import { createApp } from './app.ts';
 import { createParentVerifier } from './auth/parent.ts';
 import { loadConfig, MOCK_ENVIRONMENTS, type ApiConfig } from './config.ts';
 import { createDb } from './db.ts';
-import { createOpenAiResponsesClient } from '@pencillift/ai';
+import {
+  createMockModerationClient,
+  createOpenAiModerationClient,
+  createOpenAiResponsesClient,
+  createRefusingModerationClient,
+  type ModerationClient,
+} from '@pencillift/ai';
 import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/dispatcher.ts';
 import { createExportBuildHandler } from './jobs/export-build.ts';
 import { createLearningHandlers } from './jobs/learning-jobs.ts';
@@ -48,6 +54,8 @@ function stringEnv(env: WorkerEnv): Record<string, string | undefined> {
 interface Runtime {
   readonly deps: AppDeps;
   readonly sql: Sql;
+  /** Provider moderation for the jobs that grade or show model output (selectModerationClient). */
+  readonly moderation: ModerationClient;
 }
 
 type RuntimeFailure = { ok: false; code: 'NOT_CONFIGURED' | 'BLOCKED_EXTERNAL'; message: string };
@@ -188,6 +196,38 @@ export function selectBillingProviders(
 }
 
 /**
+ * The moderation client the configuration selects (spec P4; AC_SECURITY_02), explicitly and failing
+ * closed like billing: the labeled mock only in development/test, the OpenAI client only with
+ * OPENAI_API_KEY, the refusing client in staging/production without it (a scan then stops instead
+ * of grading unmoderated text), and never a mock outside development/test.
+ */
+export function selectModerationClient(
+  config: ApiConfig,
+  env: WorkerEnv,
+): { ok: true; client: ModerationClient } | RuntimeFailure {
+  let client: ModerationClient;
+  switch (config.providers.moderation) {
+    case 'development_mock':
+      client = createMockModerationClient();
+      break;
+    case 'unavailable':
+      client = createRefusingModerationClient();
+      break;
+    case 'openai':
+      if (typeof env.OPENAI_API_KEY !== 'string' || !env.OPENAI_API_KEY) return NOT_CONFIGURED;
+      client = createOpenAiModerationClient({
+        apiKey: env.OPENAI_API_KEY,
+        ...(typeof env.OPENAI_PROJECT === 'string' ? { project: env.OPENAI_PROJECT } : {}),
+      });
+      break;
+    default:
+      return NOT_CONFIGURED;
+  }
+  if (client.isMock && !MOCK_ENVIRONMENTS.has(config.environment)) return NOT_READY;
+  return { ok: true, client };
+}
+
+/**
  * Storage and email outside development/test without their credentials: a provider that refuses
  * every call, never a labeled mock (L-016). An in-memory store loses homework photos and an outbox
  * delivers nothing, yet both answer as if they worked.
@@ -285,6 +325,8 @@ function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
   if (!billing.ok) return billing;
   const storageAndEmail = selectStorageAndEmail(config, env);
   if (!storageAndEmail.ok) return storageAndEmail;
+  const moderation = selectModerationClient(config, env);
+  if (!moderation.ok) return moderation;
   // Last, so a refused configuration never opens a client. One client configuration for the
   // Worker and the tests (BUG-063: array parameters need types).
   const sql = createPostgresClient(env.HYPERDRIVE.connectionString);
@@ -305,7 +347,7 @@ function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
     },
     log: (event) => console.log(JSON.stringify(event)),
   };
-  return { ok: true, runtime: { deps, sql } };
+  return { ok: true, runtime: { deps, sql, moderation: moderation.client } };
 }
 
 interface ExecutionContext {
@@ -336,7 +378,7 @@ export default {
       );
       return;
     }
-    const { deps, sql } = built.runtime;
+    const { deps, sql, moderation } = built.runtime;
     const ai =
       typeof env.OPENAI_API_KEY === 'string' && env.OPENAI_API_KEY.length > 0
         ? createOpenAiResponsesClient({
@@ -347,15 +389,18 @@ export default {
     const handlers: Record<string, JobHandler> = {
       ...DEFAULT_HANDLERS,
       // Practice sets are built from the original bank; the AI only re-themes them when a key,
-      // consent and the child-data gate allow it, so these run with or without a key.
-      ...createLearningHandlers(ai ? { ai } : {}),
+      // consent and the child-data gate allow it, so these run with or without a key. Every
+      // re-themed story and intro passes provider moderation before a child sees it.
+      ...createLearningHandlers(ai ? { ai, moderation } : {}),
       export_build: createExportBuildHandler(),
     };
     if (ai) {
       // Without a real key scans stay queued and readiness reports AI as blocked; they are never
-      // processed by a mock in a deployed environment.
+      // processed by a mock in a deployed environment. The child's answers are moderated before
+      // grading and every child-facing output after it (fail closed on a moderation error).
       handlers.scan_process = createScanProcessHandler({
         ai,
+        moderation,
         readObject: storageReader(deps.providers.storage),
       });
     }

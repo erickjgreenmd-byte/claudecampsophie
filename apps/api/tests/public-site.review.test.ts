@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createMockResponsesClient } from '@pencillift/ai';
+import { createMockModerationClient, createMockResponsesClient } from '@pencillift/ai';
 import { cryptoRandom } from '@pencillift/domain';
 import { seedFamily } from '@pencillift/db/testing/fixtures';
 import { runJobs, type JobDeps } from '../src/jobs/dispatcher.ts';
@@ -117,6 +117,7 @@ describe('public-site review: privacy draft vs the implemented scan pipeline', (
     await runJobs(deps, {
       scan_process: createScanProcessHandler({
         ai: client,
+        moderation: createMockModerationClient(),
         readObject: () => Promise.resolve(stored),
         sleep: () => Promise.resolve(),
       }),

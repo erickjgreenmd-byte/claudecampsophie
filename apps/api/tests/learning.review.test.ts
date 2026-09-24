@@ -5,7 +5,11 @@ import {
   practiceAnswerResponseSchema,
   skillsResponseSchema,
 } from '@pencillift/contracts';
-import { createMockResponsesClient, type ResponsesResult } from '@pencillift/ai';
+import {
+  createMockModerationClient,
+  createMockResponsesClient,
+  type ResponsesResult,
+} from '@pencillift/ai';
 import { cryptoRandom } from '@pencillift/domain';
 import { generateSkillItems, seededRandom, type AnswerSpec } from '@pencillift/domain/bank';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
@@ -458,7 +462,14 @@ describe('RV-learning-api-7: unsafe AI intro lines never reach the child (spec P
         items: [],
       }),
     );
-    const out = await personalizeItems(deps, { ai: mock }, ctx, items, 'daily_set', []);
+    const out = await personalizeItems(
+      deps,
+      { ai: mock, moderation: createMockModerationClient() },
+      ctx,
+      items,
+      'daily_set',
+      [],
+    );
     expect(mock.requests).toHaveLength(1);
     // Actual: the intro passes INTRO_RE (letters/spaces) and the answer-leak guard, and is stored
     // as practice_sets.child_intro, shown to the child.

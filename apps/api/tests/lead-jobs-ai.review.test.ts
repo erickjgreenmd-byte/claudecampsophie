@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  createMockModerationClient,
   createMockResponsesClient,
   type ResponsesClient,
   type ResponsesRequest,
@@ -226,6 +227,7 @@ function syntheticJpeg(): Uint8Array {
 function scanHandler(client: ResponsesClient): JobHandler {
   return createScanProcessHandler({
     ai: client,
+    moderation: createMockModerationClient(),
     readObject: () => Promise.resolve(syntheticJpeg()),
     sleep: () => Promise.resolve(),
   });

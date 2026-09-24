@@ -25,6 +25,8 @@ export interface LogEvent {
   readonly status?: number;
   readonly code?: string;
   readonly durationMs?: number;
+  /** A number of items (e.g. texts sent to provider moderation); never the items themselves. */
+  readonly count?: number;
 }
 
 export interface AppEnv {

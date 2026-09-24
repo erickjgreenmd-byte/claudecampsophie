@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createMockResponsesClient } from '@pencillift/ai';
+import { createMockModerationClient, createMockResponsesClient } from '@pencillift/ai';
 import {
   DEFAULT_HOMEWORK_UPLOAD_LIMITS,
   HOMEWORK_BUSINESS_RULES,
@@ -519,6 +519,7 @@ describe('the scan job refuses a decompression bomb before any AI request (AC_CA
     await runJobs(deps, {
       scan_process: createScanProcessHandler({
         ai: client,
+        moderation: createMockModerationClient(),
         readObject: () => Promise.resolve(bomb),
         sleep: () => Promise.resolve(),
       }),

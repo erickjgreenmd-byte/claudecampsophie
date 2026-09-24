@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  createMockModerationClient,
   createMockResponsesClient,
   type ResponsesClient,
   type ResponsesRequest,
@@ -19,6 +20,7 @@ import {
   createScanProcessHandler,
   keysAgree,
   protectedAnswers,
+  rubricProtectedAnswers,
   storageReader,
   StoredPageTooLarge,
   TEMPLATE_FALLBACK,
@@ -331,6 +333,7 @@ function handlerFor(client: ResponsesClient): Record<string, JobHandler> {
   return {
     scan_process: createScanProcessHandler({
       ai: client,
+      moderation: createMockModerationClient(),
       readObject,
       sleep: () => Promise.resolve(),
     }),
@@ -549,6 +552,7 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
     await runJobs(deps, {
       scan_process: createScanProcessHandler({
         ai: second,
+        moderation: createMockModerationClient(),
         readObject: () => Promise.resolve(truncated),
         sleep: () => Promise.resolve(),
       }),
@@ -1594,8 +1598,12 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
         'Answers will vary — any complete sentence that uses glow correctly.',
         'Uses glow correctly',
       ],
-      ['Check for sentence parts, e.g. a subject and a verb.', 'Has a subject and a verb'],
       ['The sentence - uses the word glow correctly.', 'Uses the word glow correctly'],
+    ] as const;
+    // Round 5 (R4-RL-B; lead decision: fail closed): the wording after "e.g." is protected even
+    // when it lists kinds of things, so the criterion that shares its words is no longer shown.
+    const failClosed = [
+      ['Check for sentence parts, e.g. a subject and a verb.', 'Has a subject and a verb'],
     ] as const;
     const questions: ScriptedQuestion[] = [
       ...examples.map((w, i) =>
@@ -1604,7 +1612,7 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
           { criterion: 'Uses a capital letter', met: true, note: 'n/a' },
         ]),
       ),
-      ...accepted.map(([w, criterion], i) =>
+      ...[...accepted, ...failClosed].map(([w, criterion], i) =>
         glow(examples.length + i + 1, w, [{ criterion, met: true, note: 'n/a' }]),
       ),
     ];
@@ -1618,6 +1626,146 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
       ].sort(),
     );
     expect(JSON.stringify(api.logs)).not.toMatch(/lamp/);
+  });
+
+  it('a sample completion after "Sample answer:", "Examples include:", "e.g." or "A good answer is" never reaches the child (R4-RL-A, R4-RL-B, R4-RL-D)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // The round-4 checker's forms: the label copies the unquoted example; the key names no answer.
+    const cases = [
+      [
+        'Finish the sentence: When it rains, my dog ...',
+        'Sample answer: stays inside and sleeps.',
+        'Stays inside and sleeps',
+      ],
+      [
+        'Finish the sentence: When it snows, my dog ...',
+        'Example: finds a bone in the yard.',
+        'Finds a bone in the yard',
+      ],
+      [
+        'Write sentence 3 using the word glow.',
+        'Examples include: The lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+      [
+        'Write sentence 4 using the word glow.',
+        'Accept complete sentences, e.g. the lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+      [
+        'Write sentence 5 using the word glow.',
+        'A good answer is the lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+      [
+        'Write sentence 6 using the word glow.',
+        'Example 1) The lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+    ] as const;
+    const questions: ScriptedQuestion[] = cases.map(([prompt, worked, criterion], i) => ({
+      page: 1,
+      number: String(i + 1),
+      prompt,
+      answer: 'x',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: 'Answers will vary.',
+      worked,
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric: [
+        { criterion, met: false, note: 'n/a' },
+        { criterion: 'Uses a capital letter', met: true, note: 'n/a' },
+      ],
+    }));
+    await runJobs(deps, handlerFor(scriptedModel({ questions })));
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => r.body)).toEqual(
+      cases.map(() => 'You did this well: Uses a capital letter.'),
+    );
+    expect(
+      api.logs.filter(
+        (l) => l.event === 'rubric_label_blocked_by_guard' && l.code === 'ANSWER_LEAK',
+      ),
+    ).toHaveLength(cases.length);
+    expect(JSON.stringify(api.logs)).not.toMatch(/lamp|sleeps|bone/);
+  });
+
+  it('an example behind an earlier cue in its sentence, or a completion behind a capitalised "-ly" word, never reaches the child (R5-RL-CHK-A, R5-RL-CHK-B)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // The round-5 checker's forms (R5-SW1..3, R5-LY1..2); the key names no answer.
+    const cases = [
+      [
+        'Write sentence 1 using the word glow.',
+        'A good answer is a sentence that uses glow; an example is the lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+      [
+        'Write sentence 2 using the word glow.',
+        'Any sentence is fine if it uses glow; an example would be the lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+      [
+        'Write sentence 3 using the word glow.',
+        'The answer is open-ended; a good example is the lamp glows at night.',
+        'Writes the lamp glows at night',
+      ],
+      [
+        'Finish the sentence: My dog hid under the bed ...',
+        'Answers will vary.',
+        'Carefully writes after the loud thunder',
+      ],
+      [
+        'Finish the sentence: My cat hid under the bed ...',
+        'Answers will vary.',
+        'Clearly writes before the storm hit',
+      ],
+    ] as const;
+    const questions: ScriptedQuestion[] = cases.map(([prompt, worked, criterion], i) => ({
+      page: 1,
+      number: String(i + 1),
+      prompt,
+      answer: 'x',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: 'Answers will vary.',
+      worked,
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric: [
+        { criterion, met: false, note: 'n/a' },
+        { criterion: 'Uses a capital letter', met: true, note: 'n/a' },
+      ],
+    }));
+    await runJobs(deps, handlerFor(scriptedModel({ questions })));
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => r.body)).toEqual(
+      cases.map(() => 'You did this well: Uses a capital letter.'),
+    );
+    // The three examples are dropped by the answer guard; the two completions by their shape.
+    expect(
+      api.logs.filter(
+        (l) => l.event === 'rubric_label_blocked_by_guard' && l.code === 'ANSWER_LEAK',
+      ),
+    ).toHaveLength(3);
+    expect(JSON.stringify(api.logs)).not.toMatch(/lamp|thunder|storm/);
+  });
+
+  it('a rubric note with a long run of spaces is read in linear time (R4-RL-C)', () => {
+    for (const gap of [' ', '\t']) {
+      const note = `a${gap.repeat(64_000)}b`;
+      const started = performance.now();
+      const answers = rubricProtectedAnswers({
+        correctAnswer: 'Answers will vary.',
+        workedSolution: 'n/a',
+        rubric: [{ note }],
+      });
+      expect(performance.now() - started).toBeLessThan(200);
+      expect(answers).not.toBeNull();
+    }
   });
 
   it('in staging, a month without an owner budget pauses a queued scan with no AI call (LJA-F2)', async () => {
@@ -2014,6 +2162,7 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
     const report = await runJobs(deps, {
       scan_process: createScanProcessHandler({
         ai: client,
+        moderation: createMockModerationClient(),
         readObject: () => Promise.reject(new StoredPageTooLarge()),
         sleep: () => Promise.resolve(),
       }),
