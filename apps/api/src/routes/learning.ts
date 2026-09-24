@@ -54,10 +54,12 @@ import type { ChildPrincipal, Tx } from '../db.ts';
 import { ApiError, pgErrorCode } from '../errors.ts';
 import {
   PRACTICE_GRADER_VERSION,
+  currentAndNextWeekKeys,
   enqueueDailyJob,
   ensureLearningDefaults,
   loadChildContext,
   loadEvidence,
+  nextReviewWeekKey,
   parseStoredKey,
   rescheduleReviewJobs,
   reviewScheduleFor,
@@ -105,6 +107,16 @@ const PARENT_SET_LIMIT = 30;
 
 const iso = (d: Date) => d.toISOString();
 const isoOrNull = (d: Date | null) => (d ? d.toISOString() : null);
+
+/**
+ * Child reads are evaluated at the request clock: the pl_child RLS policies show a set and its
+ * questions only from release_at on (migration 0650; review finding RV-learning-db-1), using this
+ * transaction-local instant (else the database clock). Call first in every pl_child transaction
+ * that reads practice sets or items.
+ */
+async function atRequestInstant(tx: Tx, now: Date): Promise<void> {
+  await tx`select set_config('pencillift.request_now', ${now.toISOString()}, true)`;
+}
 
 function paramUuid(c: Context<AppEnv>, name: string, notFound: string): string {
   const parsed = uuidSchema.safeParse(c.req.param(name));
@@ -259,6 +271,7 @@ async function childSets(
   const { deps } = c.var;
   const now = deps.clock();
   const { sets, items } = await deps.db.asChild(child, async (tx) => {
+    await atRequestInstant(tx, now);
     const sets =
       filter.kind === 'daily'
         ? await tx<ChildSetRow[]>`
@@ -340,10 +353,7 @@ async function scheduleResponse(
   now: Date,
 ): Promise<LearningScheduleResponse> {
   const nextReviewReleases: LearningScheduleResponse['nextReviewReleases'] = [];
-  for (const weekKey of [
-    reviewWeekKey(now, ctx.zone),
-    reviewWeekKey(new Date(now.getTime() + 7 * 86_400_000), ctx.zone),
-  ]) {
+  for (const weekKey of currentAndNextWeekKeys(now, ctx.zone)) {
     const { monday, sunday } = isoWeekDates(weekKey);
     const tests = await tx<{ subject_key: string; test_date: string }[]>`
       select s.subject_key, t.test_date::text as test_date from public.test_dates t
@@ -1069,8 +1079,8 @@ export function learningRoutes(): Hono<AppEnv> {
       return c.json(body);
     }
     // A Monday test releases its review on Sunday but is keyed to the test's week, so released
-    // sets of next week are included too.
-    const nextWeek = reviewWeekKey(new Date(now.getTime() + 7 * 86_400_000), zone);
+    // sets of next week are included too. Calendar week, not now + 168 h (DST; RV-learning-api-5).
+    const nextWeek = nextReviewWeekKey(now, zone);
     const sets = await childSets(c, child, { kind: 'review', weekKeys: [weekKey, nextWeek] });
     const names = await deps.db.asChild(
       child,
@@ -1117,14 +1127,15 @@ export function learningRoutes(): Hono<AppEnv> {
     );
     const body = await readJson(c, practiceAnswerRequestSchema);
     const now = deps.clock();
-    // First layer: the child's own session must be able to see the item (RLS + column grants).
-    const [visible] = await deps.db.asChild(
-      child,
-      (tx) => tx<{ id: string; set_id: string; release_at: Date | null }[]>`
+    // First layer: the child's own session must be able to see the item (RLS + column grants,
+    // including the release instant).
+    const [visible] = await deps.db.asChild(child, async (tx) => {
+      await atRequestInstant(tx, now);
+      return tx<{ id: string; set_id: string; release_at: Date | null }[]>`
         select i.id, i.set_id, s.release_at from public.practice_items i
           join public.practice_sets s on s.id = i.set_id
-         where i.id = ${itemId} and i.child_id = ${child.childId}`,
-    );
+         where i.id = ${itemId} and i.child_id = ${child.childId}`;
+    });
     if (!visible || (visible.release_at !== null && visible.release_at.getTime() > now.getTime())) {
       throw new ApiError('NOT_FOUND', 'Question not found');
     }
@@ -1148,6 +1159,17 @@ export function learningRoutes(): Hono<AppEnv> {
          where i.id = ${itemId} and i.child_id = ${child.childId} and i.family_id = ${child.familyId}
            and s.status in ('ready', 'in_progress', 'completed')`;
       if (!item) return null;
+      // Serialize every submission within the SET first (lock order: set, then question). Two
+      // devices finishing the last two open questions at once otherwise each counted the other's
+      // question as still open and nobody completed the set (review finding RV-learning-api-4).
+      // The status is re-read under the lock: another answer may have completed the set.
+      const [locked] = await tx<{ status: string }[]>`
+        select status from public.practice_sets
+         where id = ${item.set_id} and family_id = ${child.familyId}
+           and status in ('ready', 'in_progress', 'completed')
+           for no key update`;
+      if (!locked) return null;
+      const setStatus = locked.status;
       // Serialize every submission for this question (duplicates, double taps, two devices).
       await tx`
         insert into public.target_answer_attempts (question_instance_id, family_id, child_id, count)
@@ -1179,7 +1201,7 @@ export function learningRoutes(): Hono<AppEnv> {
       // Idempotent replay: the same submission returns its recorded outcome and awards nothing new.
       const replay = history.find((h) => h.idempotency_key === attemptKey);
       if (replay) {
-        const setDone = item.set_status === 'completed';
+        const setDone = setStatus === 'completed';
         return {
           result: replay.correctness === 'correct' ? 'correct' : 'try_again',
           attemptNumber: graded.length,
@@ -1204,7 +1226,7 @@ export function learningRoutes(): Hono<AppEnv> {
           offerHelp: true,
           itemStatus: 'help_offered',
           pointsAwarded: 0,
-          setCompleted: item.set_status === 'completed',
+          setCompleted: setStatus === 'completed',
         };
       }
       const [keyRow] = await tx<{ answer_spec: unknown }[]>`
@@ -1218,7 +1240,7 @@ export function learningRoutes(): Hono<AppEnv> {
           offerHelp: false,
           itemStatus: status(unsuccessful, solved),
           pointsAwarded: 0,
-          setCompleted: item.set_status === 'completed',
+          setCompleted: setStatus === 'completed',
         };
       }
       const verdict = gradeBankAnswer(key.spec, body.answer).verdict;
@@ -1230,7 +1252,7 @@ export function learningRoutes(): Hono<AppEnv> {
           offerHelp: false,
           itemStatus: status(unsuccessful, solved),
           pointsAwarded: 0,
-          setCompleted: item.set_status === 'completed',
+          setCompleted: setStatus === 'completed',
         };
       }
       if (solved) {
@@ -1241,7 +1263,7 @@ export function learningRoutes(): Hono<AppEnv> {
           offerHelp: false,
           itemStatus: 'correct',
           pointsAwarded: 0,
-          setCompleted: item.set_status === 'completed',
+          setCompleted: setStatus === 'completed',
         };
       }
       const attemptNumber = (history.at(-1)?.attempt_number ?? 0) + 1;
@@ -1249,19 +1271,6 @@ export function learningRoutes(): Hono<AppEnv> {
         select max(a.occurred_at) as at from public.attempts a
           join public.practice_items i on i.id = a.question_instance_id
          where i.set_id = ${item.set_id} and a.child_id = ${child.childId}`;
-      await tx`
-        insert into public.attempts (family_id, child_id, question_instance_id, source, subject_key, skill,
-                                     attempt_number, hints_used, correctness, grader_version, idempotency_key, occurred_at)
-        values (${child.familyId}, ${child.childId}, ${itemId}, ${item.kind === 'daily' ? 'daily' : 'review'},
-                ${item.subject_key}, ${item.skill}, ${attemptNumber}, 0, ${verdict}, ${PRACTICE_GRADER_VERSION},
-                ${attemptKey}, ${now})`;
-      let count = unsuccessful;
-      if (verdict === 'incorrect') {
-        const [updated] = await tx<{ count: number }[]>`
-          update public.target_answer_attempts set count = count + 1, updated_at = now()
-           where question_instance_id = ${itemId} returning count`;
-        count = updated?.count ?? unsuccessful + 1;
-      }
 
       // Points (spec P9): effort + independent-correct bonus once per question, completion once per set.
       const [rulesRow] = await tx<
@@ -1276,19 +1285,43 @@ export function learningRoutes(): Hono<AppEnv> {
           from public.reward_rules where family_id = ${child.familyId}`;
       const rules = mapRewardsRules(rulesRow);
       const since = previous?.at ?? item.release_at ?? item.ready_at ?? now;
+      const attemptEvent = {
+        kind: 'practice_attempt',
+        childId: child.childId,
+        questionInstanceId: itemId,
+        answerText: body.answer,
+        responseTimeMs: Math.max(0, now.getTime() - since.getTime()),
+        independentCorrect: verdict === 'correct' && attemptNumber === 1,
+      } as const;
+      // Meaningful = the attempt meets the earning rule (non-empty answer, not faster than the
+      // family's minimum response time): exactly when a fresh question would earn its effort award.
+      const fresh = computeAwards(attemptEvent, rules, []);
+      const meaningful = fresh.ok && fresh.value.length > 0;
+
+      // evidence_key: a digest of the private instance key, so the same bank question served again
+      // in a later set is one distinct question in the evidence (spec P7; RV-learning-api-1).
+      await tx`
+        insert into public.attempts (family_id, child_id, question_instance_id, source, subject_key, skill,
+                                     attempt_number, hints_used, correctness, grader_version, idempotency_key,
+                                     occurred_at, evidence_key, meaningful)
+        values (${child.familyId}, ${child.childId}, ${itemId}, ${item.kind === 'daily' ? 'daily' : 'review'},
+                ${item.subject_key}, ${item.skill}, ${attemptNumber}, 0, ${verdict}, ${PRACTICE_GRADER_VERSION},
+                ${attemptKey}, ${now}, 'bank:' || encode(sha256(convert_to(${key.instanceKey}::text, 'UTF8')), 'hex'),
+                ${meaningful})`;
+      let count = unsuccessful;
+      if (verdict === 'incorrect') {
+        const [updated] = await tx<{ count: number }[]>`
+          update public.target_answer_attempts set count = count + 1, updated_at = now()
+           where question_instance_id = ${itemId} returning count`;
+        count = updated?.count ?? unsuccessful + 1;
+      }
+
       const keys = [`attempt:${itemId}`, `independent:${itemId}`, `set:${item.set_id}`];
       const existing = await tx<{ idempotency_key: string }[]>`
         select idempotency_key from public.points_ledger
          where child_id = ${child.childId} and idempotency_key = any(${keys})`;
       const awards = computeAwards(
-        {
-          kind: 'practice_attempt',
-          childId: child.childId,
-          questionInstanceId: itemId,
-          answerText: body.answer,
-          responseTimeMs: Math.max(0, now.getTime() - since.getTime()),
-          independentCorrect: verdict === 'correct' && attemptNumber === 1,
-        },
+        attemptEvent,
         rules,
         existing.map((e) => e.idempotency_key),
       );
@@ -1307,7 +1340,7 @@ export function learningRoutes(): Hono<AppEnv> {
                             where a.question_instance_id = i.id and a.correctness = 'correct')
            and coalesce((select t.count from public.target_answer_attempts t
                           where t.question_instance_id = i.id), 0) < ${MAX_TARGET_ATTEMPTS}`;
-      let setCompleted = item.set_status === 'completed';
+      let setCompleted = setStatus === 'completed';
       if ((remaining?.n ?? 1) === 0) {
         const done = await tx`
           update public.practice_sets set status = 'completed'
@@ -1316,7 +1349,16 @@ export function learningRoutes(): Hono<AppEnv> {
         setCompleted = true;
         // Completion points for daily sets and weekly reviews; optional top-ups earn per-question
         // points only, so late-scan versions can never multiply completion awards (AC_LEARNING_09).
-        if (done.length > 0 && item.kind !== 'top_up') {
+        // Decision: the award also needs meaningful work on EVERY question (at least one attempt
+        // meeting the earning rule); a set finished only by rapid guesses completes but earns no
+        // completion points (spec P9 anti-farming; review finding RV-learning-api-3).
+        const [unearned] = await tx<{ n: number }[]>`
+          select count(*)::int as n from public.practice_items i
+           where i.set_id = ${item.set_id}
+             and not exists (select 1 from public.attempts a
+                              where a.question_instance_id = i.id and a.child_id = ${child.childId}
+                                and a.meaningful)`;
+        if (done.length > 0 && item.kind !== 'top_up' && (unearned?.n ?? 1) === 0) {
           const completion = computeAwards(
             { kind: 'set_completed', childId: child.childId, setId: item.set_id },
             rules,

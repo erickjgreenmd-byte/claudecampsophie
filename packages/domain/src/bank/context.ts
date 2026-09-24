@@ -73,6 +73,95 @@ function clean(value: unknown, pattern: RegExp): string | null {
   return text;
 }
 
+/** Intro line: English letters, spaces and light punctuation (no digits, links, markup or look-alike letters). */
+const INTRO_RE = /^[A-Za-z ,.!'’-]{1,200}$/;
+
+/**
+ * Decision: an intro line is optional encouragement, so its denylist is broader than the story
+ * one. Besides the story words it refuses anything that steers a child toward credentials, a
+ * grown-up's role or account, the answers, contact details or money (spec P6: fake parent/PIN
+ * requests must not work; P12: validate child-facing output and fail closed; review finding
+ * RV-learning-api-7). A refused intro is simply left out.
+ */
+const INTRO_DENYLIST = new Set([
+  ...DENYLIST,
+  'answered',
+  'keys',
+  'solutions',
+  'solve',
+  'solved',
+  'hints',
+  'cheat',
+  'cheats',
+  'cheating',
+  'copy',
+  'parents',
+  'mom',
+  'moms',
+  'mommy',
+  'mother',
+  'dad',
+  'dads',
+  'daddy',
+  'father',
+  'grown',
+  'grownup',
+  'grownups',
+  'adult',
+  'adults',
+  'guardian',
+  'passwords',
+  'passcode',
+  'passcodes',
+  'pin',
+  'pins',
+  'code',
+  'codes',
+  'secret',
+  'secrets',
+  'login',
+  'log',
+  'unlock',
+  'account',
+  'accounts',
+  'admin',
+  'email',
+  'phone',
+  'address',
+  'website',
+  'http',
+  'https',
+  'www',
+  'com',
+  'org',
+  'net',
+  'link',
+  'links',
+  'click',
+  'download',
+  'buy',
+  'pay',
+  'money',
+  'cash',
+  'prize',
+]);
+
+/**
+ * Validates an untrusted AI intro line; the normalized line, or null when anything is off. The
+ * caller still runs the answer-leak guard (this checks content, not answers).
+ */
+export function validateIntro(input: unknown): string | null {
+  if (typeof input !== 'string') return null;
+  const text = input.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (!INTRO_RE.test(text)) return null;
+  const words = text
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter((w) => w.length > 0);
+  if (words.length === 0 || words.some((w) => INTRO_DENYLIST.has(w))) return null;
+  return text;
+}
+
 /** Validates an untrusted proposed context; null when anything is off. */
 export function validateContext(input: unknown): WordProblemContext | null {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) return null;

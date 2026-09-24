@@ -425,10 +425,42 @@ export function parseSpellingList(text: string): string[] {
   return words;
 }
 
+/** Bounded redraws for a teacher-list pattern that no other list word completes. */
+const MAX_PATTERN_DRAWS = 8;
+
+/** True when `candidate` fills every blank of `pattern` ("b _ t") and matches its shown letters. */
+function completesPattern(pattern: string, candidate: string): boolean {
+  const shown = pattern.split(' ');
+  const letters = [...candidate];
+  if (shown.length !== letters.length) return false;
+  return shown.every((c, i) => c === '_' || c.toLowerCase() === letters[i]?.toLowerCase());
+}
+
+/**
+ * A missing-letter pattern for `word` that no OTHER word on the same list also completes (review
+ * finding RV-learning-bank-1): "spell one of your spelling words: b _ t" is ambiguous on the list
+ * "bat, bit", because "bat" would be graded as a misspelling. Redraws a bounded number of times;
+ * null (no missing-letter item) when every draw is ambiguous.
+ */
+function unambiguousPattern(
+  random: RandomSource,
+  word: string,
+  list: readonly string[],
+): string | null {
+  const others = list.filter((w) => w.toLowerCase() !== word.toLowerCase());
+  for (let draw = 0; draw < MAX_PATTERN_DRAWS; draw += 1) {
+    const pattern = missingLetterPattern(random, word);
+    if (pattern === null) return null;
+    if (!others.some((w) => completesPattern(pattern, w))) return pattern;
+  }
+  return null;
+}
+
 /**
  * Items for one teacher-list word. Decision: prompts say "one of your spelling words" and a
  * choose-the-spelling distractor may never be another word on the same list, so the question has
- * exactly one right answer even when a misspelling happens to be a real English word.
+ * exactly one right answer even when a misspelling happens to be a real English word; for the same
+ * reason a missing-letter pattern is never one that another list word also completes.
  */
 export function teacherWordItems(
   random: RandomSource,
@@ -449,7 +481,7 @@ export function teacherWordItems(
   const wrongs = misspellings(word).filter((m) => !onList.has(m));
   if (wrongs.length === 0) return [];
   const items: BankItem[] = [];
-  const pattern = missingLetterPattern(random, word);
+  const pattern = unambiguousPattern(random, word, list);
   if (pattern !== null) {
     items.push(
       buildItem({

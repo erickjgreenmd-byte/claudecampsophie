@@ -84,7 +84,7 @@ export {
   type CoverageSkill,
   type SubjectCoverage,
 } from './coverage.ts';
-export { rethemeWordProblem, validateContext } from './context.ts';
+export { rethemeWordProblem, validateContext, validateIntro } from './context.ts';
 export {
   SPACED_REVIEW_AFTER_DAYS,
   interleaveBySubject,

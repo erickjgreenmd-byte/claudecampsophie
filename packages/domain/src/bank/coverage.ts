@@ -72,22 +72,35 @@ export const GENERAL_UNSUPPORTED: readonly string[] = [
   'Languages other than English',
 ];
 
-function curatedCount(def: SkillDefinition): number | null {
-  if (def.source !== 'curated') return null;
-  if (def.subject === 'science') return SCIENCE_ITEMS.filter((i) => i.skill === def.skill).length;
-  if (def.subject === 'social_studies')
-    return SOCIAL_STUDIES_ITEMS.filter((i) => i.skill === def.skill).length;
-  if (def.subject === 'reading')
-    return PASSAGES.reduce(
-      (n, p) => n + p.questions.filter((q) => q.skill === def.skill).length,
-      0,
-    );
-  return null;
+/** Curated item grade ranges for a skill (fact items and passage questions). */
+function curatedRanges(def: SkillDefinition): readonly { gradeMin: number; gradeMax: number }[] {
+  if (def.subject === 'science' || def.subject === 'social_studies') {
+    const pool = def.subject === 'science' ? SCIENCE_ITEMS : SOCIAL_STUDIES_ITEMS;
+    return pool.filter((i) => i.skill === def.skill);
+  }
+  if (def.subject === 'reading') {
+    return PASSAGES.flatMap((p) => p.questions.filter((q) => q.skill === def.skill).map(() => p));
+  }
+  return [];
 }
 
 /**
- * Supported skills per subject (optionally only those covering `grade`) plus the explicitly
- * unsupported niches. Nothing here claims completeness.
+ * Distinct fixed items a curated skill can serve (null for generated/family skills). With a grade,
+ * only items the generator actually serves at that grade count: standard items target the grade
+ * and accessible items one grade below (as `factItems`/`passageItems` do). A skill whose count is 0
+ * at a grade is not listed as supported there (review finding RV-learning-bank-3).
+ */
+function curatedCount(def: SkillDefinition, grade: number | null): number | null {
+  if (def.source !== 'curated') return null;
+  const targets = grade === null ? null : [grade, Math.max(0, grade - 1)];
+  return curatedRanges(def).filter(
+    (r) => targets === null || targets.some((t) => r.gradeMin <= t && t <= r.gradeMax),
+  ).length;
+}
+
+/**
+ * Supported skills per subject (optionally only those the bank can serve at `grade`) plus the
+ * explicitly unsupported niches. Nothing here claims completeness.
  */
 export function bankCoverage(grade?: number): BankCoverage {
   const g = grade === undefined ? null : bankGrade(grade);
@@ -97,15 +110,22 @@ export function bankCoverage(grade?: number): BankCoverage {
       subject,
       skills: SKILLS.filter(
         (s) => s.subject === subject && (g === null || (s.gradeMin <= g && g <= s.gradeMax)),
-      ).map((s) => ({
-        skill: s.skill,
-        label: s.label,
-        gradeMin: s.gradeMin,
-        gradeMax: s.gradeMax,
-        answerKinds: s.answerKinds,
-        source: s.source,
-        curatedItems: curatedCount(s),
-      })),
+      ).flatMap((s) => {
+        const curatedItems = curatedCount(s, g);
+        // A curated skill with no item at this grade is not supported here (no fake completion).
+        if (curatedItems === 0) return [];
+        return [
+          {
+            skill: s.skill,
+            label: s.label,
+            gradeMin: s.gradeMin,
+            gradeMax: s.gradeMax,
+            answerKinds: s.answerKinds,
+            source: s.source,
+            curatedItems,
+          },
+        ];
+      }),
       unsupported: UNSUPPORTED_NICHES[subject],
     })),
     general: GENERAL_UNSUPPORTED,

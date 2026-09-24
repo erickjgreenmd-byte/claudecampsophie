@@ -247,6 +247,26 @@ describe('Thursday review scheduling in the family zone (AC_LEARNING_08)', () =>
     });
     expect(after.filter((j) => j.status === 'cancelled')).toHaveLength(1);
   });
+
+  it('a family time-zone change moves the queued job under the same key (a current key is never cancelled)', async () => {
+    // Fix pass (with RV-learning-api-6): "replace" used to cancel the job and then fail to re-queue
+    // the same (now cancelled, terminal) key, so the week lost its review.
+    const fam = await family('America/New_York');
+    const child = fam.children[0]!.id;
+    await onlySubjects(fam, ['math']);
+    at('2026-09-21T12:00:00Z'); // Monday 2026-W39
+    await enqueueDueLearningJobs(deps, api.now.value);
+    await api.db
+      .sql`update public.families set timezone = 'America/Los_Angeles' where id = ${fam.familyId}`;
+    await enqueueDueLearningJobs(deps, api.now.value);
+    const w39 = (await jobs(child, 'thursday_review_generate')).filter(
+      (j) => j.payload.weekKey === '2026-W39',
+    );
+    expect(w39.map((j) => [j.idempotency_key, j.status, j.payload.releaseAt])).toEqual([
+      [`review:${child}:math:2026-W39:s1`, 'queued', '2026-09-24T23:00:00.000Z'], // 16:00 PDT
+    ]);
+    expect(w39[0]!.run_after.toISOString()).toBe('2026-09-24T21:00:00.000Z');
+  });
 });
 
 describe('Thursday review content (AC_LEARNING_07)', () => {

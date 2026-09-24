@@ -494,6 +494,12 @@ const RECALL_DISTRACTORS = [
   'harbor',
 ];
 
+/** Other spellings/irregular forms of a distractor (regular -s/-es plurals contain the word). */
+const RECALL_DISTRACTOR_FORMS: Readonly<Record<string, readonly string[]>> = {
+  cactus: ['cacti'],
+  harbor: ['harbour'],
+};
+
 /** Sentences of 20..160 characters that occur exactly once (so "which comes first" is exact). */
 function sentencesOf(text: string): string[] {
   const all = (text.replace(/\s+/g, ' ').match(/[^.!?]+[.!?]+["”’']?/g) ?? []).map((s) => s.trim());
@@ -555,9 +561,15 @@ export function parentPassageItems(
     }
   }
   const lower = ` ${text.toLowerCase().replace(/[^a-z\s]/g, ' ')} `;
-  const words = [...new Set(lower.split(/\s+/).filter((w) => w.length >= 5 && w.length <= 12))];
+  const tokens = lower.split(/\s+/).filter((w) => w.length > 0);
+  const words = [...new Set(tokens.filter((w) => w.length >= 5 && w.length <= 12))];
+  // A distractor must be truly absent: any passage word that contains it or one of its other forms
+  // ("volcanoes", "cacti", "harbour") makes it a second defensible answer (RV-learning-bank-2).
   const absent = RECALL_DISTRACTORS.filter(
-    (w) => !lower.includes(` ${w} `) && !lower.includes(`${w}s `),
+    (w) =>
+      ![w, ...(RECALL_DISTRACTOR_FORMS[w] ?? [])].some((form) =>
+        tokens.some((token) => token.includes(form)),
+      ),
   );
   if (words.length > 0 && absent.length >= 3) {
     const word = pick(random, words);

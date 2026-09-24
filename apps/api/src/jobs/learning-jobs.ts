@@ -24,6 +24,7 @@ import {
   rethemeWordProblem,
   skillLabel,
   validateBankItem,
+  validateIntro,
   type AnswerSpec,
   type BankItem,
   type BankSubject,
@@ -54,6 +55,7 @@ import {
   reviewWeekKey,
   startOfLocalDay,
   topUpIdempotencyKey,
+  weekKeyOfDate,
   type ReviewJobStatus,
   type ReviewRelease,
   type ReviewSchedule,
@@ -217,7 +219,19 @@ export async function loadChildContext(
   };
 }
 
-/** Attempts (+ latest parent override) as validated learning events. */
+/** At most this many attempts are read per evidence query (the NEWEST ones in the window). */
+export const EVIDENCE_EVENT_LIMIT = 5000;
+
+/**
+ * Attempts (+ latest parent override) as validated learning events, oldest first.
+ *
+ * - The newest `EVIDENCE_EVENT_LIMIT` attempts in the window are kept (review finding
+ *   RV-learning-api-2: an ascending sort with a limit dropped this week's evidence for a busy child).
+ * - A practice attempt is keyed by its bank question (`evidence_key`, a digest of the private
+ *   instance key), so the same question served again in a later set is ONE distinct question, not a
+ *   new one (spec P7 "avoid repeatedly counting resubmissions of the same question as new
+ *   evidence"; RV-learning-api-1). Homework attempts keep their extracted-question id.
+ */
 export async function loadEvidence(
   tx: Tx,
   ctx: { familyId: string; childId: string },
@@ -238,17 +252,21 @@ export async function loadEvidence(
       overridden_at: Date | null;
     }[]
   >`
-    select a.id, a.question_instance_id, a.subject_key, a.skill, a.attempt_number, a.hints_used,
-           a.correctness, a.grader_version, a.occurred_at,
-           o.correctness as override_correctness, o.created_at as overridden_at
-      from public.attempts a
-      left join lateral (
-        select correctness, created_at from public.attempt_overrides
-         where attempt_id = a.id order by created_at desc limit 1
-      ) o on true
-     where a.child_id = ${ctx.childId} and a.family_id = ${ctx.familyId} and a.occurred_at >= ${since}
-     order by a.occurred_at, a.id
-     limit 5000`;
+    select recent.* from (
+      select a.id, coalesce(a.evidence_key, a.question_instance_id::text) as question_instance_id,
+             a.subject_key, a.skill, a.attempt_number, a.hints_used,
+             a.correctness, a.grader_version, a.occurred_at,
+             o.correctness as override_correctness, o.created_at as overridden_at
+        from public.attempts a
+        left join lateral (
+          select correctness, created_at from public.attempt_overrides
+           where attempt_id = a.id order by created_at desc limit 1
+        ) o on true
+       where a.child_id = ${ctx.childId} and a.family_id = ${ctx.familyId} and a.occurred_at >= ${since}
+       order by a.occurred_at desc, a.id desc
+       limit ${EVIDENCE_EVENT_LIMIT}
+    ) recent
+    order by recent.occurred_at, recent.id`;
   const events: AttemptEvent[] = [];
   for (const row of rows) {
     const parsed = validateAttemptEvent({
@@ -431,7 +449,12 @@ interface NewSet {
   readonly items: readonly { readonly item: BankItem; readonly category: ItemCategoryColumn }[];
 }
 
-/** Inserts the set, items and private keys atomically. Returns the new id, or null if it existed. */
+/**
+ * Inserts the set, items and private keys atomically. Returns the new id, or null if it existed.
+ * "Existed" covers the set key AND the one-base-review-per-child/subject/week index (migration
+ * 0650), so two workers holding jobs of different schedule versions for the same week save one
+ * review between them (review finding RV-learning-api-8).
+ */
 async function saveSet(deps: JobDeps, ctx: ChildContext, set: NewSet): Promise<string | null> {
   for (const { item } of set.items) {
     // Defense in depth: re-validate right before storage (AC_LEARNING_06, AC_GRADING_06).
@@ -457,7 +480,7 @@ async function saveSet(deps: JobDeps, ctx: ChildContext, set: NewSet): Promise<s
               ${set.localDate}::date, ${set.reviewWeek}, ${set.version}, 'ready',
               ${JSON.stringify(set.mix)}::text::jsonb, ${JSON.stringify(set.notes)}::text::jsonb,
               ${deps.clock()}, ${set.releaseAt}, ${set.evidenceCutoffAt}, ${set.intro})
-      on conflict (set_key) do nothing
+      on conflict do nothing
       returning id`;
     if (!created) return null;
     let position = 0;
@@ -531,8 +554,6 @@ async function spendCeilingReached(deps: JobDeps): Promise<boolean> {
   );
   return budget !== undefined && BigInt(budget.spent) >= BigInt(budget.budget_micros);
 }
-
-const INTRO_RE = /^[\p{L} ,.!'’-]{1,200}$/u;
 
 /**
  * One bounded request that may re-theme word problems and add an intro line. Fails closed to the
@@ -630,13 +651,15 @@ export async function personalizeItems(
     next[index] = themed;
     rethemed += 1;
   }
-  let intro: string | null = result.intro.trim().replace(/\s+/g, ' ');
+  // Content check first (charset + denylist: no credentials, grown-up roles, answers, contact
+  // details or money; review finding RV-learning-api-7), then the answer-leak guard.
+  let intro: string | null = validateIntro(result.intro);
   // The guard takes at most 32 protected answers per call: check the intro against every batch.
   const answers = items.flatMap((item) => protectedAnswersFor(item.answerSpec));
   const batches: (typeof answers)[] = [];
   for (let i = 0; i < answers.length; i += 32) batches.push(answers.slice(i, i + 32));
   if (
-    !INTRO_RE.test(intro) ||
+    intro === null ||
     batches.some(
       (batch) => guardChildContent({ packet: { intro }, answers: batch }).decision !== 'release',
     )
@@ -1309,27 +1332,63 @@ export async function enqueueDailyJob(
 }
 
 /**
+ * The ISO week key one calendar week after `now` in the family zone. Calendar arithmetic, not
+ * `now + 7 × 24 h`: the day before a DST spring-forward that would land in the week after next
+ * (review finding RV-learning-api-5).
+ */
+export function nextReviewWeekKey(now: Date, zone: string): string {
+  return weekKeyOfDate(addCalendarDays(localDateOf(now, zone), 7));
+}
+
+/** The current and next ISO week (family zone, calendar weeks). */
+export function currentAndNextWeekKeys(now: Date, zone: string): string[] {
+  return [...new Set([reviewWeekKey(now, zone), nextReviewWeekKey(now, zone)])];
+}
+
+/**
+ * Re-reads the schedule version and zone under a FOR SHARE lock on the schedule row. A context
+ * loaded before a parent change committed is stale: planning with it cancelled the parent's new job
+ * and left the week with none (review finding RV-learning-api-6). A stale context is reloaded; the
+ * lock keeps a schedule update from committing until this plan is written (the updater's own
+ * reschedule then sees these jobs).
+ */
+async function freshScheduleContext(tx: Tx, ctx: ChildContext): Promise<ChildContext | null> {
+  const [current] = await tx<{ schedule_version: number; timezone: string }[]>`
+    select s.schedule_version, f.timezone
+      from public.learning_schedules s
+      join public.families f on f.id = s.family_id
+     where s.child_id = ${ctx.childId} and s.family_id = ${ctx.familyId}
+       for share of s`;
+  if (!current) return null;
+  const zone = isSchedulingZone(current.timezone) ? current.timezone : FALLBACK_ZONE;
+  if (current.schedule_version === ctx.schedule.schedule_version && zone === ctx.zone) return ctx;
+  return loadChildContext(tx, ctx.familyId, ctx.childId);
+}
+
+/**
  * Plans review jobs for the current and next ISO week (family zone, DST-aware). A job starts at
  * `release - lead` so the review is ready before the release instant with the app closed. Keys are
  * `reviewIdempotencyKey(child, subject, week, schedule_version)`; a not-started job whose release
  * moved (new review day/time or test date) is replaced; started work is never touched.
+ *
+ * Decision: a cancelled job is terminal (jobs_guard), so a key must never be cancelled while it is
+ * still the current one: plans use the schedule as committed (stale contexts are reloaded under a
+ * lock), a job whose key is unchanged is moved rather than cancelled (time zone change), and a
+ * replacement is inserted only when the old job was actually cancelled, never next to a job a
+ * worker claimed in between (RV-learning-api-6, RV-learning-api-8).
  */
 export async function rescheduleReviewJobs(
   tx: Tx,
-  ctx: ChildContext,
+  loadedCtx: ChildContext,
   now: Date,
 ): Promise<{ created: number; cancelled: number }> {
   let created = 0;
   let cancelled = 0;
+  const ctx = await freshScheduleContext(tx, loadedCtx);
+  if (!ctx) return { created, cancelled };
   // Decision: a disabled subject keeps its queued job; the handler skips it at run time. Cancelling
   // here would dead-end a same-version re-enable (a cancelled key can never be queued again).
-  const weeks = [
-    ...new Set([
-      reviewWeekKey(now, ctx.zone),
-      reviewWeekKey(new Date(now.getTime() + 7 * DAY_MS), ctx.zone),
-    ]),
-  ];
-  for (const weekKey of weeks) {
+  for (const weekKey of currentAndNextWeekKeys(now, ctx.zone)) {
     const { monday, sunday } = isoWeekDates(weekKey);
     const tests = await loadTestDates(tx, ctx, monday, sunday);
     const releases = reviewReleases({
@@ -1368,12 +1427,28 @@ export async function rescheduleReviewJobs(
       if (!decision.ok) continue;
       const action = decision.value;
       if (action.action === 'none' || action.action === 'keep') continue;
-      if ((action.action === 'cancel' || action.action === 'replace') && job) {
+      const key = reviewIdempotencyKey(
+        ctx.childId,
+        subject,
+        weekKey,
+        ctx.schedule.schedule_version,
+      );
+      // Same key, new release instant (e.g. the family changed time zone): the job is moved below,
+      // never cancelled (a cancelled key could not be queued again).
+      const sameKey = job !== undefined && job.idempotency_key === key;
+      if ((action.action === 'cancel' || action.action === 'replace') && job && !sameKey) {
         const rows = await tx`
           update public.jobs set status = 'cancelled', last_error_code = 'RESCHEDULED'
            where id = ${job.id} and status in ('queued', 'failed_retryable')
           returning id`;
         cancelled += rows.length;
+        if (rows.length === 0 && action.action === 'replace') {
+          // A worker claimed the old job between our read and the cancel: it generates this week's
+          // review with the current release (the handler reads the schedule), so no second job.
+          const [after] = await tx<{ status: string }[]>`
+            select status from public.jobs where id = ${job.id}`;
+          if (after?.status !== 'cancelled') continue;
+        }
       }
       if (action.action === 'cancel') continue;
       const releaseAt = action.releaseAt;
@@ -1385,12 +1460,6 @@ export async function rescheduleReviewJobs(
         now,
       });
       if (!plan.ok) continue;
-      const key = reviewIdempotencyKey(
-        ctx.childId,
-        subject,
-        weekKey,
-        ctx.schedule.schedule_version,
-      );
       const payload = {
         childId: ctx.childId,
         subject,
@@ -1407,7 +1476,7 @@ export async function rescheduleReviewJobs(
       if (inserted.length > 0) {
         created += 1;
       } else {
-        // Same key, new release instant (e.g. the family changed time zone): move the queued job.
+        // Same key, new release instant: move the queued job.
         await tx`
           update public.jobs set run_after = ${plan.value.jobStartAt}, payload = ${JSON.stringify(payload)}::text::jsonb
            where idempotency_key = ${key} and status in ('queued', 'failed_retryable')`;

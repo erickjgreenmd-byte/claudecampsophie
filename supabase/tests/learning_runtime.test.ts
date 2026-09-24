@@ -136,6 +136,43 @@ describe('practice set columns for children (AC_GRADING_06)', () => {
   });
 });
 
+describe('release instant as the second layer (spec P8; RV-learning-db-1)', () => {
+  it('a child reads a review and its questions only from release_at on (DB clock or the API request instant)', async () => {
+    const riley = fam.children[0]!.id;
+    const [set] = await db.sql<{ id: string }[]>`
+      insert into public.practice_sets (family_id, child_id, kind, set_key, subject_key, review_week, status,
+                                        ready_at, release_at)
+      values (${fam.familyId}, ${riley}, 'thursday_review', ${'review:release-layer:' + riley}, 'math', '2026-W39',
+              'ready', now(), now() + interval '3 hours')
+      returning id`;
+    await db.sql`
+      insert into public.practice_items (set_id, family_id, child_id, position, subject_key, skill, category, prompt)
+      values (${set!.id}, ${fam.familyId}, ${riley}, 1, 'math', 'math.multiplication_facts', 'weak',
+              ${JSON.stringify({ text: 'What is 3 × 4?' })}::text::jsonb)`;
+    const read = (instant: string | null) =>
+      db.asChild(childClaims(fam, 0), async (tx) => {
+        if (instant !== null)
+          await tx`select set_config('pencillift.request_now', ${instant}, true)`;
+        const sets = await tx`select id from public.practice_sets where id = ${set!.id}`;
+        const items = await tx`select id from public.practice_items where set_id = ${set!.id}`;
+        return { sets: sets.length, items: items.length };
+      });
+    // Database clock: not released yet.
+    expect(await read(null)).toEqual({ sets: 0, items: 0 });
+    // The API's request instant before and after the release.
+    const [times] = await db.sql<{ before: Date; after: Date }[]>`
+      select now() + interval '2 hours' as before, now() + interval '4 hours' as after`;
+    expect(await read(times!.before.toISOString())).toEqual({ sets: 0, items: 0 });
+    expect(await read(times!.after.toISOString())).toEqual({ sets: 1, items: 1 });
+    // Released or not, a sibling never sees Riley's review.
+    const sibling = await db.asChild(childClaims(fam, 1), async (tx) => {
+      await tx`select set_config('pencillift.request_now', ${times!.after.toISOString()}, true)`;
+      return tx`select id from public.practice_sets where id = ${set!.id}`;
+    });
+    expect(sibling).toEqual([]);
+  });
+});
+
 describe('purge compatibility (AC_ACCESS_10)', () => {
   it('a family purge removes test dates without the version trigger getting in the way', async () => {
     const other = await seedFamily(db, { childCount: 1 });

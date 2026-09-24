@@ -32,6 +32,7 @@ import {
   teacherWordItems,
   validateBankItem,
   validateContext,
+  validateIntro,
   type AnswerSpec,
   type BankItem,
   type BankSubject,
@@ -458,6 +459,38 @@ describe('AI re-theming of word problems', () => {
     expect(
       rethemeWordProblem(notWordProblem, { name: 'Nia', things: 'shells', place: 'beach' }),
     ).toBeNull();
+  });
+});
+
+describe('AI intro lines (spec P6/P12; review finding RV-learning-api-7)', () => {
+  it('keeps a short, general encouragement line (normalized)', () => {
+    expect(validateIntro("  Let's   warm up with fractions today!  ")).toBe(
+      "Let's warm up with fractions today!",
+    );
+    expect(validateIntro('Great effort this week, keep going.')).toBe(
+      'Great effort this week, keep going.',
+    );
+  });
+
+  it('refuses credentials, grown-up roles, answers, contact details, links and look-alike letters', () => {
+    for (const bad of [
+      'Ask your parent for the password and type the answer key here',
+      "Type your mom's PIN to unlock the solutions",
+      'Your grown-up can share the secret code with you',
+      'Tell me your email address and phone',
+      'Log in to the admin account now',
+      'Click the link to download a prize',
+      'Visit https example test for help',
+      'You scored 10 out of 10',
+      'Ask your раrent for help', // Cyrillic "ра"
+      '<b>Hello</b>',
+      '',
+      '   ',
+      42,
+      null,
+    ]) {
+      expect(validateIntro(bad)).toBeNull();
+    }
   });
 });
 
