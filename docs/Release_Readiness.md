@@ -30,6 +30,10 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 | Hosted Supabase not verified for migrations 0710/0720 | Sign-out must end API access; 0720 needs a trigger on `auth.sessions` that the local shim accepts but the hosted project may refuse | Owner action #20 + staging migration run |
 | No AI spend cap for the launch month | Readiness blocks without this month's `spend_budgets` row; without it there is no application ceiling | Owner action #19 |
 | AI quality, latency and cost unmeasured | Cost analysis is modelled, not measured; educator evaluation absent | Live AI access + evaluation set |
+| Child-safety package unapproved | The child safety messages, parent wording, family-hold default and runbook 5.1 escalation steps are drafts; readiness reports `safety_templates` blocked | Owner action #24 (owner, educator, counsel) |
+| No provider moderation | Only the deterministic first-layer screen runs (English plus a few Spanish phrases); the OpenAI moderation endpoint is not wired; readiness reports `ai_moderation` blocked | OpenAI key + ZDR (Owner action #6) + wiring |
+| Database not marked production | The fixture/fake catalog guard activates only once the deployed database is marked; readiness reports `database_environment` blocked | Owner action #21 |
+| Family read access to held safety flags undecided | The child's answer and safety message stay readable to family members through the Data API while a report is held | Owner action #25 (COPPA decision) |
 
 ## Gates that are implemented and tested (software level)
 
@@ -55,5 +59,20 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 - A restated computation is never graded correct; keys that disagree fall back to reviewed templates
   (`scan-process.test.ts`).
 - The pre-commit gate typechecks and secret-scans exactly the staged tree (BUG-034).
+- Child safety (BUG-084): every child answer and printed prompt is screened before coaching, and child-facing model
+  output after generation; a severe answer gets no AI call, a reviewed message with US resources and an escalated
+  report without homework text; abuse-type reports are held from the family (`safety-screening.test.ts`,
+  `packages/domain/src/safety`).
+- Answer guard reads arithmetic expressions by default; only problem statements opt out (BUG-076,
+  `guard-call-sites.test.ts`).
+- Spend ceiling never lets a stage overshoot the owner's cap (BUG-064).
+- Outside development/test no consent, billing, storage or email mock ever serves; missing credentials select
+  providers that refuse every call (BUG-067, BUG-079, BUG-082, `runtime.test.ts`).
+- Production never serves fixture or fake catalog rows; a database marked production refuses them (BUG-080, 0770).
+- Uploads: image dimensions and frame structure checked before any decode; stored size and sha256 verified at
+  finalize and at scan time (BUG-078, BUG-088).
+- Release-shaped build artifacts are secret-scanned in CI with a negative control (BUG-081).
+- The approved-price gate applies to every capacity change (BUG-065).
+- School viewers cannot isolate small groups across time zones (BUG-074, 0740).
 
 Residual risk is listed per threat in `docs/Threat_Model.md`; open defects in `docs/Bug_Ledger.md`.
