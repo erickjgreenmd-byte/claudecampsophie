@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   CHILD_SAFETY_MESSAGE_MAX_LENGTH,
@@ -6,6 +7,7 @@ import {
   SAFETY_RESOURCES_US,
   SAFETY_TEMPLATES_APPROVED,
   SAFETY_TEMPLATES_STATUS,
+  SAFETY_TEMPLATES_VERSION,
   SEVERE_SAFETY_CATEGORIES,
   childSafetyMessage,
   heldFromFamily,
@@ -104,5 +106,41 @@ describe('approval status', () => {
   it('the templates are drafts until the owner and an educator approve them', () => {
     expect(SAFETY_TEMPLATES_STATUS).toBe('draft_pending_owner_and_educator_approval');
     expect(SAFETY_TEMPLATES_APPROVED).toBe(false);
+  });
+});
+
+describe('template version', () => {
+  it('the version names the wording: any change to a message needs a new version (and approval)', () => {
+    // RV-child-safety-14: Owner action #24 approves the wording by SAFETY_TEMPLATES_VERSION and every
+    // safety row stores it as guard_version. A digest of every message (each category set, each age
+    // band) is pinned per version, so editing the wording without a bump fails here.
+    const messages: string[] = [];
+    const n = SEVERE_SAFETY_CATEGORIES.length;
+    for (const band of [...SAFETY_AGE_BANDS, null]) {
+      for (let mask = 0; mask < 1 << n; mask += 1) {
+        const set = SEVERE_SAFETY_CATEGORIES.filter((_, i) => (mask & (1 << i)) !== 0);
+        messages.push(childSafetyMessage(set, band));
+      }
+    }
+    const digest = createHash('sha256')
+      .update(
+        JSON.stringify({
+          messages,
+          hold: FAMILY_HOLD_CATEGORIES,
+          resources: SAFETY_RESOURCES_US,
+          max: CHILD_SAFETY_MESSAGE_MAX_LENGTH,
+        }),
+      )
+      .digest('hex');
+    // A new version adds a line here (never edit an existing one) and needs a new approval.
+    const PINNED: Readonly<Record<string, string>> = {
+      'safety-templates.v2': '5b6d311e294e09e3053f426a3de90173fd5f8ee8b49989914d96bdbd39bf17d1',
+      // v3: the child messages are the same as v2; the parent wording changed (API test pin).
+      'safety-templates.v3': '5b6d311e294e09e3053f426a3de90173fd5f8ee8b49989914d96bdbd39bf17d1',
+    };
+    expect({ version: SAFETY_TEMPLATES_VERSION, digest }).toEqual({
+      version: SAFETY_TEMPLATES_VERSION,
+      digest: PINNED[SAFETY_TEMPLATES_VERSION],
+    });
   });
 });

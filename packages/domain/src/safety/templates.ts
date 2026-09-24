@@ -16,7 +16,9 @@
 // rules; it is a draft under the same approval status.
 import type { SafetyAgeBand, SevereSafetyCategory } from './types.ts';
 
-export const SAFETY_TEMPLATES_VERSION = 'safety-templates.v2';
+// v3 (round 3, CHK2-CS-5): the child messages are unchanged; the parent wording gains `cleared`
+// for a visible flag a reviewer cleared as a false match.
+export const SAFETY_TEMPLATES_VERSION = 'safety-templates.v3';
 
 /** Release-readiness flag: the templates below are drafts until approved. */
 export const SAFETY_TEMPLATES_STATUS = 'draft_pending_owner_and_educator_approval' as const;

@@ -1,16 +1,25 @@
 // The safety screen's matcher (see index.ts for the rules, their limits and how callers use it).
 import {
+  FIRST_PERSON,
+  FIRST_PERSON_FRAMES,
+  HOLDER_TO_NOT_A_NAME,
   HYPOTHETICALS,
+  NEGATION_BRIDGES,
   NEGATORS,
+  OPINION_FRAME_NOT_BEFORE,
+  OPINION_FRAMES,
   RULES,
   SIGNATURES,
   SUBJECT_TOPICS,
+  VOID_WINDOW,
   type RuleDef,
   type SignatureDef,
 } from './lexicon.ts';
 import {
   BOUNDARY,
   collapseRepeats,
+  ILL_VERBS,
+  illReadsAsIWill,
   normalizeForScreen,
   normalizeRulePhrase,
   type CompactStream,
@@ -30,7 +39,7 @@ import {
 } from './types.ts';
 
 /** Bumped whenever a rule, a signature or the normalization changes. */
-export const SAFETY_SCREEN_VERSION = 'safety-screen.v2';
+export const SAFETY_SCREEN_VERSION = 'safety-screen.v3';
 
 // ---------------------------------------------------------------------------------------------
 // Compilation (once, at module load)
@@ -42,6 +51,11 @@ interface Slot {
   readonly byFirst: ReadonlyMap<string, readonly Phrase[]>;
   readonly gap: number;
   readonly optional: boolean;
+  /**
+   * A `*` slot: any one word except these (a name: "I will kill Riley"). Null for a phrase slot.
+   * A sentence boundary and a number never match a `*`.
+   */
+  readonly anyExcept: ReadonlySet<string> | null;
 }
 
 interface Exemption {
@@ -49,13 +63,25 @@ interface Exemption {
   readonly cues: ReadonlySet<string>;
 }
 
+interface CompiledGuard {
+  readonly words: Slot;
+  readonly within: number;
+  readonly stopAtFirstPerson: boolean;
+  readonly holderTo: boolean;
+  readonly firstPersonAfter: boolean;
+  readonly quoteWords: Slot | null;
+}
+
 interface CompiledRule {
   readonly def: RuleDef;
   readonly sources: ReadonlySet<ScreenSource>;
   readonly slots: readonly Slot[];
   readonly notFollowedBy: Slot | null;
+  readonly notFollowedWithin: number;
+  /** Words later in the sentence that void the notFollowedBy exclusion (round 3, CHK2-CS-1). */
+  readonly unlessAfter: Slot | null;
   readonly notPrecededBy: ReadonlySet<string> | null;
-  readonly guard: { readonly words: Slot; readonly within: number } | null;
+  readonly guard: CompiledGuard | null;
   readonly gapStop: ReadonlySet<string> | null;
   readonly exempt: Exemption | null;
 }
@@ -90,7 +116,16 @@ function expandAlternative(alt: string): string[] {
   return values.flatMap((v) => expandAlternative(alt.replace(m[0], v)));
 }
 
-function compileSlot(text: string, gap: number, optional: boolean): Slot {
+function compileSlot(
+  text: string,
+  gap: number,
+  optional: boolean,
+  anyExcept: ReadonlySet<string> | null = null,
+): Slot {
+  if (text === '*') {
+    if (anyExcept === null) throw new Error(`safety lexicon: a * slot needs notObject`);
+    return { byFirst: new Map(), gap, optional, anyExcept };
+  }
   const byFirst = new Map<string, Phrase[]>();
   for (const raw of text.split('|')) {
     for (const alt of expandAlternative(raw.trim())) {
@@ -101,7 +136,7 @@ function compileSlot(text: string, gap: number, optional: boolean): Slot {
       byFirst.set(tokens[0]!, list);
     }
   }
-  return { byFirst, gap, optional };
+  return { byFirst, gap, optional, anyExcept: null };
 }
 
 function compileTokens(text: string): Set<string> {
@@ -119,16 +154,17 @@ function compileExemption(exempt: RuleDef['exempt']): Exemption | null {
 function compileRule(def: RuleDef): CompiledRule {
   const parts = def.pattern.split(/\s\+(\d?)\s/);
   const slots: Slot[] = [];
+  const notObject = def.notObject === undefined ? null : compileTokens(def.notObject);
   for (let i = 0; i < parts.length; i += 2) {
     let text = parts[i]!.trim();
     const gapText = i === 0 ? '0' : (parts[i - 1] ?? '');
     const gap = i === 0 ? 0 : gapText === '' ? (def.gap ?? 1) : Number(gapText);
     const optional = text.startsWith('?');
     if (optional) text = text.slice(1);
-    slots.push(compileSlot(text, gap, optional));
+    slots.push(compileSlot(text, gap, optional, notObject));
   }
-  if (slots.length === 0 || slots[0]!.optional) {
-    throw new Error(`safety lexicon: ${def.id} must start with a required slot`);
+  if (slots.length === 0 || slots[0]!.optional || slots[0]!.anyExcept !== null) {
+    throw new Error(`safety lexicon: ${def.id} must start with a required phrase slot`);
   }
   if ((def.kind === 'severe') !== (def.category !== undefined)) {
     throw new Error(`safety lexicon: ${def.id} category does not match its kind`);
@@ -136,14 +172,29 @@ function compileRule(def: RuleDef): CompiledRule {
   if ((def.exempt !== undefined || def.kind === 'topic') && def.topic === undefined) {
     throw new Error(`safety lexicon: ${def.id} needs a topic`);
   }
+  if (
+    (def.unlessAfter !== undefined || def.notFollowedWithin !== undefined) &&
+    def.notFollowedBy === undefined
+  ) {
+    throw new Error(`safety lexicon: ${def.id} voids or widens an exclusion it does not have`);
+  }
   return {
     def,
     sources: new Set(def.sources),
     slots,
     notFollowedBy: def.notFollowedBy ? compileSlot(def.notFollowedBy, 0, false) : null,
+    notFollowedWithin: def.notFollowedWithin ?? 0,
+    unlessAfter: def.unlessAfter ? compileSlot(def.unlessAfter, 0, false) : null,
     notPrecededBy: def.notPrecededBy ? compileTokens(def.notPrecededBy) : null,
     guard: def.guard
-      ? { words: compileSlot(def.guard.words, 0, false), within: def.guard.within }
+      ? {
+          words: compileSlot(def.guard.words, 0, false),
+          within: def.guard.within,
+          stopAtFirstPerson: def.guard.stopAtFirstPerson ?? false,
+          holderTo: def.guard.holderTo ?? false,
+          firstPersonAfter: def.guard.firstPersonAfter ?? false,
+          quoteWords: def.guard.quoteWords ? compileSlot(def.guard.quoteWords, 0, false) : null,
+        }
       : null,
     gapStop: def.gapStop ? compileTokens(def.gapStop) : null,
     exempt: compileExemption(def.exempt),
@@ -177,7 +228,54 @@ function compileSignature(def: SignatureDef): CompiledSignature {
 const COMPILED_RULES: readonly CompiledRule[] = RULES.map(compileRule);
 const COMPILED_SIGNATURES: readonly CompiledSignature[] = SIGNATURES.map(compileSignature);
 const NEGATOR_SET = compileTokens(NEGATORS);
+const NEGATION_BRIDGE_SET = compileTokens(NEGATION_BRIDGES);
 const HYPOTHETICAL_SET = compileTokens(HYPOTHETICALS);
+const FIRST_PERSON_SET = compileTokens(FIRST_PERSON);
+const FIRST_PERSON_FRAME_SLOT = compileSlot(FIRST_PERSON_FRAMES, 0, false);
+const OPINION_FRAME_SLOT = compileSlot(OPINION_FRAMES, 0, false);
+const OPINION_NOT_BEFORE = compileTokens(OPINION_FRAME_NOT_BEFORE);
+const HOLDER_TO_NOT_A_NAME_SET = compileTokens(HOLDER_TO_NOT_A_NAME);
+
+/**
+ * Every word the rules know. The normalizer uses it to read a "1" as "i" or "l" per word when a
+ * text mixes both ("k1ll myse1f").
+ */
+const VOCABULARY: ReadonlySet<string> = (() => {
+  const words = new Set<string>();
+  const addSlot = (slot: Slot | null | undefined) => {
+    if (!slot) return;
+    for (const list of slot.byFirst.values())
+      for (const phrase of list) phrase.forEach((w) => words.add(w));
+    slot.anyExcept?.forEach((w) => words.add(w));
+  };
+  const addSet = (set: ReadonlySet<string> | null | undefined) => set?.forEach((w) => words.add(w));
+  for (const rule of COMPILED_RULES) {
+    rule.slots.forEach(addSlot);
+    addSlot(rule.notFollowedBy);
+    addSlot(rule.unlessAfter);
+    addSlot(rule.guard?.words);
+    addSlot(rule.guard?.quoteWords);
+    addSet(rule.notPrecededBy);
+    addSet(rule.gapStop);
+    addSet(rule.exempt?.cues);
+  }
+  for (const sig of SIGNATURES) {
+    for (const alt of sig.phrases.split('|')) normalizeRulePhrase(alt).forEach((w) => words.add(w));
+  }
+  for (const set of [
+    NEGATOR_SET,
+    NEGATION_BRIDGE_SET,
+    HYPOTHETICAL_SET,
+    FIRST_PERSON_SET,
+    OPINION_NOT_BEFORE,
+    HOLDER_TO_NOT_A_NAME_SET,
+    ILL_VERBS,
+  ])
+    addSet(set);
+  addSlot(FIRST_PERSON_FRAME_SLOT);
+  addSlot(OPINION_FRAME_SLOT);
+  return words;
+})();
 
 /** Rules indexed by every first token of their first slot. */
 const INDEX: ReadonlyMap<string, readonly CompiledRule[]> = (() => {
@@ -196,10 +294,15 @@ const INDEX: ReadonlyMap<string, readonly CompiledRule[]> = (() => {
 // Matching
 // ---------------------------------------------------------------------------------------------
 
+const NUMBER = /^[0-9]+$/;
+
 /** End index (exclusive) of the longest alternative of `slot` at `p`, or -1. */
 function matchSlot(tokens: readonly string[], p: number, slot: Slot): number {
   const t = tokens[p];
   if (t === undefined) return -1;
+  if (slot.anyExcept !== null) {
+    return t === BOUNDARY || NUMBER.test(t) || slot.anyExcept.has(t) ? -1 : p + 1;
+  }
   const list = slot.byFirst.get(t);
   if (list === undefined) return -1;
   let best = -1;
@@ -230,17 +333,120 @@ function anyBefore(
   return false;
 }
 
-/** A guard word or phrase starting within `within` tokens before `start` (same sentence). */
-function guardedBefore(
-  tokens: readonly string[],
-  start: number,
-  guard: { readonly words: Slot; readonly within: number },
-): boolean {
+/**
+ * A guard word or phrase starting within `within` tokens before `start` (same sentence). With
+ * `stopAtFirstPerson`, a first-person word nearer than the guard, or right before it ("I think",
+ * "I really believe"), means the child holds the view: not guarded. With `holderTo`, "to" and a
+ * name inside a sentence hold the view ("According to Cleopatra, suicide is ..."; not "to me", "to
+ * be honest", "... to Mom"). Round 4 (CHK3-CS-5): a "to" that starts the sentence opens a note
+ * ("To Riley, suicide is the only answer", "To whoever reads this ..."), so it never holds a view.
+ */
+function guardedBefore(tokens: readonly string[], start: number, guard: CompiledGuard): boolean {
+  const firstPersonAt = (p: number) => p >= 0 && FIRST_PERSON_SET.has(tokens[p]!);
   for (let k = 1; k <= guard.within && start - k >= 0; k += 1) {
-    if (tokens[start - k] === BOUNDARY) return false;
-    if (matchSlot(tokens, start - k, guard.words) >= 0) return true;
+    const p = start - k;
+    const t = tokens[p]!;
+    if (t === BOUNDARY) return false;
+    if (guard.stopAtFirstPerson && FIRST_PERSON_SET.has(t)) return false;
+    if (matchSlot(tokens, p, guard.words) >= 0) {
+      return !(guard.stopAtFirstPerson && (firstPersonAt(p - 1) || firstPersonAt(p - 2)));
+    }
+    const salutation = p === 0 || tokens[p - 1] === BOUNDARY;
+    if (guard.holderTo && t === 'to' && !salutation && p + 1 < start) {
+      const name = tokens[p + 1]!;
+      if (
+        name !== BOUNDARY &&
+        !NUMBER.test(name) &&
+        !FIRST_PERSON_SET.has(name) &&
+        !HOLDER_TO_NOT_A_NAME_SET.has(name)
+      ) {
+        return true;
+      }
+    }
   }
   return false;
+}
+
+/**
+ * A negation right before `start`, or one word earlier across a NEGATION_BRIDGES word, in the same
+ * sentence ("don't want to die", "I don't think suicide is ..."; not "I'm not ok, dying is ...").
+ */
+function negatedBefore(tokens: readonly string[], start: number): boolean {
+  const prev = tokens[start - 1];
+  if (prev === undefined || prev === BOUNDARY) return false;
+  if (NEGATOR_SET.has(prev)) return true;
+  const prev2 = tokens[start - 2];
+  return prev2 !== undefined && NEGATOR_SET.has(prev2) && NEGATION_BRIDGE_SET.has(prev);
+}
+
+/**
+ * A first-person word (outside a frame) within VOID_WINDOW tokens after `pos`, in the same
+ * sentence (a guard's `firstPersonAfter`; round 4, CHK3-CS-3).
+ */
+function firstPersonAfter(tokens: readonly string[], pos: number): boolean {
+  let i = pos;
+  while (i < tokens.length && i <= pos + VOID_WINDOW) {
+    const t = tokens[i]!;
+    if (t === BOUNDARY) return false;
+    const frameEnd = matchSlot(tokens, i, FIRST_PERSON_FRAME_SLOT);
+    if (frameEnd > i) {
+      i = frameEnd;
+      continue;
+    }
+    const opinionEnd = matchSlot(tokens, i, OPINION_FRAME_SLOT);
+    if (opinionEnd > i && !OPINION_NOT_BEFORE.has(tokens[opinionEnd] ?? '')) {
+      i = opinionEnd;
+      continue;
+    }
+    if (FIRST_PERSON_SET.has(t) || illReadsAsIWill(tokens, i)) return true;
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * Whether the child's own first person voids a `firstPersonAfter` guard that matched before
+ * tokens[start, pos): a first-person word after the phrase, or one inside it ("sex is OUR secret",
+ * "sex with ME") unless one of the guard's `quoteWords` holds the view ("If someone tells you
+ * touching private parts is our secret, tell"; round 4 lead policy).
+ */
+function childVoidsGuard(
+  tokens: readonly string[],
+  start: number,
+  pos: number,
+  guard: CompiledGuard,
+): boolean {
+  if (firstPersonAfter(tokens, pos)) return true;
+  if (guard.quoteWords === null) return false;
+  let inPhrase = false;
+  for (let p = start; p < pos && !inPhrase; p += 1) inPhrase = FIRST_PERSON_SET.has(tokens[p]!);
+  return inPhrase && !guardedBefore(tokens, start, { ...guard, words: guard.quoteWords });
+}
+
+/**
+ * Whether the rule's notFollowedBy exclusion applies at `pos` (the match end): the exclusion may
+ * start up to `notFollowedWithin` tokens later in the sentence ("poison berries in Minecraft"), and
+ * a listed deliberate or distress word within VOID_WINDOW tokens voids it ("with the paper cutter
+ * on purpose"; round 3, CHK2-CS-1).
+ */
+function excludedAfter(tokens: readonly string[], pos: number, rule: CompiledRule): boolean {
+  const slot = rule.notFollowedBy;
+  if (slot === null) return false;
+  let hit = false;
+  for (let g = 0; g <= rule.notFollowedWithin; g += 1) {
+    const p = pos + g;
+    if (p >= tokens.length || (g > 0 && tokens[p - 1] === BOUNDARY)) break;
+    if (matchSlot(tokens, p, slot) >= 0) {
+      hit = true;
+      break;
+    }
+  }
+  if (!hit || rule.unlessAfter === null) return hit;
+  for (let p = pos; p < tokens.length && p <= pos + VOID_WINDOW; p += 1) {
+    if (tokens[p] === BOUNDARY) break;
+    if (matchSlot(tokens, p, rule.unlessAfter) >= 0) return false;
+  }
+  return true;
 }
 
 /** Greedy, bounded match of one rule starting at `start` (no backtracking). */
@@ -249,9 +455,11 @@ function matchAt(tokens: readonly string[], start: number, rule: CompiledRule): 
   if (rule.notPrecededBy !== null && start > 0 && rule.notPrecededBy.has(tokens[start - 1]!)) {
     return false;
   }
-  if (def.negatable && anyBefore(tokens, start, 2, NEGATOR_SET)) return false;
+  if (def.negatable && negatedBefore(tokens, start)) return false;
   if (def.hypothetical && anyBefore(tokens, start, 3, HYPOTHETICAL_SET)) return false;
-  if (rule.guard !== null && guardedBefore(tokens, start, rule.guard)) return false;
+  const guard = rule.guard;
+  const guarded = guard !== null && guardedBefore(tokens, start, guard);
+  if (guarded && !guard.firstPersonAfter) return false;
   if (def.sentenceStart && start > 0 && tokens[start - 1] !== BOUNDARY) return false;
   if (def.alone && !onlyBoundaries(tokens, 0, start)) return false;
   let pos = matchSlot(tokens, start, rule.slots[0]!);
@@ -278,7 +486,9 @@ function matchAt(tokens: readonly string[], start: number, rule: CompiledRule): 
     pos = next;
   }
   if (def.alone && !onlyBoundaries(tokens, pos, tokens.length)) return false;
-  return rule.notFollowedBy === null || matchSlot(tokens, pos, rule.notFollowedBy) < 0;
+  if (def.sentenceEnd && pos < tokens.length && tokens[pos] !== BOUNDARY) return false;
+  if (guarded && !childVoidsGuard(tokens, start, pos, guard)) return false;
+  return !excludedAfter(tokens, pos, rule);
 }
 
 /** True when tokens[from, to) are all sentence boundaries (or the range is empty). */
@@ -319,20 +529,80 @@ function anchored(stream: CompactStream, phrase: SignaturePhrase): boolean {
   }
 }
 
+/**
+ * Sentence indexes (counted by BOUNDARY tokens, which every stream places alike) whose words
+ * include a first-person word outside a frame ("my", "me", "I", "I'll" — but not the "I" of "I
+ * learned that ...", "I think ..." or the "our" of "In our class ..."). RV-child-safety-1, CHK-CS-3.
+ */
+function firstPersonSentences(tokens: readonly string[]): ReadonlySet<number> {
+  const out = new Set<number>();
+  let sentence = 0;
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i]!;
+    if (t === BOUNDARY) {
+      sentence += 1;
+      i += 1;
+      continue;
+    }
+    const frameEnd = matchSlot(tokens, i, FIRST_PERSON_FRAME_SLOT);
+    if (frameEnd > i) {
+      i = frameEnd;
+      continue;
+    }
+    const opinionEnd = matchSlot(tokens, i, OPINION_FRAME_SLOT);
+    if (opinionEnd > i && !OPINION_NOT_BEFORE.has(tokens[opinionEnd] ?? '')) {
+      i = opinionEnd;
+      continue;
+    }
+    if (FIRST_PERSON_SET.has(t) || illReadsAsIWill(tokens, i)) out.add(sentence);
+    i += 1;
+  }
+  return out;
+}
+
 interface Hits {
   readonly rules: ReadonlySet<CompiledRule>;
   readonly signatures: ReadonlySet<CompiledSignature>;
+  /**
+   * Tier-B hits in a child's text that sit in a first-person sentence (for signatures, in a text
+   * that uses the first person at all). Such a hit is the child's own statement, never a topic.
+   */
+  readonly personal: ReadonlySet<CompiledRule | CompiledSignature>;
 }
 
-function scan(norm: NormalizedText, source: ScreenSource): Hits {
+/**
+ * `firstPerson`: whether a first-person sentence keeps a tier-B word from being exempt. True for
+ * the child's own text; false for the printed prompt, which is not the child's statement
+ * (CHK-CS-2: "In our unit we discuss child abuse." is a worksheet's words).
+ */
+function scan(norm: NormalizedText, source: ScreenSource, firstPerson: boolean): Hits {
   const rules = new Set<CompiledRule>();
+  const personal = new Set<CompiledRule | CompiledSignature>();
+  let sentences: ReadonlySet<number> | null = null;
+  // The split "1 → i" stream: a bare "Ill" is its token "il" (see illReadsAsIWill).
+  const personalSentences = () => (sentences ??= firstPersonSentences(norm.streams[0] ?? []));
   for (const tokens of norm.streams) {
+    let sentence = 0;
     for (let i = 0; i < tokens.length; i += 1) {
-      const candidates = INDEX.get(tokens[i]!);
+      const token = tokens[i]!;
+      if (token === BOUNDARY) {
+        sentence += 1;
+        continue;
+      }
+      const candidates = INDEX.get(token);
       if (candidates === undefined) continue;
       for (const rule of candidates) {
-        if (rules.has(rule) || !rule.sources.has(source)) continue;
-        if (matchAt(tokens, i, rule)) rules.add(rule);
+        if (!rule.sources.has(source)) continue;
+        // A rule about the child's own answer never reads the printed prompt (CHK2-CS-4).
+        if (rule.def.answerOnly && !firstPerson) continue;
+        // A tier-B rule on a child's text keeps looking (still bounded: one check per position)
+        // until it finds an occurrence in a first-person sentence.
+        const tierB = rule.exempt !== null && source === 'child' && firstPerson;
+        if (tierB ? personal.has(rule) : rules.has(rule)) continue;
+        if (!matchAt(tokens, i, rule)) continue;
+        rules.add(rule);
+        if (tierB && personalSentences().has(sentence)) personal.add(rule);
       }
     }
   }
@@ -341,9 +611,17 @@ function scan(norm: NormalizedText, source: ScreenSource): Hits {
     if (!sig.sources.has(source)) continue;
     if (norm.compacts.some((c) => sig.phrases.some((phrase) => anchored(c, phrase)))) {
       signatures.add(sig);
+      if (
+        sig.exempt !== null &&
+        source === 'child' &&
+        firstPerson &&
+        personalSentences().size > 0
+      ) {
+        personal.add(sig);
+      }
     }
   }
-  return { rules, signatures };
+  return { rules, signatures, personal };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -367,8 +645,8 @@ function contextInfo(context: ScreenContext | undefined): ContextInfo {
   const subject = context?.subject ?? null;
   const prompt = context?.prompt ?? null;
   if (prompt === null || prompt.trim().length === 0) return { ...EMPTY_CONTEXT, subject };
-  const norm = normalizeForScreen(prompt);
-  const hits = scan(norm, 'child');
+  const norm = normalizeForScreen(prompt, VOCABULARY, true);
+  const hits = scan(norm, 'child', false);
   const promptTopics = new Set<SensitiveTopic>();
   for (const rule of hits.rules) if (rule.def.topic !== undefined) promptTopics.add(rule.def.topic);
   for (const sig of hits.signatures)
@@ -413,17 +691,25 @@ function finish(
   };
 }
 
-function screenWith(text: string, source: ScreenSource, ctx: ContextInfo): SafetyScreen {
-  const norm = normalizeForScreen(text);
-  const hits = scan(norm, source);
+function screenWith(
+  text: string,
+  source: ScreenSource,
+  ctx: ContextInfo,
+  childStatement = true,
+): SafetyScreen {
+  // A printed prompt is the worksheet's text: "World War I" there is a numeral (normalize.ts).
+  const norm = normalizeForScreen(text, VOCABULARY, !childStatement);
+  const hits = scan(norm, source, childStatement);
   const categories = new Set<SevereSafetyCategory>();
   const topics = new Set<SensitiveTopic>();
   const codes = new Set<string>();
+  const firstPerson: { id: string; category: SevereSafetyCategory; topic: SensitiveTopic }[] = [];
   const record = (
     id: string,
     category: SevereSafetyCategory | undefined,
     topic: SensitiveTopic | undefined,
     exempt: Exemption | null,
+    personal: boolean,
   ) => {
     if (category === undefined) {
       if (topic !== undefined) topics.add(topic);
@@ -433,17 +719,30 @@ function screenWith(text: string, source: ScreenSource, ctx: ContextInfo): Safet
       topic !== undefined &&
       exemptFor(exempt, topic, source, norm, ctx)
     ) {
-      topics.add(topic);
-      codes.add(`${id}_EDUCATIONAL`);
+      // RV-child-safety-1: the context would make the word educational, but the child used it in
+      // a first-person sentence ("suicide is the only way out for me" in reading): never exempt.
+      if (personal) {
+        firstPerson.push({ id, category, topic });
+      } else {
+        topics.add(topic);
+        codes.add(`${id}_EDUCATIONAL`);
+      }
     } else {
       categories.add(category);
       codes.add(id);
     }
   };
   for (const rule of hits.rules)
-    record(rule.def.id, rule.def.category, rule.def.topic, rule.exempt);
+    record(rule.def.id, rule.def.category, rule.def.topic, rule.exempt, hits.personal.has(rule));
   for (const sig of hits.signatures)
-    record(sig.def.id, sig.def.category, sig.def.topic, sig.exempt);
+    record(sig.def.id, sig.def.category, sig.def.topic, sig.exempt, hits.personal.has(sig));
+  for (const hit of firstPerson) {
+    codes.add(`${hit.id}_FIRST_PERSON`);
+    // A sexual-violence word inside a first-person abuse disclosure is part of that disclosure
+    // ("I was a victim of rape" in reading is `abuse`); on its own it is `sexual`.
+    if (hit.category === 'sexual' && categories.has('abuse')) topics.add(hit.topic);
+    else categories.add(hit.category);
+  }
   if (source === 'ai') {
     // Grounding (spec P4 "keep tutoring grounded in the current assignment"): model output may
     // not bring up a sensitive topic that neither the printed question nor its subject raises.
@@ -487,7 +786,9 @@ export function screenText(text: string, options: ScreenOptions): SafetyScreen {
 /**
  * The scan pipeline's input screen for one extracted question: the child's answer (in the context
  * of the printed question and subject) and the printed prompt itself (a child may have written in
- * it, or the extraction may have merged a margin note into it).
+ * it, or the extraction may have merged a margin note into it). Every rule reads the prompt, but
+ * its first person does not make a tier-B word severe: a worksheet's "our class" or "we discuss"
+ * is not the child's statement (CHK-CS-2), so a tier-B word in it is judged by subject and cues.
  */
 export function screenQuestion(input: {
   readonly prompt: string | null;
@@ -506,7 +807,7 @@ export function screenQuestion(input: {
     );
   }
   if (input.prompt !== null && input.prompt.trim().length > 0) {
-    screens.push(screenWith(input.prompt, 'child', contextInfo({ subject: input.subject })));
+    screens.push(screenWith(input.prompt, 'child', contextInfo({ subject: input.subject }), false));
   }
   return mergeScreens(screens);
 }
