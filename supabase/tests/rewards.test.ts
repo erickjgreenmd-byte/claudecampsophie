@@ -8,7 +8,12 @@ let fam: SeededFamily;
 let other: SeededFamily;
 const UNLOCKED_SESSION = '00000000-0000-4000-8000-00000000f00d';
 
-async function award(family: SeededFamily, childIndex: number, points: number, key = randomUUID()) {
+async function award(
+  family: SeededFamily,
+  childIndex: number,
+  points: number,
+  key: string = randomUUID(),
+) {
   await db.sql`
     insert into public.points_ledger (family_id, child_id, kind, points, idempotency_key, actor_kind)
     values (${family.familyId}, ${family.children[childIndex]!.id}, 'award', ${points}, ${'attempt:' + key}, 'system')
