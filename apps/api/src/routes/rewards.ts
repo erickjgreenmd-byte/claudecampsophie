@@ -230,6 +230,19 @@ async function readChildRequest(
   return row ?? null;
 }
 
+/**
+ * SQL condition: the child with this id is not under a data deletion. Parents keep reading the
+ * reward records of archived and downgraded (draft) children (spec P11, AC_CAPACITY_08); a child
+ * whose deletion is under way is shown nowhere. A tombstoned family is already invisible (its
+ * membership no longer resolves). `childColumn` is a fixed column reference, never request input.
+ */
+function notBeingDeleted(tx: Tx, childColumn: 'c.id' | 'r.child_id') {
+  return tx`
+    not exists (
+      select 1 from public.deletion_requests d
+       where d.target_child_id = ${tx(childColumn)} and d.status in ('requested', 'processing'))`;
+}
+
 function paramUuid(c: Context<AppEnv>, name: string, notFound: string): string {
   const parsed = uuidSchema.safeParse(c.req.param(name));
   if (!parsed.success) throw new ApiError('NOT_FOUND', notFound);
@@ -275,11 +288,12 @@ export function rewardsRoutes(): Hono<AppEnv> {
         select id, title, point_cost, instructions, child_id, active, created_at, updated_at
           from public.rewards where family_id = ${familyId}
          order by active desc, point_cost, created_at`,
+      // Every profile's balance, archived and draft included: earned points are history (P11).
       children: await tx<{ id: string; nickname: string; balance: number }[]>`
         select c.id, c.nickname, coalesce(b.balance, 0) as balance
           from public.child_profiles c
           left join public.point_balances b on b.child_id = c.id
-         where c.family_id = ${familyId} and c.status = 'active'
+         where c.family_id = ${familyId} and ${notBeingDeleted(tx, 'c.id')}
          order by c.created_at, c.id`,
       open: await tx<ParentRequestRow[]>`
         select r.id, r.child_id, c.nickname as child_nickname, r.reward_id, w.title as reward_title,
@@ -288,6 +302,7 @@ export function rewardsRoutes(): Hono<AppEnv> {
           join public.rewards w on w.id = r.reward_id
           join public.child_profiles c on c.id = r.child_id
          where r.family_id = ${familyId} and r.state in ('pending', 'approved')
+           and ${notBeingDeleted(tx, 'r.child_id')}
          order by r.requested_at, r.id`,
       recent: await tx<ParentRequestRow[]>`
         select r.id, r.child_id, c.nickname as child_nickname, r.reward_id, w.title as reward_title,
@@ -296,6 +311,7 @@ export function rewardsRoutes(): Hono<AppEnv> {
           join public.rewards w on w.id = r.reward_id
           join public.child_profiles c on c.id = r.child_id
          where r.family_id = ${familyId} and r.state in ('fulfilled', 'declined', 'cancelled')
+           and ${notBeingDeleted(tx, 'r.child_id')}
          order by r.updated_at desc, r.id
          limit ${RECENT_REQUESTS_LIMIT}`,
     }));
@@ -319,15 +335,18 @@ export function rewardsRoutes(): Hono<AppEnv> {
     const body = await readJson(c, createRewardRequestSchema);
     const instructions =
       body.instructions !== undefined && body.instructions.length > 0 ? body.instructions : null;
-    let row: RewardRow | null;
+    let row: RewardRow | 'archived' | null;
     try {
       row = await deps.db.asParent(parent, async (tx) => {
         if (body.childId !== null) {
           // The composite FK would also refuse a foreign child; checking first gives a clean 404.
-          const [child] = await tx<{ id: string }[]>`
-            select id from public.child_profiles
-             where id = ${body.childId} and family_id = ${familyId} and status <> 'archived'`;
+          const [child] = await tx<{ status: string }[]>`
+            select c.status from public.child_profiles c
+             where c.id = ${body.childId} and c.family_id = ${familyId}
+               and ${notBeingDeleted(tx, 'c.id')}`;
           if (!child) return null;
+          // An archived profile is history only: its records stay readable, nothing new is added.
+          if (child.status === 'archived') return 'archived' as const;
         }
         const [inserted] = await tx<RewardRow[]>`
           insert into public.rewards (family_id, child_id, title, point_cost, instructions, created_by)
@@ -337,6 +356,12 @@ export function rewardsRoutes(): Hono<AppEnv> {
       });
     } catch (error) {
       mapRewardsDbError(error, 'parent');
+    }
+    if (row === 'archived') {
+      throw businessRule(
+        'CHILD_ARCHIVED',
+        'This child’s profile is archived. Its points and rewards stay visible, but new rewards can’t be added for it.',
+      );
     }
     if (!row) throw new ApiError('NOT_FOUND', 'Child not found');
     await audit(c, familyId, 'reward.created', row.id);
@@ -439,8 +464,10 @@ export function rewardsRoutes(): Hono<AppEnv> {
     const childId = parsed.data;
     const familyId = await currentFamilyId(c);
     const data = await deps.db.asParent(parent, async (tx) => {
+      // Archived and draft profiles keep their history; only a child under deletion is hidden.
       const [child] = await tx<{ id: string }[]>`
-        select id from public.child_profiles where id = ${childId} and family_id = ${familyId}`;
+        select c.id from public.child_profiles c
+         where c.id = ${childId} and c.family_id = ${familyId} and ${notBeingDeleted(tx, 'c.id')}`;
       if (!child) return null;
       const entries = await tx<
         {

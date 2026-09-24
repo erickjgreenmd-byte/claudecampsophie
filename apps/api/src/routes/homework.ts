@@ -1039,6 +1039,13 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     const data = await deps.db.asParent(parent, async (tx) => {
       let childHasPaidSlot = false;
       if (childId !== null) {
+        // Archived and draft profiles keep their scan history (spec P11, AC_CAPACITY_08); a child
+        // whose data deletion is under way is not shown, like every other parent read.
+        const [deleting] = await tx<{ id: string }[]>`
+          select id from public.deletion_requests
+           where family_id = ${familyId} and target_child_id = ${childId}
+             and status in ('requested', 'processing')`;
+        if (deleting) return null;
         // Parent read under RLS; the same rule the capture gate applies.
         const profile = await readPaidProfile(tx, familyId, childId);
         if (!profile) return null;

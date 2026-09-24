@@ -25,6 +25,7 @@ import {
   type TestDate,
 } from '@pencillift/contracts';
 import {
+  BANK_SUBJECTS,
   bankCoverage,
   gradeBankAnswer,
   isBankSubject,
@@ -45,15 +46,17 @@ import {
 import {
   DAILY_PRACTICE_POINTS_POLICY,
   dailyPracticeState,
+  isSchedulingZone,
   isoWeekDates,
   reviewReleases,
   reviewWeekKey,
 } from '@pencillift/domain/scheduling';
 import { readJson } from '../app.ts';
 import type { ChildPrincipal, Tx } from '../db.ts';
-import { ApiError, pgErrorCode } from '../errors.ts';
+import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
 import {
   PRACTICE_GRADER_VERSION,
+  SCHEDULE_COLUMNS,
   currentAndNextWeekKeys,
   enqueueDailyJob,
   ensureLearningDefaults,
@@ -128,20 +131,73 @@ interface OwnedChild {
   readonly familyId: string;
   readonly childId: string;
   readonly gradeLevel: number;
+  /** An archived profile is history only: its parents read it, nothing changes it. */
+  readonly archived: boolean;
 }
 
-/** The child must belong to the caller's family (cross-family and unknown ids are NOT_FOUND). */
-async function ownedChild(c: Context<AppEnv>): Promise<OwnedChild> {
+/**
+ * `read`: a parent view of the child's history. `write`: anything that plans, stores or changes
+ * something for the child (subjects, schedule, test dates, study material).
+ */
+type ChildAccess = 'read' | 'write';
+
+function archivedChild(): ApiError {
+  return businessRule(
+    'CHILD_ARCHIVED',
+    'This child’s profile is archived. Its history stays available, but nothing can be added or changed unless the profile is active again.',
+  );
+}
+
+/**
+ * The child must belong to the caller's live family. Cross-family and unknown ids, children of a
+ * tombstoned family and a child whose data deletion is under way are all NOT_FOUND.
+ *
+ * Archived and downgraded (draft) profiles keep parent-readable history (spec P11 "keep history for
+ * inactive profiles", AC_CAPACITY_08), so `read` admits every other profile. `write` refuses an
+ * archived profile with CHILD_ARCHIVED. A draft profile stays editable, because a parent sets up the
+ * plan before activation; no new practice work starts for it, since practice jobs are only created
+ * for active profiles (loadChildContext).
+ */
+async function ownedChild(c: Context<AppEnv>, access: ChildAccess): Promise<OwnedChild> {
   const childId = paramUuid(c, 'childId', 'Child not found');
   const familyId = await currentFamilyId(c);
   const [row] = await c.var.deps.db.asParent(
     c.var.parent,
-    (tx) => tx<{ grade_level: number }[]>`
-      select grade_level from public.child_profiles
-       where id = ${childId} and family_id = ${familyId} and status <> 'archived'`,
+    (tx) => tx<{ grade_level: number; status: string }[]>`
+      select c.grade_level, c.status from public.child_profiles c
+        join public.families f on f.id = c.family_id and f.deleted_at is null
+       where c.id = ${childId} and c.family_id = ${familyId}
+         and not exists (
+           select 1 from public.deletion_requests d
+            where d.family_id = c.family_id and d.target_child_id = c.id
+              and d.status in ('requested', 'processing'))`,
   );
   if (!row) throw new ApiError('NOT_FOUND', 'Child not found');
-  return { familyId, childId, gradeLevel: row.grade_level };
+  const archived = row.status === 'archived';
+  if (archived && access === 'write') throw archivedChild();
+  return { familyId, childId, gradeLevel: row.grade_level, archived };
+}
+
+/**
+ * A practice set of the caller's family whose child is still visible (not under a data deletion).
+ * Archived children's sets stay readable and exportable (AC_CAPACITY_08: history and exports kept).
+ */
+async function ownedSet(
+  c: Context<AppEnv>,
+  familyId: string,
+  setId: string,
+): Promise<{ id: string; child_id: string } | undefined> {
+  const [row] = await c.var.deps.db.asParent(
+    c.var.parent,
+    (tx) => tx<{ id: string; child_id: string }[]>`
+      select s.id, s.child_id from public.practice_sets s
+       where s.id = ${setId} and s.family_id = ${familyId}
+         and not exists (
+           select 1 from public.deletion_requests d
+            where d.family_id = s.family_id and d.target_child_id = s.child_id
+              and d.status in ('requested', 'processing'))`,
+  );
+  return row;
 }
 
 /** Service-role child context for scheduling side effects after a parent change. */
@@ -347,9 +403,57 @@ function scheduleDto(row: ScheduleRow): LearningScheduleResponse['schedule'] {
   };
 }
 
+/** What the schedule view needs: the saved plan, the family zone and the enabled subjects. */
+type PlanContext = Pick<ChildContext, 'familyId' | 'childId' | 'zone' | 'schedule' | 'subjects'>;
+
+/**
+ * Migration 0100's `learning_schedules` column defaults: the plan a profile has before anything is
+ * saved. tests/archived-history.test.ts pins this to the database defaults.
+ */
+const DEFAULT_SCHEDULE: ScheduleRow = {
+  review_weekday: 4,
+  review_local_time: '16:00',
+  review_questions_per_subject: 8,
+  schedule_version: 1,
+  daily_local_time: '15:30',
+  daily_question_count: 5,
+  paused_from: null,
+  paused_to: null,
+  quiet_hours_start: null,
+  quiet_hours_end: null,
+  child_reminders_permitted: false,
+};
+/** Same fallback as loadChildContext (jobs/learning-jobs.ts) for a zone the scheduler can't use. */
+const FALLBACK_ZONE = 'America/New_York';
+
+/**
+ * The saved plan of an archived profile, read as stored (history only). Unlike loadChildContext it
+ * never creates defaults; a profile archived before anything was saved shows the defaults every new
+ * profile starts with.
+ */
+async function storedPlan(tx: Tx, owned: OwnedChild): Promise<PlanContext> {
+  const [family] = await tx<{ timezone: string }[]>`
+    select timezone from public.families where id = ${owned.familyId}`;
+  const [schedule] = await tx.unsafe<ScheduleRow[]>(
+    `select ${SCHEDULE_COLUMNS} from public.learning_schedules where child_id = $1 and family_id = $2`,
+    [owned.childId, owned.familyId],
+  );
+  const rows = await tx<{ subject_key: string }[]>`
+    select subject_key from public.child_subjects
+     where child_id = ${owned.childId} and family_id = ${owned.familyId} and enabled`;
+  const enabled = new Set(rows.map((row) => row.subject_key));
+  return {
+    familyId: owned.familyId,
+    childId: owned.childId,
+    zone: family && isSchedulingZone(family.timezone) ? family.timezone : FALLBACK_ZONE,
+    schedule: schedule ?? DEFAULT_SCHEDULE,
+    subjects: BANK_SUBJECTS.filter((subject) => enabled.has(subject)),
+  };
+}
+
 async function scheduleResponse(
   tx: Tx,
-  ctx: ChildContext,
+  ctx: PlanContext,
   now: Date,
 ): Promise<LearningScheduleResponse> {
   const nextReviewReleases: LearningScheduleResponse['nextReviewReleases'] = [];
@@ -482,9 +586,10 @@ export function learningRoutes(): Hono<AppEnv> {
   // ----- Subjects --------------------------------------------------------------------------------
 
   r.get('/children/:childId/subjects', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'read');
     const rows = await c.var.deps.db.asParent(c.var.parent, async (tx) => {
-      await ensureLearningDefaults(tx, owned.familyId, owned.childId);
+      // An archived profile's subjects are read as stored; defaults are created only for a live one.
+      if (!owned.archived) await ensureLearningDefaults(tx, owned.familyId, owned.childId);
       return tx<SubjectRow[]>`
         select id, subject_key, display_name, enabled from public.child_subjects
          where child_id = ${owned.childId} and family_id = ${owned.familyId}
@@ -495,7 +600,7 @@ export function learningRoutes(): Hono<AppEnv> {
   });
 
   r.post('/children/:childId/subjects', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'write');
     const body = await readJson(c, createChildSubjectRequestSchema);
     const displayName =
       body.displayName ??
@@ -519,7 +624,7 @@ export function learningRoutes(): Hono<AppEnv> {
   });
 
   r.patch('/children/:childId/subjects', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'write');
     const body = await readJson(c, updateChildSubjectRequestSchema);
     let row: SubjectRow | undefined;
     try {
@@ -545,7 +650,13 @@ export function learningRoutes(): Hono<AppEnv> {
   // ----- Learning schedule -----------------------------------------------------------------------
 
   r.get('/children/:childId/learning-schedule', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'read');
+    if (owned.archived) {
+      const body = await c.var.deps.db.asParent(c.var.parent, async (tx) =>
+        scheduleResponse(tx, await storedPlan(tx, owned), c.var.deps.clock()),
+      );
+      return c.json(body);
+    }
     const ctx = await parentContext(c, owned);
     const body = await c.var.deps.db.asParent(c.var.parent, (tx) =>
       scheduleResponse(tx, ctx, c.var.deps.clock()),
@@ -554,7 +665,7 @@ export function learningRoutes(): Hono<AppEnv> {
   });
 
   r.put('/children/:childId/learning-schedule', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'write');
     const body = await readJson(c, updateLearningScheduleRequestSchema);
     await parentContext(c, owned); // creates defaults
     await c.var.deps.db.asParent(
@@ -605,7 +716,7 @@ export function learningRoutes(): Hono<AppEnv> {
   });
 
   r.get('/children/:childId/test-dates', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'read');
     const rows = await c.var.deps.db.asParent(
       c.var.parent,
       (tx) => tx<
@@ -626,7 +737,7 @@ export function learningRoutes(): Hono<AppEnv> {
   });
 
   r.post('/children/:childId/test-dates', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'write');
     const body = await readJson(c, createTestDateRequestSchema);
     const scope =
       body.scopeNotes !== undefined && body.scopeNotes.length > 0 ? body.scopeNotes : null;
@@ -666,7 +777,7 @@ export function learningRoutes(): Hono<AppEnv> {
   });
 
   r.delete('/children/:childId/test-dates/:testDateId', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'write');
     const testDateId = paramUuid(c, 'testDateId', 'Test date not found');
     const rows = await c.var.deps.db.asParent(
       c.var.parent,
@@ -683,7 +794,7 @@ export function learningRoutes(): Hono<AppEnv> {
   // ----- Study material (text only, size-limited) ------------------------------------------------
 
   r.post('/children/:childId/study-materials', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'write');
     const body = await readJson(c, createStudyMaterialRequestSchema);
     if (body.text.length > STUDY_MATERIAL_MAX_CHARS[body.kind]) {
       throw new ApiError('PAYLOAD_TOO_LARGE', 'That is too long for this kind of material');
@@ -745,7 +856,7 @@ export function learningRoutes(): Hono<AppEnv> {
   // ----- Skill evidence (AC_LEARNING_01/02) ------------------------------------------------------
 
   r.get('/children/:childId/skills', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'read');
     const now = c.var.deps.clock();
     const { events, zone } = await c.var.deps.db.asParent(c.var.parent, async (tx) => {
       const [family] = await tx<
@@ -801,7 +912,7 @@ export function learningRoutes(): Hono<AppEnv> {
   // ----- Parent practice sets (questions only) ---------------------------------------------------
 
   r.get('/children/:childId/practice-sets', requireParent, async (c) => {
-    const owned = await ownedChild(c);
+    const owned = await ownedChild(c, 'read');
     const kind = c.req.query('kind');
     const week = c.req.query('week');
     if (kind !== undefined && !['daily', 'thursday_review', 'top_up'].includes(kind)) {
@@ -899,11 +1010,7 @@ export function learningRoutes(): Hono<AppEnv> {
     const { deps, parent } = c.var;
     const setId = paramUuid(c, 'id', 'Practice set not found');
     const familyId = await currentFamilyId(c);
-    const [owned] = await deps.db.asParent(
-      parent,
-      (tx) => tx<{ id: string }[]>`
-        select id from public.practice_sets where id = ${setId} and family_id = ${familyId}`,
-    );
+    const owned = await ownedSet(c, familyId, setId);
     if (!owned) throw new ApiError('NOT_FOUND', 'Practice set not found');
     await assertRecentUnlock(c);
     const rows = await deps.db.asService(
@@ -954,11 +1061,7 @@ export function learningRoutes(): Hono<AppEnv> {
     const { deps, parent } = c.var;
     const body = await readJson(c, reviewPdfExportRequestSchema);
     const familyId = await currentFamilyId(c);
-    const [set] = await deps.db.asParent(
-      parent,
-      (tx) => tx<{ id: string; child_id: string }[]>`
-        select id, child_id from public.practice_sets where id = ${body.setId} and family_id = ${familyId}`,
-    );
+    const set = await ownedSet(c, familyId, body.setId);
     if (!set) throw new ApiError('NOT_FOUND', 'Practice set not found');
     // Every export holds private family data; the answer key especially (spec P8). The database RPC
     // re-checks membership and the step-up.
