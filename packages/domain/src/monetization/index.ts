@@ -3,12 +3,18 @@
 // workflow and owner revenue reporting. Pure functions: no I/O, clock or randomness.
 export * from './types.ts';
 export {
+  AMAZON_MOBILE_PLATFORMS,
   FIXTURE_EVIDENCE_PREFIX,
+  NON_IDENTIFYING_WORDS,
   PUBLISHER_TAG_PATTERN,
+  approvalEvidenceQuality,
   evidenceQuality,
   isValidPublisherTag,
+  linkingToolQuality,
   providerGate,
+  requiresLinkingTool,
   resolveMerchantMode,
+  type EvidenceContext,
   type EvidenceQuality,
   type GateContext,
   type GateReason,

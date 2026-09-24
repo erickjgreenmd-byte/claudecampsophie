@@ -32,6 +32,7 @@ import {
   evidenceQuality,
   isValidPublisherTag,
   providerGate,
+  requiresLinkingTool,
   revenueSummary,
   suppressSmallCount,
   validateCreative,
@@ -122,6 +123,7 @@ interface CreativeRow {
   id: string;
   sponsor_id: string;
   version: number;
+  sponsor_name: string;
   headline: string;
   body: string;
   cta_label: string;
@@ -139,6 +141,7 @@ const creativeBody = (r: CreativeRow) => ({
   id: r.id,
   sponsorId: r.sponsor_id,
   version: r.version,
+  sponsorName: r.sponsor_name,
   headline: r.headline,
   body: r.body,
   ctaLabel: r.cta_label,
@@ -223,6 +226,7 @@ interface ApprovalRow {
   evidence_ref: string;
   approval_scope: string;
   publisher_tag: string | null;
+  linking_tool_ref: string | null;
   status: 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired';
   status_reason: string | null;
   expires_at: Date;
@@ -239,9 +243,10 @@ const approvalBody = (a: ApprovalRow) => ({
   vendorSdkVersion: a.vendor_sdk_version,
   policyReviewedAt: a.policy_reviewed_at.toISOString(),
   evidenceRef: a.evidence_ref,
-  evidenceQuality: evidenceQuality(a.evidence_ref),
+  evidenceQuality: evidenceQuality(a.evidence_ref, { publisherTag: a.publisher_tag }),
   approvalScope: a.approval_scope,
   publisherTag: a.publisher_tag,
+  linkingToolRef: a.linking_tool_ref,
   status: a.status,
   statusReason: a.status_reason,
   expiresAt: a.expires_at.toISOString(),
@@ -465,18 +470,17 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
     const { deps } = c.var;
     const input = await readJson(c, approvalInputSchema);
     const now = deps.clock();
-    const quality = evidenceQuality(input.evidenceRef);
+    const linkingToolRef = input.linkingToolRef ?? null;
+    const testing = deps.config.environment === 'development' || deps.config.environment === 'test';
+    // Judged against the record's own tag: the tag (or a status word, flag, key) is not evidence.
+    const quality = evidenceQuality(input.evidenceRef, { publisherTag: input.publisherTag });
     if (quality === 'invalid') {
       throw businessRule(
         'EVIDENCE_INVALID',
         'Record a reference to the actual policy evidence (a boolean, key or placeholder is not evidence)',
       );
     }
-    if (
-      quality === 'fixture' &&
-      deps.config.environment !== 'development' &&
-      deps.config.environment !== 'test'
-    ) {
+    if (quality === 'fixture' && !testing) {
       throw businessRule(
         'FIXTURE_EVIDENCE_NOT_ALLOWED',
         'Fixture evidence is only for development and tests',
@@ -513,14 +517,39 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
         'An approved Amazon property needs its publisher-level tag',
       );
     }
+    // Permitted Amazon linking tool/API (spec P16.3, AC_MON_10, RV-MON-09).
+    if (input.provider !== 'amazon_associates' && linkingToolRef !== null) {
+      throw new ApiError('VALIDATION_FAILED', 'Only Amazon approvals record a linking tool');
+    }
+    if (linkingToolRef !== null) {
+      const linking = evidenceQuality(linkingToolRef, { publisherTag: input.publisherTag });
+      if (linking === 'invalid') {
+        throw businessRule(
+          'LINKING_TOOL_INVALID',
+          'Record where the permitted linking tool/API determination is kept (a yes, key or tag is not a record)',
+        );
+      }
+      if (linking === 'fixture' && !testing) {
+        throw businessRule(
+          'FIXTURE_EVIDENCE_NOT_ALLOWED',
+          'Fixture evidence is only for development and tests',
+        );
+      }
+    }
+    if (input.status === 'approved' && requiresLinkingTool(input) && linkingToolRef === null) {
+      throw businessRule(
+        'LINKING_TOOL_REQUIRED',
+        'An approved Amazon mobile app needs its permitted linking tool/API recorded',
+      );
+    }
     const row = await deps.db.asService(async (tx) => {
       const [created] = await tx<ApprovalRow[]>`
         insert into public.monetization_approvals
           (provider, platform, property_identifier, locale, intended_audience, vendor_sdk_version, policy_reviewed_at,
-           evidence_ref, approval_scope, publisher_tag, status, expires_at, recorded_by)
+           evidence_ref, approval_scope, publisher_tag, linking_tool_ref, status, expires_at, recorded_by)
         values (${input.provider}, ${input.platform}, ${input.propertyIdentifier}, ${input.locale}, ${input.intendedAudience},
                 ${input.vendorSdkVersion}, ${reviewedAt}, ${input.evidenceRef}, ${input.approvalScope}, ${input.publisherTag},
-                ${input.status}, ${expiresAt}, ${c.var.parent.userId})
+                ${linkingToolRef}, ${input.status}, ${expiresAt}, ${c.var.parent.userId})
         returning *
       `;
       await audit(tx, c, 'monetization.approval_recorded', 'monetization_approval', created!.id, {
@@ -553,13 +582,22 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
         if (!allowed)
           throw businessRule('INVALID_TRANSITION', `Cannot ${action} a ${current.status} approval`);
         if (target === 'approved') {
-          if (evidenceQuality(current.evidence_ref) === 'invalid') {
+          if (
+            evidenceQuality(current.evidence_ref, { publisherTag: current.publisher_tag }) ===
+            'invalid'
+          ) {
             throw businessRule('EVIDENCE_INVALID', 'This record has no usable evidence reference');
           }
           if (current.provider === 'amazon_associates' && current.publisher_tag === null) {
             throw businessRule(
               'TAG_REQUIRED',
               'An approved Amazon property needs its publisher-level tag',
+            );
+          }
+          if (requiresLinkingTool(current) && current.linking_tool_ref === null) {
+            throw businessRule(
+              'LINKING_TOOL_REQUIRED',
+              'An approved Amazon mobile app needs its permitted linking tool/API recorded',
             );
           }
         }
@@ -631,7 +669,7 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
     const id = idParam(c);
     const rows = await c.var.deps.db.asService(
       (tx) => tx<CreativeRow[]>`
-        select id, sponsor_id, version, headline, body, cta_label, destination_url, image_asset_ref, image_license_ref,
+        select id, sponsor_id, version, sponsor_name, headline, body, cta_label, destination_url, image_asset_ref, image_license_ref,
                review_status, self_reviewed, created_by, reviewed_at, created_at
           from public.sponsor_creatives where sponsor_id = ${id} order by version desc
       `,
@@ -658,7 +696,7 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
                 (select coalesce(max(version), 0) + 1 from public.sponsor_creatives where sponsor_id = ${sponsorId}),
                 ${input.headline.trim()}, ${input.body.trim()}, ${input.ctaLabel.trim()}, ${destination},
                 ${input.imageAssetRef}, ${input.imageLicenseRef}, ${c.var.parent.userId})
-        returning id, sponsor_id, version, headline, body, cta_label, destination_url, image_asset_ref, image_license_ref,
+        returning id, sponsor_id, version, sponsor_name, headline, body, cta_label, destination_url, image_asset_ref, image_license_ref,
                   review_status, self_reviewed, created_by, reviewed_at, created_at
       `;
       await audit(tx, c, 'monetization.creative_created', 'sponsor_creative', created!.id, {
@@ -681,7 +719,7 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
       const [current] = await tx<
         (CreativeRow & { allowed_domains: string[]; sponsor_status: string })[]
       >`
-        select cr.id, cr.sponsor_id, cr.version, cr.headline, cr.body, cr.cta_label, cr.destination_url,
+        select cr.id, cr.sponsor_id, cr.version, cr.sponsor_name, cr.headline, cr.body, cr.cta_label, cr.destination_url,
                cr.image_asset_ref, cr.image_license_ref, cr.review_status, cr.self_reviewed, cr.created_by,
                cr.reviewed_at, cr.created_at, s.allowed_domains, s.status as sponsor_status
           from public.sponsor_creatives cr join public.sponsors s on s.id = cr.sponsor_id
@@ -734,7 +772,7 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
                review_note = ${note ?? null},
                self_reviewed = ${selfReviewed}
          where id = ${id}
-        returning id, sponsor_id, version, headline, body, cta_label, destination_url, image_asset_ref, image_license_ref,
+        returning id, sponsor_id, version, sponsor_name, headline, body, cta_label, destination_url, image_asset_ref, image_license_ref,
                   review_status, self_reviewed, created_by, reviewed_at, created_at
       `;
       await audit(tx, c, `monetization.creative_${target}`, 'sponsor_creative', id, {
@@ -1111,34 +1149,68 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
         );
       }
     }
-    // Deterministic fingerprint of the file's content: a re-upload is refused, not double-counted.
+    // Deterministic fingerprint of the file's CONTENT (its rows and month). The source label is
+    // not part of it: the same provider rows re-imported as 'manual' are the same file
+    // (RV-MON-06). A re-upload is refused, never double-counted.
     const fileSha256 = await sha256Hex(
-      JSON.stringify({ source: input.source, periodMonth: input.periodMonth, rows: input.rows }),
+      JSON.stringify({ periodMonth: input.periodMonth, rows: input.rows }),
     );
+    const duplicateImport = () =>
+      new ApiError('CONFLICT', 'This file was already imported', { rule: 'DUPLICATE_IMPORT' });
     const body = await c.var.deps.db.asService(async (tx) => {
+      // A sponsor fee row names the placement its campaign actually runs on: the same-inventory
+      // double-count guard keys on placement (RV-MON-07).
+      const campaignIds = [
+        ...new Set(input.rows.flatMap((row) => (row.campaignId === null ? [] : [row.campaignId]))),
+      ];
+      const campaigns = new Map(
+        campaignIds.length === 0
+          ? []
+          : (
+              await tx<{ id: string; placement: Placement }[]>`
+                select id, placement from public.sponsor_campaigns where id = any(${campaignIds}::uuid[])
+              `
+            ).map((r) => [r.id, r.placement]),
+      );
+      for (const [i, row] of input.rows.entries()) {
+        if (row.campaignId === null) continue;
+        const placement = campaigns.get(row.campaignId);
+        if (placement === undefined) {
+          throw new ApiError('VALIDATION_FAILED', `Row ${i + 1}: campaign not found`);
+        }
+        if (row.placement !== placement) {
+          throw businessRule(
+            'CAMPAIGN_PLACEMENT_MISMATCH',
+            `Row ${i + 1}: this campaign runs on ${placement}; record its revenue on that placement`,
+          );
+        }
+      }
       const [existing] = await tx<{ id: string }[]>`
         select id from public.revenue_imports where file_sha256 = ${fileSha256}
       `;
-      if (existing) {
-        throw new ApiError('CONFLICT', 'This file was already imported', {
-          rule: 'DUPLICATE_IMPORT',
-        });
-      }
-      const [imp] = await tx<{ id: string }[]>`
+      if (existing) throw duplicateImport();
+      const imp = await tx<{ id: string }[]>`
         insert into public.revenue_imports (source, file_sha256, period_month, imported_by, row_count, note)
         values (${input.source}, ${fileSha256}, ${input.periodMonth}, ${c.var.parent.userId}, ${input.rows.length}, ${input.note})
         returning id
-      `;
+      `.then(
+        ([row]) => row!,
+        (error: unknown) => {
+          // A concurrent upload of the same file won the race.
+          throw isUniqueViolation(error) ? duplicateImport() : error;
+        },
+      );
       try {
         for (const row of input.rows) {
           await tx`
             insert into public.revenue_entries
               (import_id, source, external_ref, category, provider, campaign_id, placement, amount_cents, period_month)
-            values (${imp!.id}, ${input.source}, ${row.externalRef}, ${row.category}, ${row.provider}, ${row.campaignId},
+            values (${imp.id}, ${input.source}, ${row.externalRef}, ${row.category}, ${row.provider}, ${row.campaignId},
                     ${row.placement}, ${row.amountCents}, ${row.periodMonth ?? input.periodMonth})
           `;
         }
       } catch (error) {
+        // Same provider reference and category already booked, under any source label.
         if (isUniqueViolation(error)) {
           throw new ApiError('CONFLICT', 'A row in this file was already imported', {
             rule: 'DUPLICATE_ENTRY',
@@ -1146,12 +1218,12 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
         }
         throw error;
       }
-      await audit(tx, c, 'monetization.revenue_imported', 'revenue_import', imp!.id, {
+      await audit(tx, c, 'monetization.revenue_imported', 'revenue_import', imp.id, {
         source: input.source,
         periodMonth: input.periodMonth,
         rows: input.rows.length,
       });
-      return { importId: imp!.id, fileSha256, rowCount: input.rows.length };
+      return { importId: imp.id, fileSha256, rowCount: input.rows.length };
     });
     return c.json(body, 201);
   });

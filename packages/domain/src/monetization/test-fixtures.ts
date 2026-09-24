@@ -18,7 +18,15 @@ export const ALL_ON: MonetizationSwitches = {
   'provider:ad_network': true,
 };
 
-export function approval(overrides: Partial<MonetizationApproval> = {}): MonetizationApproval {
+/**
+ * Synthetic reference to a recorded Amazon linking-tool determination. `approval()` deliberately
+ * records none: tests that need live mobile affiliate mode add it explicitly (AC_MON_10).
+ */
+export const LINKING_TOOL_REF = 'OWNER-DOC/amazon-mobile-linking-2026-09-01#case-4413';
+
+export type MonetizationApprovalFixture = Partial<MonetizationApproval>;
+
+export function approval(overrides: MonetizationApprovalFixture = {}): MonetizationApproval {
   return {
     id: 'appr-1',
     provider: 'amazon_associates',
@@ -30,6 +38,7 @@ export function approval(overrides: Partial<MonetizationApproval> = {}): Monetiz
     expiresAt: new Date('2027-03-01T00:00:00Z'),
     evidenceRef: 'OWNER-DOC/amazon-eligibility-2026-09-01#case-4412',
     publisherTag: 'pencillift-20',
+    linkingToolRef: null,
     ...overrides,
   };
 }

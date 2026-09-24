@@ -116,12 +116,17 @@ export const VIEW_TIMING_TOLERANCE_MS = 1000;
 /**
  * Documented visible-duration rule (spec P16.5, AC_MON_16): a served card counts as one viewable
  * impression only once, only when at least `minVisibleRatio` of it was on screen for at least
- * `minVisibleMs`, and only if that duration fits between the serve and now (a prefetched or
- * replayed card cannot claim visibility it never had).
+ * `minVisibleMs`, and only if that duration fits the time the card could actually have been on
+ * screen by the server's own clock: from the serve until now, or until the parent dismissed or
+ * reported it. The server-side window itself must be at least `minVisibleMs` (the clock-skew
+ * tolerance never shortens it), so a beacon sent the instant a card is served (prefetch), a
+ * replayed beacon and a beacon for a card closed before it was viewable never count.
  */
 export function countViewable(input: {
   readonly servedAt: Date;
   readonly viewedAt: Date | null;
+  /** When the serve was dismissed or reported (the card left the screen); null while shown. */
+  readonly dismissedAt: Date | null;
   readonly now: Date;
   readonly visibleMs: number;
   readonly visibleRatio: number;
@@ -138,13 +143,21 @@ export function countViewable(input: {
     return { counted: false, reason: 'invalid_measurement' };
   }
   if (input.viewedAt !== null) return { counted: false, reason: 'already_counted' };
-  const age = input.now.getTime() - input.servedAt.getTime();
+  const served = input.servedAt.getTime();
+  const age = input.now.getTime() - served;
   if (age > MAX_SERVE_AGE_FOR_VIEW_MS) return { counted: false, reason: 'stale_serve' };
-  if (visibleMs > Math.max(0, age) + VIEW_TIMING_TOLERANCE_MS) {
+  const shownUntil =
+    input.dismissedAt === null
+      ? input.now.getTime()
+      : Math.min(input.now.getTime(), input.dismissedAt.getTime());
+  const windowMs = Math.max(0, shownUntil - served);
+  if (visibleMs > windowMs + VIEW_TIMING_TOLERANCE_MS) {
     return { counted: false, reason: 'implausible_duration' };
   }
   if (visibleMs < input.rule.minVisibleMs) return { counted: false, reason: 'below_min_duration' };
   if (visibleRatio < input.rule.minVisibleRatio)
     return { counted: false, reason: 'below_min_ratio' };
+  // The server's clock must confirm the minimum duration could have elapsed on screen.
+  if (windowMs < input.rule.minVisibleMs) return { counted: false, reason: 'implausible_duration' };
   return { counted: true };
 }

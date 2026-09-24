@@ -124,6 +124,7 @@ describe('countViewable (AC_MON_16)', () => {
   const base = {
     servedAt,
     viewedAt: null,
+    dismissedAt: null,
     now: new Date('2026-09-24T15:00:05Z'),
     visibleMs: 1500,
     visibleRatio: 0.8,
@@ -148,6 +149,68 @@ describe('countViewable (AC_MON_16)', () => {
     [{ visibleRatio: 1.5 }, 'invalid_measurement'],
   ])('%j -> %s', (overrides, reason) => {
     expect(countViewable({ ...base, ...overrides })).toEqual({ counted: false, reason });
+  });
+
+  it('a beacon sent the instant a card is served (prefetch) never counts (RV-MON-02)', () => {
+    for (const age of [0, 1, 500, 999]) {
+      expect(
+        countViewable({
+          ...base,
+          now: new Date(servedAt.getTime() + age),
+          visibleMs: DEFAULT_PLACEMENT_RULE.minVisibleMs,
+          visibleRatio: 1,
+        }),
+      ).toEqual({ counted: false, reason: 'implausible_duration' });
+    }
+    expect(
+      countViewable({
+        ...base,
+        now: new Date(servedAt.getTime() + DEFAULT_PLACEMENT_RULE.minVisibleMs),
+        visibleMs: DEFAULT_PLACEMENT_RULE.minVisibleMs,
+        visibleRatio: 1,
+      }),
+    ).toEqual({ counted: true });
+  });
+
+  it('a dismissed/reported card is bounded by the time it was actually shown (RV-MON-03)', () => {
+    const dismissedEarly = { ...base, dismissedAt: new Date(servedAt.getTime() + 300) };
+    expect(countViewable(dismissedEarly)).toEqual({
+      counted: false,
+      reason: 'implausible_duration',
+    });
+    expect(countViewable({ ...dismissedEarly, visibleMs: 1000 })).toEqual({
+      counted: false,
+      reason: 'implausible_duration',
+    });
+    // Viewed for real before the parent closed it: a late beacon still counts once.
+    expect(countViewable({ ...base, dismissedAt: new Date(servedAt.getTime() + 3000) })).toEqual({
+      counted: true,
+    });
+  });
+
+  it('counted impressions always fit a server-side window of at least the minimum (property)', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 120_000 }),
+        fc.option(fc.integer({ min: 0, max: 120_000 }), { nil: null }),
+        fc.integer({ min: 0, max: 120_000 }),
+        (age, dismissedAfter, visible) => {
+          const outcome = countViewable({
+            ...base,
+            now: new Date(servedAt.getTime() + age),
+            dismissedAt:
+              dismissedAfter === null ? null : new Date(servedAt.getTime() + dismissedAfter),
+            visibleMs: visible,
+            visibleRatio: 1,
+          });
+          const shown = Math.min(age, dismissedAfter ?? age);
+          return (
+            !outcome.counted ||
+            (shown >= DEFAULT_PLACEMENT_RULE.minVisibleMs && visible <= shown + 1000)
+          );
+        },
+      ),
+    );
   });
 
   it('a card can never claim more visibility than time since it was served (property)', () => {

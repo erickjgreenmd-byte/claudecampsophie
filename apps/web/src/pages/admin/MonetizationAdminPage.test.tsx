@@ -84,6 +84,7 @@ function approval(overrides: Partial<Approval> = {}): Approval {
     evidenceQuality: 'fixture',
     approvalScope: 'Parent resource directory sponsor cards',
     publisherTag: null,
+    linkingToolRef: null,
     status: 'approved',
     statusReason: null,
     expiresAt: '2027-09-20T15:00:00.000Z',
@@ -106,6 +107,7 @@ function creative(overrides: Partial<Creative> = {}): Creative {
     id: CREATIVE,
     sponsorId: SPONSOR,
     version: 2,
+    sponsorName: 'Bright Owl Tutoring',
     headline: '<script>alert(1)</script> Reading coaching',
     body: 'Small-group reading sessions with certified teachers.',
     ctaLabel: 'Learn more',
@@ -461,6 +463,70 @@ describe('Approvals (AC_MON_09/10)', () => {
   });
 });
 
+describe('Amazon mobile linking tool (RV-MON-09, AC_MON_10)', () => {
+  it('asks an iOS/Android Amazon approval for its permitted linking tool and explains a refusal', async () => {
+    const { api, sent } = fakeApi({
+      [`POST ${BASE}/approvals`]: new ApiRequestError(
+        'BUSINESS_RULE',
+        'Linking tool required',
+        422,
+        'LINKING_TOOL_REQUIRED',
+      ),
+    });
+    renderPage(<MonetizationAdminPage />, { api });
+    const form = await screen.findByRole('form', { name: 'Record an approval' });
+    await userEvent.selectOptions(within(form).getByLabelText('Provider'), 'amazon_associates');
+    expect(within(form).queryByLabelText(/Permitted linking tool/)).toBeNull();
+    await userEvent.selectOptions(within(form).getByLabelText('Platform'), 'ios');
+    await userEvent.type(within(form).getByLabelText(/Property identifier/), 'com.pencillift.app');
+    await userEvent.type(
+      within(form).getByLabelText('Intended audience'),
+      'Adults in the parent area',
+    );
+    await userEvent.type(within(form).getByLabelText(/Policy review date/), '2026-09-01T10:00');
+    await userEvent.type(
+      within(form).getByLabelText('Evidence reference'),
+      'OWNER-DOC/amazon-ios-2026-09#12',
+    );
+    await userEvent.type(within(form).getByLabelText('Approval scope'), 'Resource browser links');
+    await userEvent.type(within(form).getByLabelText(/Publisher-level tag/), 'pencillift-20');
+    await userEvent.type(
+      within(form).getByLabelText(/Permitted linking tool/),
+      'OWNER-DOC/amazon-linking-2026-09#13',
+    );
+    await userEvent.type(within(form).getByLabelText(/Expiry or revalidation/), '2027-09-01T10:00');
+    await userEvent.click(within(form).getByRole('button', { name: 'Record approval' }));
+    await waitFor(() => expect(sent()).toHaveLength(1));
+    expect(sent()[0]!.body).toMatchObject({
+      provider: 'amazon_associates',
+      platform: 'ios',
+      linkingToolRef: 'OWNER-DOC/amazon-linking-2026-09#13',
+    });
+    expect(
+      await within(form).findByText(/app needs its permitted linking tool or API recorded/),
+    ).toBeTruthy();
+  });
+
+  it('shows whether an Amazon app approval records its linking tool', async () => {
+    const { api } = fakeApi({
+      [`GET ${BASE}/approvals`]: {
+        approvals: [
+          approval({
+            provider: 'amazon_associates',
+            platform: 'ios',
+            publisherTag: 'pencillift-20',
+          }),
+        ],
+      },
+    });
+    renderPage(<MonetizationAdminPage />, { api });
+    const section = await region('Provider and platform approvals');
+    expect(
+      await within(section).findByText(/Linking tool: not recorded \(affiliate links stay off\)/),
+    ).toBeTruthy();
+  });
+});
+
 describe('Sponsors and creatives (AC_MON_06)', () => {
   it('previews creative text as plain text and approves a version in review', async () => {
     const { api, sent } = fakeApi({
@@ -489,6 +555,20 @@ describe('Sponsors and creatives (AC_MON_06)', () => {
       body: {},
     });
     expect(await within(section).findByText(/self-reviewed by the sole owner admin/)).toBeTruthy();
+  });
+
+  it('previews the reviewed "Sponsored by" name frozen with the version, not a later rename (RV-MON-05)', async () => {
+    const { api } = fakeApi({
+      [`GET ${BASE}/sponsors/${SPONSOR}/creatives`]: {
+        creatives: [creative({ sponsorName: 'Bright Owl Learning', reviewStatus: 'approved' })],
+      },
+    });
+    renderPage(<MonetizationAdminPage />, { api });
+    const section = await region('Sponsors and creatives');
+    await userEvent.click(await within(section).findByRole('button', { name: 'Creatives' }));
+    const preview = await within(section).findByRole('group', { name: 'Preview of version 2' });
+    expect(within(preview).getByText('Sponsored by Bright Owl Learning')).toBeTruthy();
+    expect(within(preview).queryByText('Sponsored by Bright Owl Tutoring')).toBeNull();
   });
 
   it('suspends a sponsor after confirmation', async () => {

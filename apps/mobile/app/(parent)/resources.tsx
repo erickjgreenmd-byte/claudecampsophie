@@ -192,9 +192,14 @@ function ParentResources({
   useEffect(
     () =>
       registerAdultCacheClearer(() => {
+        // The loaded list (affiliate items included) lives in `state` too: drop it with the rest.
+        setState({ status: 'loading' });
         setLastData(null);
         setPlacement(null);
         setPrefs(null);
+        setOverrides({});
+        setNotes({});
+        setSponsorClosed(null);
       }),
     [],
   );

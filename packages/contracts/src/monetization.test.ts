@@ -113,4 +113,28 @@ describe('P16 monetization contracts', () => {
     expect(approvalInputSchema.safeParse({ ...base, evidenceRef: 'yes' }).success).toBe(false);
     expect(approvalInputSchema.safeParse({ ...base, status: 'revoked' }).success).toBe(false);
   });
+
+  it('a mobile Amazon approval may record its permitted linking tool as reference text', () => {
+    const base = {
+      provider: 'amazon_associates',
+      platform: 'ios',
+      propertyIdentifier: 'com.pencillift.app',
+      locale: 'en-US',
+      intendedAudience: 'Adults',
+      vendorSdkVersion: null,
+      policyReviewedAt: '2026-09-01T00:00:00Z',
+      evidenceRef: 'OWNER-DOC/eligibility#1',
+      approvalScope: 'Parent resource browser',
+      publisherTag: 'pencillift-20',
+      status: 'approved',
+      expiresAt: '2027-03-01T00:00:00Z',
+    };
+    expect(
+      approvalInputSchema.safeParse({ ...base, linkingToolRef: 'OWNER-DOC/linking-tool#2' })
+        .success,
+    ).toBe(true);
+    expect(approvalInputSchema.safeParse({ ...base, linkingToolRef: null }).success).toBe(true);
+    expect(approvalInputSchema.safeParse({ ...base, linkingToolRef: true }).success).toBe(false);
+    expect(approvalInputSchema.safeParse({ ...base, linkingToolRef: 'yes' }).success).toBe(false);
+  });
 });

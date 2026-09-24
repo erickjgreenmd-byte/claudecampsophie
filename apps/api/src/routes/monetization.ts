@@ -22,6 +22,7 @@ import {
   validateCreative,
   type MerchantModeResult,
   type MonetizationPlatform,
+  type MonetizationProperty,
   type Placement,
 } from '@pencillift/domain/monetization';
 import { readJson } from '../app.ts';
@@ -43,7 +44,8 @@ import {
   loadPlacementRule,
   loadPrefs,
   loadSwitches,
-  propertyFor,
+  lockCampaignBilling,
+  requestProperty,
   serveTokenHash,
   sessionKeyHash,
   type CampaignCandidate,
@@ -79,6 +81,28 @@ async function adultContext(c: Ctx): Promise<{ familyId: string; now: Date }> {
   await assertRecentUnlock(c);
   const familyId = await currentFamilyId(c);
   return { familyId, now: c.var.deps.clock() };
+}
+
+/**
+ * The property this request is served on. A browser is always the web property, whatever
+ * `platform` it declares, so a web visitor can never obtain another property's approvals, merchant
+ * mode or tagged links by claiming ios/android (RV-MON-04).
+ */
+function servedProperty(
+  c: Ctx,
+  declared: MonetizationPlatform,
+  locale: string,
+): MonetizationProperty {
+  return requestProperty(
+    c.var.deps.config,
+    {
+      origin: c.req.header('origin') ?? null,
+      secFetchSite: c.req.header('sec-fetch-site') ?? null,
+      secFetchMode: c.req.header('sec-fetch-mode') ?? null,
+    },
+    declared,
+    locale,
+  );
 }
 
 function serveTokenParam(c: Ctx): string {
@@ -130,7 +154,9 @@ async function serveStillLive(
   const { config } = c.var.deps;
   const [campaign] = await loadCampaignCandidates(tx, { campaignId: serve.campaign_id });
   if (!campaign) return null;
-  const property = propertyFor(config, serve.platform, serve.locale);
+  // The follow-up request must come from the same kind of property the card was served on.
+  const property = servedProperty(c, serve.platform, serve.locale);
+  if (property.platform !== serve.platform) return null;
   const gate = providerGate('sponsor_direct', {
     environment: config.environment,
     property,
@@ -166,18 +192,16 @@ function destinationHost(url: string): string {
 async function merchantModeFor(
   c: Ctx,
   tx: Tx,
-  platform: MonetizationPlatform,
-  locale: string,
+  property: MonetizationProperty,
   now: Date,
 ): Promise<MerchantModeResult> {
-  const { config } = c.var.deps;
   return resolveMerchantMode({
-    environment: config.environment,
-    property: propertyFor(config, platform, locale),
+    environment: c.var.deps.config.environment,
+    property,
     approvals: await loadApprovals(tx),
     switches: await loadSwitches(tx),
     now,
-    linksPermitted: LINK_LOCALES.has(locale),
+    linksPermitted: LINK_LOCALES.has(property.locale),
   });
 }
 
@@ -199,7 +223,8 @@ export function monetizationRoutes(): Hono<AppEnv> {
     const { familyId, now } = await adultContext(c);
     const query = parseQuery(c, placementQuerySchema);
     const locale = query.locale ?? DEFAULT_LOCALE;
-    const property = propertyFor(deps.config, query.platform, locale);
+    const property = servedProperty(c, query.platform, locale);
+    const platform = property.platform;
     const sessionKey = await sessionKeyHash(deps.config, parent.sessionId);
 
     const body = await deps.db.asService(async (tx) => {
@@ -215,7 +240,7 @@ export function monetizationRoutes(): Hono<AppEnv> {
           servingOnly: true,
         }),
         placement: query.placement,
-        platform: query.platform,
+        platform,
         propertyIdentifier: property.identifier,
         locale,
         environment: deps.config.environment,
@@ -235,7 +260,7 @@ export function monetizationRoutes(): Hono<AppEnv> {
         if (selection.reason !== 'disabled') {
           await bumpCounter(tx, {
             now,
-            platform: query.platform,
+            platform,
             placement: query.placement,
             kind: 'opportunity',
           });
@@ -263,19 +288,19 @@ export function monetizationRoutes(): Hono<AppEnv> {
       await tx`
         insert into private.placement_serves
           (serve_token_hash, session_key_hash, campaign_id, placement, platform, locale, served_at)
-        values (${await serveTokenHash(token)}, ${sessionKey}, ${campaign.id}, ${query.placement}, ${query.platform},
+        values (${await serveTokenHash(token)}, ${sessionKey}, ${campaign.id}, ${query.placement}, ${platform},
                 ${locale}, ${now})
       `;
       await bumpCounter(tx, {
         now,
-        platform: query.platform,
+        platform,
         placement: query.placement,
         kind: 'opportunity',
       });
       await bumpCounter(tx, {
         campaignId: campaign.id,
         now,
-        platform: query.platform,
+        platform,
         placement: query.placement,
         kind: 'served',
       });
@@ -304,12 +329,17 @@ export function monetizationRoutes(): Hono<AppEnv> {
     const input = await readJson(c, placementViewedRequestSchema);
     const body = await deps.db.asService(async (tx) => {
       const serve = await lockServe(c, tx, token);
+      // Billing is serialized per campaign BEFORE the cap is re-read, so parallel beacons from
+      // other sessions can never push a campaign past its impression cap (RV-MON-01).
+      await lockCampaignBilling(tx, serve.campaign_id);
       const live = await serveStillLive(c, tx, serve, familyId, now);
       if (!live) return { counted: false, reason: 'placement_withdrawn' };
       const rule = await loadPlacementRule(tx, serve.placement);
       const outcome = countViewable({
         servedAt: serve.served_at,
         viewedAt: serve.viewed_at,
+        // A dismissed/reported card left the screen then: no later beacon can claim more (RV-MON-03).
+        dismissedAt: serve.dismissed_at,
         now,
         visibleMs: input.visibleMs,
         visibleRatio: input.visibleRatio,
@@ -383,6 +413,11 @@ export function monetizationRoutes(): Hono<AppEnv> {
     const token = serveTokenParam(c);
     const url = await deps.db.asService(async (tx) => {
       const serve = await lockServe(c, tx, token);
+      // A dismissed or reported card is gone from the parent's screen: a later tap is a replay and
+      // never navigates or counts (RV-MON-03).
+      if (serve.dismissed_at !== null) {
+        throw new ApiError('NOT_FOUND', 'This offer is no longer available');
+      }
       const live = await serveStillLive(c, tx, serve, familyId, now);
       if (!live) throw new ApiError('NOT_FOUND', 'This offer is no longer available');
       if (
@@ -422,9 +457,9 @@ export function monetizationRoutes(): Hono<AppEnv> {
     const { deps } = c.var;
     const { familyId, now } = await adultContext(c);
     const query = parseQuery(c, resourcesQuerySchema);
-    const locale = query.locale ?? DEFAULT_LOCALE;
+    const property = servedProperty(c, query.platform, query.locale ?? DEFAULT_LOCALE);
     const body = await deps.db.asService(async (tx) => {
-      const mode = await merchantModeFor(c, tx, query.platform, locale, now);
+      const mode = await merchantModeFor(c, tx, property, now);
       const prefs = await loadPrefs(tx, familyId);
       const rows = await loadCatalog(tx, { approvedOnly: true });
       const ranked = rankResources(
@@ -490,7 +525,7 @@ export function monetizationRoutes(): Hono<AppEnv> {
     if (!id.success) throw new ApiError('NOT_FOUND', 'This resource is no longer available');
     const { familyId, now } = await adultContext(c);
     const query = parseQuery(c, resourcesQuerySchema.pick({ platform: true, locale: true }));
-    const locale = query.locale ?? DEFAULT_LOCALE;
+    const property = servedProperty(c, query.platform, query.locale ?? DEFAULT_LOCALE);
     const body = await deps.db.asService(async (tx) => {
       const [row] = await loadCatalog(tx, { id: id.data, approvedOnly: true });
       // Invalid, retired or unavailable products fail safely (AC_MON_12).
@@ -501,7 +536,7 @@ export function monetizationRoutes(): Hono<AppEnv> {
       if (prefs.hideAffiliate && row.merchant !== 'none') {
         throw new ApiError('NOT_FOUND', 'This resource is hidden by your preferences');
       }
-      const mode = await merchantModeFor(c, tx, query.platform, locale, now);
+      const mode = await merchantModeFor(c, tx, property, now);
       const itemMode = effectiveItemMode(
         mode.mode,
         { merchant: row.merchant, merchantUrl: row.merchant_url },
@@ -519,7 +554,7 @@ export function monetizationRoutes(): Hono<AppEnv> {
       await bumpCounter(tx, {
         catalogId: row.id,
         now,
-        platform: query.platform,
+        platform: property.platform,
         placement: 'resources_browse',
         kind: 'click',
       });

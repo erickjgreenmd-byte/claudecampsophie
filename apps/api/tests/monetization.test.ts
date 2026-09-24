@@ -15,6 +15,7 @@ import { issueChildAccessToken } from '../src/auth/child.ts';
 import { purgeExpiredServes } from '../src/services/monetization-retention.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
 import {
+  WEB_PROPERTY,
   fixtureApproval,
   fixtureCampaign,
   fixtureResource,
@@ -361,6 +362,72 @@ describe('sponsor click-through (AC_MON_12)', () => {
     await post(`/v1/placements/${card.serveToken}/click`, token);
     expect(await counter(campaignId, 'click')).toBe(before);
   });
+
+  it('a dismissed or reported card never navigates or counts a click (RV-MON-03)', async () => {
+    const dash = 'placement=adult_dashboard&platform=ios';
+    for (const close of ['dismiss', 'report'] as const) {
+      const token = await unlocked(fam);
+      const card = (await serve(token, dash)).card!;
+      const clicks = await counter(campaignDash.campaignId, 'click');
+      const closed = await post(
+        `/v1/placements/${card.serveToken}/${close}`,
+        token,
+        close === 'report' ? { category: 'irrelevant' } : undefined,
+      );
+      expect(closed.status).toBe(204);
+      const click = await post(`/v1/placements/${card.serveToken}/click`, token);
+      expect(click.status).toBe(404);
+      expect(Object.keys(await json<Record<string, unknown>>(click))).toEqual(['error']);
+      expect(await counter(campaignDash.campaignId, 'click')).toBe(clicks);
+    }
+  });
+});
+
+describe('the declared platform is not trusted on its own (RV-MON-04, AC_MON_09)', () => {
+  const dash = (platform: string) =>
+    `/v1/placements?placement=adult_dashboard&platform=${platform}`;
+
+  it('a browser is always the web property, bound to the configured origin it came from', async () => {
+    // Android has no sponsor approval; the web property does.
+    const native = await api.request(dash('android'), { token: await unlocked(fam) });
+    expect(placementResponseSchema.parse(await native.json()).reason).toBe('disabled');
+    for (const headers of [
+      { origin: WEB_PROPERTY },
+      // Same-origin browser fetches may omit Origin but always carry fetch metadata.
+      { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors' },
+    ]) {
+      const browser = await api.request(dash('android'), { token: await unlocked(fam), headers });
+      expect(placementResponseSchema.parse(await browser.json()).reason).toBe('served');
+    }
+    // A browser on an origin that is not a configured property matches no approval.
+    const foreign = await api.request(dash('web'), {
+      token: await unlocked(fam),
+      headers: { origin: 'https://elsewhere.example' },
+    });
+    expect(placementResponseSchema.parse(await foreign.json()).reason).toBe('disabled');
+  });
+
+  it('a card served to a native app cannot be billed or opened from a browser', async () => {
+    api.now.value = BASE_NOW;
+    const token = await unlocked(fam);
+    const card = (await serve(token, 'placement=adult_dashboard&platform=ios')).card!;
+    api.now.value = new Date(BASE_NOW.getTime() + 5000);
+    const browser = { origin: WEB_PROPERTY };
+    const viewed = await api.request(`/v1/placements/${card.serveToken}/viewed`, {
+      method: 'POST',
+      token,
+      headers: browser,
+      body: { visibleMs: 1500, visibleRatio: 1 },
+    });
+    expect(await json(viewed)).toEqual({ counted: false, reason: 'placement_withdrawn' });
+    const click = await api.request(`/v1/placements/${card.serveToken}/click`, {
+      method: 'POST',
+      token,
+      headers: browser,
+    });
+    expect(click.status).toBe(404);
+    api.now.value = BASE_NOW;
+  });
 });
 
 describe('ad-free entitlement and parent preferences (AC_MON_04)', () => {
@@ -574,6 +641,28 @@ describe('resource browser, merchant modes and outbound links (AC_MON_08..12)', 
       .sql`update public.monetization_approvals set status = 'revoked' where id = ${approval}`;
     expect((await browse(token)).mode).toBe('plain_link');
     await setSwitches(api.db, { amazon_associates: false });
+  });
+
+  it('a mobile Amazon approval without a recorded permitted linking tool keeps plain links (RV-MON-09)', async () => {
+    const token = await unlocked(fam);
+    await setSwitches(api.db, { amazon_associates: true });
+    const noTool = await fixtureApproval(api.db, adminId, {
+      provider: 'amazon_associates',
+      linkingTool: null,
+    });
+    try {
+      expect((await browse(token)).mode).toBe('plain_link');
+      const link = outboundUrlResponseSchema.parse(await (await outbound(token, workbook)).json());
+      expect(link).toEqual({
+        url: 'https://www.amazon.com/dp/B000TEST01',
+        mode: 'plain_link',
+        disclosure: 'External link',
+      });
+    } finally {
+      await api.db
+        .sql`update public.monetization_approvals set status = 'revoked' where id = ${noTool}`;
+      await setSwitches(api.db, { amazon_associates: false });
+    }
   });
 
   it('free adults and cancelled subscribers keep resource and link access (AC_MON_11)', async () => {

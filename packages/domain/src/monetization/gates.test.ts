@@ -7,13 +7,24 @@ import {
   resolveMerchantMode,
   type MerchantModeInput,
 } from './index.ts';
-import { ALL_ON, IOS_PROPERTY, NOW, approval } from './test-fixtures.ts';
+import {
+  ALL_ON,
+  IOS_PROPERTY,
+  LINKING_TOOL_REF,
+  NOW,
+  approval,
+  type MonetizationApprovalFixture,
+} from './test-fixtures.ts';
+
+/** An otherwise complete mobile Amazon approval that also records its permitted linking tool. */
+const linked = (overrides: MonetizationApprovalFixture = {}) =>
+  approval({ linkingToolRef: LINKING_TOOL_REF, ...overrides });
 
 function input(overrides: Partial<MerchantModeInput> = {}): MerchantModeInput {
   return {
     environment: 'production',
     property: IOS_PROPERTY,
-    approvals: [approval()],
+    approvals: [linked()],
     switches: ALL_ON,
     now: NOW,
     linksPermitted: true,
@@ -68,6 +79,93 @@ describe('evidenceQuality (AC_MON_09)', () => {
   });
 });
 
+describe('evidenceQuality: statuses, flags, tags and credentials are not evidence (RV-MON-08)', () => {
+  it.each([
+    '{"approved":true}',
+    '["amazon_associates"]',
+    'amazon_associates=true',
+    'approved: yes',
+    'Eligibility: approved',
+    'Approved.',
+    'N/A !!',
+    'Amazon Associates approved',
+    'pencillift-20',
+    'my-store-21',
+    'amzn1.application-oa2-client.0123456789abcdef0123456789abcdef',
+    'client_id=abcdef123456',
+    ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiIxMjM0In0', 'c2lnbmF0dXJl'].join('.'),
+  ])('rejects %j', (ref) => {
+    expect(evidenceQuality(ref)).toBe('invalid');
+  });
+
+  it('the approval’s own tag is never evidence, even inside status words', () => {
+    expect(evidenceQuality('tag pencillift-20 approved', { publisherTag: 'pencillift-20' })).toBe(
+      'invalid',
+    );
+    // A real document reference may mention the tag and stays a reference.
+    expect(
+      evidenceQuality('OWNER-DOC/amazon-2026-09#pencillift-20', { publisherTag: 'pencillift-20' }),
+    ).toBe('real');
+  });
+
+  it('no word-only status phrase is ever accepted (property)', () => {
+    const vocabulary = ['approved', 'true', 'amazon', 'associates', 'ios', 'eligible', 'yes'];
+    fc.assert(
+      fc.property(
+        fc.array(fc.constantFrom(...vocabulary), { minLength: 1, maxLength: 5 }),
+        fc.constantFrom(' ', '=', ':', '_', '-', '.', '/'),
+        (words, separator) => evidenceQuality(words.join(separator)) === 'invalid',
+      ),
+    );
+  });
+});
+
+describe('mobile affiliate mode needs a recorded permitted linking tool (RV-MON-09, AC_MON_10)', () => {
+  it.each(['ios', 'android'] as const)(
+    '%s: missing or placeholder linking tool -> plain_link',
+    (platform) => {
+      const property = { ...IOS_PROPERTY, platform };
+      const missing = resolveMerchantMode(input({ property, approvals: [approval({ platform })] }));
+      expect(missing).toMatchObject({ mode: 'plain_link', tag: null });
+      expect(missing.reasons).toContain('LINKING_TOOL_MISSING');
+      const placeholder = resolveMerchantMode(
+        input({ property, approvals: [linked({ platform, linkingToolRef: 'Approved.' })] }),
+      );
+      expect(placeholder.mode).toBe('plain_link');
+      expect(placeholder.reasons).toContain('LINKING_TOOL_INVALID');
+      expect(resolveMerchantMode(input({ property, approvals: [linked({ platform })] })).mode).toBe(
+        'amazon_associates',
+      );
+    },
+  );
+
+  it('a fixture linking tool is a labeled mock: test only, reported as a fixture', () => {
+    const approvals = [linked({ linkingToolRef: 'fixture:amazon-linking-tool' })];
+    expect(resolveMerchantMode(input({ approvals })).reasons).toContain(
+      'FIXTURE_EVIDENCE_OUTSIDE_TEST',
+    );
+    expect(resolveMerchantMode(input({ environment: 'test', approvals }))).toMatchObject({
+      mode: 'amazon_associates',
+      fixture: true,
+    });
+  });
+
+  it('the web property uses standard text links and needs no mobile linking-tool record', () => {
+    const web = {
+      platform: 'web' as const,
+      identifier: 'https://app.pencillift.example',
+      locale: 'en-US',
+    };
+    const result = resolveMerchantMode(
+      input({
+        property: web,
+        approvals: [approval({ platform: 'web', propertyIdentifier: web.identifier })],
+      }),
+    );
+    expect(result.mode).toBe('amazon_associates');
+  });
+});
+
 describe('publisher tag shape', () => {
   it('accepts store tags and rejects arbitrary values', () => {
     expect(isValidPublisherTag('pencillift-20')).toBe(true);
@@ -102,20 +200,20 @@ describe('resolveMerchantMode (AC_MON_09, AC_MON_10)', () => {
       'PROVIDER_SWITCH_OFF',
     ],
     ['missing switches fail closed', { switches: {} }, 'GLOBAL_SWITCH_OFF'],
-    ['revoked', { approvals: [approval({ status: 'revoked' })] }, 'APPROVAL_NOT_APPROVED'],
-    ['pending', { approvals: [approval({ status: 'pending' })] }, 'APPROVAL_NOT_APPROVED'],
+    ['revoked', { approvals: [linked({ status: 'revoked' })] }, 'APPROVAL_NOT_APPROVED'],
+    ['pending', { approvals: [linked({ status: 'pending' })] }, 'APPROVAL_NOT_APPROVED'],
     [
       'expired by date',
-      { approvals: [approval({ expiresAt: new Date('2026-09-24T14:59:59Z') })] },
+      { approvals: [linked({ expiresAt: new Date('2026-09-24T14:59:59Z') })] },
       'APPROVAL_EXPIRED',
     ],
-    ['expired status', { approvals: [approval({ status: 'expired' })] }, 'APPROVAL_EXPIRED'],
-    ['boolean evidence', { approvals: [approval({ evidenceRef: 'true' })] }, 'EVIDENCE_INVALID'],
+    ['expired status', { approvals: [linked({ status: 'expired' })] }, 'APPROVAL_EXPIRED'],
+    ['boolean evidence', { approvals: [linked({ evidenceRef: 'true' })] }, 'EVIDENCE_INVALID'],
     [
       'api key as evidence',
       {
         approvals: [
-          approval({
+          linked({
             evidenceRef: ['sk', 'live', 'abcdefghijklmnop1234'].join(
               '_',
             ) /* built at runtime: fake, keeps the secret scan meaningful */,
@@ -126,28 +224,28 @@ describe('resolveMerchantMode (AC_MON_09, AC_MON_10)', () => {
     ],
     [
       'fixture evidence in production',
-      { approvals: [approval({ evidenceRef: 'fixture:amazon-ios' })] },
+      { approvals: [linked({ evidenceRef: 'fixture:amazon-ios' })] },
       'FIXTURE_EVIDENCE_OUTSIDE_TEST',
     ],
     [
       'review dated in the future',
-      { approvals: [approval({ policyReviewedAt: new Date('2026-10-01T00:00:00Z') })] },
+      { approvals: [linked({ policyReviewedAt: new Date('2026-10-01T00:00:00Z') })] },
       'APPROVAL_REVIEW_IN_FUTURE',
     ],
     [
       'different property',
-      { approvals: [approval({ propertyIdentifier: 'com.other.app' })] },
+      { approvals: [linked({ propertyIdentifier: 'com.other.app' })] },
       'NO_APPROVAL',
     ],
-    ['different platform', { approvals: [approval({ platform: 'android' })] }, 'NO_APPROVAL'],
-    ['different locale', { approvals: [approval({ locale: 'en-GB' })] }, 'NO_APPROVAL'],
+    ['different platform', { approvals: [linked({ platform: 'android' })] }, 'NO_APPROVAL'],
+    ['different locale', { approvals: [linked({ locale: 'en-GB' })] }, 'NO_APPROVAL'],
     [
       'generic account (other provider)',
-      { approvals: [approval({ provider: 'sponsor_direct' })] },
+      { approvals: [linked({ provider: 'sponsor_direct' })] },
       'NO_APPROVAL',
     ],
-    ['missing tag', { approvals: [approval({ publisherTag: null })] }, 'TAG_MISSING'],
-    ['arbitrary tag', { approvals: [approval({ publisherTag: 'anything' })] }, 'TAG_INVALID'],
+    ['missing tag', { approvals: [linked({ publisherTag: null })] }, 'TAG_MISSING'],
+    ['arbitrary tag', { approvals: [linked({ publisherTag: 'anything' })] }, 'TAG_INVALID'],
   ] as const)('%s -> plain_link with a reason', (_label, overrides, reason) => {
     const result = resolveMerchantMode(input(overrides));
     expect(result.mode).toBe('plain_link');
@@ -160,7 +258,7 @@ describe('resolveMerchantMode (AC_MON_09, AC_MON_10)', () => {
   });
 
   it('labeled fixtures work only in development/test and are reported as fixtures', () => {
-    const fixture = [approval({ evidenceRef: 'fixture:amazon-ios' })];
+    const fixture = [linked({ evidenceRef: 'fixture:amazon-ios' })];
     const dev = resolveMerchantMode(input({ environment: 'test', approvals: fixture }));
     expect(dev).toMatchObject({ mode: 'amazon_associates', fixture: true });
     expect(resolveMerchantMode(input({ environment: 'staging', approvals: fixture })).mode).toBe(
@@ -177,8 +275,8 @@ describe('resolveMerchantMode (AC_MON_09, AC_MON_10)', () => {
     );
     fc.assert(
       fc.property(fc.array(statusArb, { maxLength: 4 }), fc.boolean(), (statuses, includeValid) => {
-        const approvals = statuses.map((status, i) => approval({ id: `a${i}`, status }));
-        if (includeValid) approvals.push(approval({ id: 'valid' }));
+        const approvals = statuses.map((status, i) => linked({ id: `a${i}`, status }));
+        if (includeValid) approvals.push(linked({ id: 'valid' }));
         const mode = resolveMerchantMode(input({ approvals })).mode;
         return mode === (includeValid ? 'amazon_associates' : 'plain_link');
       }),

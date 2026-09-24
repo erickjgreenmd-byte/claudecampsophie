@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   approvalSchema,
@@ -16,6 +17,7 @@ import {
   seedOwnerAdmin,
   type SeededFamily,
 } from '@pencillift/db/testing/fixtures';
+import { NON_IDENTIFYING_WORDS, evidenceQuality } from '@pencillift/domain/monetization';
 import { issueChildAccessToken } from '../src/auth/child.ts';
 import {
   setLinkCheckFetchForTests,
@@ -198,6 +200,7 @@ describe('status, switches and approvals (AC_MON_09, AC_MON_10, AC_MON_19)', () 
     evidenceRef: 'fixture:amazon-ios-eligibility',
     approvalScope: 'Parent resource browser links',
     publisherTag: 'pencillift-20',
+    linkingToolRef: 'fixture:amazon-ios-linking-tool',
     status: 'approved',
     expiresAt: '2027-03-01T00:00:00Z',
   };
@@ -210,6 +213,12 @@ describe('status, switches and approvals (AC_MON_09, AC_MON_10, AC_MON_19)', () 
         '_',
       ) /* built at runtime: fake, keeps the secret scan meaningful */,
       '1234567',
+      // RV-MON-08: serialized booleans, flags, punctuated placeholders, the tag, client ids.
+      '{"approved":true}',
+      'amazon_associates=true',
+      'Approved.',
+      'pencillift-20',
+      'amzn1.application-oa2-client.0123456789abcdef0123456789abcdef',
     ]) {
       const res = await admin('/approvals', 'POST', { ...approvalInput, evidenceRef });
       expect(res.status).toBe(422);
@@ -232,6 +241,85 @@ describe('status, switches and approvals (AC_MON_09, AC_MON_10, AC_MON_19)', () 
       provider: 'sponsor_direct',
     });
     expect(sponsorTag.status).toBe(400);
+  });
+
+  it('an approved Amazon mobile record needs a real permitted linking tool (RV-MON-09, AC_MON_10)', async () => {
+    for (const platform of ['ios', 'android']) {
+      const missing = await admin('/approvals', 'POST', {
+        ...approvalInput,
+        platform,
+        linkingToolRef: null,
+      });
+      expect(missing.status).toBe(422);
+      expect(await rule(missing)).toBe('LINKING_TOOL_REQUIRED');
+    }
+    for (const linkingToolRef of ['Approved.', 'amazon_associates=true', 'pencillift-20']) {
+      const placeholder = await admin('/approvals', 'POST', { ...approvalInput, linkingToolRef });
+      expect(await rule(placeholder)).toBe('LINKING_TOOL_INVALID');
+    }
+    const notAmazon = await admin('/approvals', 'POST', {
+      ...approvalInput,
+      provider: 'sponsor_direct',
+      publisherTag: null,
+    });
+    expect(notAmazon.status).toBe(400);
+    // The web property uses Amazon's standard text links: no mobile linking-tool record needed.
+    const { linkingToolRef: _omitted, ...webInput } = approvalInput;
+    const web = approvalSchema.parse(
+      await ok(
+        await admin('/approvals', 'POST', {
+          ...webInput,
+          platform: 'web',
+          propertyIdentifier: 'https://app.pencillift.test',
+          status: 'pending',
+        }),
+        201,
+      ),
+    );
+    expect(web.linkingToolRef).toBeNull();
+    // A pending mobile record without the tool cannot be approved later either.
+    const pending = approvalSchema.parse(
+      await ok(
+        await admin('/approvals', 'POST', {
+          ...approvalInput,
+          status: 'pending',
+          linkingToolRef: null,
+        }),
+        201,
+      ),
+    );
+    const refused = await admin(`/approvals/${pending.id}/approve`, 'POST', {
+      reason: 'Approved by Amazon',
+    });
+    expect(await rule(refused)).toBe('LINKING_TOOL_REQUIRED');
+    for (const id of [web.id, pending.id]) {
+      await ok(await admin(`/approvals/${id}/revoke`, 'POST', { reason: 'Test cleanup' }));
+    }
+  });
+
+  it('the database word list mirrors the domain evidence vocabulary (RV-MON-08)', async () => {
+    const migration = await readFile(
+      new URL('../../../supabase/migrations/0640_monetization.sql', import.meta.url),
+      'utf8',
+    );
+    const body = migration.slice(migration.indexOf('app.monetization_reference_ok'));
+    const list = body.slice(body.indexOf('<@ array['), body.indexOf(']::text[]'));
+    const sqlWords = [...list.matchAll(/'([^']*)'/g)].map((m) => m[1]);
+    expect(new Set(sqlWords)).toEqual(new Set(NON_IDENTIFYING_WORDS));
+    expect(sqlWords).toHaveLength(NON_IDENTIFYING_WORDS.size);
+    // And the live function agrees with the domain on status phrases vs references.
+    for (const word of NON_IDENTIFYING_WORDS) {
+      const phrase = Array.from({ length: 6 }, () => word).join(' ');
+      const [row] = await api.db.sql<{ ok: boolean }[]>`
+        select app.monetization_reference_ok(${phrase}, null) as ok
+      `;
+      expect(row!.ok, phrase).toBe(false);
+      expect(evidenceQuality(phrase)).toBe('invalid');
+    }
+    const [real] = await api.db.sql<{ ok: boolean }[]>`
+      select app.monetization_reference_ok('OWNER-DOC/amazon-2026-09#pencillift-20', 'pencillift-20') as ok
+    `;
+    expect(real!.ok).toBe(true);
   });
 
   it('records a labeled fixture approval (reported as a mock), then revokes it', async () => {
@@ -505,6 +593,43 @@ describe('sponsors, creative review and re-review (AC_MON_06)', () => {
     ).toBe(404);
   });
 
+  it('a sponsor rename never relabels a reviewed version; only a new reviewed version carries it (RV-MON-05)', async () => {
+    const oak = sponsorSchema.parse(
+      await ok(
+        await admin('/sponsors', 'POST', {
+          ...sponsorInput,
+          businessName: 'Oak Tutoring',
+          allowedDomains: ['oak.example'],
+        }),
+        201,
+      ),
+    );
+    const v1 = creativeSchema.parse(
+      await ok(
+        await admin(`/sponsors/${oak.id}/creatives`, 'POST', {
+          ...creativeInput,
+          destinationUrl: 'https://www.oak.example/families',
+        }),
+        201,
+      ),
+    );
+    expect(v1.sponsorName).toBe('Oak Tutoring');
+    await ok(await admin(`/sponsors/${oak.id}`, 'PATCH', { businessName: 'Oak Tutoring Group' }));
+    const listed = await ok<{ creatives: unknown[] }>(await admin(`/sponsors/${oak.id}/creatives`));
+    const versions = listed.creatives.map((c) => creativeSchema.parse(c));
+    expect(versions.map((c) => c.sponsorName)).toEqual(['Oak Tutoring']);
+    const v2 = creativeSchema.parse(
+      await ok(
+        await admin(`/sponsors/${oak.id}/creatives`, 'POST', {
+          ...creativeInput,
+          destinationUrl: 'https://www.oak.example/families',
+        }),
+        201,
+      ),
+    );
+    expect(v2).toMatchObject({ sponsorName: 'Oak Tutoring Group', reviewStatus: 'draft' });
+  });
+
   it('suspending a sponsor stops serving', async () => {
     await ok(await admin(`/sponsors/${sponsorId}`, 'PATCH', { status: 'suspended' }));
     const list = await ok<{ campaigns: { id: string; notServableReason: string | null }[] }>(
@@ -751,6 +876,17 @@ describe('revenue imports, adjustments and reporting (AC_MON_16..18)', () => {
       rows: [{ ...importBody.rows[0], externalRef: 'X-2', placement: null }],
     });
     expect(noPlacement.status).toBe(400);
+    const unknownCampaign = await admin('/revenue/imports', 'POST', {
+      ...importBody,
+      rows: [
+        {
+          ...importBody.rows[0],
+          externalRef: 'X-3',
+          campaignId: '00000000-0000-4000-8000-000000000000',
+        },
+      ],
+    });
+    expect(unknownCampaign.status).toBe(400);
   });
 
   it('reversals are separate, idempotent adjustments that can never take an entry below zero', async () => {

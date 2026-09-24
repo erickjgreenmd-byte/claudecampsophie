@@ -197,6 +197,8 @@ export const creativeSchema = z.strictObject({
   id: uuidSchema,
   sponsorId: uuidSchema,
   version: z.number().int().min(1),
+  /** The reviewed "Sponsored by" name, frozen with this version (a sponsor rename needs a new one). */
+  sponsorName: z.string(),
   headline: z.string(),
   body: z.string(),
   ctaLabel: z.string(),
@@ -280,6 +282,11 @@ export const approvalInputSchema = z.strictObject({
   evidenceRef: z.string().trim().min(6).max(300),
   approvalScope: z.string().trim().min(3).max(500),
   publisherTag: z.string().trim().max(64).nullable(),
+  /**
+   * Amazon only: reference to the recorded determination of which Amazon-permitted linking
+   * tool/API the property may use. Required before mobile (iOS/Android) affiliate mode can run.
+   */
+  linkingToolRef: z.string().trim().min(6).max(300).nullable().optional(),
   status: z.enum(['pending', 'approved', 'rejected']),
   expiresAt: isoDateTimeSchema,
 });
@@ -302,6 +309,7 @@ export const approvalSchema = z.strictObject({
   evidenceQuality: z.enum(['real', 'fixture', 'invalid']),
   approvalScope: z.string(),
   publisherTag: z.string().nullable(),
+  linkingToolRef: z.string().nullable(),
   status: z.enum(['pending', 'approved', 'rejected', 'revoked', 'expired']),
   statusReason: z.string().nullable(),
   expiresAt: isoDateTimeSchema,

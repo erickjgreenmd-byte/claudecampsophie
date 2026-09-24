@@ -35,6 +35,46 @@ begin
 end
 $$;
 
+-- A policy evidence / linking-tool reference must point at a document, ticket or letter. Never a
+-- status word, flag or boolean in any punctuation ('Approved.', 'amazon_associates=true'), a
+-- serialized value ('{"approved":true}'), a credential (Amazon 'amzn1.' client ids, JWTs, opaque
+-- keys) or a bare Associates tracking id / the approval's own publisher tag (RV-MON-08). Labeled
+-- 'fixture:' references pass here; the API refuses them outside development/test. Mirrors
+-- @pencillift/domain/monetization evidenceQuality(); the word list equals NON_IDENTIFYING_WORDS
+-- (apps/api/tests/admin-monetization.test.ts checks that the two lists stay identical).
+create or replace function app.monetization_reference_ok(p_ref text, p_tag text) returns boolean
+language sql immutable
+set search_path = ''
+as $$
+  select case
+    when p_ref is null then false
+    when lower(btrim(p_ref)) like 'fixture:%' then char_length(btrim(p_ref)) >= 11
+    else char_length(btrim(p_ref)) between 6 and 300
+      and btrim(p_ref) !~ '^[\[{]'
+      and btrim(p_ref) !~* '^(amzn1\.|eyJ[A-Za-z0-9_-]{8,}\.|bearer\s)'
+      and btrim(p_ref) !~ '^[A-Za-z0-9+/=]{32,}$'
+      and btrim(p_ref) !~* '^[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*-2[0-9]$'
+      and not (
+        array_remove(regexp_split_to_array(
+          case when p_tag is null or btrim(p_tag) = '' then lower(btrim(p_ref))
+               else replace(lower(btrim(p_ref)), lower(btrim(p_tag)), ' ') end,
+          '[^a-z0-9]+'), '')
+        <@ array[
+      'true', 'false', 'yes', 'no', 'on', 'off', 'ok', 'okay', 'enabled', 'disabled', 'approved',
+      'granted', 'eligible', 'pending', 'unknown', 'none', 'null', 'undefined', 'na', 'tbd', 'todo',
+      'test', 'testing', 'fixture', 'mock', 'placeholder', 'evidence', 'y', 'n', 'a', '0', '1', 'nil',
+      'enable', 'disable', 'approve', 'approval', 'grant', 'eligibility', 'verified', 'confirmed',
+      'accepted', 'allowed', 'active', 'live', 'done', 'complete', 'completed', 'pass', 'passed',
+      'valid', 'checked', 'reviewed', 'review', 'status', 'flag', 'set', 'value', 'is', 'was', 'has',
+      'been', 'by', 'the', 'and', 'for', 'of', 'to', 'in', 'it', 'we', 'are', 'our', 'all', 'see',
+      'amazon', 'associate', 'associates', 'affiliate', 'program', 'programme', 'account', 'sponsor',
+      'direct', 'network', 'ad', 'ads', 'provider', 'ios', 'android', 'web', 'app', 'apps', 'mobile',
+      'site', 'website', 'store', 'tag', 'tracking', 'id', 'publisher', 'key', 'api', 'client',
+      'secret', 'token', 'policy'
+        ]::text[])
+  end
+$$;
+
 -- ---------------------------------------------------------------------------------------------
 -- Sponsors and immutable creative versions
 -- ---------------------------------------------------------------------------------------------
@@ -63,6 +103,10 @@ create table public.sponsor_creatives (
   id uuid primary key default gen_random_uuid(),
   sponsor_id uuid not null references public.sponsors (id),
   version integer not null check (version >= 1),
+  -- The reviewed "Sponsored by <business>" name. Copied from the sponsor when the version is
+  -- created (app.guard_sponsor_creative) and immutable like the rest of the version, so renaming a
+  -- sponsor reaches parents only through a new, human-reviewed creative version (RV-MON-05).
+  sponsor_name text not null check (char_length(sponsor_name) between 2 and 120 and sponsor_name !~ '[<>]'),
   -- Plain text only: no markup, script schemes or event handlers (defense in depth; the API runs
   -- the full @pencillift/domain/monetization validateCreative first).
   headline text not null check (char_length(btrim(headline)) between 1 and 80 and char_length(headline) <= 80),
@@ -102,6 +146,8 @@ begin
     if new.review_status <> 'draft' then
       raise exception 'a new creative version starts as a draft' using errcode = 'P0001';
     end if;
+    -- The label is always the sponsor's name at creation time, never a caller-supplied value.
+    new.sponsor_name := (select s.business_name from public.sponsors s where s.id = new.sponsor_id);
     return new;
   end if;
   if old.review_status in ('approved', 'rejected') then
@@ -260,13 +306,15 @@ create table public.monetization_approvals (
   intended_audience text not null check (char_length(btrim(intended_audience)) between 3 and 200),
   vendor_sdk_version text check (char_length(vendor_sdk_version) between 1 and 60),
   policy_reviewed_at timestamptz not null,
-  -- Reference to the actual policy evidence; a boolean/stub can never be evidence.
-  evidence_ref text not null check (char_length(btrim(evidence_ref)) between 6 and 300
-    and lower(btrim(evidence_ref)) not in ('enabled', 'disabled', 'approved', 'granted', 'eligible',
-      'pending', 'unknown', 'undefined', 'testing', 'fixture', 'placeholder', 'evidence')),
+  -- Reference to the actual policy evidence; a boolean/stub/key/tag can never be evidence.
+  evidence_ref text not null,
   approval_scope text not null check (char_length(btrim(approval_scope)) between 3 and 500),
   -- Amazon publisher-level tag issued under this approval (null for other providers).
   publisher_tag text check (publisher_tag ~* '^[a-z0-9][a-z0-9-]{1,60}-[0-9]{2}$'),
+  -- Amazon only: reference to the recorded determination of which Amazon-permitted linking
+  -- tool/API this property may use (spec P16.3, AC_MON_10). Mobile affiliate mode stays off
+  -- without it (@pencillift/domain/monetization providerGate, RV-MON-09).
+  linking_tool_ref text,
   status text not null default 'pending'
     check (status in ('pending', 'approved', 'rejected', 'revoked', 'expired')),
   status_reason text check (char_length(status_reason) <= 300),
@@ -275,7 +323,12 @@ create table public.monetization_approvals (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (expires_at > policy_reviewed_at),
-  check (provider = 'amazon_associates' or publisher_tag is null)
+  check (provider = 'amazon_associates' or publisher_tag is null),
+  check (provider = 'amazon_associates' or linking_tool_ref is null),
+  constraint monetization_approvals_evidence_ref_check
+    check (app.monetization_reference_ok(evidence_ref, publisher_tag)),
+  constraint monetization_approvals_linking_tool_ref_check
+    check (linking_tool_ref is null or app.monetization_reference_ok(linking_tool_ref, publisher_tag))
 );
 
 create index monetization_approvals_lookup on public.monetization_approvals (provider, platform, status);
@@ -512,6 +565,10 @@ create table public.revenue_entries (
   created_at timestamptz not null default now(),
   foreign key (import_id, source) references public.revenue_imports (id, source),
   unique (source, external_ref, category),
+  -- A provider's report row is one fact whatever source label it is imported under: the same
+  -- provider reference/category can never be booked twice, e.g. once as 'amazon_report' and again
+  -- as 'manual' (RV-MON-06).
+  unique (provider, external_ref, category),
   -- Sponsor and network inventory must name its placement so the same sold inventory is never
   -- counted twice (fixed sponsor fees substitute for network revenue).
   check (provider = 'amazon_associates' or placement is not null),
@@ -519,6 +576,30 @@ create table public.revenue_entries (
 );
 
 create index revenue_entries_month on public.revenue_entries (period_month);
+
+-- A sponsor row that references a campaign names that campaign's placement: the same-inventory
+-- double-count guard keys on placement, so a mismatched row could hide a sponsor fee from it
+-- (RV-MON-07). The API validates first; this is the second layer.
+create or replace function app.guard_revenue_entry_campaign() returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  campaign_placement text;
+begin
+  if new.campaign_id is not null then
+    select placement into campaign_placement from public.sponsor_campaigns where id = new.campaign_id;
+    if campaign_placement is not null and new.placement is distinct from campaign_placement then
+      raise exception 'revenue row placement % does not match its campaign placement %',
+        new.placement, campaign_placement using errcode = 'P0001';
+    end if;
+  end if;
+  return new;
+end
+$$;
+
+create trigger revenue_entries_campaign_placement before insert on public.revenue_entries
+  for each row execute function app.guard_revenue_entry_campaign();
 
 create table public.revenue_adjustments (
   id uuid primary key default gen_random_uuid(),
@@ -596,3 +677,4 @@ create policy family_monetization_prefs_member_read on public.family_monetizatio
   for select to authenticated using (app.is_family_member(family_id));
 
 revoke execute on function app.all_match(text[], text) from public, anon;
+revoke execute on function app.monetization_reference_ok(text, text) from public, anon;

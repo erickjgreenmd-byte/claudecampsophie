@@ -49,6 +49,44 @@ export function propertyFor(
   return { platform, identifier, locale };
 }
 
+/** Browser signals on a request (header values, or null when absent). */
+export interface RequestOriginSignals {
+  readonly origin: string | null;
+  readonly secFetchSite: string | null;
+  readonly secFetchMode: string | null;
+}
+
+/** Identifier for a browser whose Origin is not a configured web property (matches no approval). */
+export const UNRECOGNIZED_WEB_ORIGIN = 'web:unrecognized-origin';
+
+/**
+ * The property a parent request is actually served on (spec P16.3: merchant mode "selected
+ * server-side per eligible property/platform/locale"; RV-MON-04). The `platform` a client declares
+ * is not trusted on its own: a browser always identifies itself, because a cross-origin fetch
+ * carries `Origin` and current browsers add `Sec-Fetch-*` fetch metadata, while the native iOS and
+ * Android HTTP stacks send neither. A browser request is therefore always the web property, bound
+ * to the configured web origin it came from, whatever platform it claims; an unrecognized origin
+ * matches no approval. A native request keeps its declared mobile platform (no app attestation
+ * exists to verify it further; mobile properties carry their own approvals).
+ */
+export function requestProperty(
+  config: ApiConfig,
+  signals: RequestOriginSignals,
+  declared: MonetizationPlatform,
+  locale: string,
+): MonetizationProperty {
+  const browser =
+    signals.origin !== null || signals.secFetchSite !== null || signals.secFetchMode !== null;
+  if (!browser) return propertyFor(config, declared, locale);
+  const identifier =
+    signals.origin === null
+      ? (config.corsOrigins[0] ?? 'web:unconfigured')
+      : config.corsOrigins.includes(signals.origin)
+        ? signals.origin
+        : UNRECOGNIZED_WEB_ORIGIN;
+  return { platform: 'web', identifier, locale };
+}
+
 export function disclosureFor(mode: MerchantMode): string | null {
   if (mode === 'amazon_associates') return AMAZON_ASSOCIATES_DISCLOSURE;
   if (mode === 'plain_link') return PLAIN_LINK_DISCLOSURE;
@@ -97,12 +135,13 @@ interface ApprovalRow {
   expires_at: Date;
   evidence_ref: string;
   publisher_tag: string | null;
+  linking_tool_ref: string | null;
 }
 
 export async function loadApprovals(tx: Tx): Promise<MonetizationApproval[]> {
   const rows = await tx<ApprovalRow[]>`
     select id, provider, platform, property_identifier, locale, status, policy_reviewed_at, expires_at,
-           evidence_ref, publisher_tag
+           evidence_ref, publisher_tag, linking_tool_ref
       from public.monetization_approvals
      where status = 'approved'
   `;
@@ -117,6 +156,7 @@ export async function loadApprovals(tx: Tx): Promise<MonetizationApproval[]> {
     expiresAt: r.expires_at,
     evidenceRef: r.evidence_ref,
     publisherTag: r.publisher_tag,
+    linkingToolRef: r.linking_tool_ref,
   }));
 }
 
@@ -245,13 +285,17 @@ function toCandidate(r: CampaignRow): CampaignCandidate {
   };
 }
 
-/** Campaigns with their creative, sponsor and delivered viewable impressions (all time). */
+/**
+ * Campaigns with their creative, sponsor and delivered viewable impressions (all time). The
+ * "Sponsored by" name comes from the reviewed creative version, never from the live sponsor row,
+ * so an unreviewed sponsor rename cannot reach parents (RV-MON-05).
+ */
 export async function loadCampaignCandidates(
   tx: Tx,
   filter: { placement?: Placement; campaignId?: string; servingOnly?: boolean } = {},
 ): Promise<CampaignCandidate[]> {
   const rows = await tx<CampaignRow[]>`
-    select c.id, c.status, s.status as sponsor_status, s.business_name as sponsor_name, s.allowed_domains,
+    select c.id, c.status, s.status as sponsor_status, cr.sponsor_name, s.allowed_domains,
            c.creative_id, cr.review_status, c.placement, c.platforms, c.starts_at, c.ends_at, c.impression_cap,
            coalesce((select sum(e.count) from public.aggregate_ad_events e
                       where e.campaign_id = c.id and e.kind = 'viewable_impression'), 0)::int as viewable,
@@ -265,6 +309,16 @@ export async function loadCampaignCandidates(
      order by c.id
   `;
   return rows.map(toCandidate);
+}
+
+/**
+ * Serializes billing decisions for one campaign (RV-MON-01). The impression cap is a hard limit:
+ * a viewable beacon takes this transaction-scoped lock BEFORE reading the delivered count, so
+ * concurrent beacons from different sessions re-check the cap one at a time and at most `cap` are
+ * ever counted. Only billing takes it; serving and safety controls never wait on it.
+ */
+export async function lockCampaignBilling(tx: Tx, campaignId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(hashtextextended(${`placement-cap:${campaignId}`}, 0))`;
 }
 
 /** Adds to one aggregate counter cell (no family/user/child/session identifier is stored). */

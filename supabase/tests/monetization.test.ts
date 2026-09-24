@@ -296,6 +296,37 @@ describe('creative versions are immutable once reviewed (AC_MON_06)', () => {
     ).rejects.toThrow(/never deleted/);
   });
 
+  it('the "Sponsored by" name is the sponsor name at creation, frozen with the version (RV-MON-05)', async () => {
+    const [sponsor] = await db.sql<{ id: string }[]>`
+      insert into public.sponsors (business_name, allowed_domains, created_by)
+      values ('Willow Reading (synthetic)', '{willow.example}', ${adminId}) returning id
+    `;
+    // A caller-supplied label is ignored: the trigger copies the sponsor's own name.
+    const [v1] = await db.sql<{ id: string; sponsor_name: string }[]>`
+      insert into public.sponsor_creatives
+        (sponsor_id, version, sponsor_name, headline, body, cta_label, destination_url, created_by)
+      values (${sponsor!.id}, 1, 'Guaranteed Straight A Academy', 'Reading help', 'Small groups.', 'Learn more',
+              'https://www.willow.example/', ${adminId})
+      returning id, sponsor_name
+    `;
+    expect(v1!.sponsor_name).toBe('Willow Reading (synthetic)');
+    await db.sql`update public.sponsors set business_name = 'Renamed Reading Co' where id = ${sponsor!.id}`;
+    const [still] = await db.sql<{ sponsor_name: string }[]>`
+      select sponsor_name from public.sponsor_creatives where id = ${v1!.id}
+    `;
+    expect(still!.sponsor_name).toBe('Willow Reading (synthetic)');
+    await expect(
+      db.sql`update public.sponsor_creatives set sponsor_name = 'Renamed Reading Co' where id = ${v1!.id}`,
+    ).rejects.toThrow(/immutable/);
+    // Only a new (draft, to-be-reviewed) version carries the new name.
+    const [v2] = await db.sql<{ sponsor_name: string; review_status: string }[]>`
+      insert into public.sponsor_creatives (sponsor_id, version, headline, body, cta_label, destination_url, created_by)
+      values (${sponsor!.id}, 2, 'Reading help', 'Small groups.', 'Learn more', 'https://www.willow.example/', ${adminId})
+      returning sponsor_name, review_status
+    `;
+    expect(v2).toEqual({ sponsor_name: 'Renamed Reading Co', review_status: 'draft' });
+  });
+
   it('approval requires a recorded reviewer', async () => {
     const draft = await creative('draft');
     await db.sql`update public.sponsor_creatives set review_status = 'in_review' where id = ${draft}`;
@@ -379,16 +410,22 @@ describe('campaign workflow guard (AC_MON_06)', () => {
 
 describe('approvals: evidence is required and immutable (AC_MON_09)', () => {
   async function insertApproval(
-    overrides: { evidence?: string; provider?: string; tag?: string | null } = {},
+    overrides: {
+      evidence?: string;
+      provider?: string;
+      tag?: string | null;
+      linkingTool?: string | null;
+    } = {},
   ) {
     const [row] = await db.sql<{ id: string }[]>`
       insert into public.monetization_approvals
         (provider, platform, property_identifier, locale, intended_audience, policy_reviewed_at, evidence_ref,
-         approval_scope, publisher_tag, expires_at, recorded_by)
+         approval_scope, publisher_tag, linking_tool_ref, expires_at, recorded_by)
       values (${overrides.provider ?? 'amazon_associates'}, 'ios', 'com.pencillift.app', 'en-US',
               'Adults in the authenticated parent area', '2026-09-01T00:00:00Z',
               ${overrides.evidence ?? 'OWNER-DOC/eligibility-2026-09#1'}, 'Parent resource browser links',
-              ${overrides.tag === undefined ? 'pencillift-20' : overrides.tag}, '2027-03-01T00:00:00Z', ${adminId})
+              ${overrides.tag === undefined ? 'pencillift-20' : overrides.tag},
+              ${overrides.linkingTool === undefined ? null : overrides.linkingTool}, '2027-03-01T00:00:00Z', ${adminId})
       returning id
     `;
     return row!.id;
@@ -401,6 +438,37 @@ describe('approvals: evidence is required and immutable (AC_MON_09)', () => {
       /check constraint/,
     );
     await expect(insertApproval({ tag: 'not a tag' })).rejects.toThrow(/check constraint/);
+  });
+
+  it('statuses, flags, serialized values, credentials and tags are refused as evidence (RV-MON-08)', async () => {
+    for (const evidence of [
+      '{"approved":true}',
+      'amazon_associates=true',
+      'Approved.',
+      'Eligibility: approved',
+      'pencillift-20',
+      'tag pencillift-20',
+      'amzn1.application-oa2-client.0123456789abcdef0123456789abcdef',
+    ]) {
+      await expect(insertApproval({ evidence }), evidence).rejects.toThrow(/check constraint/);
+    }
+    // A document reference that mentions the tag is still a reference.
+    await insertApproval({ evidence: 'OWNER-DOC/amazon-2026-09#pencillift-20' });
+  });
+
+  it('only Amazon records a linking tool, and it must be a reference too (RV-MON-09)', async () => {
+    await expect(
+      insertApproval({ provider: 'sponsor_direct', tag: null, linkingTool: 'OWNER-DOC/linking#7' }),
+    ).rejects.toThrow(/check constraint/);
+    for (const linkingTool of ['Approved.', 'yes=true', 'pencillift-20']) {
+      await expect(insertApproval({ linkingTool }), linkingTool).rejects.toThrow(
+        /check constraint/,
+      );
+    }
+    const id = await insertApproval({ linkingTool: 'OWNER-DOC/amazon-mobile-linking-2026-09#7' });
+    await expect(
+      db.sql`update public.monetization_approvals set linking_tool_ref = null where id = ${id}`,
+    ).rejects.toThrow(/immutable/);
   });
 
   it('only status moves; evidence changes need a new record; revoked is final', async () => {
@@ -524,6 +592,41 @@ describe('aggregate counters and revenue ledgers', () => {
       values (${entry!.id}, 'refund', 500, 'Positive refund', 'adj-key-0003', ${adminId})
     `).rejects.toThrow(/check constraint/);
     await expect(db.sql`delete from public.revenue_adjustments`).rejects.toThrow(/append-only/);
+  });
+
+  it('the same provider row cannot be booked again under another source label (RV-MON-06)', async () => {
+    const [amazon] = await db.sql<{ id: string }[]>`
+      insert into public.revenue_imports (source, file_sha256, period_month, imported_by, row_count)
+      values ('amazon_report', ${'c'.repeat(64)}, '2026-08', ${adminId}, 1) returning id
+    `;
+    const [manual] = await db.sql<{ id: string }[]>`
+      insert into public.revenue_imports (source, file_sha256, period_month, imported_by, row_count)
+      values ('manual', ${'d'.repeat(64)}, '2026-08', ${adminId}, 1) returning id
+    `;
+    await db.sql`
+      insert into public.revenue_entries (import_id, source, external_ref, category, provider, amount_cents, period_month)
+      values (${amazon!.id}, 'amazon_report', 'AMZ-2026-08', 'affiliate_reported', 'amazon_associates', 5000, '2026-08')
+    `;
+    await expect(db.sql`
+      insert into public.revenue_entries (import_id, source, external_ref, category, provider, amount_cents, period_month)
+      values (${manual!.id}, 'manual', 'AMZ-2026-08', 'affiliate_reported', 'amazon_associates', 5000, '2026-08')
+    `).rejects.toThrow(/revenue_entries_provider_external_ref_category_key/);
+  });
+
+  it('a sponsor row names its campaign’s placement (RV-MON-07)', async () => {
+    const campaignId = await campaign(await creative('approved'));
+    const [imp] = await db.sql<{ id: string }[]>`
+      insert into public.revenue_imports (source, file_sha256, period_month, imported_by, row_count)
+      values ('sponsor_invoice', ${'e'.repeat(64)}, '2026-07', ${adminId}, 1) returning id
+    `;
+    await expect(db.sql`
+      insert into public.revenue_entries (import_id, source, external_ref, category, provider, campaign_id, placement, amount_cents, period_month)
+      values (${imp!.id}, 'sponsor_invoice', 'INV-7001', 'recognized', 'sponsor_direct', ${campaignId}, 'adult_dashboard', 50000, '2026-07')
+    `).rejects.toThrow(/does not match its campaign placement/);
+    await db.sql`
+      insert into public.revenue_entries (import_id, source, external_ref, category, provider, campaign_id, placement, amount_cents, period_month)
+      values (${imp!.id}, 'sponsor_invoice', 'INV-7001', 'recognized', 'sponsor_direct', ${campaignId}, 'resources_browse', 50000, '2026-07')
+    `;
   });
 
   it('sponsor/network revenue must name its placement (same-inventory double-count guard)', async () => {

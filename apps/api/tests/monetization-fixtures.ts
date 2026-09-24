@@ -28,20 +28,29 @@ export async function fixtureApproval(
     locale?: string;
     tag?: string | null;
     evidence?: string;
+    /** Amazon only; defaults to a labeled fixture record on iOS/Android (null elsewhere). */
+    linkingTool?: string | null;
     expiresAt?: string;
     status?: 'pending' | 'approved';
   },
 ): Promise<string> {
   const platform = options.platform ?? 'ios';
+  const amazonMobile = options.provider === 'amazon_associates' && platform !== 'web';
+  const linkingTool =
+    options.linkingTool === undefined
+      ? amazonMobile
+        ? `fixture:amazon-linking-tool-${platform}`
+        : null
+      : options.linkingTool;
   const [row] = await db.sql<{ id: string }[]>`
     insert into public.monetization_approvals
       (provider, platform, property_identifier, locale, intended_audience, policy_reviewed_at, evidence_ref,
-       approval_scope, publisher_tag, status, expires_at, recorded_by)
+       approval_scope, publisher_tag, linking_tool_ref, status, expires_at, recorded_by)
     values (${options.provider}, ${platform}, ${options.property ?? (platform === 'web' ? WEB_PROPERTY : IOS_PROPERTY)},
             ${options.locale ?? 'en-US'}, 'Adults in the authenticated parent area (test fixture)', '2026-09-01T00:00:00Z',
             ${options.evidence ?? `fixture:${options.provider}-${platform}`}, 'Parent-only surfaces (test fixture)',
             ${options.tag === undefined ? (options.provider === 'amazon_associates' ? 'pencillift-20' : null) : options.tag},
-            ${options.status ?? 'approved'}, ${options.expiresAt ?? '2027-03-01T00:00:00Z'}, ${recordedBy})
+            ${linkingTool}, ${options.status ?? 'approved'}, ${options.expiresAt ?? '2027-03-01T00:00:00Z'}, ${recordedBy})
     returning id
   `;
   return row!.id;

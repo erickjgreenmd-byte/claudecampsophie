@@ -106,6 +106,12 @@ const RULES: Readonly<Record<string, string>> = {
     'Fixture evidence is a labeled mock for development and tests only. It never counts in production.',
   TAG_INVALID: 'Enter the publisher-level tag exactly as Amazon issued it (for example name-20).',
   TAG_REQUIRED: 'An approved Amazon property needs its publisher-level tag.',
+  LINKING_TOOL_REQUIRED:
+    'An approved Amazon iOS or Android app needs its permitted linking tool or API recorded. Adding a tag to a link is not a permitted linking mechanism by itself.',
+  LINKING_TOOL_INVALID:
+    'Record where the permitted linking tool/API determination is kept (a document, ticket or letter). A “yes”, key or tag is not a record.',
+  CAMPAIGN_PLACEMENT_MISMATCH:
+    'A sponsor row must name the placement its campaign runs on, so the same inventory is never counted twice.',
   SELF_REVIEW_NOT_ALLOWED: 'Another owner admin must review this creative.',
   SPONSOR_SUSPENDED: 'This sponsor is suspended. Reactivate it before approving its creatives.',
   CREATIVE_NOT_APPROVED: 'Approve the campaign’s creative version first.',
@@ -114,7 +120,7 @@ const RULES: Readonly<Record<string, string>> = {
     'Paste the plain product link without a tag or tracking parameters. PencilLift adds only an approved publisher-level tag.',
   DUPLICATE_IMPORT: 'This file was already imported. Nothing was added.',
   DUPLICATE_ENTRY:
-    'A row in this file was already imported (same source, reference and category). Nothing was added.',
+    'A row in this file was already imported (same provider, reference and category, under any source). Nothing was added.',
   ADJUSTMENT_EXCEEDS_ENTRY: 'An adjustment cannot take an entry below zero.',
 };
 
@@ -153,6 +159,8 @@ const GATE_REASON: Readonly<Record<string, string>> = {
   FIXTURE_EVIDENCE_OUTSIDE_TEST: 'Fixture evidence outside development/test',
   TAG_MISSING: 'Publisher tag missing',
   TAG_INVALID: 'Publisher tag invalid',
+  LINKING_TOOL_MISSING: 'No permitted Amazon linking tool/API recorded for this app',
+  LINKING_TOOL_INVALID: 'Linking tool record is not usable',
   LINKS_NOT_PERMITTED: 'Links not permitted for this locale',
 };
 
@@ -785,6 +793,12 @@ function ApprovalsSection({ onChanged }: { onChanged: () => void }) {
                     {a.evidenceRef}
                     <div style={mutedText}>{EVIDENCE_LABEL[a.evidenceQuality]}</div>
                     <div style={mutedText}>Reviewed {formatUtc(a.policyReviewedAt)}</div>
+                    {a.provider === 'amazon_associates' && a.platform !== 'web' ? (
+                      <div style={mutedText}>
+                        Linking tool:{' '}
+                        {a.linkingToolRef ?? 'not recorded (affiliate links stay off)'}
+                      </div>
+                    ) : null}
                   </Td>
                   <Td>{formatUtc(a.expiresAt)}</Td>
                   <Td>
@@ -849,9 +863,13 @@ function ApprovalForm({ onCreated }: { onCreated: () => void }) {
   const [evidence, setEvidence] = useState('');
   const [scope, setScope] = useState('');
   const [tag, setTag] = useState('');
+  const [linkingTool, setLinkingTool] = useState('');
   const [status, setStatus] = useState<ApprovalInput['status']>('pending');
   const [expiresAt, setExpiresAt] = useState('');
   const [error, setError] = useState<string | null>(null);
+
+  // Amazon's approved-mobile-app rules: an app records its permitted linking tool/API.
+  const amazonMobile = provider === 'amazon_associates' && platform !== 'web';
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -865,6 +883,9 @@ function ApprovalForm({ onCreated }: { onCreated: () => void }) {
       return setError('Enter a reference to the actual evidence (at least 6 characters).');
     }
     if (scope.trim().length < 3) return setError('Describe the approval scope.');
+    if (amazonMobile && linkingTool.trim() !== '' && linkingTool.trim().length < 6) {
+      return setError('Enter a reference to the linking tool record (at least 6 characters).');
+    }
     if (!expires) return setError('Enter the expiry or revalidation date and time (UTC).');
     setError(null);
     const body: ApprovalInput = {
@@ -878,6 +899,7 @@ function ApprovalForm({ onCreated }: { onCreated: () => void }) {
       evidenceRef: evidence.trim(),
       approvalScope: scope.trim(),
       publisherTag: provider === 'amazon_associates' && tag.trim() ? tag.trim() : null,
+      ...(amazonMobile ? { linkingToolRef: linkingTool.trim() ? linkingTool.trim() : null } : {}),
       status,
       expiresAt: expires,
     };
@@ -948,6 +970,22 @@ function ApprovalForm({ onCreated }: { onCreated: () => void }) {
         <>
           <label htmlFor={`${id}-tag`}>Publisher-level tag (as issued)</label>
           <input id={`${id}-tag`} value={tag} onChange={(e) => setTag(e.target.value)} />
+        </>
+      ) : null}
+      {amazonMobile ? (
+        <>
+          <label htmlFor={`${id}-linking`}>Permitted linking tool or API (record reference)</label>
+          <input
+            id={`${id}-linking`}
+            value={linkingTool}
+            aria-describedby={`${id}-linking-hint`}
+            onChange={(e) => setLinkingTool(e.target.value)}
+          />
+          <p id={`${id}-linking-hint`} style={mutedText}>
+            Where Amazon’s determination of the approved linking tool or API for this app is kept.
+            Adding a tag to a link is not a permitted linking mechanism by itself; without this
+            record affiliate links stay off in the app.
+          </p>
         </>
       ) : null}
       <label htmlFor={`${id}-status`}>Status</label>
@@ -1138,8 +1176,11 @@ const CREATIVE_STATUS_LABEL: Record<Creative['reviewStatus'], string> = {
   rejected: 'Rejected',
 };
 
-/** Plain-text preview of a creative as the parent card would show it. Never rendered as HTML. */
-function CreativePreview({ creative, sponsor }: { creative: Creative; sponsor: Sponsor }) {
+/**
+ * Plain-text preview of a creative as the parent card would show it. Never rendered as HTML. The
+ * label is the name frozen with this version (what parents see), not the sponsor's current name.
+ */
+function CreativePreview({ creative }: { creative: Creative }) {
   return (
     <div
       className="card sponsored"
@@ -1147,7 +1188,7 @@ function CreativePreview({ creative, sponsor }: { creative: Creative; sponsor: S
       aria-label={`Preview of version ${creative.version}`}
       style={{ overflowWrap: 'anywhere', marginTop: 8 }}
     >
-      <p style={{ margin: 0, fontWeight: 800 }}>Sponsored by {sponsor.businessName}</p>
+      <p style={{ margin: 0, fontWeight: 800 }}>Sponsored by {creative.sponsorName}</p>
       <p style={{ margin: '4px 0', color: 'var(--muted)' }}>(why-shown text for the placement)</p>
       <p style={{ margin: '4px 0', fontWeight: 700 }}>{creative.headline}</p>
       <p style={{ margin: '4px 0' }}>{creative.body}</p>
@@ -1188,7 +1229,9 @@ function CreativesPanel({ sponsor }: { sponsor: Sponsor }) {
       <h3 style={{ margin: 0 }}>Creatives for {sponsor.businessName}</h3>
       <p style={mutedText}>
         Creative versions are immutable. Editing creates a new version that needs its own human
-        review; a campaign that switches to it goes back to review.
+        review; a campaign that switches to it goes back to review. Each version keeps the
+        “Sponsored by” name it was reviewed with: after renaming a sponsor, create and review a new
+        version to show the new name.
       </p>
       <AdminFeedback feedback={feedback} rules={RULES} />
       {query.status === 'loading' && creatives === null ? (
@@ -1205,7 +1248,7 @@ function CreativesPanel({ sponsor }: { sponsor: Sponsor }) {
             {c.reviewedAt ? ` · reviewed ${formatUtc(c.reviewedAt)}` : ''}
             {c.selfReviewed ? ' · self-reviewed (sole owner admin)' : ''}
           </p>
-          <CreativePreview creative={c} sponsor={sponsor} />
+          <CreativePreview creative={c} />
           <div style={buttonRow}>
             {c.reviewStatus === 'draft' ? (
               <ConfirmButton
