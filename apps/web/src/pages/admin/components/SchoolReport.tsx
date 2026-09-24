@@ -59,6 +59,12 @@ export function SchoolReport({
           <dd style={{ margin: 0 }}>{report.attributedSignups}</dd>
           <dt>Donation-eligible families (this month)</dt>
           <dd style={{ margin: 0 }}>{report.donationEligibleFamilies}</dd>
+          <dt>Active families (a plan period started this month)</dt>
+          <dd style={{ margin: 0 }}>{report.activeFamilies}</dd>
+          <dt>Families who paid more than $0</dt>
+          <dd style={{ margin: 0 }}>{report.positivePayingFamilies}</dd>
+          <dt>Families fully discounted by a code</dt>
+          <dd style={{ margin: 0 }}>{report.fullyDiscountedFamilies}</dd>
           <dt>Accrued (owed by PencilLift)</dt>
           <dd style={{ margin: 0 }}>
             {report.accruedCents === null ? 'Not available' : formatUsd(report.accruedCents)}
@@ -77,10 +83,6 @@ export function SchoolReport({
         family can be identified; this owner view receives exact counts. Accrual is $1 per
         full-price family month; a discounted month (any code, 5%–100%) accrues $0. Accrued is not
         paid.
-      </p>
-      <p className="notice">
-        Active, positive-paying and fully discounted family counts are not part of this report yet;
-        they need an extended report from the API before they can be shown.
       </p>
     </section>
   );

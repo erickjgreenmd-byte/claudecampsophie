@@ -124,20 +124,36 @@ function SchoolsConsole() {
         )}
         <p style={{ color: 'var(--muted)' }}>
           New schools start as pending verification and don’t appear in parent search until they are
-          active. Verifying a school and its payout recipient isn’t available in this console yet.
+          active. Open a school to verify its listing and, separately, its payout recipient.
         </p>
       </section>
-      {open ? <SchoolPanel key={open.id} school={open} month={month} /> : null}
+      {open ? (
+        <SchoolPanel
+          key={open.id}
+          school={open}
+          month={month}
+          onChanged={() => setVersion((v) => v + 1)}
+        />
+      ) : null}
       <CreateSchool onCreated={() => setVersion((v) => v + 1)} />
     </>
   );
 }
 
-function SchoolPanel({ school, month }: { school: AdminSchool; month: string }) {
+function SchoolPanel({
+  school,
+  month,
+  onChanged,
+}: {
+  school: AdminSchool;
+  month: string;
+  onChanged: () => void;
+}) {
   const headingId = useId();
   return (
     <section className="card" style={sectionStyle} aria-labelledby={headingId}>
       <h2 id={headingId}>{school.name}: report and payouts</h2>
+      <VerifySchool school={school} onChanged={onChanged} />
       <SchoolReport schoolId={school.id} initialMonth={month} />
       <PayoutsPanel
         schoolId={school.id}
@@ -145,6 +161,86 @@ function SchoolPanel({ school, month }: { school: AdminSchool; month: string }) 
         initialMonth={month}
       />
     </section>
+  );
+}
+
+/**
+ * Owner verification (P17): a listing becomes visible to parents only when active; a payout
+ * recipient is verified separately. The note says where the evidence is kept — never banking data.
+ */
+function VerifySchool({ school, onChanged }: { school: AdminSchool; onChanged: () => void }) {
+  const { api } = useSession();
+  const formId = useId();
+  const [status, setStatus] = useState<'active' | 'inactive'>(
+    school.status === 'active' ? 'active' : 'inactive',
+  );
+  const [recipient, setRecipient] = useState(school.recipientVerified);
+  const [note, setNote] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const { busy, feedback, run } = useAdminAction();
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const trimmed = note.trim();
+    if (trimmed.length < 3 || trimmed.length > 300) {
+      setError('Say where the verification evidence is kept (3 to 300 characters).');
+      return;
+    }
+    setError(null);
+    const ok = await run('verify', async () => {
+      const updated = await api.send(
+        'PATCH',
+        `/v1/admin/schools/${school.id}`,
+        { status, recipientVerified: recipient, verificationNote: trimmed },
+        schoolAdminSchema,
+      );
+      return `${updated.name} saved: ${STATUS_LABEL[updated.status]}, ${
+        updated.recipientVerified ? 'recipient verified' : 'recipient not verified'
+      }.`;
+    });
+    if (ok) {
+      setNote('');
+      onChanged();
+    }
+  };
+
+  const id = (f: string) => `${formId}-${f}`;
+  return (
+    <form aria-labelledby={id('title')} onSubmit={(e) => void submit(e)} noValidate>
+      <h3 id={id('title')}>Verification</h3>
+      <label htmlFor={id('status')}>Listing</label>
+      <select
+        id={id('status')}
+        value={status}
+        onChange={(e) => setStatus(e.target.value === 'active' ? 'active' : 'inactive')}
+      >
+        <option value="active">Active (parents can choose it)</option>
+        <option value="inactive">Inactive (hidden from parents)</option>
+      </select>
+      <label>
+        <input
+          type="checkbox"
+          checked={recipient}
+          onChange={(e) => setRecipient(e.target.checked)}
+        />{' '}
+        Payout recipient verified out of band
+      </label>
+      <label htmlFor={id('note')}>Where the evidence is kept</label>
+      <input
+        id={id('note')}
+        value={note}
+        maxLength={300}
+        aria-describedby={error ? id('note-error') : undefined}
+        onChange={(e) => setNote(e.target.value)}
+      />
+      <FieldError id={id('note-error')} message={error} />
+      <div style={buttonRow}>
+        <button type="submit" className="btn" disabled={busy !== null}>
+          Save verification
+        </button>
+      </div>
+      <AdminFeedback feedback={feedback} />
+    </form>
   );
 }
 

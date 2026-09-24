@@ -3,6 +3,7 @@ import {
   calendarMonthSchema,
   campaignActionSchema,
   createSchoolRequestSchema,
+  updateSchoolRequestSchema,
   generationRequestSchema,
   markPayoutPaidRequestSchema,
   offerMappingInputSchema,
@@ -473,6 +474,46 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
     );
   });
 
+  // A school appears to parents only after the owner verifies it; payouts need a separately
+  // verified recipient (details kept out of band, never stored here).
+  r.patch('/schools/:id', async (c) => {
+    const id = idParam(c, 'id');
+    const input = await readJson(c, updateSchoolRequestSchema);
+    const row = await c.var.deps.db.asService(async (tx) => {
+      const [updated] = await tx<
+        {
+          id: string;
+          name: string;
+          city: string | null;
+          region: string | null;
+          status: 'pending_verification' | 'active' | 'inactive';
+          recipient_verified: boolean;
+        }[]
+      >`
+        update public.schools
+           set status = coalesce(${input.status ?? null}, status),
+               recipient_verified = coalesce(${input.recipientVerified ?? null}::boolean, recipient_verified)
+         where id = ${id}
+        returning id, name, city, region, status, recipient_verified
+      `;
+      if (!updated) throw new ApiError('NOT_FOUND', 'School not found');
+      await audit(tx, c, 'school.updated', 'school', id, {
+        status: input.status ?? null,
+        recipientVerified: input.recipientVerified ?? null,
+        note: input.verificationNote,
+      });
+      return updated;
+    });
+    return c.json({
+      id: row.id,
+      name: row.name,
+      city: row.city,
+      region: row.region,
+      status: row.status,
+      recipientVerified: row.recipient_verified,
+    });
+  });
+
   r.get('/schools/:id/report', async (c) => {
     const id = idParam(c, 'id');
     const month = monthQuery(c);
@@ -493,11 +534,27 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
       `,
     );
     if (!row) throw new ApiError('NOT_FOUND', 'School not found');
+    const [counts] = await c.var.deps.db.asParent(
+      c.var.parent,
+      (tx) => tx<
+        {
+          active_families: string;
+          positive_paying_families: string;
+          fully_discounted_families: string;
+        }[]
+      >`
+        select active_families, positive_paying_families, fully_discounted_families
+          from public.school_month_report_counts(${id}, ${month}, ${c.var.deps.config.programTimezone})
+      `,
+    );
     return c.json({
       schoolId: row.school_id,
       month: row.donation_month,
       attributedSignups: row.attributed_signups,
       donationEligibleFamilies: row.donation_eligible_families,
+      activeFamilies: counts!.active_families,
+      positivePayingFamilies: counts!.positive_paying_families,
+      fullyDiscountedFamilies: counts!.fully_discounted_families,
       accruedCents: row.accrued_cents === null ? null : Number(row.accrued_cents),
       paidCents: row.paid_cents === null ? null : Number(row.paid_cents),
     });

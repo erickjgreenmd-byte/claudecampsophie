@@ -247,6 +247,24 @@ describe('donation accrual and payouts (AC_PROMO_11, AC_PROMO_12)', () => {
     expect(report).toMatchObject({ donationEligibleFamilies: '1', accruedCents: 100 });
   });
 
+  it('reports active, paying and fully discounted designated families for the month (AC_PROMO_10)', async () => {
+    const free = await seedFamily(api.db);
+    await api.db
+      .sql`insert into public.family_school_designations (family_id, school_id, effective_from) values (${free.familyId}, ${schoolId}, '2026-09-01')`;
+    await paidPeriod(free.familyId, `gp_free_${free.familyId}`, '2026-10-09T00:00:00Z', {
+      discount: 3999,
+    });
+    const report = await json<Record<string, unknown>>(
+      await adminReq(`/schools/${schoolId}/report?month=2026-10`),
+    );
+    // full price + 200-cent discount + 100% discount (the family without a school is not counted).
+    expect(report).toMatchObject({
+      activeFamilies: '3',
+      positivePayingFamilies: '2',
+      fullyDiscountedFamilies: '1',
+    });
+  });
+
   it('prepares one idempotent batch, approves it and records the external transfer once', async () => {
     const prepared = await json<{ status: string; payout: { id: string; totalCents: number } }>(
       await adminReq('/payouts/prepare', 'POST', { schoolId, throughMonth: '2026-10' }),
@@ -309,5 +327,45 @@ describe('transfers disabled by default', () => {
     } finally {
       await plain.close();
     }
+  });
+});
+
+describe('school verification (P17 onboarding)', () => {
+  it('a new school is hidden from parents until the owner verifies it; changes are audited', async () => {
+    const created = await json<{ id: string; status: string }>(
+      await adminReq('/schools', 'POST', { name: 'Birch Academy', city: null, region: null }),
+    );
+    expect(created.status).toBe('pending_verification');
+    const listed = async () =>
+      (
+        await json<{ schools: { id: string }[] }>(
+          await api.request('/v1/schools?query=Birch', { token: parentOnly }),
+        )
+      ).schools.map((s) => s.id);
+    expect(await listed()).not.toContain(created.id);
+
+    expect(
+      (
+        await api.request(`/v1/admin/schools/${created.id}`, {
+          method: 'PATCH',
+          token: adminNoMfa,
+          body: { status: 'active', verificationNote: 'district listing checked' },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (await adminReq(`/schools/${created.id}`, 'PATCH', { verificationNote: 'nothing' })).status,
+    ).toBe(400);
+    const updated = await adminReq(`/schools/${created.id}`, 'PATCH', {
+      status: 'active',
+      recipientVerified: true,
+      verificationNote: 'district listing and W-9 checked (owner files)',
+    });
+    expect(updated.status).toBe(200);
+    expect(await json(updated)).toMatchObject({ status: 'active', recipientVerified: true });
+    expect(await listed()).toContain(created.id);
+    const [audit] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.audit_events where action = 'school.updated' and target_id = ${created.id}`;
+    expect(audit!.n).toBe(1);
   });
 });

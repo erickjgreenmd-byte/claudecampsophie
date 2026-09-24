@@ -259,12 +259,28 @@ export const createSchoolRequestSchema = z.strictObject({
   region: z.string().trim().max(40).nullable(),
 });
 
+/** Owner verification of a school listing and, separately, of its payout recipient (out of band). */
+export const updateSchoolRequestSchema = z
+  .strictObject({
+    status: z.enum(['active', 'inactive']).optional(),
+    recipientVerified: z.boolean().optional(),
+    /** Where the verification evidence is kept (never banking details). */
+    verificationNote: z.string().trim().min(3).max(300),
+  })
+  .refine((v) => v.status !== undefined || v.recipientVerified !== undefined, {
+    message: 'Nothing to change',
+  });
+
 export const schoolMonthReportSchema = z.strictObject({
   schoolId: uuidSchema,
   month: calendarMonthSchema,
   /** Counts are strings because school-facing views may show "<5" (privacy suppression). */
   attributedSignups: z.string(),
   donationEligibleFamilies: z.string(),
+  /** Designated families with a subscription period starting this month (AC_PROMO_10). */
+  activeFamilies: z.string(),
+  positivePayingFamilies: z.string(),
+  fullyDiscountedFamilies: z.string(),
   accruedCents: z.number().int().nullable(),
   paidCents: z.number().int().nullable(),
 });

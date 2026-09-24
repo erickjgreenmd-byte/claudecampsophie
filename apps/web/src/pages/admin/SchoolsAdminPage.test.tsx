@@ -69,6 +69,9 @@ function fakeApi(
         month: '2026-09',
         attributedSignups: '12',
         donationEligibleFamilies: '<5',
+        activeFamilies: '9',
+        positivePayingFamilies: '7',
+        fullyDiscountedFamilies: '2',
         accruedCents: 300,
         paidCents: 100,
       };
@@ -278,5 +281,39 @@ describe('SchoolsAdminPage — payouts', () => {
     await userEvent.click(within(row).getByRole('button', { name: /Yes, approve/ }));
     await waitFor(() => expect(sends).toHaveLength(1));
     expect(sends[0]!.path).toBe(`/v1/admin/payouts/${PAYOUT}/approve`);
+  });
+});
+
+describe('SchoolsAdminPage — verification (P17 onboarding)', () => {
+  it('shows the new family counts and saves a verification with its evidence note', async () => {
+    const { api, sends } = fakeApi({
+      send: (call) =>
+        call.method === 'PATCH'
+          ? { ...maple, status: 'active', recipientVerified: true }
+          : new Error('unexpected send'),
+    });
+    renderPage(<SchoolsAdminPage />, { api });
+    const panel = await openSchool();
+    expect(
+      await within(panel).findByText('Active families (a plan period started this month)'),
+    ).toBeTruthy();
+    expect(within(panel).getByText('9')).toBeTruthy();
+    const user = userEvent.setup();
+    await user.click(within(panel).getByRole('button', { name: 'Save verification' }));
+    expect(await within(panel).findByText(/where the verification evidence is kept/i)).toBeTruthy();
+    expect(sends).toHaveLength(0);
+    await user.selectOptions(within(panel).getByLabelText('Listing'), 'active');
+    await user.click(within(panel).getByLabelText(/payout recipient verified/i));
+    await user.type(
+      within(panel).getByLabelText('Where the evidence is kept'),
+      'district site + W-9 in owner files',
+    );
+    await user.click(within(panel).getByRole('button', { name: 'Save verification' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({
+      method: 'PATCH',
+      path: `/v1/admin/schools/${MAPLE}`,
+      body: { status: 'active', verificationNote: 'district site + W-9 in owner files' },
+    });
   });
 });
