@@ -4,6 +4,7 @@ import type { BillingChannel } from '../shared/billing.ts';
 import type { Cents } from '../shared/money.ts';
 import { err, ok, type Result } from '../shared/result.ts';
 import {
+  addMonths,
   isValidIanaZone,
   monthBoundsUtc,
   parseCalendarMonth,
@@ -244,6 +245,11 @@ export function generationKeyFor(templateId: string, month: CalendarMonth): stri
  * [opensAt, closesAt) UTC instants of `window` within `month` in `zone`: opens at the start of
  * `startDay`, closes at the start of the day after `endDay` (or at the next month's start).
  * DST-correct because each boundary is a local start-of-day converted to UTC.
+ *
+ * A month-end close is the NEXT month's own start (`monthBoundsUtc(next).start`), not this month's
+ * start plus one month: when a DST jump skips local midnight on the 1st (America/Asuncion
+ * 2023-10-01 began at 01:00), adding a month to that 01:00 start would carry the hour into the
+ * next month and make consecutive monthly windows overlap.
  */
 export function redemptionWindowUtc(
   month: CalendarMonth,
@@ -252,14 +258,14 @@ export function redemptionWindowUtc(
 ): { opensAt: Date; closesAt: Date } {
   if (!windowIsValid(window)) throw new RangeError('Invalid redemption window');
   const { year, month: m } = parseCalendarMonth(month);
-  const bounds = monthBoundsUtc(month, zone);
+  const nextMonthStart = monthBoundsUtc(addMonths(month, 1), zone).start;
   const startOfDay = (day: number) =>
     DateTime.fromObject({ year, month: m, day }, { zone }).startOf('day').toUTC().toJSDate();
   const daysInMonth = DateTime.fromObject({ year, month: m, day: 1 }, { zone }).daysInMonth ?? 28;
   const opensAt = startOfDay(window.startDay);
   const closesAt =
     window.endDay === 'end_of_month' || window.endDay >= daysInMonth
-      ? bounds.end
+      ? nextMonthStart
       : startOfDay(window.endDay + 1);
   return { opensAt, closesAt };
 }

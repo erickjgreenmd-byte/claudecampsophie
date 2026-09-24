@@ -61,8 +61,15 @@ const TRANSITIONS: Readonly<
   reconciled: {},
 };
 
+/**
+ * Both keys are checked as OWN properties: states and events are mapped from untrusted
+ * provider/webhook/job payloads, and a plain-object lookup would otherwise resolve names such as
+ * `constructor` or `__proto__` through Object.prototype and report a "successful" transition.
+ */
 function targetOf(state: RedemptionState, event: RedemptionEvent): RedemptionState | undefined {
-  return Object.hasOwn(TRANSITIONS, state) ? TRANSITIONS[state][event] : undefined;
+  if (!Object.hasOwn(TRANSITIONS, state)) return undefined;
+  const row = TRANSITIONS[state];
+  return Object.hasOwn(row, event) ? row[event] : undefined;
 }
 
 export function transitionRedemption(
@@ -87,16 +94,38 @@ export function isLiveState(state: RedemptionState): boolean {
   return state !== 'rejected' && state !== 'expired';
 }
 
-/** States an event would have produced (or already passed through) had it been applied before. */
-const ALREADY_APPLIED: Readonly<Record<RedemptionEvent, readonly RedemptionState[]>> = {
-  submit_to_provider: ['provider_pending'],
-  provider_confirmed: ['confirmed', 'reconciled'],
-  reconcile_applied: ['confirmed', 'reconciled'],
-  provider_rejected: ['rejected'],
-  reconcile_not_applied: ['rejected'],
-  reservation_timeout: ['expired'],
-  period_completed: ['reconciled'],
-};
+/** `state` and every state reachable from it through TRANSITIONS. */
+function selfAndDescendants(state: RedemptionState): Set<RedemptionState> {
+  const seen = new Set<RedemptionState>([state]);
+  const queue: RedemptionState[] = [state];
+  for (let current = queue.shift(); current !== undefined; current = queue.shift()) {
+    for (const next of Object.values(TRANSITIONS[current])) {
+      if (!seen.has(next)) {
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  return seen;
+}
+
+/**
+ * States an event would have produced (or already passed through) had it been applied before:
+ * the event's target state plus everything downstream of it. Derived from TRANSITIONS rather than
+ * hand-listed, so a redelivered event is recognized in every later state (e.g. a retried
+ * `submit_to_provider` after the provider already confirmed or rejected) and the two tables cannot
+ * drift apart. A Map keeps untrusted event names away from Object.prototype.
+ */
+const ALREADY_APPLIED: ReadonlyMap<RedemptionEvent, ReadonlySet<RedemptionState>> = new Map(
+  REDEMPTION_EVENTS.map((event) => {
+    const states = new Set<RedemptionState>();
+    for (const from of REDEMPTION_STATES) {
+      const target = TRANSITIONS[from][event];
+      if (target !== undefined) for (const s of selfAndDescendants(target)) states.add(s);
+    }
+    return [event, states] as const;
+  }),
+);
 
 /**
  * A redelivered webhook/job event whose outcome is already recorded (acknowledge, change nothing).
@@ -104,5 +133,5 @@ const ALREADY_APPLIED: Readonly<Record<RedemptionEvent, readonly RedemptionState
  * reservation that expired unsubmitted) are NOT duplicates and need reconciliation.
  */
 export function isDuplicateDelivery(state: RedemptionState, event: RedemptionEvent): boolean {
-  return Object.hasOwn(ALREADY_APPLIED, event) && ALREADY_APPLIED[event].includes(state);
+  return ALREADY_APPLIED.get(event)?.has(state) ?? false;
 }

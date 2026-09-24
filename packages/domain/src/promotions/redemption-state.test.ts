@@ -102,4 +102,55 @@ describe('P17 durable redemption state machine (AC_PROMO_05, AC_PROMO_09)', () =
     expect(isDuplicateDelivery('confirmed', 'provider_rejected')).toBe(false);
     expect(isDuplicateDelivery('rejected', 'provider_confirmed')).toBe(false);
   });
+
+  it('a redelivered event is a duplicate in exactly the states at or downstream of its target (full matrix)', () => {
+    // Regression for RV-promotions-3: a retried submit_to_provider arriving after the provider
+    // outcome is recorded is acknowledged, not escalated as a conflict.
+    const DUPLICATE_IN: Readonly<Record<RedemptionEvent, readonly RedemptionState[]>> = {
+      submit_to_provider: ['provider_pending', 'confirmed', 'rejected', 'reconciled'],
+      provider_confirmed: ['confirmed', 'reconciled'],
+      reconcile_applied: ['confirmed', 'reconciled'],
+      provider_rejected: ['rejected'],
+      reconcile_not_applied: ['rejected'],
+      reservation_timeout: ['expired'],
+      period_completed: ['reconciled'],
+    };
+    for (const event of REDEMPTION_EVENTS) {
+      for (const state of REDEMPTION_STATES) {
+        expect(isDuplicateDelivery(state, event), `${state} + ${event}`).toBe(
+          DUPLICATE_IN[event].includes(state),
+        );
+      }
+    }
+    // A submit for a reservation that expired unsubmitted is never silently absorbed.
+    expect(isDuplicateDelivery('expired', 'submit_to_provider')).toBe(false);
+  });
+
+  it('names inherited from Object.prototype are never transitions or duplicates, in any state', () => {
+    // Regression for RV-promotions-1: event/state strings come from untrusted provider payloads.
+    const inherited = [
+      'constructor',
+      'toString',
+      '__proto__',
+      'hasOwnProperty',
+      'valueOf',
+      'isPrototypeOf',
+    ];
+    for (const name of inherited) {
+      for (const state of REDEMPTION_STATES) {
+        const byEvent = transitionRedemption(state, name as RedemptionEvent);
+        expect(byEvent.ok ? byEvent.value : byEvent.error.code, `${state} + ${name}`).toBe(
+          'INVALID_TRANSITION',
+        );
+        expect(isDuplicateDelivery(state, name as RedemptionEvent)).toBe(false);
+      }
+      for (const event of REDEMPTION_EVENTS) {
+        const byState = transitionRedemption(name as RedemptionState, event);
+        expect(byState.ok ? byState.value : byState.error.code, `${name} + ${event}`).toBe(
+          'INVALID_TRANSITION',
+        );
+        expect(isDuplicateDelivery(name as RedemptionState, event)).toBe(false);
+      }
+    }
+  });
 });

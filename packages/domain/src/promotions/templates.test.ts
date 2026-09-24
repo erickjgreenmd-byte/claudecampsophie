@@ -1,9 +1,11 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
+import { addMonths, calendarMonthOf } from '../shared/time.ts';
 import {
   draftCampaignTemplate,
   explainMonthlyGeneration,
   planMonthlyGeneration,
+  redemptionWindowUtc,
   validateTemplateForActivation,
   type CampaignTemplate,
 } from './templates.ts';
@@ -227,6 +229,57 @@ describe('P17 monthly generation plan (AC_PROMO_01)', () => {
     });
     expect(plan('2028-02', 28)?.closesAt).toEqual(new Date('2028-02-29T00:00:00.000Z'));
     expect(plan('2028-02', 29)?.closesAt).toEqual(new Date('2028-03-01T00:00:00.000Z'));
+  });
+
+  it('whole-month windows tile consecutive months exactly: no gap, no overlap, even after a midnight DST jump on the 1st', () => {
+    // Regression for RV-promotions-2. Each listed month began at 01:00 local because DST skipped
+    // midnight on the 1st; the previous month's window must close exactly at that first instant,
+    // and that month's window must close at the following month's own local midnight.
+    const whole = { startDay: 1, endDay: 'end_of_month' } as const;
+    const skippedMidnightMonths: ReadonlyArray<[string, string]> = [
+      ['America/Asuncion', '2023-10'],
+      ['America/Asuncion', '2017-10'],
+      ['America/Havana', '2012-04'],
+      ['Asia/Amman', '2016-04'],
+      ['Africa/Cairo', '2014-08'],
+    ];
+    const zones = [
+      'UTC',
+      'America/New_York',
+      'America/Santiago',
+      'Australia/Lord_Howe',
+      ...skippedMidnightMonths.map(([zone]) => zone),
+    ];
+    const checkTiling = (zone: string, month: string) => {
+      const current = redemptionWindowUtc(month, zone, whole);
+      const next = redemptionWindowUtc(addMonths(month, 1), zone, whole);
+      expect(current.closesAt.getTime(), `${zone} ${month}`).toBe(next.opensAt.getTime());
+      expect(current.closesAt.getTime()).toBeGreaterThan(current.opensAt.getTime());
+      // opensAt is the month's first real local instant; closesAt is the next month's.
+      expect(calendarMonthOf(current.opensAt, zone)).toBe(month);
+      expect(calendarMonthOf(new Date(current.opensAt.getTime() - 1), zone)).toBe(
+        addMonths(month, -1),
+      );
+      expect(calendarMonthOf(new Date(current.closesAt.getTime() - 1), zone)).toBe(month);
+      expect(calendarMonthOf(current.closesAt, zone)).toBe(addMonths(month, 1));
+    };
+    for (const [zone, month] of skippedMidnightMonths) {
+      checkTiling(zone, addMonths(month, -1));
+      checkTiling(zone, month);
+    }
+    fc.assert(
+      fc.property(fc.constantFrom(...zones), fc.integer({ min: 0, max: 12 * 70 }), (zone, offset) =>
+        checkTiling(zone, addMonths('1995-01', offset)),
+      ),
+      { numRuns: 200 },
+    );
+
+    // An explicit end day at the month's last day closes at the same boundary.
+    const october = redemptionWindowUtc('2023-10', 'America/Asuncion', {
+      startDay: 20,
+      endDay: 31,
+    });
+    expect(october.closesAt.toISOString()).toBe('2023-11-01T03:00:00.000Z');
   });
 
   it('skips disabled, paused and invalid templates, with a visible reason in the preview', () => {
