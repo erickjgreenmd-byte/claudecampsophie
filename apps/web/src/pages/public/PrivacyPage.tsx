@@ -7,6 +7,11 @@ import { lead, muted, PageTitle, Section, SupportEmail } from './common.tsx';
  * design exactly: consent before child data, private storage, 30-day raw-scan retention,
  * tombstone-first deletion within 30 days, AI only under zero data retention, and no ads or
  * affiliate links in children's areas. Anything not yet decided is marked "to be confirmed".
+ *
+ * Limits are stated, not glossed over (RV-public-site-1, -2, -4): photo metadata is removed on the
+ * device where possible and always by the scan job before any processing (image-metadata.ts); export
+ * files are not built by any deployed job yet; the retention exceptions match
+ * app.purge_family_data (billing, consent records, audit log, family tombstone, adult sign-in).
  */
 export default function PrivacyPage() {
   return (
@@ -29,7 +34,10 @@ export default function PrivacyPage() {
           <li>Homework photos are kept in private storage and deleted after 30 days by default.</li>
           <li>We do not sell personal information and there is no behavioral advertising.</li>
           <li>There are no ads or affiliate links in children’s areas.</li>
-          <li>You can delete your child’s data or your whole account at any time.</li>
+          <li>
+            Any parent or guardian in the family can delete a child’s data at any time, and the
+            family owner can delete the whole family account.
+          </li>
         </ul>
       </Section>
 
@@ -70,8 +78,8 @@ export default function PrivacyPage() {
           <li>Practice and review activity, points and reward requests.</li>
         </ul>
         <p>
-          Children don’t need an email address, phone number, social login or public profile, and
-          PencilLift does not collect precise location.
+          Children don’t need an email address, phone number, social login or public profile.
+          PencilLift doesn’t ask for location permission and doesn’t use your child’s location.
         </p>
       </Section>
 
@@ -86,7 +94,11 @@ export default function PrivacyPage() {
       <Section title="Homework photos and learning history">
         <ul>
           <li>Homework photos are stored in private storage, never on public web pages.</li>
-          <li>Location and camera details are removed from photos before they are processed.</li>
+          <li>
+            The app removes location and camera details from photos on the device before upload
+            where it can. If that step fails, the photo is stored as taken, and our servers remove
+            those details before the photo is processed or sent to AI.
+          </li>
           <li>
             Raw homework photos are deleted after 30 days by default. You can delete them sooner.
           </li>
@@ -148,7 +160,11 @@ export default function PrivacyPage() {
       <Section title="Your choices">
         <ul>
           <li>Review and correct your child’s profile.</li>
-          <li>Ask for a copy (export) of your family’s information.</li>
+          <li>
+            Ask for a copy (export) of your family’s information. Export files aren’t available yet:
+            a request is saved, but there is nothing to download until the export service is
+            switched on.
+          </li>
           <li>Delete homework photos, a child’s data, or your whole account.</li>
           <li>Withdraw consent for your child’s information to be processed.</li>
         </ul>
@@ -159,7 +175,28 @@ export default function PrivacyPage() {
           When you ask us to delete your account or a child’s data, processing stops immediately:
           your child’s devices are signed out and pending work is cancelled. Deletion from our
           active systems completes within 30 days. Backups expire on a documented schedule (length
-          to be confirmed). We may keep limited billing records where the law requires it.
+          to be confirmed). Only the family owner can delete the whole family account.
+        </p>
+        <p>After deletion we keep only:</p>
+        <ul>
+          <li>
+            Limited billing records (subscription, promotion and school-donation records) where the
+            law requires it.
+          </li>
+          <li>
+            Consent records: when consent was given or withdrawn, its version and the consent
+            provider’s reference.
+          </li>
+          <li>A security log that uses pseudonymous ids only, never homework or answers.</li>
+          <li>
+            When the whole family account is deleted, a minimal record that the family was deleted,
+            so late store notices can’t bring any data back.
+          </li>
+        </ul>
+        <p>
+          Deleting the whole family account does not close your parent sign-in (your email address
+          and password), but that sign-in no longer opens any of the family’s information. To have
+          the sign-in closed as well, email us.
         </p>
         <p>
           <Link to="/account-deletion">How to delete your account</Link>

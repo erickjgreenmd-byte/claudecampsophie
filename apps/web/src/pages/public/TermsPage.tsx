@@ -93,7 +93,8 @@ export default function TermsPage() {
 
       <Section title="Ending your account">
         <p>
-          You can delete your account at any time; see{' '}
+          The family owner can delete the family account at any time, and any parent or guardian in
+          the family can delete a child’s data; see{' '}
           <Link to="/account-deletion">how to delete your account</Link>. We may suspend accounts
           that put children or other families at risk.
         </p>

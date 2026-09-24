@@ -115,6 +115,35 @@ describe('PrivacyPage draft content (spec P3, P4, P16.1)', () => {
   });
 });
 
+describe('PrivacyPage states the limits of the implemented design (RV-public-site-1, -2, -3)', () => {
+  it('describes photo metadata removal as implemented, exports as unavailable, and owner-only family deletion', async () => {
+    vi.stubEnv('VITE_LEGAL_REVIEWED', 'false');
+    const { container } = await renderPublic(PrivacyPage, '/privacy');
+    const text = container.textContent;
+    // The device re-encode can fail and upload the original (apps/mobile scan.tsx); only the
+    // server scan job's stripImageMetadata is guaranteed, so the copy names both steps.
+    expect(text).toMatch(
+      /our servers remove those details before the photo is processed or sent to AI/i,
+    );
+    expect(text).not.toMatch(/does not collect precise location/i);
+    // No deployed job builds export files yet (dispatcher DEFAULT_HANDLERS).
+    expect(text).toMatch(/export files aren.t available yet/i);
+    // POST /v1/deletion scope "family" is owner-only (privacy.ts ownerOnlyFamilyDeletion).
+    expect(text).toMatch(/only the family owner can delete the whole family account/i);
+  });
+});
+
+describe('TermsPage deletion rights match the API', () => {
+  it('says the family owner deletes the family account and any guardian can delete a child’s data', async () => {
+    vi.stubEnv('VITE_LEGAL_REVIEWED', 'false');
+    const { container } = await renderPublic(TermsPage, '/terms');
+    expect(container.textContent).toMatch(/family owner can delete the family account/i);
+    expect(container.textContent).toMatch(
+      /any parent or guardian in the family can delete a child.s data/i,
+    );
+  });
+});
+
 describe('AccountDeletionPage (spec P4, P11, P15)', () => {
   it('explains both ways to delete, what happens, and that store subscriptions must be cancelled in the store', async () => {
     vi.stubEnv('VITE_LEGAL_REVIEWED', 'false');

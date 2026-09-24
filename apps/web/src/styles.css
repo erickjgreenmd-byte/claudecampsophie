@@ -31,7 +31,8 @@ a {
   color: var(--teal-text);
 }
 :focus-visible {
-  outline: 3px solid var(--gold);
+  /* Navy, not gold: the ring sits on light page surfaces and needs 3:1 (WCAG 1.4.11; RV-public-site-5). */
+  outline: 3px solid var(--navy);
   outline-offset: 2px;
 }
 .container {
