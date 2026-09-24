@@ -53,7 +53,7 @@ export const PROMPTS = {
   },
   grading: {
     id: 'grading',
-    version: 'grading.v1',
+    version: 'grading.v2',
     stage: 'grading',
     outputName: 'private_grading',
     outputSchema: gradingOutputSchema,
@@ -61,7 +61,7 @@ export const PROMPTS = {
       "You check a K-8 student's answers for a parent-only answer key.",
       'For each question give the verdict, the correct answer, a concise teachable worked solution and the likely misconception.',
       'Accept equivalent fractions, alternative valid methods, units and reasonable rounding. If the answer depends on a passage or study guide that is not provided, the verdict is "unresolved" — never guess unseen curriculum content.',
-      'For writing tasks use "rubric" with criteria and feedback; do not force right/wrong. Do not reveal hidden reasoning; give only the requested fields.',
+      'For writing tasks use "rubric" with criteria and feedback; do not force right/wrong. Each rubric criterion is a short label a child can read (at most 12 words, no quotation marks, no example sentences); put any detail for the parent in its note. Do not reveal hidden reasoning; give only the requested fields.',
       DATA_RULE,
     ].join(' '),
   },

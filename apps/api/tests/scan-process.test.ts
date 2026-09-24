@@ -63,6 +63,7 @@ interface ScriptedQuestion {
   primary: { verdict: string; confidence: 'low' | 'medium' | 'high' };
   verifier: { verdict: string; confidence: 'low' | 'medium' | 'high' };
   coaching?: 'safe' | 'leaky';
+  rubric?: { criterion: string; met: boolean; note: string }[];
 }
 
 const WORKSHEET: ScriptedQuestion[] = [
@@ -176,7 +177,7 @@ function scriptedModel(script: Script): ResponsesClient & { requests: ResponsesR
               correctAnswer: s.key,
               workedSolution: `Worked solution for ${q.questionNumber}`,
               misconception: s.primary.verdict === 'incorrect' ? 'dropped a letter' : null,
-              rubric: null,
+              rubric: s.rubric ?? null,
               evidence: 'student work visible',
               confidence: s.primary.confidence,
             };
@@ -551,6 +552,68 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
     expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'needs_parent_review' });
     expect(await feedback(scan.assignmentId)).toEqual([]);
     expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+  });
+
+  it('written work gets rubric feedback in fixed wording; the model’s notes never reach the child (AC_GRADING_03)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '7',
+      prompt: 'Write two sentences about your favorite animal.',
+      answer: 'I like dogs. They are fun',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: '',
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric: [
+        { criterion: 'Uses complete sentences', met: true, note: 'Both sentences have a subject.' },
+        {
+          criterion: 'Gives a reason for the opinion.',
+          met: false,
+          note: 'Try: "I like dogs because they are loyal and kind."',
+        },
+        // Unsafe labels are dropped, never shortened: a quotation, a paragraph, a link.
+        { criterion: 'Topic sentence like "Dogs are loyal"', met: false, note: 'n/a' },
+        { criterion: 'Uses details '.repeat(10), met: false, note: 'n/a' },
+        { criterion: 'See https://example.com/writing', met: true, note: 'n/a' },
+      ],
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [q] })));
+    expect(await results(scan.assignmentId)).toMatchObject([{ verdict: 'rubric' }]);
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => [r.kind, r.body]).sort()).toEqual([
+      ['encouragement', 'You did this well: Uses complete sentences.'],
+      ['method_step', 'Next time, work on: Gives a reason for the opinion.'],
+    ]);
+    for (const r of rows) {
+      expect(r.body).not.toMatch(/because they are loyal|Dogs are loyal|https?:|subject\./);
+    }
+    // Written work is never forced into right/wrong and is not skill evidence.
+    const attempts = await api.db.sql`
+      select 1 from public.attempts a
+        join public.extracted_questions q on q.id = a.question_instance_id
+       where q.assignment_id = ${scan.assignmentId}`;
+    expect(attempts).toHaveLength(0);
+  });
+
+  it('written work whose rubric has no child-safe label gets no rubric rows', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '8',
+      prompt: 'Write a sentence using the word bright.',
+      answer: 'The sun is bright',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: '',
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric: [{ criterion: 'Write “The sun is very bright today.”', met: false, note: 'n/a' }],
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [q] })));
+    expect(await results(scan.assignmentId)).toMatchObject([{ verdict: 'rubric' }]);
+    expect(await feedback(scan.assignmentId)).toEqual([]);
   });
 
   it('restating a computation is never graded correct, even when both models say so (RV-grading-1)', async () => {

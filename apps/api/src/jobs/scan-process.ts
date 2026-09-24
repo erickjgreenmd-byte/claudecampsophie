@@ -46,6 +46,7 @@ import { hasVerifiedConsent } from '../services/consent.ts';
 import { ImageFormatError, stripImageMetadata } from '../services/image-metadata.ts';
 import type { DeadLetterReason, JobDeferral, JobDeps, JobHandler, JobRow } from './dispatcher.ts';
 import { acquireSpendHold, releaseSpendHold, SpendCeilingReached } from './spend-ceiling.ts';
+import { childRubricFeedback } from './rubric-feedback.ts';
 
 /**
  * Homework scan processing (spec P5, P6, P12; AC_CAPTURE_*, AC_GRADING_*). One durable job per
@@ -1162,6 +1163,9 @@ class ScanRun {
       // settled by a grown-up (RV-lead-jobs-ai-19).
       if (g.final === 'incorrect' && g.private && g.question.parent_override === null)
         await this.coach(g);
+      // Written work: the child sees the rubric's criteria in fixed wording (AC_GRADING_03).
+      if (g.final === 'rubric' && g.private && g.question.parent_override === null)
+        await this.rubricFeedback(g);
     }
 
     const needsReview =
@@ -1296,6 +1300,30 @@ class ScanRun {
     const feedback = rows ?? [{ kind: 'template_fallback', body: TEMPLATE_FALLBACK }];
     await this.guardedWrite(async (tx) => {
       for (const row of feedback) {
+        await tx`
+          insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
+          values (${g.question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${row.kind}, ${row.body}, ${GUARD_VERSION})
+        `;
+      }
+    });
+  }
+
+  /**
+   * Rubric feedback for written work: criterion labels in fixed wording, never the model's notes or
+   * any example text (rubric-feedback.ts). No AI call; when no label is safe to show, the child app
+   * asks the child to go over the writing with a grown-up.
+   */
+  private async rubricFeedback(g: Graded): Promise<void> {
+    const rows = childRubricFeedback(g.private?.rubric ?? null);
+    if (rows.length === 0) return;
+    await this.guardedWrite(async (tx) => {
+      const [existing] = await tx<{ n: number }[]>`
+        select count(*)::int as n from public.child_feedback f
+          join public.extracted_questions q on q.id = f.question_id
+         where f.question_id = ${g.question.id} and f.created_at >= coalesce(q.corrected_at, '-infinity'::timestamptz)
+      `;
+      if ((existing?.n ?? 0) > 0) return; // already written for this transcription (crash replay)
+      for (const row of rows) {
         await tx`
           insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
           values (${g.question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${row.kind}, ${row.body}, ${GUARD_VERSION})
