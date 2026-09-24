@@ -30,7 +30,9 @@ export function tryMonthlyPriceCents(
 }
 
 /** Price table for every configured tier, e.g. [{paidSlots:1, cents:3999}, …]. */
-export function priceTable(maxSlots = DEFAULT_MAX_PAID_SLOTS): { paidSlots: number; cents: Cents }[] {
+export function priceTable(
+  maxSlots = DEFAULT_MAX_PAID_SLOTS,
+): { paidSlots: number; cents: Cents }[] {
   return Array.from({ length: maxSlots }, (_, i) => ({
     paidSlots: i + 1,
     cents: monthlyPriceCents(i + 1, maxSlots),
@@ -38,7 +40,11 @@ export function priceTable(maxSlots = DEFAULT_MAX_PAID_SLOTS): { paidSlots: numb
 }
 
 /** True when `cents` is exactly the approved regular price for `paidSlots`. */
-export function isRegularTierPrice(paidSlots: number, cents: Cents, maxSlots = DEFAULT_MAX_PAID_SLOTS): boolean {
+export function isRegularTierPrice(
+  paidSlots: number,
+  cents: Cents,
+  maxSlots = DEFAULT_MAX_PAID_SLOTS,
+): boolean {
   const price = tryMonthlyPriceCents(paidSlots, maxSlots);
   return price.ok && price.value === cents;
 }

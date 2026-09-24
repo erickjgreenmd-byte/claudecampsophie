@@ -7,8 +7,8 @@ import type { RouteObject } from 'react-router';
  * Parent portal: /app/*   Owner admin: /admin/*
  */
 const page =
-  (loader: () => Promise<{ default: ComponentType }>): RouteObject['lazy'] =>
-  async () => ({ Component: (await loader()).default });
+  (loader: () => Promise<{ default: ComponentType }>) =>
+  async (): Promise<{ Component: ComponentType }> => ({ Component: (await loader()).default });
 
 export const routes: RouteObject[] = [
   { path: '/', lazy: page(() => import('./pages/public/LandingPage.tsx')) },

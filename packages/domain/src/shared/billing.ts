@@ -7,15 +7,11 @@ export type BillingChannel = 'app_store' | 'play_store' | 'stripe';
 export type BillingPeriodKind = 'subscription_period' | 'proration' | 'addon' | 'tax_only';
 
 export type SettlementStatus =
-  | 'pending'
-  | 'settled'
-  | 'failed'
-  | 'refunded'
-  | 'partially_refunded'
-  | 'chargeback';
+  'pending' | 'settled' | 'failed' | 'refunded' | 'partially_refunded' | 'chargeback';
 
 /** Why an amount below the regular tier price was charged. Payment instruments are not discounts. */
-export type DiscountSource = 'promo_code' | 'promotional_credit' | 'introductory_offer' | 'other_discount';
+export type DiscountSource =
+  'promo_code' | 'promotional_credit' | 'introductory_offer' | 'other_discount';
 
 /**
  * A provider-reported billing period for one family subscription, normalized from RevenueCat or

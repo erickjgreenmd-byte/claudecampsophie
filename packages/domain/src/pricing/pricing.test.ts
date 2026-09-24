@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { isRegularTierPrice, monthlyPriceCents, priceTable, tryMonthlyPriceCents } from './index.ts';
+import {
+  isRegularTierPrice,
+  monthlyPriceCents,
+  priceTable,
+  tryMonthlyPriceCents,
+} from './index.ts';
 
 describe('approved pricing (AC_CAPACITY_01)', () => {
   it('returns $39.99/$49.98/$59.97/$69.96 for 1/2/3/4 paid slots', () => {
