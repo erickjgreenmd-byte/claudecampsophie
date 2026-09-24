@@ -21,10 +21,15 @@
  * and of any example wording in the parent-only solution, and each row passes the answer-leak guard
  * against them, expressions read as their value. A row the guard blocks is dropped (LJA-F1).
  *
- * Moderation after generation (spec P4; AC_SECURITY_02): a label is model output, so each one also
- * passes the child-safety screen for model output, grounded in the writing prompt and subject. A
- * label that screens severe (companion persona, secrecy, contact, a sensitive topic the prompt did
- * not raise, ...) is dropped; the caller is told a code, never the label.
+ * Moderation after generation (spec P4; AC_SECURITY_02): a label is model output, so each
+ * criterion, as the model wrote it and before any other check, also passes the child-safety screen
+ * for model output, grounded in the writing prompt and subject, in three readings: as written, as
+ * the instruction the fixed wording makes of it ("Keep this a secret") and in the first person ("I
+ * keep this a secret"). A criterion that screens severe in any reading (self-harm, abuse,
+ * secrecy, contact, companion persona, a sensitive topic the prompt did not raise, ...) or holds a
+ * listed risk topic word ("secret", "strangers", "hurt", ...) is dropped; the caller is told a
+ * code, never the label (round-5 check R4-RL-OOA). The word list is a backstop, not the safety
+ * control.
  */
 import {
   guardChildContent,
@@ -47,8 +52,9 @@ export interface RubricFeedbackRow {
 }
 
 /**
- * A criterion label a child may read, or null when it is not short plain text or does not read as
- * a criterion (a completed sentence or an instruction with wording to copy; see isCriterionShaped).
+ * A criterion label as a child may read it, or null when it is not short plain text or does not
+ * read as a criterion (a completed sentence or an instruction with wording to copy; see
+ * isCriterionShaped). Its safety screen needs the prompt, so childRubricFeedback runs it.
  */
 export function childCriterionLabel(raw: unknown): string | null {
   const label = plainLabel(raw);
@@ -130,12 +136,24 @@ const LEAD_ADVERBS: ReadonlySet<string> = wordSet(`
   also always mostly never often only sometimes still usually
 `);
 
+/** A lead adverb or a word in "-ly", in any case ("Clearly", "Probably", "Sally"). */
+function lyWord(text: string | undefined): boolean {
+  return text !== undefined && (LEAD_ADVERBS.has(text) || /^\p{L}{3,}ly$/u.test(text));
+}
+
 /**
- * A lead adverb or any word in "-ly" ("Clearly", "Probably"): every rule that allows a lead
- * adverb allows any "-ly" word too (round-4 check R3-RL-1).
+ * A lead adverb that lets a criterion through ("Always uses", "Explains clearly why"): a listed
+ * one, or a word in "-ly" in lower case (round-4 check R3-RL-1). A capitalised "-ly" word is a name,
+ * not a lead adverb ("Sally explains why she was sad", "Emily tells how she hid"; round-5 check
+ * R4-RL-F), so a label that opens with one is judged as a noun phrase; isCriterionShaped also
+ * judges it with the word read as a lead adverb and drops it if either reading does (fail closed;
+ * round-5 recheck R5-RL-CHK-B).
  */
-function isAdverb(word: string | undefined): boolean {
-  return word !== undefined && (LEAD_ADVERBS.has(word) || /^\p{L}{3,}ly$/u.test(word));
+function isAdverb(word: Word | undefined): boolean {
+  return (
+    word !== undefined &&
+    (LEAD_ADVERBS.has(word.text) || (!word.capitalised && /^\p{L}{3,}ly$/u.test(word.text)))
+  );
 }
 
 /**
@@ -144,9 +162,16 @@ function isAdverb(word: string | undefined): boolean {
  */
 const LEAD_WORDS: ReadonlySet<string> = wordSet('all even ever just maybe not perhaps right');
 
-function isLeadWord(word: string | undefined): boolean {
-  return isAdverb(word) || (word !== undefined && LEAD_WORDS.has(word));
+/**
+ * A word skipped before an opener or an instruction: a lead adverb or "-ly" word in any case, or
+ * one of LEAD_WORDS. Skipping it only drops more labels, so a name in "-ly" is skipped too.
+ */
+function isLeadWord(text: string | undefined): boolean {
+  return lyWord(text) || (text !== undefined && LEAD_WORDS.has(text));
 }
+
+/** Words an instruction may also follow ("Now write ...", "First, write ..."; round-5 R4-RL-F). */
+const INSTRUCTION_LEADS: ReadonlySet<string> = wordSet('first next now then');
 
 /** Instruction verbs: "Write ...", "Add ..." is a task for the child, not a criterion ("Use of" is). */
 const INSTRUCTION_VERBS: ReadonlySet<string> = wordSet(`
@@ -392,28 +417,38 @@ function withoutMarks(text: string): string {
 /** Abbreviations whose full stop does not end a clause ("Dr. King", "St. Louis"). */
 const ABBREVIATIONS: ReadonlySet<string> = wordSet('dr etc jr mr mrs ms mt mx prof sr st vs');
 
-function words(label: string): Word[] {
-  return (
-    label
-      // A bracket, a dash or an ellipsis ends a clause as a comma does ("Tells why (he was ...)",
-      // "Tells why - the dog ...", "Tells why … he ..."; round-4 check R3-RL-1).
-      .replace(/\s*(?:[()[\]{}—–…]|\.{2,})+\s*|\s+-+\s+/gu, ', ')
-      // Words joined by a hyphen, an underscore or a dot are read one by one ("It-was-raining",
-      // "That.was.scary"; round-4 check R3-RL-4).
-      .replace(/(?<=\p{L})[-_‐‑.](?=\p{L})/gu, ' ')
-      .split(' ')
-      .map((raw) => {
-        const core = raw.replace(/[’‘]/gu, "'").replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, '');
-        const text = withoutMarks(core).toLocaleLowerCase('en-US');
-        const fullStop = /[.!?]$/u.test(raw) && !ABBREVIATIONS.has(text) && text.length > 1;
-        return {
-          text,
-          capitalised: /^\p{Lu}/u.test(core),
-          endsClause: fullStop || /[,;:]$/u.test(raw),
-        };
-      })
-      .filter((w) => w.text.length > 0)
-  );
+/**
+ * The words of a label. A bracket, a dash or an ellipsis ends a clause as a comma does, and words
+ * joined by a hyphen, an underscore or a dot are read one by one. With `split`, so are words joined
+ * by "/", ",", ";", "+", "·", "|", "~" or "*", each read as a clause end, and the words of a
+ * CamelCase run; without it, such a joined run is one word (isCriterionShaped reads both).
+ */
+function words(label: string, split: boolean): Word[] {
+  let spaced = label
+    // "Tells why (he was ...)", "Tells why - the dog ...", "Tells why … he ..." (round-4 check
+    // R3-RL-1).
+    .replace(/\s*(?:[()[\]{}—–…]|\.{2,})+\s*|\s+-+\s+/gu, ', ')
+    // "It-was-raining", "That.was.scary" (round-4 check R3-RL-4).
+    .replace(/(?<=\p{L})[-_‐‑.](?=\p{L})/gu, ' ');
+  if (split) {
+    // "It/was/raining", "Tells why/he was scared", "ItWasRaining" (round-5 check R4-RL-E).
+    spaced = spaced
+      .replace(/(?<=\p{L})[/,;+·|~*](?=\p{L})/gu, ', ')
+      .replace(/(?<=\p{Ll})(?=\p{Lu})/gu, ' ');
+  }
+  return spaced
+    .split(' ')
+    .map((raw) => {
+      const core = raw.replace(/[’‘]/gu, "'").replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, '');
+      const text = withoutMarks(core).toLocaleLowerCase('en-US');
+      const fullStop = /[.!?]$/u.test(raw) && !ABBREVIATIONS.has(text) && text.length > 1;
+      return {
+        text,
+        capitalised: /^\p{Lu}/u.test(core),
+        endsClause: fullStop || /[,;:]$/u.test(raw),
+      };
+    })
+    .filter((w) => w.text.length > 0);
 }
 
 /** A regular past form in "-ed" ("scared", "jumped"; not "need" or "speed"). */
@@ -571,9 +606,7 @@ function questionAfterVerb(list: readonly Word[], i: number, lead: number | null
     const between = list.slice(lead, start - 1);
     return between.every((w) => !w.endsClause && !CLAUSE_WORDS.has(w.text));
   }
-  return (
-    !before.endsClause && (isAdverb(before.text) || before.text === 'out') && verbAt(start - 2)
-  );
+  return !before.endsClause && (isAdverb(before) || before.text === 'out') && verbAt(start - 2);
 }
 
 /**
@@ -585,7 +618,7 @@ function presentVerbAt(list: readonly Word[], k: number): boolean {
   const word = list[k]?.text;
   if (word === undefined) return false;
   if (PRESENT_FINITE.has(word) || THIRD_PERSON_VERBS.has(word)) return true;
-  if (!/^\p{L}{2,}$/u.test(word) || /ing$/u.test(word) || isAdverb(word)) return false;
+  if (!/^\p{L}{2,}$/u.test(word) || /ing$/u.test(word) || lyWord(word)) return false;
   if (FINITE_VERBS.has(word) || regularPast(word) || CLAUSE_WORDS.has(word)) return false;
   if (NOT_BEFORE_RELATIVE.has(word) || OBJECT_STARTS.has(word) || word === 'it') return false;
   if (!/[^su]s$/u.test(word)) return true;
@@ -598,7 +631,7 @@ function presentVerbAt(list: readonly Word[], k: number): boolean {
     OBJECT_STARTS.has(next) ||
     DETERMINERS.has(next) ||
     PREPOSITIONS.has(next) ||
-    isAdverb(next) ||
+    isAdverb(list[k + 1]) ||
     /[^su]s$/u.test(next)
   );
 }
@@ -624,7 +657,7 @@ function clauseIdiom(list: readonly Word[], i: number, lead: number | null): boo
     return (word !== 'which' && word !== 'whose') || nounNext;
   }
   if ((word === 'that' || word === 'who') && relativeThat(list, i)) {
-    return presentVerbAt(list, isAdverb(next) ? i + 2 : i + 1);
+    return presentVerbAt(list, isAdverb(list[i + 1]) ? i + 2 : i + 1);
   }
   if (prev.endsClause || next === undefined) return false;
   if (/^(?:if|when|whenever|where|wherever)$/u.test(word) && AS_NEEDED.has(next)) return true;
@@ -693,7 +726,7 @@ function afterLeadingVerb(list: readonly Word[]): number | null {
   if (first === undefined) return null;
   if (first === "doesn't" && list.length > 1) return 2;
   if (first === 'does' && list[1]?.text === 'not' && list.length > 2) return 3;
-  const at = isAdverb(first) ? 1 : 0;
+  const at = isAdverb(list[0]) ? 1 : 0;
   return THIRD_PERSON_VERBS.has(list[at]?.text ?? '') ? at + 1 : null;
 }
 
@@ -712,18 +745,27 @@ function afterLeadingVerb(list: readonly Word[]): number | null {
  * the last word; anywhere else, and straight after any preposition, it drops the label. Not
  * criteria either: a label that opens with a clause word, "after", "as", "like", "once", "there",
  * "to", ... after up to two lead words ("Probably when ..."), a lead verb followed straight away by
- * "that" or a subordinator ("Writes because of ..."), an instruction ("Write a topic sentence",
- * "Neatly write ..."), a capitalised sentence start after the first word ("Write The lamp ..."),
- * and any letter that is not a Latin letter over a-z (homoglyphs such as a Cyrillic "а", or another
- * script), since the word lists are English. A full stop, bracket, dash or ellipsis ends a clause
- * as a comma does, and words joined by a hyphen, underscore or dot are read one by one. This fails
- * closed: a dropped label shows no row.
+ * "that" or a subordinator ("Writes because of ..."), an instruction after up to two lead words or
+ * "now"/"first"/"next"/"then" ("Write a topic sentence", "Just neatly write ...", "First, write
+ * ..."), a capitalised sentence start after the first word ("Write The lamp ..."), and any letter
+ * that is not a Latin letter over a-z (homoglyphs such as a Cyrillic "а", or another script), since
+ * the word lists are English. A full stop, bracket, dash or ellipsis ends a clause as a comma does;
+ * words joined by a hyphen, underscore or dot are read one by one, words joined by "/", ",", ";",
+ * "+", "·", "|", "~" or "*" are read one by one with a clause end between them, and a CamelCase run
+ * is read word by word ("ItWasRaining"); such a label is also read with the joined run as one word,
+ * and dropped if either reading drops it ("TellsWhy it was scary", "Tells how/why he ran home"). A
+ * capitalised "-ly" word first is read both as a name ("Sally explains why she was sad") and as a
+ * lead adverb ("Carefully writes after the loud thunder"), and the label is dropped if either
+ * reading drops it. This fails closed: a dropped label shows no row (round-5 checks R4-RL-E,
+ * R4-RL-F; round-5 recheck R5-RL-CHK-B, R5-RL-CHK-C).
  *
- * Heuristic limits (round 4, measured with synthetic labels):
- * - Kept: the checker's 95 realistic K-8 criteria 92 (the 3 dropped are statements); a further
- *   132 criteria across the six subjects 128; the round-3 checker's 83 math, science, social
- *   studies and reading criteria 69 (79 in round 2, 73 in round 3); 124 criteria that use a
- *   clause word in an idiom, all 124.
+ * Heuristic limits (round 5, measured with synthetic labels):
+ * - Kept: the checker's 95 realistic K-8 criteria 92 (the 3 dropped are statements); the fixer's
+ *   132 criteria across the six subjects 128; the round-3 checker's 83 math,
+ *   science, social studies and reading criteria 69 (79 in round 2, 73 in round 3); 124 criteria
+ *   that use a clause word in an idiom, all 124 (these 124 were written next to the code by the
+ *   round-4 fixer, so they are not an independent measure); 30 criteria that open with a
+ *   capitalised "-ly" adverb 22 (written by the round-5 fixer).
  * - Dropped although legitimate (the fail-closed cost): statements ("Spelling is mostly correct");
  *   "that" straight after a lead verb ("Checks that the answer makes sense", "Shows that both
  *   sides are equal", "Explains that plants need sunlight"; 8 of the 83); a relative clause in the
@@ -733,8 +775,11 @@ function afterLeadingVerb(list: readonly Word[]): number | null {
  *   fractions work", "Asks questions about what was read", "Explains why the character made that
  *   choice", "Uses details so the reader understands"); a finite verb after a verb that asks no
  *   question ("Makes sure the answer is labeled"); a label opening with "Like" ("Like terms
- *   combined"); a letter outside a-z ("Uses π to find the circumference", "Uses µ correctly"); and
- *   first person ("Uses a capital I for yourself").
+ *   combined"); a letter outside a-z ("Uses π to find the circumference", "Uses µ correctly");
+ *   first person ("Uses a capital I for yourself"); a capitalised "-ly" adverb first, read as a
+ *   name, with a clause or more than six words after it ("Clearly explains why the plant grew",
+ *   "Neatly labels each part of the diagram"; 8 of the 30); and a CamelCase name that reads as a
+ *   pronoun ("Uses YouTube safely").
  * - Still shown (the answer guard against the key and the protected example wording is then the
  *   only protection): of the round-3 checker's 125 completions and sentences 25, and of the
  *   round-2 checker's 33 completions 7. They are a sentence whose verb is a regular present, or a
@@ -743,13 +788,25 @@ function afterLeadingVerb(list: readonly Word[]): number | null {
  *   listed ("The dog found a bone", "The girl felt happy", "Mom left early"); a noun, gerund or
  *   adjective completion with no clause word ("Due to the loud thunder", "Scared of the loud
  *   thunder", "Swimming at the lake with friends"); a clause inside an idiom ("Tells why it was
- *   scary", "Writes the lamp that is bright"); and a digit written for a letter ("Dogs 4re loyal").
+ *   scary", "Writes the lamp that is bright"); a digit written for a letter ("Dogs 4re loyal"); a
+ *   regular present after a name in "-ly" ("Holly writes the lamp glows"); a name not in "-ly"
+ *   before a verb and a subordinator, as on HEAD before round 5 ("Sam writes after the storm");
+ *   a joiner with a space on either side ("Tells why / he was scared", "Tells why -he was
+ *   scared", "Tells why = he was scared"); and an instruction behind "very" or "needs to" ("Very
+ *   carefully write the lamp glows", "Needs to write the lamp glows").
  */
 export function isCriterionShaped(label: string): boolean {
   // The word lists are English in Latin letters: a letter from another script or a Latin look-alike
   // with no a-z base ("а" Cyrillic, "ɑ", "ı") could spell a listed word the check would not see.
   if (/\p{L}/u.test(withoutMarks(label).replace(/[A-Za-z]/g, ''))) return false;
-  const list = words(label);
+  // Joined words are read both ways, and the label is dropped if either reading drops it
+  // ("TellsWhy it was scary" split reads as an idiom, joined as a clause; round-5 recheck
+  // R5-RL-CHK-C).
+  return shapedWords(words(label, true)) && shapedWords(words(label, false));
+}
+
+/** isCriterionShaped for one reading of a label's words. */
+function shapedWords(list: readonly Word[]): boolean {
   if (list.length === 0) return false;
   const rest = list.slice(1).filter((w) => /^\p{L}{4,}/u.test(w.text));
   const titleCase = rest.length > 0 && rest.every((w) => w.capitalised);
@@ -769,13 +826,30 @@ export function isCriterionShaped(label: string): boolean {
   const opener = list[first];
   if (opener !== undefined && CLAUSE_OPENERS.has(opener.text)) return false;
   const lead = afterLeadingVerb(list);
+  // A capitalised "-ly" word before a lead verb is read both as a name (the noun-phrase rules
+  // below) and as a lead adverb, and the label is dropped if either reading drops it ("Carefully
+  // writes after the loud thunder", "Sally writes after the storm"; round-5 recheck R5-RL-CHK-B).
+  // The adverb reading's stray-word check needs no call of its own: a lead only allows more idioms
+  // and named words, so strayClauseWord(list, null) below drops whatever it would.
+  if (
+    lead === null &&
+    list[0]!.capitalised &&
+    lyWord(list[0]!.text) &&
+    THIRD_PERSON_VERBS.has(list[1]?.text ?? '') &&
+    clauseAfterLead(list, 2)
+  )
+    return false;
   if (strayClauseWord(list, lead)) return false;
   if (lead !== null) return !clauseAfterLead(list, lead);
-  const head = isLeadWord(list[0]!.text) ? list[1] : list[0];
-  if (head !== undefined && INSTRUCTION_VERBS.has(head.text)) {
-    const next = list[list.indexOf(head) + 1]?.text;
-    if (next !== 'of') return false;
-  }
+  // An instruction, after the same lead words as an opener or "now"/"first"/"next"/"then" ("Just
+  // neatly write ...", "Now write ...", "First, write ..."; round-5 check R4-RL-F).
+  let verb = 0;
+  while (
+    verb < 2 &&
+    (isLeadWord(list[verb]?.text) || INSTRUCTION_LEADS.has(list[verb]?.text ?? ''))
+  )
+    verb += 1;
+  if (INSTRUCTION_VERBS.has(list[verb]?.text ?? '') && list[verb + 1]?.text !== 'of') return false;
   // A noun phrase holds no embedded question of its own ("The day when she ran home").
   return (
     list.length <= NOUN_PHRASE_MAX_WORDS && !makesClause(list, false) && !regularPastAfterNoun(list)
@@ -791,65 +865,66 @@ const EXAMPLE_ABBREVIATION = String.raw`(?<!\p{L})(?:Mr|Mrs|Ms|Mx|Dr|Prof|St|Mt|
 /** The example after its cue: the rest of the sentence, after an optional line break. */
 const EXAMPLE_TEXT = String.raw`[ \t]*\n?[ \t]*(?<text>(?:${EXAMPLE_ABBREVIATION}|[^\n.!?]){3,400})`;
 
-/** A colon, a dash (a hyphen only with a space after it) or an arrow after a cue. */
-const CUE_MARK = String.raw`[ \t]*(?:[:：]|[—–→]|-(?=[ \t]))`;
+/**
+ * A colon, a dash (a hyphen with a space before or after it), an arrow ("→", "=>", "->"), "=" or a
+ * closing bracket ("Example 1)") after a cue (round-5 check R4-RL-D).
+ */
+const CUE_MARK = String.raw`[ \t]*(?:[-=]>|[:：=)]|[—–→]|-(?=[ \t])|(?<=[ \t])-)`;
 
 /** Up to two words, numbers ("1", "#1") or a bracketed note between a label word and its mark. */
 const CUE_EXTRA = String.raw`(?<extra>(?:[ \t]+(?:[\p{L}'’]+|#?\p{N}{1,3}|\([^)\n]{1,40}\))){0,2}?)`;
 
 /**
  * Words after a label word that make it a description of what to accept, not an example
- * ("Answers will vary - look for ...", "Response should include: ...").
+ * ("Answers will vary - look for ...", "Response should include: ..."). "include" and "contain"
+ * are not among them: "Examples include: ..." gives examples (round-5 check R4-RL-B).
  */
-const NOT_EXAMPLE_EXTRA =
-  /(?<!\p{L})(?:vary|varies|should|must|needs?|includes?|contains?)(?!\p{L})/iu;
+const NOT_EXAMPLE_EXTRA = /(?<!\p{L})(?:vary|varies|should|must|needs?)(?!\p{L})/iu;
 
 /**
  * The start of a description of an answer rather than an example: "a sentence that uses glow",
- * "any complete sentence", "one that rhymes", or a criterion verb in lower case ("has a capital
- * letter", "uses glow as a verb").
+ * "any complete sentence", "one that rhymes". Wording that starts with a criterion verb in lower
+ * case is an example, not a description ("Sample answer: stays inside and sleeps."; round-5 check
+ * R4-RL-A): "A good sentence: has a capital letter and a period." is protected too, the fail-closed
+ * cost, and a row that copies it is dropped.
  */
 const DESCRIBED_ANSWER =
   /^(?:(?:a|an|any|one|some|each|every)[ \t]+(?:[\p{L}'’]+[ \t]+)?(?:sentences?|answers?|responses?|words?|phrases?|paragraphs?)|(?:one|something|anything)[ \t]+(?:that|which|with|about|using))(?!\p{L})/iu;
 
-function describesAnswer(text: string): boolean {
-  if (DESCRIBED_ANSWER.test(text)) return true;
-  const first = /^\p{Ll}[\p{L}'’]*/u.exec(text)?.[0];
-  return (
-    first !== undefined &&
-    (THIRD_PERSON_VERBS.has(first) || /^(?:is|are|should|must|needs)$/u.test(first))
-  );
-}
-
 interface ExampleCue {
   readonly pattern: RegExp;
-  /** Whether a match is example wording, given the source (round-4 check R3-RL-5). */
-  readonly accept: (match: RegExpMatchArray, source: string) => boolean;
+  /** Whether a match is example wording (round-4 check R3-RL-5). */
+  readonly accept: (match: RegExpMatchArray) => boolean;
 }
 
 /**
  * Where unquoted example wording starts in a parent-only solution or note (round-3 check
- * R2-LJA-F1-example-span-gaps; round-4 check R3-RL-5):
- * - after a label word, up to two more words, numbers or a bracketed note and a colon, dash or
- *   arrow ("A good answer:", "Example 1:", "Sample answer #1:", "Model answer (for the parent):",
- *   "Example —", "Ideal response →", "Answer key:", "Sample response:" and a new line), but not
- *   "Answers will vary -" or "Response should include:";
+ * R2-LJA-F1-example-span-gaps; round-4 check R3-RL-5; round-5 checks R4-RL-A..D):
+ * - after a label word, up to two more words, numbers or a bracketed note and a colon, dash, arrow,
+ *   "=" or closing bracket ("A good answer:", "Example 1:", "Example 1)", "Sample answer #1:",
+ *   "Model answer (for the parent):", "Example —", "Example 1 -The", "Ideal response →",
+ *   "Example 1 =>", "Answer key:", "Sample response:" and a new line, "Examples include:"), but not
+ *   "Answers will vary -" or "Response should include:" (vary/should/must/need);
  * - after "write" or "say" behind another word ("They could write:"; a note that starts
  *   "Writes: ..." describes the criterion);
  * - after a word of praise and "sentence" or "paragraph" ("A strong sentence -", "Possible
  *   sentence:"), not "Topic sentence:", "First sentence -" or "The sentence -";
- * - after "example is", "example would be" and the like ("A good example is ...", "An example
- *   would be ..."), when at least three words follow;
- * - after "for example" or "for instance"; after "e.g." or "i.e." as well, except straight after
- *   a word in "-s" (and a comma) with no colon or dash of their own, where they list kinds of
- *   things ("sentence parts, e.g. a subject and a verb");
+ * - after "example", "answer", "response" or "sentence" and "is", "would be" and the like ("A good
+ *   example is ...", "A good answer would be ...", "The answer could be ...", "A possible sentence
+ *   is ..."), when at least three words follow;
+ * - after "for example", "for instance", "e.g.", "i.e." or "Ex." ("Accept complete sentences,
+ *   e.g. the lamp glows at night"; a list of kinds such as "sentence parts, e.g. a subject and a
+ *   verb" is protected too, the fail-closed cost);
  * - after "such as", "something like" or "like this" with a colon or dash.
  * Wording that describes an answer instead of giving one is not an example: "a sentence that uses
- * glow", "any complete sentence", "has a capital letter" (describesAnswer).
- * Not found (measured in round 4): an instruction or other opener before a colon ("Try: ...",
- * "Here is one: ..."), a label word alone on its line ("Answer" and a new line), and "could write"
- * or "might say" with no colon or dash. A label copying such an example is then dropped only by its
- * shape (isCriterionShaped) or by the answer guard against the key and any quoted wording.
+ * glow", "any complete sentence", "one that rhymes" (DESCRIBED_ANSWER). Wording that starts with a
+ * lower-case criterion verb is an example ("Sample answer: stays inside and sleeps.").
+ * Not found (measured in round 5): an instruction or other opener before a colon ("Try: ...",
+ * "Here is one: ..."), a label word alone on its line ("Answer" and a new line), "could write" or
+ * "might say" with no mark, a comma or semicolon after a label word ("Example 1, The lamp ...",
+ * "Example 1; ..."), and "Examples include the lamp ..." with no mark. A label copying such an
+ * example is then dropped only by its shape (isCriterionShaped) or by the answer guard against the
+ * key and any quoted wording.
  */
 const EXAMPLE_CUES: readonly ExampleCue[] = [
   {
@@ -864,7 +939,11 @@ const EXAMPLE_CUES: readonly ExampleCue[] = [
   },
   {
     pattern: new RegExp(
-      String.raw`(?<=\p{L}[ \t]+)(?:writes?|says?|wrote|said)${CUE_MARK}${EXAMPLE_TEXT}`,
+      // The whitespace is consumed from the first blank after a letter: only that position passes
+      // the one-character lookbehind, so a run of any length is scanned once (linear). An
+      // unbounded lookbehind rescanned the run at every position (R4-RL-C); a bounded one missed
+      // a cue after more than 20 blanks (round-5 recheck R5F-RL-1).
+      String.raw`(?<=\p{L})[ \t]+(?:writes?|says?|wrote|said)${CUE_MARK}${EXAMPLE_TEXT}`,
       'giu',
     ),
     accept: () => true,
@@ -880,7 +959,7 @@ const EXAMPLE_CUES: readonly ExampleCue[] = [
   },
   {
     pattern: new RegExp(
-      String.raw`(?<![\p{L}\p{N}])examples?(?:[ \t]+(?:sentences?|answers?|responses?))?[ \t]+(?:(?:would|could|might|may|will|can)[ \t]+be|is|are|was|were)(?:[ \t]*[:：—–])?` +
+      String.raw`(?<![\p{L}\p{N}])(?:examples?|answers?|responses?|sentences?)(?:[ \t]+(?:sentences?|answers?|responses?))?[ \t]+(?:(?:would|could|might|may|will|can)[ \t]+be|is|are|was|were)(?:[ \t]*[:：—–])?` +
         EXAMPLE_TEXT,
       'giu',
     ),
@@ -888,17 +967,11 @@ const EXAMPLE_CUES: readonly ExampleCue[] = [
   },
   {
     pattern: new RegExp(
-      String.raw`(?<![\p{L}\p{N}])(?:for example|for instance|(?<abbr>e\.g\.|e\.g|eg|i\.e\.|i\.e|ie))(?![\p{L}\p{N}])(?<mark>[ \t]*[,:：—–]?)` +
+      String.raw`(?<![\p{L}\p{N}])(?:for example|for instance|e\.g\.|e\.g|eg|i\.e\.|i\.e|ie|ex\.)(?![\p{L}\p{N}])[ \t]*[,:：—–]?` +
         EXAMPLE_TEXT,
       'giu',
     ),
-    accept: (match, source) => {
-      if (match.groups?.abbr === undefined || /[:：—–]/u.test(match.groups.mark ?? '')) return true;
-      const index = match.index ?? 0;
-      const before = source.slice(Math.max(0, index - 80), index).replace(/[ \t]+$/u, '');
-      if (before === '' || /[\n.!?;:：([—–-]$/u.test(before)) return true;
-      return !/\p{L}{2,}[^su\s]s,?$/iu.test(before);
-    },
+    accept: () => true,
   },
   {
     pattern: new RegExp(
@@ -915,13 +988,21 @@ const EXAMPLE_CUES: readonly ExampleCue[] = [
  * R2-LJA-F1-example-span-gaps, round-4 check R3-RL-5; the cues are listed at EXAMPLE_CUES). What a
  * grown-up is told to look for ("Look for: a capital letter", "Answers will vary - look for ...")
  * and a plain list after "such as" ("words such as first, next and last") are not examples.
+ * Each cue is tried at every start, not only after its previous match: a match earlier in a
+ * sentence ("A good answer is a sentence that uses glow; an example is the lamp glows at night")
+ * runs to the end of the sentence, and a later cue inside it must still give its own span (round-5
+ * recheck R5-RL-CHK-A).
  */
 export function exampleWordingSpans(source: string): string[] {
   const spans = new Set<string>();
   for (const cue of EXAMPLE_CUES) {
-    for (const match of source.matchAll(cue.pattern)) {
+    const pattern = new RegExp(cue.pattern.source, cue.pattern.flags);
+    for (let match = pattern.exec(source); match !== null; match = pattern.exec(source)) {
+      pattern.lastIndex = match.index + 1;
       const span = (match.groups?.text ?? '').replace(/^[\s"“”„«»'‘’([]+|[\s"“”„«»'‘’)\]]+$/gu, '');
-      if (span.length > 0 && cue.accept(match, source) && !describesAnswer(span)) spans.add(span);
+      if (span.length > 0 && cue.accept(match) && !DESCRIBED_ANSWER.test(span)) {
+        spans.add(span);
+      }
     }
   }
   return [...spans];
@@ -947,6 +1028,130 @@ export function rowStatesNoAnswer(body: string, answers: readonly ProtectedAnswe
         options: { evaluateExpressions: true },
       }).decision === 'release',
   );
+}
+
+// ---- child safety of a criterion (round-5 check R4-RL-OOA) -----------------------------------
+
+/**
+ * Pronouns the child reads as their own once a label becomes "Next time, work on: ...": the
+ * imperative reading and the first-person reading of each.
+ */
+const OWN_PRONOUNS: ReadonlyMap<string, readonly [string, string]> = new Map<
+  string,
+  readonly [string, string]
+>([
+  ...['himself', 'herself', 'themselves', 'themself'].map(
+    (word) => [word, ['yourself', 'myself']] as const,
+  ),
+  ...['his', 'her', 'their'].map((word) => [word, ['your', 'my']] as const),
+  ...['him', 'them'].map((word) => [word, ['you', 'me']] as const),
+]);
+
+/** Lead verbs whose imperative and first-person forms are irregular. */
+const IRREGULAR_LEADS: ReadonlyMap<string, readonly [string, string]> = new Map<
+  string,
+  readonly [string, string]
+>([
+  ['is', ['be', 'am']],
+  ['was', ['be', 'was']],
+  ['has', ['have', 'have']],
+  ['does', ['do', 'do']],
+  ["doesn't", ["don't", "don't"]],
+]);
+
+/** The base form of a verb in the third person ("hurts" -> "hurt", "tries" -> "try"). */
+function baseForm(verb: string): string {
+  if (/^\p{L}{1,2}ies$/u.test(verb)) return verb.slice(0, -1); // dies, lies, ties
+  if (/ies$/u.test(verb)) return `${verb.slice(0, -3)}y`; // tries, carries
+  if (/(?:ss|sh|ch|x|zz|o)es$/u.test(verb)) return verb.slice(0, -2); // touches, goes
+  if (/[^su]s$/u.test(verb)) return verb.slice(0, -1); // hurts, keeps, uses
+  return verb;
+}
+
+/**
+ * The readings of a criterion the safety screen sees. The fixed wording "Next time, work on:
+ * Keeps this a secret" asks the child to do what the label names, while the screen's secrecy,
+ * self-harm and contact rules read a request or a statement, not a third-person label. So the
+ * label is screened as written, in the imperative (the lead verb in its base form, "Doesn't" as
+ * "Don't" and "Does not" as "Do not", "himself"/"herself"/"themselves" as "yourself",
+ * "his"/"her"/"their" as "your", "him"/"them" as "you": "Keep this a secret", "Hurt yourself") and
+ * in the first person ("I keep this a secret", "I hurt myself", "I am hit ..."). The lead verb
+ * comes after up to two lead words ("Never tells parents": "Never tell parents").
+ */
+function safetyReadings(text: string): string[] {
+  const tokens = text.split(' ');
+  const coreOf = (token: string | undefined) =>
+    (token ?? '')
+      .replace(/^[^\p{L}']+|[^\p{L}']+$/gu, '')
+      .replace(/’/gu, "'")
+      .toLowerCase();
+  let at = 0;
+  while (at < 2 && at < tokens.length - 1 && isLeadWord(coreOf(tokens[at]))) at += 1;
+  const leads = tokens.slice(0, at).map((t) => t.toLowerCase());
+  const verb = coreOf(tokens[at]);
+  const rest = tokens.slice(at + 1);
+  const [imperative, firstPerson] = IRREGULAR_LEADS.get(verb) ?? [baseForm(verb), baseForm(verb)];
+  const own = (reading: 0 | 1) =>
+    rest.map((token) =>
+      token.replace(/\p{L}+/u, (word) => OWN_PRONOUNS.get(word.toLowerCase())?.[reading] ?? word),
+    );
+  return [
+    ...new Set([
+      text,
+      [...leads, imperative, ...own(0)].join(' '),
+      ['I', ...leads, firstPerson, ...own(1)].join(' '),
+    ]),
+  ];
+}
+
+/**
+ * Topic words a writing criterion does not need and a child must not be steered to (round-5 check
+ * R4-RL-OOA; lead decision: a short explicit list, fail closed): hurt, cut (before a body word, a
+ * "-self" word, a punctuation mark or the end), kill, die, dead, suicide, secret, hide ... from, strangers, address,
+ * photos or pictures of, touch, hit ... at home, bruise, abuse, weapon and online chat. A label
+ * holding one is dropped whatever the screen says; a criterion that needs such a word ("Explains
+ * why the plant might die") is the fail-closed cost.
+ */
+const RISK_TOPIC_WORDS = new RegExp(
+  String.raw`(?<![\p{L}\p{N}])(?:` +
+    [
+      String.raw`hurt(?:s|ing)?`,
+      String.raw`cut(?:s|ting)?(?=(?:[ \t]+(?:a|an|his|her|its|my|their|the|your|own))*[ \t]+(?:arms?|wrists?|legs?|skin|body|fingers?|hands?|face|thighs?|stomach|neck|self|yourself|himself|herself|themselves|themself|myself|oneself)(?![\p{L}\p{N}])|[ \t]*(?:[^\p{L}\p{N}\s]|$))`,
+      String.raw`kill(?:s|ed|ing)?`,
+      String.raw`die|dies|died|dying|dead`,
+      String.raw`suicid(?:e|es|al)`,
+      String.raw`secrets?|secretly`,
+      String.raw`hid(?:e|es|ing|den)?(?:[ \t]+[\p{L}'’-]+){0,3}?[ \t]+from`,
+      String.raw`strangers?`,
+      String.raw`address`,
+      String.raw`(?:photos?|pictures?)[ \t]+of`,
+      String.raw`touch(?:es|ed|ing)?`,
+      String.raw`hit(?:s|ting)?(?:[ \t]+[\p{L}'’-]+){0,3}?[ \t]+at[ \t]+home`,
+      String.raw`bruis(?:e|es|ed|ing)`,
+      String.raw`abus(?:e|es|ed|ing|ive)`,
+      String.raw`weapons?`,
+      String.raw`online[ \t]+chats?|chat(?:s|ted|ting)?[ \t]+online`,
+    ].join('|') +
+    String.raw`)(?![\p{L}\p{N}])`,
+  'iu',
+);
+
+/**
+ * The payload-free code of a criterion that must not reach the child, or null: a severe screen of
+ * any of its readings (safetyReadings) gives that category ("SAFETY_SECRECY"), and a risk topic
+ * word (RISK_TOPIC_WORDS) gives "SAFETY_RISK_TOPIC". The raw criterion is screened, before it is
+ * judged as plain text, so a first-person, long or quoted criterion is reported too.
+ */
+function criterionSafetyCode(criterion: string, options: RubricSafetyOptions): string | null {
+  const text = criterion.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  for (const reading of safetyReadings(text)) {
+    const screen = screenModelOutput([reading], {
+      ageBand: options.ageBand ?? null,
+      context: options.context ?? {},
+    });
+    if (screen.level === 'severe') return `SAFETY_${screen.categories[0]!.toUpperCase()}`;
+  }
+  return RISK_TOPIC_WORDS.test(withoutMarks(text)) ? 'SAFETY_RISK_TOPIC' : null;
 }
 
 export interface RubricSafetyOptions {
@@ -979,20 +1184,17 @@ export function childRubricFeedback(
   for (const item of rubric as unknown[]) {
     if (item === null || typeof item !== 'object') continue;
     const { criterion, met } = item as { criterion?: unknown; met?: unknown };
-    if (typeof met !== 'boolean') continue;
-    const label = plainLabel(criterion);
-    if (label === null) continue;
-    // The safety screen sees every plain label before its shape is judged, so a severe label is
-    // always reported, even one that would also be dropped as not a criterion.
-    const screen = screenModelOutput([label], {
-      ageBand: options.ageBand ?? null,
-      context: options.context ?? {},
-    });
-    if (screen.level === 'severe') {
-      options.onSafetyReject?.(`SAFETY_${screen.categories[0]!.toUpperCase()}`);
+    if (typeof met !== 'boolean' || typeof criterion !== 'string') continue;
+    // The safety screen sees every criterion as the model wrote it, before it is judged as plain
+    // text or as a criterion, so a severe criterion is always reported, even one that would also be
+    // dropped for its length, first person or shape (round-5 check R4-RL-OOA).
+    const code = criterionSafetyCode(criterion, options);
+    if (code !== null) {
+      options.onSafetyReject?.(code);
       continue;
     }
-    if (!isCriterionShaped(label)) continue;
+    const label = plainLabel(criterion);
+    if (label === null || !isCriterionShaped(label)) continue;
     const key = label.toLocaleLowerCase('en-US');
     if (seen.has(key)) continue;
     const row: RubricFeedbackRow = met

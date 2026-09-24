@@ -292,6 +292,119 @@ describe('childCriterionLabel', () => {
     }
   });
 
+  // Round-5 check (R4-RL-G): these round-4 rules survived a mutation because every tested case was
+  // also caught by another rule, or used "with".
+  it('pins the preposition rule for every preposition and clause word, and the two-word opener skip', () => {
+    for (const raw of [
+      // A clause word straight after a preposition, where it is also the last word or in an idiom.
+      'Writes about why',
+      'Stops at when needed',
+      // A subordinator that is not a clause word, after a preposition other than "with".
+      'Writes about before the storm',
+      'Ends on after the storm',
+      'Ends in once upon a time',
+      // An opener that is not a clause word, behind two lead words.
+      'Maybe just after the storm',
+      'Not just once upon a time',
+    ]) {
+      expect(childCriterionLabel(raw), raw).toBeNull();
+    }
+  });
+
+  // Round-5 check (R4-RL-E, R4-RL-F; lead decision: fail closed): a sentence joined by "/", ",",
+  // ";", "+", "·", "|", "~" or "*", or written in CamelCase, was read as one word; the instruction
+  // check skipped one lead word only and not "Now" or "First"; and a name in "-ly" ("Sally") was read
+  // as a lead adverb, so the sentence after it was judged as a criterion.
+  it('reads other joiners and CamelCase as word breaks, skips lead words before an instruction, and reads a capitalised "-ly" word as a name', () => {
+    for (const raw of [
+      'It/was/raining',
+      'The/dog/was/scared',
+      'Because/of/the/thunder',
+      'Tells why/he was scared',
+      'It,was,raining',
+      'It;was;raining',
+      'It+was+raining',
+      'It·was·raining',
+      'It|was|raining',
+      'It~was~raining',
+      'It*was*raining',
+      'ItWasRaining',
+      'WritesTheLampIsBright',
+      'Just neatly write the lamp glows',
+      'Maybe just write the lamp glows',
+      'Now write the lamp glows',
+      'First, write the lamp glows',
+      'Next write the lamp glows',
+      'Then write the lamp glows',
+      'Sally explains why she was sad',
+      'Emily tells how she hid',
+      'Billy explains why he ran home',
+      'Molly describes where she was hiding',
+      'Kelly shows how the dog hid',
+      'Sally explains why the dog was scared',
+      // The fail-closed cost: a criterion that opens with a capitalised "-ly" adverb is judged as a
+      // noun phrase, so it may hold no clause and at most six words.
+      'Clearly explains why the plant grew',
+      'Neatly labels each part of the diagram',
+    ]) {
+      expect(childCriterionLabel(raw), raw).toBeNull();
+    }
+    for (const label of [
+      'Uses he/she correctly',
+      'Uses and/or correctly',
+      'Tells who/what happened',
+      'Clearly explains the reason',
+      'Uses a capital A at the start',
+    ]) {
+      expect(childCriterionLabel(label), label).toBe(label);
+    }
+  });
+
+  // Round-5 recheck (R5-RL-CHK-B, R5-RL-CHK-C; lead decision: fail closed): reading a capitalised
+  // "-ly" word as a name moved "Carefully writes after the loud thunder" from the lead-verb rules
+  // to the noun-phrase rules, which have no check for a subordinator or "that" after the verb; and
+  // splitting joined words let through completions that only their joined reading dropped
+  // ("TellsWhy it was scary" reads as the idiom "Tells why it was scary"). A label is now dropped
+  // when either reading drops it.
+  it('drops a label that either reading of a capitalised "-ly" word or of joined words drops', () => {
+    for (const raw of [
+      // A capitalised "-ly" word read both as a lead adverb and as a name.
+      'Carefully writes after the loud thunder',
+      'Clearly writes before the storm hit',
+      'Neatly writes once upon a time',
+      'Clearly writes that is bright',
+      'Correctly finishes after the long storm',
+      'Quickly writes cause it rained',
+      'Clearly shows that is correct',
+      'Sally writes after the storm',
+      'Holly writes before the bell',
+      // Joined words read both joined and split.
+      'TellsWhy it was scary',
+      'TellsWhy + he was scared',
+      'VeryCarefully write the lamp glows',
+      'Completes it withScared of thunder',
+      'ExplainsWhy she was sad',
+      'DescribesWhere she was hiding',
+      'Tells how/why he ran home',
+      'Writes The catSleeps All Day',
+      'Explains who/why she was sad',
+    ]) {
+      expect(childCriterionLabel(raw), raw).toBeNull();
+    }
+    for (const label of [
+      'Clearly explains the reason',
+      'Carefully writes the date',
+      // Only a capitalised "-ly" word is read both ways, not any capitalised first word.
+      'Graph shows before and after',
+      'Uses he/she correctly',
+      'Uses and/or correctly',
+      'Tells who/what happened',
+      'Compares x/y ratios',
+    ]) {
+      expect(childCriterionLabel(label), label).toBe(label);
+    }
+  });
+
   // Round-4 check (R3-RL-1 fix c, R3-RL-4): only "," and ";" ended a clause, and words were split
   // on spaces only, so a second sentence after "why." or a sentence written with hyphens was shown.
   it('reads a full stop, bracket, dash or ellipsis as a clause end, and joined words one by one', () => {
@@ -325,7 +438,9 @@ describe('childCriterionLabel', () => {
       'Estimates how many are in the jar',
       'Figures out what the question asks',
       'Explains how and why the strategy works',
-      'Clearly explains why the plant grew',
+      // "Clearly explains why the plant grew" is dropped since round 5: a capitalised "-ly" word
+      // is read as a name (R4-RL-F), the fail-closed cost; the adverb after the verb is kept.
+      'Explains clearly why the plant grew',
       'Explains clearly how the pattern grows',
       'Uses a model to show how the fractions compare',
       'Knows when to double the final consonant',
@@ -452,16 +567,185 @@ describe('exampleWordingSpans', () => {
       'First sentence - starts with a capital letter and uses glow.',
       'Answers will vary - look for a capital letter, the word glow and a period.',
       'Answers will vary — any complete sentence that uses glow correctly.',
-      'Check for sentence parts, e.g. a subject and a verb.',
       'The sentence - uses the word glow correctly.',
       'Response should include: a capital letter and end punctuation.',
       'Writes: a complete sentence.',
       'Writes: correct end punctuation.',
-      'A good sentence: has a capital letter and a period.',
       'An example would be a sentence that uses glow as a verb.',
       'The example is correct.',
     ]) {
       expect(exampleWordingSpans(source), source).toEqual([]);
+    }
+  });
+
+  // Round-5 check (R4-RL-A, R4-RL-B; lead decision: fail closed): a lower-case criterion verb after
+  // the cue, "include"/"contain" after the label word, and a word in "-s" before "e.g." each made
+  // the wording count as a description, so a sample completion reached the child word for word.
+  it('protects a sample completion that starts with a lower-case verb, "Examples include:" and any wording after "e.g."', () => {
+    for (const [source, expected] of [
+      ['Sample answer: stays inside and sleeps.', 'stays inside and sleeps'],
+      ['Example: finds a bone in the yard.', 'finds a bone in the yard'],
+      ['Possible answer: hides under the bed.', 'hides under the bed'],
+      ['Example answer: goes to the park.', 'goes to the park'],
+      ['A good answer: makes a big mess.', 'makes a big mess'],
+      ['Sample response - keeps barking at the door.', 'keeps barking at the door'],
+      ['Example 1: opens the door and runs outside.', 'opens the door and runs outside'],
+      ['Example: looks for his ball.', 'looks for his ball'],
+      ['For example, reads a book by the fire.', 'reads a book by the fire'],
+      ['e.g. builds a fort with blankets.', 'builds a fort with blankets'],
+      ['Examples include: builds a fort with blankets.', 'builds a fort with blankets'],
+      ['Example: Stays inside and sleeps.', 'Stays inside and sleeps'],
+      ['Examples include: The lamp glows at night.', 'The lamp glows at night'],
+      ['Example includes: The lamp glows at night.', 'The lamp glows at night'],
+      ['Examples contain: The lamp glows at night.', 'The lamp glows at night'],
+      ['Example answers include: The lamp glows at night.', 'The lamp glows at night'],
+      ['Sample answers include - the lamp glows at night.', 'the lamp glows at night'],
+      ['Accept complete sentences, e.g. the lamp glows at night.', 'the lamp glows at night'],
+      ['Accept any answers, e.g. the lamp glows at night.', 'the lamp glows at night'],
+      ['Look for sentences like this, e.g. the lamp glows at night.', 'the lamp glows at night'],
+      [
+        'Students may write different things, e.g. the lamp glows at night.',
+        'the lamp glows at night',
+      ],
+      ['Answers vary by students e.g. the lamp glows at night.', 'the lamp glows at night'],
+      // The fail-closed cost: a description in these forms is protected too, and a row that copies
+      // it is dropped (round 4 left these two out).
+      ['A good sentence: has a capital letter and a period.', 'has a capital letter and a period'],
+      ['Check for sentence parts, e.g. a subject and a verb.', 'a subject and a verb'],
+    ] as const) {
+      expect(exampleWordingSpans(source), source).toEqual([expected]);
+    }
+    const spans = exampleWordingSpans('Sample answer: stays inside and sleeps.');
+    const leaks: string[] = [];
+    const rows = childRubricFeedback(
+      [
+        { criterion: 'Stays inside and sleeps', met: false, note: '' },
+        { criterion: 'Uses a capital letter', met: true, note: '' },
+      ],
+      {
+        protectedAnswers: spans.map((value) => ({ kind: 'text' as const, value })),
+        onLeak: (code) => leaks.push(code),
+      },
+    );
+    expect(rows).toEqual([
+      { kind: 'encouragement', body: 'You did this well: Uses a capital letter.' },
+    ]);
+    expect(leaks).toEqual(['ANSWER_LEAK']);
+  });
+
+  // Round-5 check (R4-RL-D): "answer", "response" or "sentence" with "is"/"would be", and a closing
+  // bracket, "Ex.", an arrow, "=" or a hyphen with no space after it were not cues.
+  it('finds "A good answer is", "The answer could be", "Example 1)", "Ex." and arrow or "=" marks', () => {
+    for (const [source, expected] of [
+      ['A good answer is the lamp glows at night.', 'the lamp glows at night'],
+      ['A good answer would be the lamp glows at night.', 'the lamp glows at night'],
+      ['A sample answer is the lamp glows at night.', 'the lamp glows at night'],
+      ['One possible answer is the lamp glows at night.', 'the lamp glows at night'],
+      ['A possible sentence is the lamp glows at night.', 'the lamp glows at night'],
+      ['A strong sentence would be the lamp glows at night.', 'the lamp glows at night'],
+      ['The answer could be the lamp glows at night.', 'the lamp glows at night'],
+      ['A model response is the lamp glows at night.', 'the lamp glows at night'],
+      ['Example 1) The lamp glows at night.', 'The lamp glows at night'],
+      ['Ex. The lamp glows at night.', 'The lamp glows at night'],
+      ['Example 1 -The lamp glows at night.', 'The lamp glows at night'],
+      ['Example 1 => The lamp glows at night.', 'The lamp glows at night'],
+      ['Example 1 -> The lamp glows at night.', 'The lamp glows at night'],
+      ['Example 1 = The lamp glows at night.', 'The lamp glows at night'],
+      ['They might say = the lamp glows at night.', 'the lamp glows at night'],
+    ] as const) {
+      expect(exampleWordingSpans(source), source).toEqual([expected]);
+    }
+    // A hyphen inside a word is no mark; fewer than three words after "is" are no example.
+    expect(exampleWordingSpans('Example-based questions help.')).toEqual([]);
+    expect(exampleWordingSpans('The answer is correct.')).toEqual([]);
+  });
+
+  // Round-5 recheck (R5-RL-CHK-A): the wider copula cue ("A good answer is ...", "Answers are
+  // ...") and the new marks ("=", ")", "->", "ex.") matched earlier in a sentence, and matches did
+  // not overlap, so the example that "an example is ..." gave was swallowed into a longer span that
+  // was dropped as a description or kept its lead-in; a label copying the example was shown. Every
+  // cue is now searched at every start, so an earlier match hides no later one.
+  it('finds an example after an earlier cue in the same sentence', () => {
+    const example = 'the lamp glows at night';
+    const sources: string[] = [
+      `A good answer is a sentence that uses glow; an example is ${example}.`,
+      `Any sentence is fine if it uses glow; an example would be ${example}.`,
+      `The answer is open-ended; a good example is ${example}.`,
+      `Answers are varied - an example is ${example}.`,
+      `A good answer is one that uses glow; an example is: ${example}.`,
+      `Example 1) Sample answer - ${example}.`,
+      `Answer = Model answer -> ${example}.`,
+      `Example 1) Model answer → ${example}.`,
+      `Answers = varied; example → ${example}.`,
+      `Accept any sentence (ex. one that uses glow as a verb, e.g. ${example}).`,
+      `A good sentence = a sentence using glow; possible sentence - ${example}.`,
+    ];
+    // The round-5 checker's grid: a lead-in holding the wider copula cue, a joiner, an older cue.
+    for (const leadIn of [
+      'The answer is open-ended',
+      'Answers are varied',
+      'A good answer is a sentence that uses glow',
+      'Any sentence is fine',
+      'The sentence is up to the student',
+      'Each response is different',
+      'Responses may be different',
+      'Answers can be short',
+      'A correct response is any sentence with glow as a verb',
+      'The best answer would be a full sentence',
+    ]) {
+      for (const joiner of ['; ', ', and ', ', but ', ' - ', ', so ']) {
+        for (const cue of [
+          'an example is',
+          'a good example is',
+          'one example would be',
+          'an example might be',
+        ]) {
+          sources.push(`${leadIn}${joiner}${cue} ${example}.`);
+        }
+      }
+    }
+    for (const source of sources) {
+      const spans = exampleWordingSpans(source);
+      expect(spans, source).toContain(example);
+      const leaks: string[] = [];
+      const rows = childRubricFeedback(
+        [{ criterion: 'Writes the lamp glows at night', met: false, note: '' }],
+        {
+          protectedAnswers: spans.map((value) => ({ kind: 'text' as const, value })),
+          onLeak: (code) => leaks.push(code),
+        },
+      );
+      expect(rows, source).toEqual([]);
+      expect(leaks, source).toEqual(['ANSWER_LEAK']);
+    }
+    expect(
+      exampleWordingSpans(
+        'Finish the sentence: When it rains, my dog ... A good answer is one that makes sense; an example is stays inside and sleeps.',
+      ),
+    ).toContain('stays inside and sleeps');
+  });
+
+  // Round-5 check (R4-RL-C): the "write"/"say" cue's lookbehind rescanned a run of spaces at every
+  // position, so a long run in a rubric note took seconds.
+  it('finds a cue in linear time on a long run of spaces', () => {
+    for (const gap of [' ', '\t']) {
+      const note = `a${gap.repeat(64_000)}b could write: the lamp glows at night.`;
+      const started = performance.now();
+      expect(exampleWordingSpans(note)).toEqual(['the lamp glows at night']);
+      expect(performance.now() - started).toBeLessThan(200);
+    }
+  });
+
+  // Round-5 recheck (R5F-RL-1): the bounded lookbehind ({1,20}) no longer found a cue after more
+  // than 20 blanks, which HEAD found; the cue must work at any gap and stay linear.
+  it('finds a "write"/"say" cue after any number of blanks, in linear time', () => {
+    for (const gap of [' ', '\t']) {
+      for (const n of [1, 21, 500, 64_000]) {
+        const note = `Students could${gap.repeat(n)}write: the lamp glows at night.`;
+        const started = performance.now();
+        expect(exampleWordingSpans(note)).toContain('the lamp glows at night');
+        expect(performance.now() - started).toBeLessThan(200);
+      }
     }
   });
 
@@ -527,6 +811,131 @@ describe('childRubricFeedback', () => {
       { kind: 'encouragement', body: 'You did this well: Uses capital letters.' },
     ]);
     expect(codes).toEqual(['SAFETY_SECRECY']);
+  });
+
+  // Round-5 check (R4-RL-OOA; lead decision: recall first): "Next time, work on: <label>." asks the
+  // child to do what a third-person label names, but the screen read only the third person, so a
+  // label about self-harm, abuse, secrecy, strangers or personal contact reached the child.
+  const GLOW = { prompt: 'Write a sentence using the word glow.', subject: 'grammar_writing' };
+  const screened = (criterion: string, context: object = GLOW) => {
+    const codes: string[] = [];
+    const rows = childRubricFeedback([{ criterion, met: false, note: '' }], {
+      context,
+      onSafetyReject: (code) => codes.push(code),
+    });
+    return { rows, codes };
+  };
+
+  it('drops a label about self-harm, abuse, secrecy, strangers or personal contact, with a code', () => {
+    for (const criterion of [
+      // The round-4 checker's labels, all shown to the child before this fix.
+      'Wants to hurt himself',
+      'Hurts himself',
+      'Talks about hurting himself',
+      'Cuts himself',
+      'Mentions cutting',
+      'Keeps it a secret from parents',
+      'Keeps secrets from mom',
+      'Keeps this a secret',
+      'Hides it from parents',
+      'Does not tell parents',
+      "Doesn't tell a grown-up",
+      'Mentions being hit at home',
+      'Gets hit at home',
+      'Writes about being touched',
+      'Meets strangers online',
+      'Shares a home address',
+      'Sends photos to strangers',
+      'Chats with strangers online',
+      'Describes abuse at home',
+      // The checker's labels that were already dropped, now each with a code.
+      'Mentions wanting to die',
+      'Wants to die',
+      'Keeps it between us',
+      'Is hit by dad',
+      'Writes about suicide',
+      'Mentions self harm',
+    ]) {
+      const { rows, codes } = screened(criterion);
+      expect(rows, criterion).toEqual([]);
+      expect(codes, criterion).toHaveLength(1);
+      expect(codes[0], criterion).toMatch(/^SAFETY_[A-Z_]+$/);
+    }
+  });
+
+  it('screens the imperative and first-person readings of a label', () => {
+    for (const [criterion, code] of [
+      // The imperative: the lead verb in its base form, "yourself", "Don't", after lead words.
+      ['Hurts himself', 'SAFETY_SELF_HARM'],
+      ['Starves himself', 'SAFETY_SELF_HARM'],
+      ['Does not tell parents', 'SAFETY_SECRECY'],
+      ["Doesn't tell a grown-up", 'SAFETY_SECRECY'],
+      ['Never tells parents', 'SAFETY_SECRECY'],
+      ['Sends a selfie to a new friend', 'SAFETY_PERSONAL_CONTACT'],
+      // The first person: "I" and the verb ("I am hit by dad", "I want to disappear forever").
+      ['Is hit by dad', 'SAFETY_ABUSE'],
+      ['Wants to disappear forever', 'SAFETY_SELF_HARM'],
+    ] as const) {
+      expect(screened(criterion), criterion).toEqual({ rows: [], codes: [code] });
+    }
+  });
+
+  it('drops a label holding a risk topic word, even where the prompt raises the topic', () => {
+    const war = {
+      prompt:
+        'Read the story about the war. Why did the old soldier die? Who was killed, what weapons were used, and why was the dead horse left behind? Was it a suicide mission?',
+      subject: 'reading',
+    };
+    for (const [criterion, context] of [
+      ['Talks about hurting animals', GLOW],
+      ['Mentions cutting', GLOW],
+      // The criterion is screened as written, so a mark after the word counts as its end.
+      ['Mentions cutting.', GLOW],
+      ['Talks about cutting, a lot', GLOW],
+      ['Cuts his arm', GLOW],
+      ['Mentions killing', war],
+      ['Explains why the soldier died', war],
+      ['Mentions the dead horse', war],
+      ['Explains the suicide mission', war],
+      ['Mentions a secret', GLOW],
+      ['Hides it from parents', GLOW],
+      ['Talks to strangers', GLOW],
+      ['Shares an address', GLOW],
+      ['Shares photos of friends', GLOW],
+      ['Mentions being touched', GLOW],
+      ['Mentions being hit at home', GLOW],
+      ['Mentions being hit hard at home', GLOW],
+      ['Mentions a bruise', GLOW],
+      ['Describes abuse at home', GLOW],
+      ['Names the weapons used', war],
+      ['Uses online chat', GLOW],
+    ] as const) {
+      expect(screened(criterion, context), criterion).toEqual({
+        rows: [],
+        codes: ['SAFETY_RISK_TOPIC'],
+      });
+    }
+    // Words that only look alike stay shown.
+    for (const criterion of [
+      'Addresses the prompt',
+      'Cuts the shape into halves',
+      'Hits the target',
+    ]) {
+      expect(screened(criterion).rows, criterion).toHaveLength(1);
+    }
+  });
+
+  // The round-4 fixer's note: the plain-text check ran first, so a severe first-person, long or
+  // quoted criterion was dropped without its code.
+  it('screens the criterion as written, before the plain-text check, so its code is logged', () => {
+    for (const [criterion, code] of [
+      ['I want to hurt myself', 'SAFETY_SELF_HARM'],
+      ['Keep this a secret from your parents: it is just between us', 'SAFETY_SECRECY'],
+      [`Keep this a secret from your parents, ${'and write neatly '.repeat(8)}`, 'SAFETY_SECRECY'],
+      ['Says "keep this a secret from your parents"', 'SAFETY_SECRECY'],
+    ] as const) {
+      expect(screened(criterion), criterion).toEqual({ rows: [], codes: [code] });
+    }
   });
 
   it('yields no rows for malformed or empty rubrics', () => {
