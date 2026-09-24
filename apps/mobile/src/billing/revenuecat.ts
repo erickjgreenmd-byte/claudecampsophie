@@ -1,6 +1,7 @@
-import { Linking, Platform } from 'react-native';
+import { AppState, Linking, Platform } from 'react-native';
 import Constants from 'expo-constants';
 import Purchases, { type PurchasesPackage } from 'react-native-purchases';
+import { parentTokenSource, registerAdultCacheClearer } from '../family/parent-session.ts';
 import { playRedeemUrl } from './offer-step.ts';
 import {
   baseSubscriptionId,
@@ -39,51 +40,84 @@ function channel(): StoreChannel | null {
   return null;
 }
 
-/** The platform's public SDK key from the build, or null (never a secret key). */
+/** The platform's public SDK key from the build, or null (only that platform's public key shape). */
 export function revenueCatPublicKey(): string | null {
   const extra = (Constants.expoConfig?.extra ?? {}) as Extra;
+  const store = channel();
   const raw =
-    Platform.OS === 'ios'
+    store === 'app_store'
       ? extra.revenueCatIosKey
-      : Platform.OS === 'android'
+      : store === 'play_store'
         ? extra.revenueCatAndroidKey
         : null;
-  return isUsablePublicSdkKey(raw) ? raw.trim() : null;
+  return store !== null && isUsablePublicSdkKey(raw, store) ? raw.trim() : null;
 }
 
-let configuredFor: string | null = null;
+/** Purchases.configure may run once per app process; identity changes use logIn/logOut after that. */
+let sdkConfigured = false;
+/** The family billing ref the SDK currently acts for, or null (signed out / child mode). */
+let identifiedAs: string | null = null;
 const packages = new Map<string, PurchasesPackage>();
+/** Identity changes run one at a time, so a logOut can never interleave with a later logIn. */
+let identityQueue: Promise<void> = Promise.resolve();
+
+function serialized(step: () => Promise<void>): Promise<void> {
+  const next = identityQueue.then(step);
+  identityQueue = next.catch(() => undefined);
+  return next;
+}
 
 /**
  * Binds the store SDK to the family's opaque billing ref (GET /v1/billing/status `billingRef`), so
  * purchases and offer redemptions belong to this family and both guardians share one subscription.
  */
-export async function identifyStoreAccount(billingRef: string): Promise<void> {
-  const apiKey = revenueCatPublicKey();
-  if (!apiKey) throw new Error('Store purchases are not configured in this build');
-  if (configuredFor === null) {
-    // Configure directly as the family's opaque billing ref: no anonymous store identity is created.
-    Purchases.configure({ apiKey, appUserID: billingRef });
-    configuredFor = billingRef;
-    return;
-  }
-  if (configuredFor !== billingRef) {
-    packages.clear();
-    await Purchases.logIn(billingRef);
-    configuredFor = billingRef;
-  }
+export function identifyStoreAccount(billingRef: string): Promise<void> {
+  return serialized(async () => {
+    const apiKey = revenueCatPublicKey();
+    if (!apiKey) throw new Error('Store purchases are not configured in this build');
+    if (!sdkConfigured) {
+      // Configure directly as the family's opaque billing ref: no anonymous store identity is created.
+      Purchases.configure({ apiKey, appUserID: billingRef });
+      sdkConfigured = true;
+      identifiedAs = billingRef;
+      return;
+    }
+    if (identifiedAs !== billingRef) {
+      packages.clear();
+      await Purchases.logIn(billingRef);
+      identifiedAs = billingRef;
+    }
+  });
 }
 
 /**
- * Called when the parent signs out: the store SDK stops acting for that family. Wired by the app's
- * session layer (src/lib/app-session.ts), which is the only place that reacts to sign-in state.
+ * The store SDK stops acting for the family (RV-billing-7): later store transactions on this device
+ * (renewals, Ask to Buy approvals, codes redeemed in the App Store app) are no longer attributed to
+ * its billing ref. Runs when the parent signs out or the device switches to child mode (see the
+ * adult-cache clearer below). The next identify() binds the SDK again.
  */
-export async function forgetStoreIdentity(): Promise<void> {
+export function forgetStoreIdentity(): Promise<void> {
   packages.clear();
-  if (configuredFor === null) return;
-  configuredFor = null;
-  await Purchases.logOut().catch(() => undefined);
+  return serialized(async () => {
+    packages.clear();
+    if (identifiedAs === null) return;
+    identifiedAs = null;
+    await Purchases.logOut().catch(() => undefined);
+  });
 }
+
+/**
+ * Wired through the adult-cache clearers that src/lib/app-session.ts (sign-out) and
+ * src/lib/mode.ts (entering child mode) already run, so no second session watcher exists. The same
+ * clearers also run when the app merely goes to the background in parent mode; that alone keeps the
+ * identity, because leaving the app for the store's own purchase sheet (Google Play) must not unbind
+ * a purchase in flight. A signed-out parent always unbinds.
+ */
+registerAdultCacheClearer(() => {
+  const signedIn = parentTokenSource() !== null;
+  if (signedIn && AppState.currentState === 'background') return;
+  void forgetStoreIdentity();
+});
 
 function toProductInfo(pkg: PurchasesPackage): StoreProductInfo {
   return {
@@ -110,7 +144,7 @@ export function createNativeBillingStore(): BillingStore {
     available,
     identify: identifyStoreAccount,
     async loadProducts() {
-      if (!available || configuredFor === null) return [];
+      if (!available || identifiedAs === null) return [];
       const offerings = await Purchases.getOfferings();
       packages.clear();
       const all = [offerings.current, ...Object.values(offerings.all)];
@@ -168,7 +202,7 @@ export function createNativeBillingStore(): BillingStore {
     async openManageSubscriptions() {
       if (storeChannel === null) return;
       let providerUrl: string | null = null;
-      if (available && configuredFor !== null) {
+      if (available && identifiedAs !== null) {
         providerUrl = await Purchases.getCustomerInfo()
           .then((info) => info.managementURL)
           .catch(() => null);

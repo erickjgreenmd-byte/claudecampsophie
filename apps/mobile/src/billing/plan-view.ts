@@ -1,4 +1,9 @@
-import type { BillingEntitlementStatus, BillingStatus } from '@pencillift/contracts';
+import type {
+  BillingEntitlement,
+  BillingEntitlementStatus,
+  BillingProduct,
+  BillingStatus,
+} from '@pencillift/contracts';
 import { formatUsd } from '@pencillift/domain';
 import { productMatches, STORE_LABEL, type StoreChannel, type StoreProductInfo } from './store.ts';
 
@@ -6,7 +11,8 @@ import { productMatches, STORE_LABEL, type StoreChannel, type StoreProductInfo }
  * View model for the parent plan screen (spec P11, P14 "subscription" + "paid-slot management";
  * AC_CAPACITY_02/06/11). Pure: no react-native imports, no clock. Every state is spelled out in
  * text, never colour alone. Two prices are never merged: the owner-approved price comes from the
- * server (integer cents), the charge comes from the store, and a difference is always stated.
+ * server (integer cents), the charge comes from the store, and a difference is always stated. A
+ * plan whose US store price is not the approved price is never offered (AC_CAPACITY_02).
  */
 
 export interface PlanViewInput {
@@ -28,6 +34,12 @@ export type PlanAvailability =
   | { readonly kind: 'no_store_on_device'; readonly message: string }
   /** The subscription is billed by a different store: buying here would create a duplicate. */
   | { readonly kind: 'managed_elsewhere'; readonly message: string }
+  /**
+   * A store subscription grants nothing right now but is still live (billing retry, or a purchase
+   * waiting for Ask to Buy / payment): the store may still charge it, so a new purchase anywhere
+   * could make the family pay twice (RV-billing-5).
+   */
+  | { readonly kind: 'store_action_needed'; readonly message: string }
   | { readonly kind: 'store_loading'; readonly message: string };
 
 export type TierRelation = 'current' | 'upgrade' | 'downgrade';
@@ -41,6 +53,11 @@ export interface TierView {
   readonly storePriceText: string | null;
   /** Stated whenever the store price differs from the approved price (never silently relabeled). */
   readonly priceNotice: string | null;
+  /**
+   * Why this plan can't be bought here because of its price (a concrete catalog constraint), or
+   * null. Set whenever the store's US price is not the approved price or can't be confirmed.
+   */
+  readonly priceBlock: string | null;
   /** Store product to buy on this device, when one is verified and offered by the store. */
   readonly productId: string | null;
   readonly relation: TierRelation;
@@ -108,6 +125,17 @@ const CURRENT_STATUSES = new Set<BillingEntitlementStatus>([
   'cancelled_active',
 ]);
 
+/**
+ * Store states that grant no access now but keep the subscription alive: the store retries the
+ * charge (billing retry) or may still complete the purchase (Ask to Buy / payment pending).
+ */
+const LIVE_NOT_GRANTING = new Set<BillingEntitlementStatus>(['billing_retry', 'pending']);
+
+/** A live subscription that grants nothing right now, if the family has one (RV-billing-5). */
+export function waitingSubscription(status: BillingStatus): BillingEntitlement | null {
+  return status.entitlements.find((e) => LIVE_NOT_GRANTING.has(e.status)) ?? null;
+}
+
 function capitalize(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
@@ -134,10 +162,42 @@ function priceNotice(
   const storeName = STORE_LABEL[channel];
   const approved = formatUsd(approvedCents);
   if (store.usdCents === null) {
-    return `${capitalize(storeName)} shows this plan as ${store.priceText} per month in your local currency. PencilLift’s approved US price is ${approved}. You pay the store’s price.`;
+    return `${capitalize(storeName)} shows this plan as ${store.priceText} per month in your local currency. PencilLift’s approved US price is ${approved}.`;
   }
   if (store.usdCents === approvedCents) return null;
-  return `${capitalize(storeName)} charges ${store.priceText} per month for this plan, which differs from PencilLift’s approved price of ${approved}. You pay the store’s price shown.`;
+  return `${capitalize(storeName)} charges ${store.priceText} per month for this plan, which differs from PencilLift’s approved price of ${approved}.`;
+}
+
+/**
+ * RV-billing-4 (AC_CAPACITY_02, docs/Owner_Actions.md #1): a plan is sold only when its US store
+ * price is known to equal the approved price, so $49.99 for 2 children is blocked with the concrete
+ * constraint instead of being offered with a notice. The device compares a USD price itself; the
+ * server's verified catalog price must also agree, and it is the only check for a storefront in
+ * another currency. Returns the parent-facing report, or null when the price is approved.
+ */
+function priceBlockFor(
+  channel: StoreChannel,
+  tier: BillingStatus['tiers'][number],
+  offered: StoreProductInfo,
+  catalogProduct: BillingProduct | undefined,
+): string | null {
+  const approved = formatUsd(tier.approvedMonthlyCents);
+  const storeName = STORE_LABEL[channel];
+  const differs = (charge: string) =>
+    `${capitalize(storeName)} charges ${charge} per month for ${childrenLabel(tier.paidSlots)}, but PencilLift’s approved price is ${approved}. Prices are never rounded, so this plan can’t be bought in ${storeName} until its store price matches.`;
+  if (offered.usdCents !== null && offered.usdCents !== tier.approvedMonthlyCents) {
+    return differs(offered.priceText);
+  }
+  if (
+    catalogProduct?.priceCheck === 'differs_from_approved' &&
+    catalogProduct.storePriceCents !== null
+  ) {
+    return differs(formatUsd(catalogProduct.storePriceCents));
+  }
+  if (offered.usdCents === null && catalogProduct?.priceCheck !== 'matches_approved') {
+    return `${capitalize(storeName)} shows this plan in another currency, and its US price hasn’t been confirmed as PencilLift’s approved ${approved} yet, so it can’t be bought here for now.`;
+  }
+  return null;
 }
 
 function availabilityFor(input: PlanViewInput): PlanAvailability {
@@ -161,6 +221,17 @@ function availabilityFor(input: PlanViewInput): PlanAvailability {
     return {
       kind: 'managed_elsewhere',
       message: `Your subscription is billed by ${other}. To avoid paying twice, change it through ${other}${status.managingChannel === 'stripe' ? '' : ' on the device and account that bought it'}.`,
+    };
+  }
+  const waiting = waitingSubscription(status);
+  if (waiting !== null) {
+    const store = STORE_LABEL[waiting.channel];
+    return {
+      kind: 'store_action_needed',
+      message:
+        waiting.status === 'billing_retry'
+          ? `Your subscription in ${store} has a payment problem, and ${store} is still trying to charge it. Update your payment details or cancel it in ${store} before buying or changing a plan, so you aren’t charged twice.`
+          : `A purchase in ${store} is waiting for approval (for example Ask to Buy) or for the payment to finish. Wait for it to complete before buying or changing a plan, so you aren’t charged twice.`,
     };
   }
   if (input.storeProducts === null) {
@@ -210,6 +281,15 @@ function tierView(
     offered && deviceChannel
       ? priceNotice(deviceChannel, tier.approvedMonthlyCents, offered)
       : null;
+  const priceBlock =
+    offered && deviceChannel
+      ? priceBlockFor(
+          deviceChannel,
+          tier,
+          offered,
+          catalog.find((p) => productMatches(p.productId, offered.productId)),
+        )
+      : null;
 
   let unavailableReason: string | null = null;
   if (relation === 'current') unavailableReason = null;
@@ -218,6 +298,7 @@ function tierView(
     unavailableReason = `This plan isn’t set up in ${STORE_LABEL[deviceChannel!]} yet.`;
   else if (!offered)
     unavailableReason = `${capitalize(STORE_LABEL[deviceChannel!])} isn’t offering this plan right now.`;
+  else if (priceBlock !== null) unavailableReason = priceBlock;
   const purchasable = relation !== 'current' && unavailableReason === null && offered !== null;
   const actionLabel =
     relation === 'current'
@@ -237,6 +318,7 @@ function tierView(
     approvedPriceText: perMonth(approvedPriceText),
     storePriceText: offered ? perMonth(offered.priceText) : null,
     priceNotice: notice,
+    priceBlock,
     productId: offered?.productId ?? null,
     relation,
     purchasable,
@@ -246,14 +328,69 @@ function tierView(
   };
 }
 
+/** What the store charges for the plan the family pays for now, as the store or server reports it. */
+function currentCharge(
+  input: PlanViewInput,
+): { readonly store: string; readonly text: string; readonly usdCents: number | null } | null {
+  const { status, deviceChannel } = input;
+  const managing = status.managingChannel;
+  if (managing === null) return null;
+  const entitlement = status.entitlements.find(
+    (e) =>
+      e.channel === managing && CURRENT_STATUSES.has(e.status) && e.paidSlots === status.paidSlots,
+  );
+  if (!entitlement) return null;
+  const store = STORE_LABEL[managing];
+  if (managing === deviceChannel) {
+    const onDevice = input.storeProducts?.find((sp) =>
+      productMatches(entitlement.productId, sp.productId),
+    );
+    if (onDevice) return { store, text: onDevice.priceText, usdCents: onDevice.usdCents };
+  }
+  const verified = status.products.find(
+    (p) =>
+      p.channel === managing && p.productId === entitlement.productId && p.storePriceCents !== null,
+  );
+  if (verified === undefined || verified.storePriceCents === null) return null;
+  return { store, text: formatUsd(verified.storePriceCents), usdCents: verified.storePriceCents };
+}
+
+/**
+ * The plan headline never presents the approved price as the charge (RV-billing-4): the store's own
+ * price is named, and a difference is stated. A live subscription that grants nothing right now is
+ * never described as "no subscription" (RV-billing-5).
+ */
+function headlineFor(input: PlanViewInput): string {
+  const { status } = input;
+  if (status.paidSlots === 0) {
+    const waiting = waitingSubscription(status);
+    if (waiting?.status === 'billing_retry') {
+      return `Paid access is paused: ${STORE_LABEL[waiting.channel]} couldn’t take the last payment and is still retrying it.`;
+    }
+    if (waiting?.status === 'pending') {
+      return `No paid access yet: a purchase in ${STORE_LABEL[waiting.channel]} is waiting for approval or for the payment to finish.`;
+    }
+    return 'No active subscription. Choose a plan to give your children paid learning features.';
+  }
+  const covers = `Your plan covers ${childrenLabel(status.paidSlots)}`;
+  const tier = status.tiers.find((t) => t.paidSlots === status.paidSlots);
+  if (!tier) return `${covers}.`;
+  const approved = formatUsd(tier.approvedMonthlyCents);
+  const charge = currentCharge(input);
+  if (charge === null) {
+    return `${covers}. PencilLift’s approved price is ${approved} per month; your store receipt shows what you’re charged.`;
+  }
+  if (charge.usdCents === tier.approvedMonthlyCents) return `${covers} (${approved} per month).`;
+  if (charge.usdCents === null) {
+    return `${covers}. ${capitalize(charge.store)} charges ${charge.text} per month in your local currency (PencilLift’s approved US price is ${approved}).`;
+  }
+  return `${covers}. ${capitalize(charge.store)} charges ${charge.text} per month, which differs from PencilLift’s approved price of ${approved}.`;
+}
+
 export function buildPlanView(input: PlanViewInput): PlanView {
   const { status, timeZone } = input;
   const availability = availabilityFor(input);
-  const current = status.tiers.find((t) => t.paidSlots === status.paidSlots);
-  const headline =
-    status.paidSlots === 0
-      ? 'No active subscription. Choose a plan to give your children paid learning features.'
-      : `Your plan covers ${childrenLabel(status.paidSlots)}${current ? ` (approved price ${formatUsd(current.approvedMonthlyCents)} per month)` : ''}.`;
+  const headline = headlineFor(input);
   const free = Math.max(0, status.paidSlots - status.assignedSlots);
   const slotsLine = `${status.paidSlots} paid child ${status.paidSlots === 1 ? 'slot' : 'slots'} · ${status.assignedSlots} in use · ${free} unused`;
   const unusedSlotLine =
@@ -293,7 +430,13 @@ export function buildPlanView(input: PlanViewInput): PlanView {
     tiers,
     currentProductId: currentProductOn(status, input.deviceChannel),
     canRestore: input.storeAvailable && input.deviceChannel !== null,
-    // Managing an existing subscription opens the store's own page; it needs no SDK key.
-    canManage: input.deviceChannel !== null && status.managingChannel === input.deviceChannel,
+    // Managing an existing subscription opens the store's own page; it needs no SDK key. A
+    // subscription in billing retry on this store is managed there too (fix the payment method).
+    canManage:
+      input.deviceChannel !== null &&
+      (status.managingChannel === input.deviceChannel ||
+        status.entitlements.some(
+          (e) => e.channel === input.deviceChannel && e.status === 'billing_retry',
+        )),
   };
 }

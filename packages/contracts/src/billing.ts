@@ -38,6 +38,18 @@ export const billingEntitlementSchema = z.strictObject({
 });
 export type BillingEntitlement = z.infer<typeof billingEntitlementSchema>;
 
+/**
+ * The server's comparison of a product's verified US store price with the approved tier price
+ * (AC_CAPACITY_02, docs/Owner_Actions.md #1). A product whose verified price differs is never
+ * sold; prices are never rounded silently.
+ */
+export const billingPriceCheckSchema = z.enum([
+  'matches_approved',
+  'differs_from_approved',
+  'not_verified',
+]);
+export type BillingPriceCheck = z.infer<typeof billingPriceCheckSchema>;
+
 export const billingProductSchema = z.strictObject({
   channel: channelSchema,
   productId: z.string(),
@@ -47,6 +59,7 @@ export const billingProductSchema = z.strictObject({
    * always shows the store's own localized price; this is for reconciliation displays only.
    */
   storePriceCents: z.number().int().positive().nullable(),
+  priceCheck: billingPriceCheckSchema,
 });
 export type BillingProduct = z.infer<typeof billingProductSchema>;
 
@@ -109,8 +122,16 @@ export const capacityChangeRequestSchema = z
   .strictObject({
     kind: capacityChangeKindSchema,
     toSlots: tierSlotsSchema,
-    /** Downgrades only: the child profiles that stay active after the store applies the change. */
+    /**
+     * Downgrades only: the child profiles that stay active after the store applies the change.
+     * When the smaller plan can't keep every child holding a slot, exactly `toSlots` are chosen.
+     */
     keepChildIds: z.array(uuidSchema).max(12).optional(),
+    /**
+     * The store the parent is about to confirm in. The server refuses a tier whose verified store
+     * price there differs from the approved price, before the store opens.
+     */
+    channel: channelSchema.optional(),
   })
   .refine((v) => v.kind === 'downgrade' || v.keepChildIds === undefined, {
     message: 'keepChildIds applies to downgrades only',

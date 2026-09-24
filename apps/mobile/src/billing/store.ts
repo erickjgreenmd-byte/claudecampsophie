@@ -64,16 +64,27 @@ export interface OfferRedemptionStore {
   openUrl(url: string): Promise<void>;
 }
 
+/** RevenueCat public SDK key prefix per store (the only key shapes that may ship in the app). */
+export const PUBLIC_SDK_KEY_PREFIX: Record<StoreChannel, string> = {
+  app_store: 'appl_',
+  play_store: 'goog_',
+};
+
 /**
- * A RevenueCat public SDK key is safe to ship in the app; a secret key (`sk_…`) never is. Anything
- * empty, secret-shaped or implausible leaves native purchases switched off in this build.
+ * A RevenueCat public SDK key is safe to ship in the app; a secret key (`sk_…`) or any other key
+ * never is. Allowlist, not denylist (RV-billing-6): only `appl_…` (App Store) and `goog_…` (Google
+ * Play) public keys qualify, and for a given store only that store's prefix. Anything else leaves
+ * native purchases switched off in this build. app.config.ts applies the same rule at build time
+ * so a wrong key never reaches the manifest.
  */
-export function isUsablePublicSdkKey(value: unknown): value is string {
+export function isUsablePublicSdkKey(value: unknown, channel?: StoreChannel): value is string {
   if (typeof value !== 'string') return false;
   const key = value.trim();
-  if (key.length < 10 || key.length > 200) return false;
-  if (/^sk_/i.test(key)) return false;
-  return /^[A-Za-z0-9_-]+$/.test(key);
+  const prefixes =
+    channel === undefined ? Object.values(PUBLIC_SDK_KEY_PREFIX) : [PUBLIC_SDK_KEY_PREFIX[channel]];
+  return prefixes.some(
+    (prefix) => key.startsWith(prefix) && /^[A-Za-z0-9]{10,100}$/.test(key.slice(prefix.length)),
+  );
 }
 
 /**

@@ -38,9 +38,27 @@ function status(overrides: Partial<BillingStatus> = {}): BillingStatus {
       },
     ],
     products: [
-      { channel: 'app_store', productId: 'pl_family_1', paidSlots: 1, storePriceCents: 3999 },
-      { channel: 'app_store', productId: 'pl_family_2', paidSlots: 2, storePriceCents: 4999 },
-      { channel: 'play_store', productId: 'pl_family_2', paidSlots: 2, storePriceCents: 4998 },
+      {
+        channel: 'app_store',
+        productId: 'pl_family_1',
+        paidSlots: 1,
+        storePriceCents: 3999,
+        priceCheck: 'matches_approved',
+      },
+      {
+        channel: 'app_store',
+        productId: 'pl_family_2',
+        paidSlots: 2,
+        storePriceCents: 4999,
+        priceCheck: 'differs_from_approved',
+      },
+      {
+        channel: 'play_store',
+        productId: 'pl_family_2',
+        paidSlots: 2,
+        storePriceCents: 4998,
+        priceCheck: 'matches_approved',
+      },
     ],
     tiers: TIERS,
     ...overrides,
@@ -100,7 +118,12 @@ describe('SubscriptionPage (spec P11, P14 subscription)', () => {
     const plan = await screen.findByRole('region', { name: 'Your plan' });
     expect(gets).toEqual(['/v1/billing/status']);
     expect(within(plan).getByText(/Your plan covers 2 children/)).toBeTruthy();
-    expect(within(plan).getByText(/approved price \$49\.98 per month/)).toBeTruthy();
+    // The store's charge is named; the approved price is never presented as it (RV-billing-4).
+    expect(
+      within(plan).getByText(
+        /App Store charges \$49\.99 per month, which differs from PencilLift’s approved price of \$49\.98/,
+      ),
+    ).toBeTruthy();
     expect(within(plan).getByText('Paid child slots').nextElementSibling?.textContent).toBe('2');
     expect(within(plan).getByText('Children using a slot').nextElementSibling?.textContent).toBe(
       '1',
@@ -162,11 +185,69 @@ describe('SubscriptionPage (spec P11, P14 subscription)', () => {
       within(two)
         .getAllByRole('cell')
         .map((c) => c.textContent),
-    ).toEqual(['$49.98', '$49.99 (differs from the approved $49.98)', '$49.98']);
+    ).toEqual([
+      '$49.98',
+      '$49.99 (differs from the approved $49.98, so this plan isn’t sold there)',
+      '$49.98',
+    ]);
     const three = within(prices).getByRole('row', { name: /^3 children/ });
     expect(within(three).getAllByText('Not verified yet')).toHaveLength(2);
     expect(within(prices).getByText(/no separate family account fee/)).toBeTruthy();
   });
+
+  it('a verified store price equal to the approved price is shown as the monthly price', async () => {
+    const { api } = fakeApi({
+      get: () =>
+        status({
+          managingChannel: 'play_store',
+          entitlements: [
+            {
+              channel: 'play_store',
+              productId: 'pl_family_2',
+              paidSlots: 2,
+              status: 'active',
+              periodEnd: PERIOD_END,
+              autoRenew: true,
+            },
+          ],
+        }),
+    });
+    renderPage(<SubscriptionPage />, { api });
+    const plan = await screen.findByRole('region', { name: 'Your plan' });
+    expect(within(plan).getByText(/^\(\$49\.98 per month\)\.$/)).toBeTruthy();
+    expect(plan.textContent).not.toMatch(/differs/);
+  });
+
+  it.each([
+    ['billing_retry', /Paid access is paused\..*still retrying.*charged twice/],
+    ['pending', /No paid access yet\..*waiting for approval.*charged twice/],
+  ] as const)(
+    'a %s subscription is never shown as “no subscription” (RV-billing-5)',
+    async (storeStatus, message) => {
+      const { api } = fakeApi({
+        get: () =>
+          status({
+            paidSlots: 0,
+            assignedSlots: 0,
+            managingChannel: null,
+            entitlements: [
+              {
+                channel: 'app_store',
+                productId: 'pl_family_2',
+                paidSlots: 2,
+                status: storeStatus,
+                periodEnd: PERIOD_END,
+                autoRenew: true,
+              },
+            ],
+          }),
+      });
+      renderPage(<SubscriptionPage />, { api });
+      const plan = await screen.findByRole('region', { name: 'Your plan' });
+      expect(plan.textContent).toMatch(message);
+      expect(plan.textContent).not.toMatch(/No active subscription/);
+    },
+  );
 
   it('offers no purchase on the web, explains the stores, and links to promo codes', async () => {
     const { api } = fakeApi();

@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { buildPlanView, childrenLabel, currentProductOn, type PlanViewInput } from './plan-view.ts';
-import { APP_STORE_PRODUCTS, billingStatus } from './testing.ts';
+import type { BillingEntitlement } from '@pencillift/contracts';
+import {
+  buildPlanView,
+  childrenLabel,
+  currentProductOn,
+  waitingSubscription,
+  type PlanViewInput,
+} from './plan-view.ts';
+import { APP_STORE_PRODUCTS, APPROVED_PRICE_PRODUCTS, billingStatus } from './testing.ts';
 
 const TZ = 'America/Chicago';
 
@@ -25,35 +32,79 @@ describe('tier list (AC_CAPACITY_01/02/11)', () => {
       ['3 children', '$59.97 per month', '$59.99 per month'],
       ['4 children', '$69.96 per month', '$69.99 per month'],
     ]);
-    expect(plan.tiers.every((t) => t.purchasable && t.relation === 'upgrade')).toBe(true);
+    expect(plan.tiers.every((t) => t.relation === 'upgrade')).toBe(true);
+    // Only the exactly representable price is sold (AC_CAPACITY_02; Apple price points).
+    expect(plan.tiers.map((t) => t.purchasable)).toEqual([true, false, false, false]);
     expect(plan.tiers[0]!.actionLabel).toBe('Choose 1 child');
+    // A store that charges every approved total exactly offers every plan.
+    expect(view({ storeProducts: APPROVED_PRICE_PRODUCTS }).tiers.every((t) => t.purchasable)).toBe(
+      true,
+    );
   });
 
-  it('states a store price that differs from the approved price and never relabels it', () => {
+  it('a store price that differs from the approved price is stated and blocked, never sold', () => {
     const two = view({}).tiers[1]!;
     expect(two.approvedCents).toBe(4998);
     expect(two.approvedPriceText).toBe('$49.98 per month');
     expect(two.storePriceText).toBe('$49.99 per month');
     expect(two.priceNotice).toBe(
-      'The App Store charges $49.99 per month for this plan, which differs from PencilLift’s approved price of $49.98. You pay the store’s price shown.',
+      'The App Store charges $49.99 per month for this plan, which differs from PencilLift’s approved price of $49.98.',
     );
+    expect(two.purchasable).toBe(false);
+    expect(two.priceBlock).toBe(
+      'The App Store charges $49.99 per month for 2 children, but PencilLift’s approved price is $49.98. Prices are never rounded, so this plan can’t be bought in the App Store until its store price matches.',
+    );
+    expect(two.unavailableReason).toBe(two.priceBlock);
     expect(two.a11yLabel).toContain('$49.99 per month from the store; approved price $49.98');
-    // One child is exactly representable: no notice.
+    // One child is exactly representable: no notice, no block.
     expect(view({}).tiers[0]!.priceNotice).toBeNull();
+    expect(view({}).tiers[0]!.priceBlock).toBeNull();
   });
 
-  it('explains a non-USD storefront instead of comparing currencies', () => {
+  it('the server’s verified catalog price also blocks a tier, even when the device shows the approved price', () => {
+    const status = billingStatus();
     const plan = view({
-      storeProducts: [
-        { productId: 'pl_family_1', priceText: '€42,99', usdCents: null, currencyCode: 'EUR' },
-      ],
+      status: {
+        ...status,
+        products: status.products.map((p) =>
+          p.channel === 'app_store' && p.paidSlots === 2
+            ? { ...p, storePriceCents: 4999, priceCheck: 'differs_from_approved' as const }
+            : p,
+        ),
+      },
+      storeProducts: APPROVED_PRICE_PRODUCTS,
     });
+    expect(plan.tiers[1]!.purchasable).toBe(false);
+    expect(plan.tiers[1]!.unavailableReason).toMatch(/charges \$49\.99 per month for 2 children/);
+  });
+
+  it('explains a non-USD storefront and sells it only when the server verified the US price', () => {
+    const eur = [
+      { productId: 'pl_family_1', priceText: '€42,99', usdCents: null, currencyCode: 'EUR' },
+    ];
+    const plan = view({ storeProducts: eur });
     expect(plan.tiers[0]!.storePriceText).toBe('€42,99 per month');
     expect(plan.tiers[0]!.priceNotice).toMatch(/local currency.*approved US price is \$39\.99/);
+    // The device can't compare currencies and the server hasn't verified the US price: blocked.
+    expect(plan.tiers[0]!.purchasable).toBe(false);
+    expect(plan.tiers[0]!.unavailableReason).toMatch(/US price hasn’t been confirmed/);
     expect(plan.tiers[1]!.purchasable).toBe(false);
     expect(plan.tiers[1]!.unavailableReason).toBe(
       'The App Store isn’t offering this plan right now.',
     );
+    const status = billingStatus();
+    const verified = view({
+      storeProducts: eur,
+      status: {
+        ...status,
+        products: status.products.map((p) =>
+          p.paidSlots === 1
+            ? { ...p, storePriceCents: 3999, priceCheck: 'matches_approved' as const }
+            : p,
+        ),
+      },
+    });
+    expect(verified.tiers[0]!.purchasable).toBe(true);
   });
 
   it('a tier with no verified catalog product on this store is not purchasable', () => {
@@ -93,12 +144,146 @@ describe('tier list (AC_CAPACITY_01/02/11)', () => {
     expect(plan.tiers[1]!.actionLabel).toBeNull();
     expect(plan.tiers[2]!.actionLabel).toBe('Change to 3 children');
     expect(plan.currentProductId).toBe('pl_family_2');
-    expect(plan.headline).toBe('Your plan covers 2 children (approved price $49.98 per month).');
+    // The approved price is never presented as the charge (RV-billing-4).
+    expect(plan.headline).toBe(
+      'Your plan covers 2 children. The App Store charges $49.99 per month, which differs from PencilLift’s approved price of $49.98.',
+    );
     expect(plan.managedByLine).toBe('Billed by the App Store.');
     expect(plan.canManage).toBe(true);
     expect(plan.entitlementLines.map((l) => l.text)).toEqual([
       'The App Store: 2 children · Active · renews October 10, 2026 · auto-renew on',
     ]);
+  });
+});
+
+describe('the plan headline names the store’s charge (RV-billing-4)', () => {
+  const current = (productId: string, paidSlots: number): BillingEntitlement => ({
+    channel: 'app_store',
+    productId,
+    paidSlots,
+    status: 'active',
+    periodEnd: '2026-10-10T17:00:00.000Z',
+    autoRenew: true,
+  });
+
+  it('an exact store price is shown as the monthly price', () => {
+    const plan = view({
+      status: billingStatus({
+        paidSlots: 1,
+        assignedSlots: 1,
+        managingChannel: 'app_store',
+        entitlements: [current('pl_family_1', 1)],
+      }),
+    });
+    expect(plan.headline).toBe('Your plan covers 1 child ($39.99 per month).');
+  });
+
+  it('without a store or verified price, the approved price is never called the charge', () => {
+    const plan = view({
+      deviceChannel: 'play_store',
+      status: billingStatus({
+        paidSlots: 2,
+        assignedSlots: 2,
+        managingChannel: 'app_store',
+        entitlements: [current('pl_family_2', 2)],
+      }),
+    });
+    expect(plan.headline).toBe(
+      'Your plan covers 2 children. PencilLift’s approved price is $49.98 per month; your store receipt shows what you’re charged.',
+    );
+  });
+
+  it('uses the server’s verified store price when this device is not the managing store', () => {
+    const status = billingStatus({
+      paidSlots: 2,
+      assignedSlots: 2,
+      managingChannel: 'app_store',
+      entitlements: [current('pl_family_2', 2)],
+    });
+    const plan = view({
+      deviceChannel: 'play_store',
+      status: {
+        ...status,
+        products: status.products.map((p) =>
+          p.channel === 'app_store' && p.paidSlots === 2
+            ? { ...p, storePriceCents: 4999, priceCheck: 'differs_from_approved' as const }
+            : p,
+        ),
+      },
+    });
+    expect(plan.headline).toBe(
+      'Your plan covers 2 children. The App Store charges $49.99 per month, which differs from PencilLift’s approved price of $49.98.',
+    );
+  });
+});
+
+describe('a live subscription that grants nothing now still prevents a duplicate (RV-billing-5)', () => {
+  const waiting = (
+    channel: 'app_store' | 'play_store',
+    status: 'billing_retry' | 'pending',
+  ): BillingEntitlement => ({
+    channel,
+    productId: 'pl_family_2',
+    paidSlots: 2,
+    status,
+    periodEnd: '2026-10-10T17:00:00.000Z',
+    autoRenew: true,
+  });
+
+  it('billing retry: nothing is purchasable on any store, the headline and manage link say why', () => {
+    const status = billingStatus({ entitlements: [waiting('play_store', 'billing_retry')] });
+    expect(waitingSubscription(status)?.status).toBe('billing_retry');
+    const plan = view({
+      status,
+      deviceChannel: 'play_store',
+      storeProducts: APPROVED_PRICE_PRODUCTS.map((p) => ({
+        ...p,
+        productId: `${p.productId}:monthly`,
+      })),
+    });
+    expect(plan.availability.kind).toBe('store_action_needed');
+    if (plan.availability.kind === 'store_action_needed') {
+      expect(plan.availability.message).toBe(
+        'Your subscription in Google Play has a payment problem, and Google Play is still trying to charge it. Update your payment details or cancel it in Google Play before buying or changing a plan, so you aren’t charged twice.',
+      );
+    }
+    expect(plan.tiers.some((t) => t.purchasable)).toBe(false);
+    expect(plan.headline).toBe(
+      'Paid access is paused: Google Play couldn’t take the last payment and is still retrying it.',
+    );
+    // The parent can reach Google Play's own page to fix the payment method.
+    expect(plan.canManage).toBe(true);
+    // From an iPhone, the App Store page is not the place to fix it.
+    expect(view({ status }).canManage).toBe(false);
+    expect(view({ status }).tiers.some((t) => t.purchasable)).toBe(false);
+  });
+
+  it('a pending purchase (Ask to Buy) blocks another purchase and is not called “no subscription”', () => {
+    const plan = view({
+      status: billingStatus({ entitlements: [waiting('app_store', 'pending')] }),
+      deviceChannel: 'play_store',
+      storeProducts: APPROVED_PRICE_PRODUCTS,
+    });
+    expect(plan.availability.kind).toBe('store_action_needed');
+    if (plan.availability.kind === 'store_action_needed') {
+      expect(plan.availability.message).toMatch(
+        /purchase in the App Store is waiting for approval.*aren’t charged twice/,
+      );
+    }
+    expect(plan.tiers.some((t) => t.purchasable)).toBe(false);
+    expect(plan.headline).toBe(
+      'No paid access yet: a purchase in the App Store is waiting for approval or for the payment to finish.',
+    );
+  });
+
+  it('ended subscriptions do not block a new purchase', () => {
+    const plan = view({
+      status: billingStatus({
+        entitlements: [{ ...waiting('play_store', 'billing_retry'), status: 'expired' }],
+      }),
+    });
+    expect(plan.availability.kind).toBe('ready');
+    expect(plan.tiers[0]!.purchasable).toBe(true);
   });
 });
 

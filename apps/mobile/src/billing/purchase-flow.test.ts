@@ -13,11 +13,13 @@ import {
 import type { StoreChannel } from './store.ts';
 import {
   APP_STORE_PRODUCTS,
+  APPROVED_PRICE_PRODUCTS,
   BILLING_REF,
   billingStatus,
   fakeApi,
   fakeStore,
   RILEY,
+  SAM,
   type Call,
 } from './testing.ts';
 
@@ -34,12 +36,16 @@ const ACTIVE_TWO = {
   autoRenew: true,
 };
 
+/**
+ * The flow mechanics are tested against a catalog priced at the approved totals; a store price that
+ * isn't approved is blocked before this flow can start (see the price tests below).
+ */
 function planFor(status: BillingStatus, channel: StoreChannel = 'app_store'): PlanView {
   return buildPlanView({
     status,
     deviceChannel: channel,
     storeAvailable: true,
-    storeProducts: APP_STORE_PRODUCTS,
+    storeProducts: APPROVED_PRICE_PRODUCTS,
     timeZone: 'UTC',
   });
 }
@@ -130,7 +136,7 @@ describe('who may buy (spec P3, AC_BILLING_05, AC_CAPACITY_04)', () => {
 });
 
 describe('confirmation shows what the parent is agreeing to (AC_CAPACITY_06)', () => {
-  it('child count, the store’s recurring total, the price difference and store confirmation', () => {
+  it('child count, the store’s recurring total and store confirmation', () => {
     const state = select(billingStatus({ paidSlots: 1, assignedSlots: 1 }), 2);
     expect(state.kind).toBe('confirming');
     if (state.kind !== 'confirming') return;
@@ -143,17 +149,55 @@ describe('confirmation shows what the parent is agreeing to (AC_CAPACITY_06)', (
       billingRef: BILLING_REF,
       heading: 'Change your plan to 2 children',
       childCountLine: 'Your plan will cover 2 children (it covers 1 child today).',
-      recurringLine: 'New monthly total: $49.99 per month, as charged by the App Store.',
+      recurringLine: 'New monthly total: $49.98 per month, as charged by the App Store.',
       storeConfirmationLine:
         'You’ll confirm in the App Store. Nothing is charged unless you confirm there.',
     });
-    expect(c.priceNotice).toMatch(/\$49\.99.*differs.*approved price of \$49\.98/);
+    expect(c.priceNotice).toBeNull();
     expect(c.dueNowLine).toMatch(/shows what you’ll pay today, including any proration/);
     expect(c.activationLine).toMatch(/only after the store confirms payment.*Ask to Buy/);
     // Never promises a fixed immediate charge such as a full $9.99 add-on today.
     const text = Object.values(c).join(' ');
     expect(text).not.toMatch(/\$9\.99/);
     expect(text).not.toMatch(/charged (today|now|immediately)/i);
+  });
+
+  it('a plan whose store price isn’t the approved price can’t be selected (AC_CAPACITY_02)', () => {
+    const status = billingStatus({ paidSlots: 1, assignedSlots: 1 });
+    const plan = buildPlanView({
+      status,
+      deviceChannel: 'app_store',
+      storeAvailable: true,
+      storeProducts: APP_STORE_PRODUCTS,
+      timeZone: 'UTC',
+    });
+    const state = transition(
+      { kind: 'idle' },
+      {
+        type: 'select',
+        tier: plan.tiers[1]!,
+        plan,
+        status,
+        channel: 'app_store',
+        context: PARENT,
+      },
+    );
+    expect(state).toMatchObject({ kind: 'blocked', reason: 'tier_unavailable' });
+    if (state.kind === 'blocked') {
+      expect(state.message).toMatch(
+        /charges \$49\.99 per month for 2 children.*approved price is \$49\.98/,
+      );
+    }
+  });
+
+  it('a subscription the store is still retrying blocks a second one (RV-billing-5)', () => {
+    const status = billingStatus({
+      entitlements: [{ ...ACTIVE_TWO, channel: 'play_store', status: 'billing_retry' }],
+    });
+    expect(select(status, 2, PARENT, 'play_store')).toMatchObject({
+      kind: 'blocked',
+      reason: 'store_action_needed',
+    });
   });
 });
 
@@ -176,7 +220,8 @@ describe('purchase outcomes (AC_BILLING_02, AC_CAPACITY_04/05)', () => {
       'store purchase pl_family_2',
       'api POST /v1/billing/sync',
     ]);
-    expect(calls[0]!.body).toEqual({ kind: 'upgrade', toSlots: 2 });
+    // The server also checks this store's verified price before the store opens.
+    expect(calls[0]!.body).toEqual({ kind: 'upgrade', toSlots: 2, channel: 'app_store' });
     expect(calls[1]!.body).toBeUndefined();
     expect(store.purchases).toEqual([{ productId: 'pl_family_2', replacing: null }]);
     expect(seen).toEqual(['purchasing', 'verifying']);
@@ -339,7 +384,12 @@ describe('smaller plans (AC_CAPACITY_08/09)', () => {
       select(current, 1),
       [RILEY],
     );
-    expect(calls[0]!.body).toEqual({ kind: 'downgrade', toSlots: 1, keepChildIds: [RILEY] });
+    expect(calls[0]!.body).toEqual({
+      kind: 'downgrade',
+      toSlots: 1,
+      keepChildIds: [RILEY],
+      channel: 'app_store',
+    });
     expect(store.purchases).toEqual([
       { productId: 'pl_family_1', replacing: { productId: 'pl_family_2', direction: 'downgrade' } },
     ]);
@@ -354,6 +404,42 @@ describe('smaller plans (AC_CAPACITY_08/09)', () => {
   it('a smaller plan with room for every active child needs no selection', () => {
     const roomy = select(billingStatus({ ...current, assignedSlots: 1 }), 1);
     expect(roomy.kind === 'confirming' && roomy.confirmation.needsKeepSelection).toBe(false);
+    expect(roomy.kind === 'confirming' && roomy.confirmation.keepCount).toBe(0);
+  });
+
+  it('the parent fills every slot of the smaller plan; a partial choice is never sent (RV-billing-3)', async () => {
+    const three = billingStatus({
+      paidSlots: 3,
+      assignedSlots: 3,
+      managingChannel: 'app_store',
+      entitlements: [{ ...ACTIVE_TWO, productId: 'pl_family_3', paidSlots: 3 }],
+    });
+    const confirming = select(three, 2);
+    expect(confirming.kind === 'confirming' && confirming.confirmation.keepCount).toBe(2);
+    for (const keep of [[RILEY], [RILEY, RILEY]]) {
+      const log: string[] = [];
+      const { api } = server(three, log);
+      const final = await runPlanChange(
+        { api, store: fakeStore({}, log), context: () => PARENT },
+        confirming,
+        keep,
+      );
+      expect(final).toMatchObject({
+        kind: 'failed',
+        message: 'Choose 2 children to keep active on the smaller plan.',
+      });
+      expect(log).toEqual([]);
+    }
+    const { api, calls } = server(three);
+    await runPlanChange({ api, store: fakeStore(), context: () => PARENT }, confirming, [
+      RILEY,
+      SAM,
+    ]);
+    expect(calls[0]!.body).toMatchObject({
+      kind: 'downgrade',
+      toSlots: 2,
+      keepChildIds: [RILEY, SAM],
+    });
   });
 });
 

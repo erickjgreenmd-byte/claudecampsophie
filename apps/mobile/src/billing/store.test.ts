@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   baseSubscriptionId,
   classifyPurchaseError,
@@ -9,6 +9,25 @@ import {
 } from './store.ts';
 
 const CODES = { cancelled: '1', pending: '20' };
+
+// --- Labeled mocks of the native layer, used only by the revenuecat.ts tests below. store.ts itself
+// is pure and imports none of these. Nothing here talks to a store, RevenueCat or a device.
+const native = vi.hoisted(() => ({
+  appState: { currentState: 'active' },
+  extra: { revenueCatIosKey: 'appl_StoreTestPublicKey01' },
+  purchases: {
+    configure: vi.fn(),
+    logIn: vi.fn(() => Promise.resolve({ customerInfo: {}, created: false })),
+    logOut: vi.fn(() => Promise.resolve({})),
+  },
+}));
+vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
+  Linking: { openURL: vi.fn(() => Promise.resolve()) },
+  AppState: native.appState,
+}));
+vi.mock('expo-constants', () => ({ default: { expoConfig: { extra: native.extra } } }));
+vi.mock('react-native-purchases', () => ({ default: native.purchases }));
 
 describe('native purchases are feature-gated on a real public SDK key', () => {
   it.each([
@@ -25,6 +44,127 @@ describe('native purchases are feature-gated on a real public SDK key', () => {
     [42, false],
   ])('%s → %s', (key, usable) => {
     expect(isUsablePublicSdkKey(key)).toBe(usable);
+  });
+
+  it.each([
+    ['rk_live_restricted_key_value_123', undefined],
+    ['strp_AbCdEf1234567890', undefined],
+    ['amzn_AbCdEf1234567890', undefined],
+    ['appl_', undefined],
+    ['goog_AbCdEf1234567890', 'app_store'],
+    ['appl_AbCdEf1234567890', 'play_store'],
+  ] as const)('allowlist: %s for %s → false (RV-billing-6)', (key, channel) => {
+    expect(isUsablePublicSdkKey(key, channel)).toBe(false);
+  });
+
+  it('accepts each store’s own public key shape', () => {
+    expect(isUsablePublicSdkKey('appl_AbCdEf1234567890', 'app_store')).toBe(true);
+    expect(isUsablePublicSdkKey('goog_AbCdEf1234567890', 'play_store')).toBe(true);
+  });
+});
+
+describe('app.config.ts never embeds a non-public RevenueCat key (RV-billing-6)', () => {
+  const NAMES = ['EXPO_PUBLIC_REVENUECAT_IOS_KEY', 'EXPO_PUBLIC_REVENUECAT_ANDROID_KEY'] as const;
+  const saved = NAMES.map((name) => process.env[name]);
+  afterEach(() => {
+    NAMES.forEach((name, i) => {
+      if (saved[i] === undefined) delete process.env[name];
+      else process.env[name] = saved[i];
+    });
+    vi.resetModules();
+  });
+
+  async function loadExtra(): Promise<Record<string, unknown>> {
+    vi.resetModules();
+    const mod = (await import('../../app.config.ts')) as {
+      default: { extra?: Record<string, unknown> };
+    };
+    return mod.default.extra ?? {};
+  }
+
+  it('embeds the platforms’ public keys and leaves blank ones out', async () => {
+    process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY = ' appl_AbCdEf1234567890 ';
+    process.env.EXPO_PUBLIC_REVENUECAT_ANDROID_KEY = '   ';
+    const extra = await loadExtra();
+    expect(extra.revenueCatIosKey).toBe('appl_AbCdEf1234567890');
+    expect(extra.revenueCatAndroidKey).toBeNull();
+  });
+
+  it.each([
+    ['EXPO_PUBLIC_REVENUECAT_IOS_KEY', 'sk_live_Synthetic_Secret_0001'],
+    ['EXPO_PUBLIC_REVENUECAT_IOS_KEY', 'goog_AbCdEf1234567890'],
+    ['EXPO_PUBLIC_REVENUECAT_ANDROID_KEY', 'appl_AbCdEf1234567890'],
+    ['EXPO_PUBLIC_REVENUECAT_ANDROID_KEY', 'rk_SyntheticRestricted0001'],
+  ] as const)('%s=%s fails the build without printing the value', async (name, value) => {
+    process.env[name] = value;
+    const failure = await loadExtra().then(
+      () => null,
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    expect(failure).toMatch(new RegExp(`^${name} is not a RevenueCat public`));
+    expect(failure).not.toContain(value);
+  });
+});
+
+describe('revenuecat.ts store identity (RV-billing-7; labeled native mocks)', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    native.appState.currentState = 'active';
+    native.purchases.configure.mockClear();
+    native.purchases.logIn.mockClear();
+    native.purchases.logOut.mockClear();
+  });
+
+  async function load() {
+    const session = await import('../family/parent-session.ts');
+    const revenuecat = await import('./revenuecat.ts');
+    session.registerParentTokenSource(() => Promise.resolve('parent-token-mock'));
+    return { session, revenuecat };
+  }
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('configures once, then switches families with logIn, never a second configure', async () => {
+    const { revenuecat } = await load();
+    await revenuecat.identifyStoreAccount('fam_aaaaaaaaaaaaaaaaaaaaaaaa');
+    await revenuecat.forgetStoreIdentity();
+    await revenuecat.identifyStoreAccount('fam_bbbbbbbbbbbbbbbbbbbbbbbb');
+    expect(native.purchases.configure).toHaveBeenCalledTimes(1);
+    expect(native.purchases.logOut).toHaveBeenCalledTimes(1);
+    expect(native.purchases.logIn).toHaveBeenCalledWith('fam_bbbbbbbbbbbbbbbbbbbbbbbb');
+  });
+
+  it('entering child mode unbinds the store SDK from the family', async () => {
+    const { session, revenuecat } = await load();
+    await revenuecat.identifyStoreAccount('fam_aaaaaaaaaaaaaaaaaaaaaaaa');
+    session.clearAdultCaches(); // enterChildMode (src/lib/mode.ts), app in the foreground
+    await settle();
+    expect(native.purchases.logOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaving the app in parent mode (e.g. for the store’s own sheet) keeps the identity', async () => {
+    const { session, revenuecat } = await load();
+    await revenuecat.identifyStoreAccount('fam_aaaaaaaaaaaaaaaaaaaaaaaa');
+    native.appState.currentState = 'background';
+    session.clearAdultCaches(); // app-session.ts relock on background
+    await settle();
+    expect(native.purchases.logOut).not.toHaveBeenCalled();
+    // …but a sign-out while in the background still unbinds.
+    session.registerParentTokenSource(null);
+    session.clearAdultCaches();
+    await settle();
+    expect(native.purchases.logOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses only this platform’s public key: an Android key on iOS leaves purchases off', async () => {
+    native.extra.revenueCatIosKey = 'goog_AbCdEf1234567890';
+    try {
+      const { revenuecat } = await load();
+      expect(revenuecat.revenueCatPublicKey()).toBeNull();
+      expect(revenuecat.createNativeBillingStore().available).toBe(false);
+    } finally {
+      native.extra.revenueCatIosKey = 'appl_StoreTestPublicKey01';
+    }
   });
 });
 

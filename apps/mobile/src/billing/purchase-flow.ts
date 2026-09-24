@@ -41,6 +41,7 @@ export type BlockReason =
   | 'not_in_build'
   | 'no_store_on_device'
   | 'managed_elsewhere'
+  | 'store_action_needed'
   | 'store_loading'
   | 'tier_unavailable';
 
@@ -55,6 +56,11 @@ export interface Confirmation {
   /** Children holding a paid slot today (a smaller plan needs a keep selection when above target). */
   readonly assignedSlots: number;
   readonly needsKeepSelection: boolean;
+  /**
+   * How many children the parent must choose to keep (0 when no choice is needed). The parent fills
+   * every slot of the smaller plan, so the server never picks who keeps paid access (RV-billing-3).
+   */
+  readonly keepCount: number;
   readonly heading: string;
   readonly childCountLine: string;
   readonly recurringLine: string;
@@ -105,6 +111,11 @@ const CHILD_MODE_MESSAGE =
   'Plans can’t be bought or changed in child mode. A grown-up needs to unlock the parent area first.';
 const SIGNED_OUT_MESSAGE = 'Sign in as a parent to buy or change a plan.';
 
+/** What the parent must do before a smaller plan can be requested (RV-billing-3). */
+export function keepSelectionMessage(keepCount: number): string {
+  return `Choose ${childrenLabel(keepCount)} to keep active on the smaller plan.`;
+}
+
 /** Child mode and a missing parent session always win, whatever else is on screen. */
 export function contextBlock(
   context: PurchaseContext,
@@ -132,6 +143,7 @@ function buildConfirmation(
     plan.currentProductId !== null && status.paidSlots > 0
       ? { productId: plan.currentProductId, direction }
       : null;
+  const needsKeepSelection = direction === 'downgrade' && status.assignedSlots > tier.paidSlots;
   return {
     direction,
     channel,
@@ -141,7 +153,8 @@ function buildConfirmation(
     currentSlots: status.paidSlots,
     targetSlots: tier.paidSlots,
     assignedSlots: status.assignedSlots,
-    needsKeepSelection: direction === 'downgrade' && status.assignedSlots > tier.paidSlots,
+    needsKeepSelection,
+    keepCount: needsKeepSelection ? Math.min(status.assignedSlots, tier.paidSlots) : 0,
     heading:
       status.paidSlots === 0
         ? `Subscribe for ${childrenLabel(tier.paidSlots)}`
@@ -317,10 +330,13 @@ export async function runPlanChange(
   if (state.kind !== 'purchasing') return state;
   deps.onState?.(state);
   const { confirmation } = state;
-  if (confirmation.needsKeepSelection && (keepChildIds?.length ?? 0) === 0) {
+  if (
+    confirmation.needsKeepSelection &&
+    new Set(keepChildIds ?? []).size !== confirmation.keepCount
+  ) {
     return {
       kind: 'failed',
-      message: 'Choose which children stay active on the smaller plan.',
+      message: keepSelectionMessage(confirmation.keepCount),
       needsPin: false,
       confirmation,
     };
@@ -330,8 +346,10 @@ export async function runPlanChange(
       kind: confirmation.direction,
       toSlots: confirmation.targetSlots,
       ...(confirmation.direction === 'downgrade' && keepChildIds !== undefined
-        ? { keepChildIds: [...keepChildIds] }
+        ? { keepChildIds: [...new Set(keepChildIds)] }
         : {}),
+      // The server refuses a tier whose verified price in this store isn't the approved price.
+      channel: confirmation.channel,
     });
   } catch (error) {
     return transition(state, { type: 'intent_rejected', problem: billingProblem(error) });

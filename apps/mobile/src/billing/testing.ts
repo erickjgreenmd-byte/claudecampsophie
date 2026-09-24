@@ -42,6 +42,7 @@ export function billingStatus(overrides: Partial<BillingStatus> = {}): BillingSt
         productId: `pl_family_${t.paidSlots}`,
         paidSlots: t.paidSlots,
         storePriceCents: null,
+        priceCheck: 'not_verified' as const,
       })),
     ),
     tiers: TIERS,
@@ -55,6 +56,18 @@ export const APP_STORE_PRODUCTS: StoreProductInfo[] = [
   { productId: 'pl_family_2', priceText: '$49.99', usdCents: 4999, currencyCode: 'USD' },
   { productId: 'pl_family_3', priceText: '$59.99', usdCents: 5999, currencyCode: 'USD' },
   { productId: 'pl_family_4', priceText: '$69.99', usdCents: 6999, currencyCode: 'USD' },
+];
+
+/**
+ * A synthetic US catalog priced exactly at the approved totals ($39.99 / $49.98 / $59.97 / $69.96),
+ * as Google Play can be configured. The App Store can't represent tiers 2–4 today (Owner Action #1),
+ * so flow tests use this only where the price itself is not what is under test.
+ */
+export const APPROVED_PRICE_PRODUCTS: StoreProductInfo[] = [
+  { productId: 'pl_family_1', priceText: '$39.99', usdCents: 3999, currencyCode: 'USD' },
+  { productId: 'pl_family_2', priceText: '$49.98', usdCents: 4998, currencyCode: 'USD' },
+  { productId: 'pl_family_3', priceText: '$59.97', usdCents: 5997, currencyCode: 'USD' },
+  { productId: 'pl_family_4', priceText: '$69.96', usdCents: 6996, currencyCode: 'USD' },
 ];
 
 export interface Call {

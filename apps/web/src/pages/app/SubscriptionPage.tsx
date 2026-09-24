@@ -3,6 +3,7 @@ import { Link } from 'react-router';
 import {
   billingStatusResponseSchema,
   type BillingChannel,
+  type BillingEntitlement,
   type BillingEntitlementStatus,
   type BillingStatus,
 } from '@pencillift/contracts';
@@ -42,6 +43,43 @@ const STATUS_LABEL: Record<BillingEntitlementStatus, string> = {
   revoked: 'Revoked by the store',
   refunded: 'Refunded',
 };
+
+/** States in which a store subscription is the family's current plan. */
+const CURRENT_STATUSES = new Set<BillingEntitlementStatus>([
+  'active',
+  'grace_period',
+  'billing_retry',
+  'cancelled_active',
+]);
+
+/**
+ * A live subscription that grants nothing now (the store is retrying the charge, or a purchase is
+ * waiting for Ask to Buy / payment). It is never described as "no subscription" (RV-billing-5).
+ */
+function waitingSubscription(data: BillingStatus): BillingEntitlement | null {
+  return (
+    data.entitlements.find((e) => e.status === 'billing_retry' || e.status === 'pending') ?? null
+  );
+}
+
+/**
+ * The store's verified price for the plan the family pays for now, or null when not verified. The
+ * approved price is never presented as the charge (RV-billing-4).
+ */
+function currentStorePriceCents(data: BillingStatus): number | null {
+  const managing = data.managingChannel;
+  if (managing === null) return null;
+  const current = data.entitlements.find(
+    (e) =>
+      e.channel === managing && CURRENT_STATUSES.has(e.status) && e.paidSlots === data.paidSlots,
+  );
+  if (!current) return null;
+  const product = data.products.find(
+    (p) =>
+      p.channel === managing && p.productId === current.productId && p.storePriceCents !== null,
+  );
+  return product?.storePriceCents ?? null;
+}
 
 const sectionStyle = { marginTop: 16 } as const;
 const cell = { textAlign: 'left', padding: '6px 12px 6px 0', verticalAlign: 'top' } as const;
@@ -107,6 +145,8 @@ function PlanSummary({ data }: { data: BillingStatus }) {
   const unused = Math.max(0, data.paidSlots - data.assignedSlots);
   const current = data.tiers.find((t) => t.paidSlots === data.paidSlots);
   const requested = data.requestedChange;
+  const waiting = waitingSubscription(data);
+  const charged = currentStorePriceCents(data);
   return (
     <section className="card" style={sectionStyle} aria-labelledby={headingId}>
       <h2 id={headingId}>Your plan</h2>
@@ -119,7 +159,20 @@ function PlanSummary({ data }: { data: BillingStatus }) {
           </p>
         </div>
       ) : null}
-      {data.paidSlots === 0 ? (
+      {data.paidSlots === 0 && waiting?.status === 'billing_retry' ? (
+        <div className="notice">
+          <strong>Paid access is paused.</strong> {STORE_NAME[waiting.channel]} couldn’t take the
+          last payment and is still retrying it. Update your payment details or cancel in{' '}
+          {STORE_NAME[waiting.channel]}. Don’t buy another plan in the meantime, or you could be
+          charged twice.
+        </div>
+      ) : data.paidSlots === 0 && waiting?.status === 'pending' ? (
+        <div className="notice">
+          <strong>No paid access yet.</strong> A purchase in {STORE_NAME[waiting.channel]} is
+          waiting for approval (for example Ask to Buy) or for the payment to finish. Don’t buy
+          again while it is waiting, or you could be charged twice.
+        </div>
+      ) : data.paidSlots === 0 ? (
         <p>
           <strong>No active subscription.</strong> Choose a plan in the PencilLift app to give your
           children paid learning features.
@@ -127,7 +180,13 @@ function PlanSummary({ data }: { data: BillingStatus }) {
       ) : (
         <p>
           <strong>Your plan covers {childrenLabel(data.paidSlots)}</strong>
-          {current ? ` (approved price ${formatUsd(current.approvedMonthlyCents)} per month)` : ''}.
+          {current === undefined
+            ? '.'
+            : charged === null
+              ? `. PencilLift’s approved price is ${formatUsd(current.approvedMonthlyCents)} per month; your store receipt shows what you’re charged.`
+              : charged === current.approvedMonthlyCents
+                ? ` (${formatUsd(charged)} per month).`
+                : `. ${data.managingChannel ? STORE_NAME[data.managingChannel] : 'The store'} charges ${formatUsd(charged)} per month, which differs from PencilLift’s approved price of ${formatUsd(current.approvedMonthlyCents)}.`}
         </p>
       )}
       <dl style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr', gap: '4px 16px' }}>
@@ -264,7 +323,7 @@ function storePriceCell(data: BillingStatus, channel: 'app_store' | 'play_store'
   const price = formatUsd(product.storePriceCents);
   return product.storePriceCents === tier.approvedMonthlyCents
     ? price
-    : `${price} (differs from the approved ${formatUsd(tier.approvedMonthlyCents)})`;
+    : `${price} (differs from the approved ${formatUsd(tier.approvedMonthlyCents)}, so this plan isn’t sold there)`;
 }
 
 function PriceTable({ data }: { data: BillingStatus }) {
@@ -312,8 +371,9 @@ function PriceTable({ data }: { data: BillingStatus }) {
         </table>
       </div>
       <p style={{ fontSize: '0.95rem' }}>
-        The store’s price is what you pay. Where a store can’t charge an approved amount exactly,
-        the difference is shown here and in the app before you buy — it is never rounded silently.
+        The store’s price is what you pay. A plan is sold only where the store can charge the
+        approved amount exactly; where it can’t, the difference is shown here and in the app and the
+        plan isn’t offered there — prices are never rounded silently.
       </p>
     </section>
   );

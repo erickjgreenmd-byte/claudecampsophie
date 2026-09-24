@@ -27,6 +27,20 @@ describe('billingProblem maps stable codes to parent messages', () => {
     ).toMatch(message);
   });
 
+  it('shows the server’s concrete report for a price or keep-selection refusal', () => {
+    const price =
+      'The App Store charges $49.99 per month for 2 children, which isn’t PencilLift’s approved price of $49.98. This plan can’t be bought there until the store price matches.';
+    expect(
+      billingProblem(new ApiRequestError('BUSINESS_RULE', price, 422, 'STORE_PRICE_NOT_APPROVED'))
+        .message,
+    ).toBe(price);
+    const keep = 'Choose 2 children to keep active on the smaller plan.';
+    expect(
+      billingProblem(new ApiRequestError('BUSINESS_RULE', keep, 422, 'KEEP_SELECTION_INCOMPLETE'))
+        .message,
+    ).toBe(keep);
+  });
+
   it('shows adult-worded server text only for known codes', () => {
     expect(
       billingProblem(

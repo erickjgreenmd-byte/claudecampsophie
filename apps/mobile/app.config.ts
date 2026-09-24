@@ -19,10 +19,24 @@ function publicEnv(name: string): string | null {
 const supabaseUrl = publicEnv('EXPO_PUBLIC_SUPABASE_URL');
 const supabasePublishableKey = publicEnv('EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY');
 const portalUrl = publicEnv('EXPO_PUBLIC_PORTAL_URL');
-// RevenueCat PUBLIC SDK keys (appl_… / goog_…), never the secret key. Absent → native purchases stay
-// switched off and the plan screen says so (src/billing/revenuecat.ts).
-const revenueCatIosKey = publicEnv('EXPO_PUBLIC_REVENUECAT_IOS_KEY');
-const revenueCatAndroidKey = publicEnv('EXPO_PUBLIC_REVENUECAT_ANDROID_KEY');
+/**
+ * RevenueCat PUBLIC SDK keys only (RV-billing-6). Everything in `extra` ships in the app bundle, so
+ * a value that is not the platform's public key shape (`appl_…` for iOS, `goog_…` for Android) — a
+ * secret `sk_…` key, another provider's key, the other platform's key — fails the build instead of
+ * being embedded. Same allowlist as isUsablePublicSdkKey (src/billing/store.ts). The value itself
+ * is never printed. Absent → native purchases stay switched off and the plan screen says so
+ * (src/billing/revenuecat.ts).
+ */
+function revenueCatPublicKey(name: string, prefix: 'appl_' | 'goog_'): string | null {
+  const key = publicEnv(name)?.trim() ?? '';
+  if (key === '') return null;
+  if (key.startsWith(prefix) && /^[A-Za-z0-9]{10,100}$/.test(key.slice(prefix.length))) return key;
+  throw new Error(
+    `${name} is not a RevenueCat public ${prefix}… SDK key. Refusing to build: anything in this variable ships inside the app, so a secret or other key must never be set here.`,
+  );
+}
+const revenueCatIosKey = revenueCatPublicKey('EXPO_PUBLIC_REVENUECAT_IOS_KEY', 'appl_');
+const revenueCatAndroidKey = revenueCatPublicKey('EXPO_PUBLIC_REVENUECAT_ANDROID_KEY', 'goog_');
 
 const config: ExpoConfig = {
   name: 'PencilLift',

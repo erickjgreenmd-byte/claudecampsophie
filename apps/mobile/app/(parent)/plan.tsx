@@ -12,6 +12,7 @@ import {
 } from '../../src/billing/actions.ts';
 import { buildPlanView, type PlanView, type TierView } from '../../src/billing/plan-view.ts';
 import {
+  keepSelectionMessage,
   runPlanChange,
   runRestore,
   transition,
@@ -251,7 +252,7 @@ function Plans({
           {tier.storePriceText ? (
             <Body>Store price (what you pay): {tier.storePriceText}</Body>
           ) : null}
-          {tier.priceNotice ? (
+          {tier.priceNotice && !tier.priceBlock ? (
             <Notice>
               <Body>{tier.priceNotice}</Body>
             </Notice>
@@ -367,6 +368,8 @@ function ConfirmPanel({
   const store = STORE_LABEL[confirmation.channel];
   const [keep, setKeep] = useState<ReadonlySet<string>>(new Set());
   const [keepError, setKeepError] = useState<string | null>(null);
+  // One tap starts one flow: a double tap must not create two intents and two store sheets.
+  const [submitted, setSubmitted] = useState(false);
   const continueLabel = `Continue to ${store}`;
   return (
     <View
@@ -383,7 +386,7 @@ function ConfirmPanel({
       {confirmation.needsKeepSelection ? (
         <KeepSelector
           api={api}
-          max={confirmation.targetSlots}
+          count={confirmation.keepCount}
           selected={keep}
           onChange={(next) => {
             setKeep(next);
@@ -394,11 +397,14 @@ function ConfirmPanel({
       {keepError ? <ErrorBox message={keepError} /> : null}
       <Button
         label={continueLabel}
+        disabled={submitted}
         onPress={() => {
-          if (confirmation.needsKeepSelection && keep.size === 0) {
-            setKeepError('Choose which children stay active on the smaller plan.');
+          if (submitted) return;
+          if (confirmation.needsKeepSelection && keep.size !== confirmation.keepCount) {
+            setKeepError(keepSelectionMessage(confirmation.keepCount));
             return;
           }
+          setSubmitted(true);
           // Without a selection the server keeps every active child (they all fit the new plan).
           onConfirm(confirmation.needsKeepSelection ? [...keep] : undefined);
         }}
@@ -410,12 +416,13 @@ function ConfirmPanel({
 
 function KeepSelector({
   api,
-  max,
+  count,
   selected,
   onChange,
 }: {
   api: ApiClient;
-  max: number;
+  /** Exactly this many children are chosen: the server never picks for the parent (RV-billing-3). */
+  count: number;
   selected: ReadonlySet<string>;
   onChange: (next: ReadonlySet<string>) => void;
 }) {
@@ -427,18 +434,22 @@ function KeepSelector({
   if (state.status !== 'ready') return <Loading label="Loading your children" />;
   const children: ActiveChild[] = state.data;
   return (
-    <View accessibilityLabel={`Choose up to ${max} children to keep active`}>
+    <View accessibilityLabel={keepSelectionMessage(count)}>
       <Text style={styles.label}>
-        Choose up to {max} {max === 1 ? 'child' : 'children'} to keep active. Others keep their
-        history, exports and rewards, but paid learning features stop when the change takes effect.
+        {keepSelectionMessage(count)} The others keep their history, exports and rewards, but their
+        paid learning features stop when the change takes effect. To stop a child’s paid features
+        sooner, archive them in Children.
       </Text>
+      <Body muted>
+        {selected.size} of {count} chosen
+      </Body>
       {children.map((child) => {
         const on = selected.has(child.id);
         return (
           <View key={child.id} style={[styles.row, { alignItems: 'center' }]}>
             <Switch
               value={on}
-              disabled={!on && selected.size >= max}
+              disabled={!on && selected.size >= count}
               accessibilityLabel={`Keep ${child.nickname} active`}
               onValueChange={(value) => {
                 const next = new Set(selected);
