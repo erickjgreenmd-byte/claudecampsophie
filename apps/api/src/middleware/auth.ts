@@ -69,3 +69,9 @@ export async function currentFamilyId(c: Context<AppEnv>): Promise<string> {
   if (!familyId) throw new ApiError('NOT_FOUND', 'Create your family first');
   return familyId;
 }
+
+/** Middleware form of assertOwnerAdmin for admin routers. */
+export const requireOwnerAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {
+  await assertOwnerAdmin(c);
+  await next();
+};
