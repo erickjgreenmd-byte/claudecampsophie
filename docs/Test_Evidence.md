@@ -9,6 +9,7 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | Run | Commit | Result | Steps |
 |---|---|---|---|
 | [#3](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35967486861) | `c71786a` | **success** (07:02–07:07 UTC, 2026-09-24) | install (frozen lockfile) → format → secret scan → lint → typecheck → all tests incl. real Postgres 16 service (2 min 9 s) → finance arithmetic → gate audit with per-package test floors (`scripts/test-minimums.json`) — every step ran and passed |
+| [#38](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36064658278) | `998dafa` | **success** (21:57–22:04 UTC) | every step on the round-5 code (`5f02621` is code-identical; later commits are records only) |
 | #37 | `1de2803` | **success** (19:49–19:55 UTC) | every step (records and the restored ai floor) |
 | [#35](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36049019610) | `e123e5c` | **success** (19:34–19:40 UTC) | every step, after 15:00 UTC real time: confirms the BUG-090 clock fix (at 4a07ac9 the pinned-clock tests would fail after 15:00) |
 | [#34](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35999435932) | `4a07ac9` | **success** (12:30–12:36 UTC) | every step |
