@@ -10,7 +10,7 @@ step is actually performed.
 
 | Environment | API (Cloudflare Worker) | Database | Billing | AI | Consent |
 |---|---|---|---|---|---|
-| development | `wrangler dev` (apps/api) | local Postgres 16 via `pnpm db:local` / `scripts/dev-db.sh` | RevenueCat/Stripe mocks | labeled mock (no child data leaves) | labeled development mock |
+| development | `wrangler dev` (apps/api; `APP_ENV` from `apps/api/.dev.vars`, §2) | local Postgres 16 via `pnpm db:local` / `scripts/dev-db.sh` | RevenueCat/Stripe mocks | labeled mock (no child data leaves) | labeled development mock |
 | test (CI) | none (Hono app in-process) | Postgres 16 service container, one database per test file | mocks | mocks | mock |
 | staging | `pencillift-api-staging` (`wrangler deploy --env staging`) | existing Supabase **staging** project (owner action #3) | RevenueCat sandbox | OpenAI project **only with ZDR evidence** | real provider sandbox |
 | production | `pencillift-api-production` | Supabase production project | RevenueCat production | OpenAI with recorded ZDR approval | contracted provider |
@@ -18,7 +18,13 @@ step is actually performed.
 `APP_ENV=production` refuses to serve with the development consent mock (HTTP 503 `BLOCKED_EXTERNAL`), and the
 scan job never runs a mock AI provider in production (`checkChildDataGate`). Labeled mocks (consent, RevenueCat,
 Stripe) are wired only in development and test: staging and production without the server keys get an
-unavailable provider that refuses every call, never a mock (§3.1).
+unavailable provider that refuses every call, never a mock (§3.1). The same rule decides consent records:
+a record the development consent mock wrote (`is_test_provider = true`) counts as verified consent only in
+development and test (`acceptsTestProviderConsent`, `apps/api/src/config.ts`). In staging and production
+every child-data gate refuses it with 422 `CONSENT_REQUIRED`: child activation, homework registration,
+upload and finalize, the scan job and AI re-theming in the learning jobs. A staging database that
+holds such rows (from before BUG-067, a seed, or a development Worker pointed at it) needs consent recorded
+again through the real provider.
 
 ## 2. Configuration (names only — values are never committed)
 
@@ -41,6 +47,17 @@ Worker **secrets** (`wrangler secret put <NAME> --env <env>`):
 
 Worker **vars** (`wrangler.toml`): `APP_ENV`, `PROGRAM_TIMEZONE` (donation month zone, default UTC),
 `PAYOUT_TRANSFERS_ENABLED` (keep `false` until owner action #12), `INACTIVITY_DELETION_ENABLED` (keep `false` until owner action #13; `INACTIVITY_MONTHS`/`INACTIVITY_NOTICE_DAYS` default 12/30).
+
+`APP_ENV` is required and never defaulted (LRD-5). It is set only in `[env.staging.vars]` and
+`[env.production.vars]`; the top-level `[vars]` deliberately leave it out. So always deploy with `--env
+staging` or `--env production` (`pnpm deploy:staging` does). A deploy without `--env` produces a Worker with no
+`APP_ENV`, and that Worker answers every request with 503 `NOT_CONFIGURED`. Its Cron Trigger only logs
+`scheduled_not_configured`. It never runs as development with the labeled mocks. For local `wrangler dev`,
+copy `apps/api/.dev.vars.example` to `apps/api/.dev.vars` (gitignored, never uploaded by a deploy) and add the
+local-only secrets there. Other configuration errors fail the same way, with 503 `NOT_CONFIGURED`: an unknown
+`CONSENT_PROVIDER`, a `SUPABASE_URL` that is not `https` (plain `http` only to `localhost`/`127.0.0.1`), a
+`SUPABASE_SERVICE_ROLE_KEY` under 20 characters, and a missing `HYPERDRIVE` binding (logged as
+`runtime_not_configured` with the error class only).
 Bindings: `HYPERDRIVE` (the three ids in `apps/api/wrangler.toml` are placeholders named
 `OWNER_ACTION_HYPERDRIVE_ID_*`; `wrangler deploy` fails until real ids replace them — intentionally).
 Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public by design).
@@ -103,6 +120,12 @@ product and ad-free mappings active, provider offers ready, sponsors active, spo
 scheduled, active or paused. Rows are never deleted: retire, revoke, deactivate, suspend the sponsor, end the
 campaign or mark the offer `failed` (with a reason) to clear one.
 
+A link check result belongs to the URL that was checked (LRD-2). Changing a resource's merchant URL clears the
+previous check: the 0770 trigger `resource_catalog_check_reset` sets `availability = 'unknown'`, whoever
+writes the change. A check that was still running when the URL changed records nothing. `POST
+/v1/admin/monetization/catalog/:id/link-check` answers 409 `CONFLICT` ("The merchant link changed during the
+check; run it again"). Run the check again for the new URL before approving the resource.
+
 Mark each deployed database once, with the migration role (the API's service role can read the mark but never
 change it):
 
@@ -125,9 +148,12 @@ in any of the seven catalogs fails (a draft creative or campaign may be stored, 
   all four. Every `VITE_*`/`EXPO_PUBLIC_*` variable holds an obviously fake value of the documented public shape
   (a legacy anon-role key, RevenueCat `appl_`/`goog_` keys, `.invalid` URLs), assembled at run time, so the
   bundles carry these variables as a release build does and the allowlist is exercised on real output.
-- **Negative control (CI)**: the same script rebuilds the web portal and the app config with a fake service-role
-  key and a fake `sb_secret_` key in the publishable-key variables and fails unless the scan finds both. A build
-  that stops embedding those variables where the scan looks, or a scan that stops seeing them, fails CI.
+- **Negative control (CI)**: the same script rebuilds the web portal and the app config with four fake secrets
+  in public build variables: a service-role key and a Stripe test-mode secret key in the web portal, and an
+  `sb_secret_` key and a database URL with an inline password in the app config. It fails unless the scan
+  fails and names each planted detector (`service-role JWT`, `Stripe test secret`, `Supabase secret key`,
+  `database URL with password`). A build that stops embedding those variables where the scan looks, or a scan
+  that stops seeing one of them, fails CI.
 - **The release builds themselves**: CI never holds the release values, so a secret pasted into a public build
   variable at release time is only caught by scanning that exact build. Scan `apps/web/dist` before upload
   (§3 step 6) and the app config before each EAS build (§3 step 7); a failed scan stops the release.
@@ -136,7 +162,11 @@ in any of the seven catalogs fails (a draft creative or campaign may be stored, 
   word or right after an escape a string literal or URL puts in front of it (`\n`, `\u0022`, `\x22`, `%20`),
   never inside a longer word. In artifacts every other signed JWT also fails, except the documented public
   client values (`docs/Connections.md`): the Supabase publishable/anon key and the RevenueCat public SDK keys.
-  The allowlist is `DOCUMENTED_PUBLIC` in the script.
+  The allowlist is `DOCUMENTED_PUBLIC` in the script. Stripe secret and restricted keys are found in live and
+  test mode (`sk_live_`, `sk_test_`, `rk_live_`, `rk_test_`). Database URLs with an inline password are found
+  too (postgres, mysql/mariadb, mongodb, redis, amqp). Loopback and reserved test hosts are ignored, and so
+  are placeholder passwords such as `${X}`, `$X`, `<…>`, `[YOUR-PASSWORD]` and `password`. Base64 `data:` URIs are
+  decoded and scanned up to two levels deep; a hit is reported as `<detector> in base64 data URI` (LRD-3).
 - **Files**: minified bundles are scanned whole, and findings give `file:line:column` and the detector, never
   the value. Source maps are scanned as the original sources they embed (findings name the source); their VLQ
   `mappings` are skipped. Binary files are read byte for byte and as UTF-16. gzip, brotli (`.br`) and zstd
@@ -145,9 +175,11 @@ in any of the seven catalogs fails (a draft creative or campaign may be stored, 
   and pass the directory. A missing or empty artifact directory fails the scan.
 - **Not covered yet**: EAS native builds (.ipa/.aab) and deployed endpoints, which need a deployment (owner
   actions #5, #8). When they exist, unpack the build and pass the directory to `--artifacts`.
-- **Last local run** (2026-09-24, `scripts/scan-release-artifacts.sh`): web portal, Worker bundle (production
-  env), Expo web export and app config, 69 files / 11.2 MiB → `Artifact secret scan passed`; negative control:
-  the planted service-role key (web portal, 2 findings) and secret key (app config, 1 finding) were found.
+- **Last local run** (2026-09-24, `scripts/scan-release-artifacts.sh <scratch dir>`, exit 0 in 18 s): web
+  portal, Worker bundle (production env), Expo web export and app config, 69 files / 11.7 MiB →
+  `Artifact secret scan passed (69 files, 11.7 MiB in 4 directories)`. Negative control: in the web portal,
+  `Stripe test secret` and `service-role JWT` (2 files, 4 findings); in the app config, `Supabase secret key`
+  and `database URL with password` (1 finding each).
 
 ## 4. Scheduled work and durable jobs
 
@@ -182,14 +214,29 @@ grown-up" card sends nothing, and PencilLift sends no automatic parent alert; ne
 was sent.
 
 System reports (migration 0760). The scan job screens every extracted answer and printed prompt with the
-deterministic first-layer screen (`@pencillift/domain/safety`; the OpenAI moderation endpoint is not wired).
-On a severe-risk result it makes no coaching call for that question, shows the child the reviewed safety
-template (feedback kind `safety`: talk to a trusted grown-up; 988 for self-harm; Childhelp 1-800-422-4453
-for abuse, secrecy, sexual content or stranger contact; 911 for immediate danger) and files one report per
-question per transcription: `reporter_kind = 'system'`, category `severe_risk`, status `escalated` from the
-start (serious by default; the database keeps it `escalated` or `resolved`). Grading and the scan's status
-are unchanged. The report holds ids and the screen's category codes only, never homework text. The child's
-results screen shows the template as its header and body (hints are hidden for that question). The family
+deterministic first-layer screen (`@pencillift/domain/safety`, version `SAFETY_SCREEN_VERSION`; the OpenAI
+moderation endpoint is not wired) BEFORE any grading call. On a severe-risk result that question gets no
+model call at all (no grading, verification or coaching; it gets no verdict and no worked solution), the
+child is shown the reviewed safety template (feedback kind `safety`: talk to a trusted grown-up; 988 for
+self-harm; Childhelp 1-800-422-4453 for abuse, secrecy, sexual content or stranger contact; 911 for
+immediate danger) and one report is filed per question per transcription: `reporter_kind = 'system'`,
+category `severe_risk`, status `escalated` from the start (serious by default; the database keeps it
+`escalated` or `resolved`). Both are written before grading starts, so a grading failure, a spend-ceiling
+pause or a dead-lettered scan cannot delay or drop them. The scan's status follows its other questions (a
+flag never moves it to parent review, so a held flag is not announced to the household); the parent sees
+the flagged question as not checked. The report holds ids and the screen's category codes only, never
+homework text. The child's results screen shows the template as its header and body as soon as it is
+filed, whatever the scan's status (still being checked, waiting for a retry, failed for good; the child
+API returns the latest notice before any result is visible), and hints and "Try again" are hidden for that
+question. If a grown-up later corrects the flagged answer's transcription, the child keeps the template
+(also while the recheck waits), the tutor is still not called and no new report is filed unless the
+corrected text screens severe again; the queue marks the original report `transcriptionCorrected: true`
+(never the corrected text), so check whether the edit was an honest transcription fix. Until a reviewer
+clears it, a flagged question stays unchecked (a parent's verdict override answers "No result to
+override") and keeps its template even after a correction. The screen leans toward escalation for a
+child's first-person words (a missed disclosure is worse than a false flag), so false matches are
+expected and are cleared by a person (below; the documented ones are listed in the screen's KNOWN LIMITS). The screen reads the printed prompt with every rule except the one for a child's own "suicide is the only way out", but
+a first person in the prompt ("In our unit we discuss ...") is the worksheet's, never the child's. The family
 sees a visible report in its report list as "Answer flagged for a grown-up", "Flagged by PencilLift", with a
 note that PencilLift sent no automatic alert and the same resources; the family never sees the category
 codes. Family hold (proposed default; owner and counsel to approve): a report whose codes include `abuse`,
@@ -197,21 +244,74 @@ codes. Family hold (proposed default; owner and counsel to approve): a report wh
 its audit rows carry no `family_id` (family members can read their family's audit log) until the owner
 releases it. The hold only stops PencilLift from drawing the household's attention to the flag; it does not
 hide the child's own answer, which the family can always see in the scan, or the child's feedback rows.
-`self_harm`, `violence` and `personal_contact` reports are visible at once. The child templates and parent
+`self_harm`, `violence` and `personal_contact` reports are visible at once. A child's own report (the results
+screen's "Get help" button, `POST /v1/child/reports`) about a question with a held system report, or naming
+its template row, starts held too (`familyVisible: false` in the queue); otherwise it would show the
+household the held question at once. Release it on its own, like the system report. The child templates and parent
 wording are drafts until the owner and an educator approve them (`SAFETY_TEMPLATES_STATUS`). Blocked model output (coaching, rubric labels, practice intros and stories) is
 logged as a code only (`coaching_blocked_by_safety`, `rubric_label_blocked_by_safety`,
 `practice_ai_blocked_by_safety`) and creates no report: watch the rates as with `coaching_blocked_by_guard`.
 
 Queue: an owner admin with MFA (aal2) lists `GET /v1/admin/safety-reports?status=open` (oldest first; use
-`?status=escalated` for system reports) and moves a report with `PATCH /v1/admin/safety-reports/:id`. There
-is no admin web screen yet; use the API. Reviewers see ids, category, status, timestamps and whether a note
+`?status=escalated` for system reports) and moves a report with `PATCH /v1/admin/safety-reports/:id`. A page
+holds at most 200 reports; while `nextCursor` is not null, fetch the next page with `&after=<nextCursor>`
+and keep going to the end, because a new severe flag is the newest item. There is no admin web screen yet;
+use the API. Reviewers see ids, category, status, timestamps and whether a note
 exists, never homework text, the child's nickname or the parent's note. A system report adds
 `screenCategories` (`self_harm`, `abuse`, `violence`, `sexual`, `secrecy`, `personal_contact`) and
-`familyVisible`, and links the question (`questionId`) and the template shown (`feedbackId`). Every change
+`familyVisible` and `transcriptionCorrected`, and links the question (`questionId`) and the template shown
+(`feedbackId`). The resolution note is internal: the family's list and the family's database access show a
+report's status and timestamps, never its resolution note (migration 0760 grants no family read of it), so
+record authority and family-contact decisions there as the steps below say. Every change
 writes an `audit_events` row (`safety_report.updated`, from/to status); a system report's creation writes
 `safety_report.created` with actor `system`. To release a held report to the family's list, send
 `PATCH /v1/admin/safety-reports/:id` with `{"familyVisible": true}` (alone or with a status); it is
 forward only (a report is never hidden again) and writes `safety_report.released_to_family`.
+
+Clearing a false match (round 3; spec P4 "human review procedures"). When the review shows the screen's
+word match was wrong (a house rule, homework hyperbole, a game, a lesson; read the one question's
+transcription through the service role only if ids and categories cannot settle it, and record that access
+in the note, never the text), resolve the system report with
+`PATCH /v1/admin/safety-reports/:id` and `{"status": "resolved", "resolution": "false_match",
+"resolutionNote": "<the screen category and the kind of false match>"}`. The queue shows the screen
+categories (`screenCategories`), not the rule that fired, so the note names the category and the kind of
+false match in general words ("self_harm; homework hyperbole", "abuse; a house rule about snacks"), never
+the text. The clearance is that report's question and transcription, and it is final.
+
+Clear every system report on the question (round 4). A question can carry several system reports, one per
+transcription (the original and a grown-up's correction that screened severe again): find them in the
+`?status=escalated` queue by their `questionId` (every page; `transcriptionCorrected: true` marks the older
+ones) and clear each one the review covers. The question is graded only after the LAST of them is
+cleared; until then its notice stays, a recheck grades and coaches nothing, and the child never sees hints
+next to a notice, so clearing only some of them is harmless but leaves the question unchecked. Each
+clearance answers with its own `recheck` value (below); the one for the last report grades the question.
+- Once every system report on the question is cleared, the child's results stop showing its safety notice
+  at once (the notice rows are kept, not deleted; nothing about the answer text is stored with the
+  clearance).
+- The response's `recheck` says what happens to grading: `queued` (the scan was ready or waiting for parent
+  review; it moves to `checking` and a re-check grades the question normally with coaching, like a
+  corrected answer), `on_retry` (the scan is waiting for a retry, which grades it), or `none` (the scan
+  failed for good, was cancelled or sent back for a retake, or the family is being deleted; nothing is
+  graded). A scan that is still being checked is refused (`SCAN_STILL_CHECKING`): clear it once the scan
+  settles, and the report stays `escalated` until then.
+- A held report stays held for good: combining the clearance with `familyVisible` is refused (400), and a
+  later release answers `FALSE_MATCH_NOT_RELEASABLE` (migration 0760 refuses it too). Its audit rows carry
+  no `family_id` and the re-check job is not family-readable, so the family never learns of a held report
+  that was cleared; they can see only that the scan was checked again and that the question now has a
+  result. A child's own "Get help" report about the question stays held until you release it on its own,
+  and so does one filed LATER (a cleared held report stays held, so a report about a hint the recheck
+  wrote starts held too, migration 0760 `child_report_content`): after clearing a held flag, check the
+  queue for the question's child reports (`?status=open`) for as long as the scan's results are shown, and
+  release each one on its own when the review allows it. A visible report stays in the family's list as
+  resolved, with wording that a reviewer found it was not a concern and that the child's results no longer
+  show the message (`clearedAsFalseMatch`; draft wording `safety-templates.v3`).
+- If a grown-up later corrects the transcription, the new text is screened afresh: a new severe match files
+  a new report and shows the notice again, and needs its own review.
+- Only system reports can be cleared (`FALSE_MATCH_SYSTEM_ONLY`). Record the category and the kind of false
+  match in the note so the rules can be tuned in a new `SAFETY_SCREEN_VERSION` if the same false match
+  recurs; the screen's KNOWN LIMITS (`packages/domain/src/safety/index.ts`) list the expected ones (for
+  example "World War I" or "Act I" next to a sensitive word, an adjective "ill" before a verb, a blade or a
+  room in an accident, a note about a lesson written in the first person).
 
 | Status | Meaning | Allowed next |
 |---|---|---|
@@ -229,8 +329,9 @@ Triage. Target: every `open` report reviewed within 1 business day (proposed; ow
    record the defect, then resolve.
 4. `other`: triage by ids and escalate anything that could involve a child's safety.
 5. `severe_risk` (system) arrives `escalated`: go straight to the escalation steps. The screen is a word
-   match and can be wrong (fiction, quotes, a sibling squabble); a false match is resolved with a note
-   naming the screen code that fired so the rule can be tuned, never with the text.
+   match and can be wrong (fiction, quotes, a sibling squabble, a house rule); a false match is cleared
+   as above (`resolution: "false_match"`, every system report on the question) with a note naming the
+   category and the kind of false match so the rule can be tuned, never with the text.
 
 Escalation (serious concerns). Target: owner review within 1 hour of `escalated` (proposed; owner to approve).
 

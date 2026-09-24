@@ -49,6 +49,13 @@ price and the release-readiness check blocks any tier whose store price ≠ appr
    only 100% (Free) campaigns on iOS; Google existing subscribers — 100% via defer; partial via web billing where
    policy allows.
 
+## 3a. AI cost assumptions to verify at activation
+
+- `IMAGE_INPUT_TOKEN_BOUND` = 1,500 input tokens per page image (`apps/api/src/jobs/spend-ceiling.ts`) bounds the
+  admitted spend estimate (BUG-094). It is unverified (no provider key): check it against the chosen model's
+  high-detail image accounting and raise it if a page can cost more.
+- Prompt versions in use: extraction.v2, grading.v3, verification.v2, coaching.v1 (`packages/ai/src/prompts.ts`).
+
 ## 4. Sandbox evidence still required (blocked on account access)
 
 - [ ] Apple sandbox: existing subscriber redeems offer for next period; second month new offer; 100% twice.
