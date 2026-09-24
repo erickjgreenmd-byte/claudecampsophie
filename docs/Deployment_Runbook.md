@@ -88,6 +88,46 @@ allowance released; the parent can resubmit.
 | Consent withdrawal | Parent action | Queued work is cancelled in the same transaction; verify no new `scan_process` jobs start for the family |
 | Deletion request | `deletion_requests` | Purge job runs on the next tick; `purge_report` records counts; storage objects are removed before rows |
 
+### 5.1 Safety reports: moderation and escalation (spec P4, P14; AC_SECURITY_01)
+
+Reports come from the child's "Tell PencilLift" choices (`POST /v1/child/reports`: `upsetting`,
+`wrong_or_confusing`, `answer_revealed`, `other`) and from parents (`POST /v1/safety-reports`, which also
+offers `unsafe_content`). The child's "Tell a grown-up" card sends nothing, and PencilLift sends no
+automatic parent alert; never tell a family that one was sent.
+
+Queue: an owner admin with MFA (aal2) lists `GET /v1/admin/safety-reports?status=open` (oldest first) and
+moves a report with `PATCH /v1/admin/safety-reports/:id`. There is no admin web screen yet; use the API.
+Reviewers see ids, category, status, timestamps and whether a note exists, never homework text, the
+child's nickname or the parent's note. Every change writes an `audit_events` row
+(`safety_report.updated`, from/to status).
+
+| Status | Meaning | Allowed next |
+|---|---|---|
+| `open` | Not reviewed yet | `triaged`, `escalated`, `resolved` |
+| `triaged` | Category confirmed; routine follow-up in progress | `escalated`, `resolved` |
+| `escalated` | Serious concern with the owner (the escalation contact) | `resolved` |
+| `resolved` | Closed with a required resolution note; final (a new concern is a new report) | none |
+
+Triage. Target: every `open` report reviewed within 1 business day (proposed; owner to approve).
+
+1. `upsetting` and `unsafe_content` are serious by default: set `escalated` at once, then follow the
+   escalation steps.
+2. `answer_revealed`: follow the "Leak report" row above, then resolve with the guard finding in the note.
+3. `wrong_or_confusing`: check the grading or hint path by ids (`question_results`, `child_feedback`), fix or
+   record the defect, then resolve.
+4. `other`: triage by ids and escalate anything that could involve a child's safety.
+
+Escalation (serious concerns). Target: owner review within 1 hour of `escalated` (proposed; owner to approve).
+
+1. The owner reviews the linked item through ids and audit records only; no casual browsing of child content.
+2. If generated content is involved, switch child coaching to reviewed templates (withhold the AI key) until
+   the cause is fixed and the answer-leak and moderation tests pass again.
+3. If a child may be at risk of harm, the owner contacts the family owner by email and, where the law
+   requires, the appropriate authorities, following the owner-approved safety policy. That policy and its
+   message templates are an owner action that must be complete before launch (spec P4: "Safety templates
+   and human review procedures must exist before launch").
+4. Resolve with a note stating the outcome and any product change, without homework text or names.
+
 ## 6. Backup, restore and rollback (not yet rehearsed)
 
 - Worker rollback: `wrangler rollback --env <env>` to the previous version. Database migrations are forward-only;
