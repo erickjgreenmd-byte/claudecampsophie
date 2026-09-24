@@ -34,6 +34,17 @@ export const DEFAULT_HOMEWORK_UPLOAD_LIMITS: HomeworkUploadLimits = {
 };
 
 /**
+ * Types the scan job can read today. HEIC and PDF are accepted for upload (spec P5) but need the
+ * isolated converter, which is not deployed yet: the scan job ends such scans as `failed_final` with
+ * error code `FORMAT_NEEDS_CONVERSION` (and gives the pages back). Clients offer only these types for
+ * new scans and show HEIC/PDF as "not available yet" until the converter ships.
+ */
+export const HOMEWORK_READABLE_MIME_TYPES: readonly HomeworkMimeType[] = [
+  'image/jpeg',
+  'image/png',
+];
+
+/**
  * Spec P11 prototype allowance: 40 homework pages per paid child per billing period. A configurable
  * proposal for pilot validation, not an owner-approved advertised limit.
  */
@@ -72,6 +83,23 @@ export const CANCELLABLE_ASSIGNMENT_STATUSES: readonly AssignmentStatus[] = [
   'queued',
   'failed_retryable',
   'needs_rescan',
+];
+
+/**
+ * Statuses a scan reaches only after finalize committed. Repeating finalize returns the current state
+ * (AC_CAPTURE_06), and a client retry whose create returns one of these knows the scan was already
+ * sent — its earlier finalize worked and only the response was lost (RV-homework-4).
+ */
+export const FINALIZED_ASSIGNMENT_STATUSES: readonly AssignmentStatus[] = [
+  'queued',
+  'extracting',
+  'checking',
+  'verifying',
+  'ready',
+  'needs_rescan',
+  'needs_parent_review',
+  'failed_retryable',
+  'failed_final',
 ];
 
 /** Statuses in which a parent may correct a transcription (the result is then re-checked). */
@@ -267,7 +295,14 @@ export const pageAllowanceSchema = z.strictObject({
   childPagesUsed: z.number().int().min(0),
   childPagesAllowed: z.number().int().min(0),
   familyPagesUsed: z.number().int().min(0),
+  /** Paid slots × per-child allowance; 0 means the family has no paid capacity (e.g. expired). */
   familyPagesAllowed: z.number().int().min(0),
+  /**
+   * Whether this child currently holds a paid slot (a downgrade or expiry releases it while the
+   * profile stays listed). The API always sends it; optional so payloads from before it existed
+   * still parse.
+   */
+  childHasPaidSlot: z.boolean().optional(),
 });
 export type PageAllowance = z.infer<typeof pageAllowanceSchema>;
 

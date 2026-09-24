@@ -4,6 +4,7 @@ import {
   CORRECTABLE_ASSIGNMENT_STATUSES,
   DEFAULT_HOMEWORK_PAGE_ALLOWANCE_PER_CHILD,
   DEFAULT_HOMEWORK_UPLOAD_LIMITS,
+  FINALIZED_ASSIGNMENT_STATUSES,
   correctTranscriptionRequestSchema,
   createAssignmentRequestSchema,
   finalizeAssignmentRequestSchema,
@@ -119,19 +120,6 @@ const EXTENSIONS: Record<HomeworkMimeType, string> = {
   'image/heic': 'heic',
   'application/pdf': 'pdf',
 };
-
-/** Once finalized, repeating finalize returns the current state (AC_CAPTURE_06). */
-const FINALIZED_STATUSES: readonly AssignmentStatus[] = [
-  'queued',
-  'extracting',
-  'checking',
-  'verifying',
-  'ready',
-  'needs_rescan',
-  'needs_parent_review',
-  'failed_retryable',
-  'failed_final',
-];
 
 /** Child verdicts are shown only once checking has finished (no interim results). */
 const RESULT_VISIBLE_STATUSES: readonly AssignmentStatus[] = ['ready', 'needs_parent_review'];
@@ -339,7 +327,63 @@ async function readPages(tx: Tx, familyId: string, assignmentId: string): Promis
      order by page_number`;
 }
 
-/** Consent (spec P3) and an active paid profile (spec P11) gate every capture step. */
+interface PaidProfileState {
+  status: string;
+  /** The profile may use paid AI now (spec P11); see `readPaidProfile`. */
+  entitled: boolean;
+}
+
+/**
+ * Whether a child profile is paid for right now (spec P11: "stop paid AI for inactive profiles";
+ * migration 0001: "active: holds a paid slot"). The profile status alone is not enough: a
+ * provider-confirmed downgrade or expiry releases the slot (`child_slot_assignments.released_at`,
+ * services/billing-sync.ts) and leaves the profile row `active` (RV-homework-3).
+ *
+ * Entitled when the profile is `active`, the family has verified paid capacity, and either
+ * - it holds an open slot assignment (the activation route always creates one), or
+ * - it has no slot history at all (a profile made `active` without the activation route, e.g. seeded
+ *   test data) and verified capacity still covers every active profile in the family.
+ * A released slot with no open one, zero capacity, or more slot-less active profiles than capacity
+ * all fail closed. Works under RLS (parent reads) and the service role; scoped by family either way.
+ */
+async function readPaidProfile(
+  tx: Tx,
+  familyId: string,
+  childId: string,
+): Promise<PaidProfileState | null> {
+  const [row] = await tx<
+    {
+      status: string;
+      holds_slot: boolean;
+      slot_history: boolean;
+      active_profiles: number;
+      paid_slots: number;
+    }[]
+  >`
+    select c.status,
+           exists (select 1 from public.child_slot_assignments s
+                    where s.child_id = c.id and s.family_id = c.family_id
+                      and s.released_at is null) as holds_slot,
+           exists (select 1 from public.child_slot_assignments s
+                    where s.child_id = c.id and s.family_id = c.family_id) as slot_history,
+           (select count(*)::int from public.child_profiles o
+             where o.family_id = c.family_id and o.status = 'active') as active_profiles,
+           coalesce((select f.paid_slots from public.family_capacity f
+                      where f.family_id = c.family_id), 0)::int as paid_slots
+      from public.child_profiles c
+     where c.id = ${childId} and c.family_id = ${familyId}`;
+  if (!row) return null;
+  const entitled =
+    row.status === 'active' &&
+    row.paid_slots >= 1 &&
+    (row.holds_slot || (!row.slot_history && row.active_profiles <= row.paid_slots));
+  return { status: row.status, entitled };
+}
+
+/**
+ * Consent (spec P3) and an active paid profile (spec P11) gate every capture step: create, upload
+ * (including a resumed upload, which signs new URLs for child photos) and finalize.
+ */
 async function assertCanCollect(
   c: Context<AppEnv>,
   tx: Tx,
@@ -357,14 +401,15 @@ async function assertCanCollect(
       ),
     );
   }
-  const [child] = await tx<{ status: string }[]>`
-    select status from public.child_profiles where id = ${childId} and family_id = ${caller.familyId}`;
-  if (child?.status !== 'active') {
+  const profile = await readPaidProfile(tx, caller.familyId, childId);
+  if (!profile?.entitled) {
     throw businessRule(
       'CHILD_NOT_ACTIVE',
       say(
         caller,
-        'Assign a paid slot to this child before scanning homework',
+        profile?.status === 'active'
+          ? 'This child has no paid child slot right now, so new scans are paused. Existing homework and results stay available.'
+          : 'Assign a paid slot to this child before scanning homework',
         'Ask a grown-up to help with scanning right now.',
       ),
     );
@@ -409,13 +454,19 @@ async function pageUsage(
   };
 }
 
-function toAllowance(periodKey: string, usage: Usage, perChild: number): PageAllowance {
+function toAllowance(
+  periodKey: string,
+  usage: Usage,
+  perChild: number,
+  childHasPaidSlot: boolean,
+): PageAllowance {
   return {
     periodKey,
     childPagesUsed: usage.childUsed,
     childPagesAllowed: perChild,
     familyPagesUsed: usage.familyUsed,
     familyPagesAllowed: usage.paidSlots * perChild,
+    childHasPaidSlot,
   };
 }
 
@@ -484,6 +535,44 @@ async function readParentQuestions(
      where q.assignment_id = ${assignmentId} and q.family_id = ${familyId}
        and (${questionId}::uuid is null or q.id = ${questionId}::uuid)
      order by p.page_number, length(q.question_number), q.question_number`;
+}
+
+/**
+ * Closes the parent review loop (RV-homework-5): once nothing in a `needs_parent_review` scan is
+ * left for the parent to decide, the scan becomes `ready`, so the parent list and the child stop
+ * saying it needs review. Service role, so every statement is scoped by the caller's family.
+ *
+ * A question is still open when it has no result, when its result is undecided
+ * (`needs_parent_review` / `unresolved`) and the parent has not overridden it — the same rule the
+ * scan job's recheck applies — or when its transcription was corrected after it was graded (a
+ * failed re-check leaves the old result in place) and no override was made since that correction.
+ */
+async function settleParentReview(tx: Tx, caller: Caller, questionId: string): Promise<void> {
+  const [assignment] = await tx<{ id: string; status: AssignmentStatus }[]>`
+    select a.id, a.status from public.assignments a
+      join public.extracted_questions q on q.assignment_id = a.id and q.family_id = a.family_id
+     where q.id = ${questionId} and a.family_id = ${caller.familyId}
+     for update of a`;
+  if (assignment?.status !== 'needs_parent_review') return;
+  const [open] = await tx<{ n: number }[]>`
+    select count(*)::int as n
+      from public.extracted_questions q
+      left join public.question_results r on r.question_id = q.id and r.family_id = q.family_id
+     where q.assignment_id = ${assignment.id} and q.family_id = ${caller.familyId}
+       and (r.question_id is null
+            or (r.parent_override_verdict is null
+                and r.verdict in ('needs_parent_review', 'unresolved'))
+            or (q.corrected_at is not null and q.corrected_at > r.graded_at
+                and (r.overridden_at is null or r.overridden_at < q.corrected_at)))`;
+  if ((open?.n ?? 1) > 0) return;
+  const settled = await tx`
+    update public.assignments set status = 'ready', error_code = null
+     where id = ${assignment.id} and family_id = ${caller.familyId}
+       and status = 'needs_parent_review'
+    returning id`;
+  if (settled.length === 1) {
+    await audit(tx, caller, 'homework.review_settled', 'assignment', assignment.id);
+  }
 }
 
 /** Validates page numbering and the configured limits before touching the database. */
@@ -638,6 +727,9 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
         const assignment = await lockAssignment(tx, caller, id);
         if (!assignment) throw new ApiError('NOT_FOUND', 'Scan not found');
         if (assignment.status === 'uploading') {
+          // A resume signs fresh PUT URLs for child photos, so it passes the same consent and
+          // paid-profile gate as a new scan (RV-homework-1): withdrawn consent stops uploads.
+          await assertCanCollect(c, tx, caller, assignment.child_id);
           // Resume after an interrupted upload: the same pages get fresh URLs; changed pages would
           // silently alter what was already sent, so they need a new scan.
           const existing = await readPages(tx, caller.familyId, id);
@@ -791,7 +883,7 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
       .asService(async (tx) => {
         const assignment = await lockAssignment(tx, caller, id);
         if (!assignment) throw new ApiError('NOT_FOUND', 'Scan not found');
-        if (FINALIZED_STATUSES.includes(assignment.status)) return assignment;
+        if (FINALIZED_ASSIGNMENT_STATUSES.includes(assignment.status)) return assignment;
         if (assignment.status === 'draft') {
           throw businessRule(
             'NO_PAGES',
@@ -853,11 +945,26 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     const caller = await resolveCaller(c);
     const { deps } = c.var;
     const id = paramUuid(c, 'id', 'Scan not found');
+    /**
+     * Decision (RV-homework-2): `source_pages.deleted_at` means "the object is gone from storage",
+     * which is what the raw-scan retention purge relies on (it only selects `deleted_at is null`).
+     * So the cancel commits the state change first, removes the objects after commit (no network I/O
+     * under row locks), and stamps `deleted_at` only for objects storage confirmed removed. If
+     * storage is unreachable the rows stay live: a repeated cancel retries the removal, and the
+     * 30-day retention purge removes them at the latest. The scan job never reads them (a cancelled
+     * scan cannot move to `extracting`).
+     */
+    const livePages = (tx: Tx) =>
+      tx<{ id: string; storage_path: string }[]>`
+        select id, storage_path from public.source_pages
+         where assignment_id = ${id} and family_id = ${caller.familyId} and deleted_at is null`;
     const outcome = await deps.db
       .asService(async (tx) => {
         const assignment = await lockAssignment(tx, caller, id);
         if (!assignment) throw new ApiError('NOT_FOUND', 'Scan not found');
-        if (assignment.status === 'cancelled') return { row: assignment, paths: [] as string[] };
+        if (assignment.status === 'cancelled') {
+          return { row: assignment, pages: await livePages(tx) };
+        }
         if (!CANCELLABLE_ASSIGNMENT_STATUSES.includes(assignment.status)) {
           throw businessRule(
             'INVALID_TRANSITION',
@@ -880,24 +987,35 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
           update public.jobs set status = 'cancelled'
            where family_id = ${caller.familyId} and status in ('queued', 'failed_retryable')
              and idempotency_key like ${`scan:${id}:v%`}`;
-        const removed = await tx<{ storage_path: string }[]>`
-          update public.source_pages set deleted_at = now()
-           where assignment_id = ${id} and family_id = ${caller.familyId} and deleted_at is null
-          returning storage_path`;
         await audit(tx, caller, 'homework.cancelled', 'assignment', id);
-        return { row: updated!, paths: removed.map((p) => p.storage_path) };
+        return { row: updated!, pages: await livePages(tx) };
       })
       .catch((error: unknown) => mapDbError(error, caller));
-    if (outcome.paths.length > 0) {
-      // Decision: cancelled pages are deleted from storage right away (data minimization); a failure
-      // is logged by code only and the retention purge job removes anything left behind.
-      await deps.providers.storage.remove(outcome.paths).catch(() => {
-        deps.log({
-          level: 'warn',
-          event: 'homework_storage_remove_failed',
-          requestId: c.var.requestId,
-        });
-      });
+    if (outcome.pages.length > 0) {
+      // Decision: cancelled pages are deleted from storage right away (data minimization). A failure
+      // is logged by code only; the rows stay live so a retried cancel or the retention purge job
+      // removes what was left behind.
+      const removed = await deps.providers.storage
+        .remove(outcome.pages.map((p) => p.storage_path))
+        .then(
+          () => true,
+          () => {
+            deps.log({
+              level: 'warn',
+              event: 'homework_storage_remove_failed',
+              requestId: c.var.requestId,
+            });
+            return false;
+          },
+        );
+      if (removed) {
+        await deps.db.asService(
+          (tx) => tx`
+            update public.source_pages set deleted_at = now()
+             where assignment_id = ${id} and family_id = ${caller.familyId} and deleted_at is null
+               and id = any(${outcome.pages.map((p) => p.id)}::uuid[])`,
+        );
+      }
     }
     const response: AssignmentStateResponse = { assignment: toState(outcome.row) };
     return c.json(response);
@@ -919,10 +1037,12 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     }
     const now = deps.clock();
     const data = await deps.db.asParent(parent, async (tx) => {
+      let childHasPaidSlot = false;
       if (childId !== null) {
-        const [child] = await tx<{ id: string }[]>`
-          select id from public.child_profiles where id = ${childId} and family_id = ${familyId}`;
-        if (!child) return null;
+        // Parent read under RLS; the same rule the capture gate applies.
+        const profile = await readPaidProfile(tx, familyId, childId);
+        if (!profile) return null;
+        childHasPaidSlot = profile.entitled;
       }
       const rows = await tx<AssignmentRow[]>`
         select ${tx(ASSIGNMENT_COLUMNS)} from public.assignments
@@ -934,7 +1054,7 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
       if (childId !== null) {
         const periodKey = await pagePeriodKey(tx, familyId, now);
         const usage = await pageUsage(tx, familyId, childId, periodKey);
-        allowance = toAllowance(periodKey, usage, config.pageAllowancePerChild);
+        allowance = toAllowance(periodKey, usage, config.pageAllowancePerChild, childHasPaidSlot);
       }
       return { rows, allowance };
     });
@@ -1061,19 +1181,21 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
       });
     if (!row || row.family_id !== familyId)
       throw new ApiError('NOT_FOUND', 'No result to override');
-    // Decision: the override corrects the evidence of the latest homework attempt on this question
-    // (append-only attempt_overrides). Points are never touched here, so an override cannot claw
-    // back rewards the child already earned.
-    await deps.db.asService(
-      (tx) => tx`
+    const caller: Caller = { kind: 'parent', parent, familyId };
+    await deps.db.asService(async (tx) => {
+      // Decision: the override corrects the evidence of the latest homework attempt on this question
+      // (append-only attempt_overrides). Points are never touched here, so an override cannot claw
+      // back rewards the child already earned.
+      await tx`
         insert into public.attempt_overrides (attempt_id, family_id, correctness, reason, overridden_by)
         select a.id, a.family_id, ${body.verdict}, ${body.reason}, ${parent.userId}
           from public.attempts a
          where a.question_instance_id = ${questionId} and a.family_id = ${familyId}
            and a.source = 'homework'
          order by a.attempt_number desc
-         limit 1`,
-    );
+         limit 1`;
+      await settleParentReview(tx, caller, questionId);
+    });
     const response: OverrideResultResponse = {
       questionId,
       result: {

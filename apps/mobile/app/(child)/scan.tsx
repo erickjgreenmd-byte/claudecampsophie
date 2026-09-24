@@ -34,6 +34,7 @@ import {
 } from '../../src/homework/scan-session.ts';
 import {
   ScanCancelledError,
+  ScanStoppedError,
   cancelScan,
   childUploadMessage,
   newAttempt,
@@ -254,8 +255,13 @@ export default function ScanScreen() {
         await cancelScan(childApi, attemptRef.current).catch(() => undefined);
         attemptRef.current = newAttempt(newKey);
         setUpload({ kind: 'error', message: childUploadMessage(new ScanCancelledError()) });
+      } else if (error instanceof ScanStoppedError) {
+        // The server scan was stopped (e.g. by a grown-up): "Try again" sends a new scan.
+        attemptRef.current = newAttempt(newKey);
+        setUpload({ kind: 'error', message: childUploadMessage(error) });
       } else {
-        // Keep the same attempt: "Try again" resumes and skips pages already sent.
+        // Keep the same attempt: "Try again" resumes and skips pages already sent, or reports a
+        // scan whose finalize already worked as sent.
         setUpload({ kind: 'error', message: childUploadMessage(error) });
       }
     } finally {

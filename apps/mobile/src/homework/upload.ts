@@ -4,10 +4,12 @@
  * pages and receive signed URLs → PUT bytes straight to storage → finalize (idempotent).
  *
  * Resume: the screen keeps the same `UploadAttempt` across retries, so the same keys return the same
- * scan and the server marks pages already stored; only missing pages are sent again. Pure logic with
- * injected I/O so it is unit-testable without a device.
+ * scan and the server marks pages already stored; only missing pages are sent again. When the create
+ * shows the scan was already finalized (a lost finalize response), the retry reports it as sent
+ * without touching pages again. Pure logic with injected I/O so it is unit-testable without a device.
  */
 import {
+  FINALIZED_ASSIGNMENT_STATUSES,
   assignmentStateResponseSchema,
   uploadPagesResponseSchema,
   type AssignmentState,
@@ -54,6 +56,18 @@ export class UploadTransferError extends Error {
     super(`upload failed (${status})`);
     this.name = 'UploadTransferError';
     this.status = status;
+  }
+}
+
+/**
+ * The scan this attempt belongs to was stopped on the server (cancelled, e.g. by a grown-up, or
+ * deleted). Its pages cannot be sent any more; the screen starts a fresh attempt so "Try again"
+ * sends the same pages as a new scan.
+ */
+export class ScanStoppedError extends Error {
+  constructor() {
+    super('stopped');
+    this.name = 'ScanStoppedError';
   }
 }
 
@@ -126,6 +140,15 @@ export async function uploadScan(args: {
   const attempt: UploadAttempt = { ...args.attempt, assignmentId: created.assignment.id };
   args.onAttempt?.(attempt);
   const base = `/v1/assignments/${attempt.assignmentId}`;
+  // Same key, same scan: if an earlier try already finalized it, it was sent. Registering pages
+  // again would be refused, so report it as sent (RV-homework-4; AC_CAPTURE_06 one job, one charge).
+  if (FINALIZED_ASSIGNMENT_STATUSES.includes(created.assignment.status)) {
+    onProgress({ phase: 'done', pagesDone: total, pagesTotal: total });
+    return { assignment: created.assignment, attempt };
+  }
+  if (created.assignment.status === 'cancelled' || created.assignment.status === 'deleted') {
+    throw new ScanStoppedError();
+  }
 
   // 3. Register pages (or resume) and receive single-object signed upload URLs.
   checkCancelled(signal);
@@ -214,6 +237,9 @@ const RULE_COPY: Record<string, string> = {
 /** Calm, blame-free words for every failure; raw server text is never shown to a child. */
 export function childUploadMessage(error: unknown): string {
   if (error instanceof ScanCancelledError) return 'Stopped. Your pages are still here.';
+  if (error instanceof ScanStoppedError) {
+    return 'That scan was stopped. Your pages are still here — tap “Try again” to send them as a new scan.';
+  }
   if (error instanceof PageLimitError) {
     return error.problem === 'too_large'
       ? `Page ${error.pageNumber} is too big or empty. Try taking that photo again.`

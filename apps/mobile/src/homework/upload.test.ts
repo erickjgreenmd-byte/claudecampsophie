@@ -4,6 +4,7 @@ import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { toScanPage, type ScanPage } from './scan-session.ts';
 import {
   ScanCancelledError,
+  ScanStoppedError,
   UploadTransferError,
   cancelScan,
   childUploadMessage,
@@ -196,6 +197,53 @@ describe('uploading a scan (spec P5, AC_CAPTURE_01, AC_CAPTURE_06)', () => {
     expect(await cancelScan(api, withId)).toBe('cancelled');
     expect(calls.at(-1)!.path).toBe(`/v1/assignments/${ASSIGNMENT}/cancel`);
     expect(await cancelScan(api, attempt)).toBe('nothing_to_cancel');
+  });
+
+  it('a retry whose scan was already finalized and processed reports it as sent without re-sending pages', async () => {
+    // The first try's finalize committed but its response was lost; by the retry the job has run.
+    const { api, calls } = fakeApi();
+    const send: ApiClient['send'] = (method, path, body, schema) =>
+      path === '/v1/assignments'
+        ? Promise.resolve(schema.parse(state('needs_rescan')))
+        : api.send(method, path, body, schema);
+    const { io, puts } = fakeIo();
+    const progress: UploadProgress[] = [];
+    const attempt = { ...newAttempt(newKey), assignmentId: ASSIGNMENT };
+    const result = await uploadScan({
+      api: { ...api, send },
+      io,
+      pages: twoPages(),
+      limits,
+      attempt,
+      signal: new AbortController().signal,
+      onProgress: (p) => progress.push(p),
+    });
+    expect(result.assignment.status).toBe('needs_rescan');
+    expect(result.attempt).toEqual(attempt);
+    expect(calls).toHaveLength(0); // no /uploads, no second /finalize
+    expect(puts).toHaveLength(0);
+    expect(progress.at(-1)).toEqual({ phase: 'done', pagesDone: 2, pagesTotal: 2 });
+  });
+
+  it('a scan stopped on the server is reported calmly and never re-registered', async () => {
+    const { api, calls } = fakeApi();
+    const send: ApiClient['send'] = (method, path, body, schema) =>
+      path === '/v1/assignments'
+        ? Promise.resolve(schema.parse(state('cancelled')))
+        : api.send(method, path, body, schema);
+    const { io } = fakeIo();
+    const error = await uploadScan({
+      api: { ...api, send },
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: { ...newAttempt(newKey), assignmentId: ASSIGNMENT },
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ScanStoppedError);
+    expect(calls).toHaveLength(0);
+    expect(childUploadMessage(error)).toMatch(/still here.*new scan/);
   });
 
   it('reports a scan that is already being checked as too late to cancel', async () => {

@@ -61,6 +61,19 @@ async function capacity(familyId: string, slots: number): Promise<void> {
     on conflict (family_id) do update set paid_slots = excluded.paid_slots`;
 }
 
+/**
+ * Gives each listed child an open paid slot, exactly as POST /v1/children/:id/activate does. An
+ * `active` profile holds a paid slot (migration 0001); capture refuses a profile without one
+ * (RV-homework-3), so fixtures must model activation rather than only the profile status.
+ */
+async function assignSlots(family: SeededFamily, indexes?: number[]): Promise<void> {
+  for (const i of indexes ?? family.children.map((_, n) => n)) {
+    await api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id)
+      values (${family.familyId}, ${family.children[i]!.id})`;
+  }
+}
+
 async function childToken(family: SeededFamily, parent: string, index = 0): Promise<string> {
   const code = await api.request(`/v1/children/${family.children[index]!.id}/pairing-code`, {
     method: 'POST',
@@ -214,6 +227,7 @@ beforeAll(async () => {
   for (const f of [fam, other]) {
     await consent(f.familyId, f.ownerId);
     await capacity(f.familyId, f.children.length);
+    await assignSlots(f);
   }
   await grantAdultUnlock(api.db, fam.ownerId, SESSION, 3600);
   await grantAdultUnlock(api.db, other.ownerId, OTHER_SESSION, 3600);
@@ -376,6 +390,7 @@ describe('creating a scan (spec P5, P3 consent gate)', () => {
   it('requires verified consent before any child data is collected (CONSENT_REQUIRED)', async () => {
     const pending = await seedFamily(api.db, { childCount: 1 });
     await capacity(pending.familyId, 1);
+    await assignSlots(pending);
     await grantAdultUnlock(api.db, pending.ownerId, SESSION, 3600);
     const t = await parentToken(pending.ownerId, { sessionId: SESSION });
     const body = () => ({ childId: pending.children[0]!.id, pageCount: 1, idempotencyKey: key() });
@@ -417,6 +432,103 @@ describe('creating a scan (spec P5, P3 consent gate)', () => {
     } finally {
       await prod.close();
     }
+  });
+});
+
+describe('paid profile gate (spec P11; RV-homework-3)', () => {
+  /** A consented family with every child activated into a paid slot and an unlocked parent. */
+  async function paidFamily(children: number) {
+    const f = await seedFamily(api.db, { childCount: children });
+    await consent(f.familyId, f.ownerId);
+    await capacity(f.familyId, children);
+    await assignSlots(f);
+    const session = randomUUID();
+    await grantAdultUnlock(api.db, f.ownerId, session, 3600);
+    return { f, t: await parentToken(f.ownerId, { sessionId: session }) };
+  }
+
+  async function allowanceOf(t: string, childId: string) {
+    const res = await api.request(`/v1/assignments?childId=${childId}`, { token: t });
+    expect(res.status).toBe(200);
+    return assignmentListResponseSchema.parse(await json(res)).allowance!;
+  }
+
+  it('a downgrade that releases a slot stops create, finalize and child capture for that profile only', async () => {
+    const { f, t } = await paidFamily(2);
+    const [first, second] = [f.children[0]!.id, f.children[1]!.id];
+    const kid = await childToken(f, t, 1);
+    // The second child's scan is mid-upload when the downgrade lands.
+    const inFlight = await created(kid, { pageCount: 1, idempotencyKey: key() });
+    expect((await upload(kid, inFlight, { pages: pages(1) })).status).toBe(200);
+    await markUploaded(inFlight);
+    expect((await allowanceOf(t, second)).childHasPaidSlot).toBe(true);
+
+    // Provider-confirmed downgrade to one slot, applied as services/billing-sync.ts does.
+    await capacity(f.familyId, 1);
+    await api.db.sql`
+      update public.child_slot_assignments set released_at = now(), release_reason = 'downgrade'
+       where child_id = ${second} and released_at is null`;
+
+    const parentCreate = await create(t, { childId: second, pageCount: 1, idempotencyKey: key() });
+    expect(parentCreate.status).toBe(422);
+    const parentError = await errorOf(parentCreate);
+    expect(parentError.rule).toBe('CHILD_NOT_ACTIVE');
+    expect(parentError.message).toMatch(/no paid child slot/);
+    const childError = await errorOf(await create(kid, { pageCount: 1, idempotencyKey: key() }));
+    expect(childError.rule).toBe('CHILD_NOT_ACTIVE');
+    expect(childError.message).not.toMatch(/slot|paid/i); // no commercial copy for a child
+    // Finalize would reserve paid AI: refused, and the uploaded work is kept (not charged).
+    const fin = await finalize(kid, inFlight);
+    expect((await errorOf(fin)).rule).toBe('CHILD_NOT_ACTIVE');
+    const [row] = await api.db.sql<{ status: string; jobs: number }[]>`
+      select a.status,
+             (select count(*)::int from public.jobs j where j.idempotency_key like ${'scan:' + inFlight + ':%'}) as jobs
+        from public.assignments a where a.id = ${inFlight}`;
+    expect(row).toEqual({ status: 'uploading', jobs: 0 });
+    // A resumed upload signs new URLs for child photos, so it is gated too.
+    expect((await errorOf(await upload(kid, inFlight, { pages: pages(1) }))).rule).toBe(
+      'CHILD_NOT_ACTIVE',
+    );
+    expect((await allowanceOf(t, second)).childHasPaidSlot).toBe(false);
+
+    // The child who kept the slot is unaffected.
+    expect((await create(t, { childId: first, pageCount: 1, idempotencyKey: key() })).status).toBe(
+      201,
+    );
+    expect((await allowanceOf(t, first)).childHasPaidSlot).toBe(true);
+  });
+
+  it('after expiry (no paid capacity) capture says there is no paid slot, not that pages are used up', async () => {
+    const { f, t } = await paidFamily(1);
+    const childId = f.children[0]!.id;
+    await capacity(f.familyId, 0);
+    await api.db.sql`
+      update public.child_slot_assignments set released_at = now(), release_reason = 'expired'
+       where child_id = ${childId} and released_at is null`;
+    const res = await create(t, { childId, pageCount: 1, idempotencyKey: key() });
+    expect((await errorOf(res)).rule).toBe('CHILD_NOT_ACTIVE');
+    const allowance = await allowanceOf(t, childId);
+    expect(allowance).toMatchObject({
+      childPagesUsed: 0,
+      familyPagesAllowed: 0,
+      childHasPaidSlot: false,
+    });
+  });
+
+  it('active profiles without any slot record are covered only while capacity covers all of them', async () => {
+    // e.g. profiles made active outside the activation route: never more than paid capacity.
+    const f = await seedFamily(api.db, { childCount: 2 });
+    await consent(f.familyId, f.ownerId);
+    await capacity(f.familyId, 1);
+    const t = await parentToken(f.ownerId);
+    for (const child of f.children) {
+      const res = await create(t, { childId: child.id, pageCount: 1, idempotencyKey: key() });
+      expect((await errorOf(res)).rule).toBe('CHILD_NOT_ACTIVE');
+    }
+    await capacity(f.familyId, 2);
+    expect(
+      (await create(t, { childId: f.children[1]!.id, pageCount: 1, idempotencyKey: key() })).status,
+    ).toBe(201);
   });
 });
 
@@ -574,6 +686,7 @@ describe('finalize, quota and jobs (AC_CAPTURE_06, AC_SECURITY_06)', () => {
     const f = await seedFamily(api.db, { childCount: 1 });
     await consent(f.familyId, f.ownerId);
     await capacity(f.familyId, 1);
+    await assignSlots(f);
     await grantAdultUnlock(api.db, f.ownerId, SESSION, 3600);
     const t = await parentToken(f.ownerId, { sessionId: SESSION });
     const childId = f.children[0]!.id;
@@ -617,6 +730,7 @@ describe('finalize, quota and jobs (AC_CAPTURE_06, AC_SECURITY_06)', () => {
       childPagesAllowed: 40,
       familyPagesUsed: 37,
       familyPagesAllowed: 40,
+      childHasPaidSlot: true,
     });
     // Releasing the in-flight scan (e.g. unreadable) frees the space again.
     await api.db.sql`
@@ -626,9 +740,13 @@ describe('finalize, quota and jobs (AC_CAPTURE_06, AC_SECURITY_06)', () => {
   });
 
   it('enforces the family ceiling (paid slots × allowance) across children', async () => {
+    // Decision (RV-homework-3): a profile without a paid slot cannot scan at all, so the ceiling is
+    // exercised the way it bites in practice — a sibling's pages from earlier this month still count
+    // after the family moved to one paid slot (spec P11: reassigning profiles must not reset usage).
     const f = await seedFamily(api.db, { childCount: 2 });
     await consent(f.familyId, f.ownerId);
-    await capacity(f.familyId, 1); // one paid slot shared by two active profiles
+    await capacity(f.familyId, 1);
+    await assignSlots(f, [1]); // the one paid slot now belongs to the second child
     const t = await parentToken(f.ownerId);
     const id = await created(t, {
       childId: f.children[1]!.id,
@@ -637,7 +755,7 @@ describe('finalize, quota and jobs (AC_CAPTURE_06, AC_SECURITY_06)', () => {
     });
     await upload(t, id, { pages: pages(3) });
     await markUploaded(id);
-    // The sibling's in-flight scan uses 38 of the family's 40 pages.
+    // The sibling's scan earlier this month used 38 of the family's 40 pages.
     await api.db.sql`
       insert into public.usage_reservations (family_id, child_id, period_key, units, idempotency_key)
       values (${f.familyId}, ${f.children[0]!.id}, 'pages:2026-09', 38, ${'seed:' + key()})`;
@@ -689,6 +807,40 @@ describe('cancelling a scan', () => {
     expect(paths.some((p) => api.providers.storage.objects.has(p))).toBe(false);
     // Repeating the cancel is harmless.
     expect((await cancel(riley, id)).status).toBe(200);
+  });
+
+  it('a cancel whose storage removal fails keeps the pages live until a retried cancel removes them', async () => {
+    const id = await queuedScan(riley, {}, 2);
+    const live = async () =>
+      (
+        await api.db.sql<{ n: number }[]>`
+          select count(*)::int as n from public.source_pages
+           where assignment_id = ${id} and deleted_at is null`
+      )[0]!.n;
+    const paths = (
+      await api.db.sql<{ storage_path: string }[]>`
+        select storage_path from public.source_pages where assignment_id = ${id}`
+    ).map((r) => r.storage_path);
+    const storage = api.providers.storage;
+    const original = storage.remove.bind(storage);
+    storage.remove = () => Promise.reject(new Error('storage down'));
+    try {
+      expect((await cancel(riley, id)).status).toBe(200);
+    } finally {
+      storage.remove = original;
+    }
+    // Not marked deleted while the objects still exist, so the retention purge still sees them.
+    expect(await live()).toBe(2);
+    expect(paths.every((p) => storage.objects.has(p))).toBe(true);
+    expect(api.logs.some((e) => e.event === 'homework_storage_remove_failed')).toBe(true);
+    // Repeating the cancel retries the removal.
+    const again = await cancel(riley, id);
+    expect(again.status).toBe(200);
+    expect(assignmentStateResponseSchema.parse(await json(again)).assignment.status).toBe(
+      'cancelled',
+    );
+    expect(await live()).toBe(0);
+    expect(paths.some((p) => storage.objects.has(p))).toBe(false);
   });
 
   it('refuses to cancel finished work', async () => {
@@ -897,6 +1049,68 @@ describe('parent override (AC_GRADING_10)', () => {
       ),
     );
     expect(child.questions.find((q) => q.id === seeded.questionId)!.verdict).toBe('correct');
+  });
+
+  it('a scan waiting for parent review becomes ready only once every open question is settled (RV-homework-5)', async () => {
+    const childId = fam.children[1]!.id;
+    const assignmentId = await queuedScan(token, { childId }, 1);
+    const [page] = await api.db.sql<{ id: string }[]>`
+      select id from public.source_pages where assignment_id = ${assignmentId}`;
+    const ids: string[] = [];
+    for (const [n, verdict] of [
+      ['1', 'needs_parent_review'],
+      ['2', 'unresolved'],
+      ['3', 'correct'],
+    ] as const) {
+      const [q] = await api.db.sql<{ id: string }[]>`
+        insert into public.extracted_questions
+          (assignment_id, family_id, child_id, page_id, question_number, prompt_text, student_answer_text,
+           answer_kind, subject_key, skill, uncertainty)
+        values (${assignmentId}, ${fam.familyId}, ${childId}, ${page!.id}, ${n}, ${'Question ' + n}, '5',
+                'numeric', 'math', 'addition', 'low')
+        returning id`;
+      await api.db.sql`
+        insert into public.question_results (question_id, family_id, child_id, verdict, route, disagreement, grader_version)
+        values (${q!.id}, ${fam.familyId}, ${childId}, ${verdict},
+                ${verdict === 'correct' ? 'deterministic' : 'parent_review'}, ${verdict !== 'correct'}, 'g1')`;
+      ids.push(q!.id);
+    }
+    // Question 3 was corrected after grading and its re-check failed, so its result is stale.
+    await api.db.sql`
+      update public.question_results set graded_at = now() - interval '10 minutes'
+       where question_id = ${ids[2]!}`;
+    await api.db.sql`
+      update public.extracted_questions set corrected_student_answer_text = '6',
+             corrected_at = now() - interval '5 minutes'
+       where id = ${ids[2]!}`;
+    await advance(assignmentId, ['extracting', 'checking', 'needs_parent_review']);
+    await api.db
+      .sql`update public.assignments set error_code = 'GRADE_FAILED' where id = ${assignmentId}`;
+    const status = async () =>
+      assignmentDetailResponseSchema.parse(
+        await json(await api.request(`/v1/assignments/${assignmentId}`, { token })),
+      ).assignment;
+    const override = (id: string, verdict: string) =>
+      api.request(`/v1/questions/${id}/override`, {
+        method: 'POST',
+        token,
+        body: { verdict, reason: 'Checked against the worksheet' },
+      });
+
+    expect((await override(ids[0]!, 'correct')).status).toBe(200);
+    expect((await status()).status).toBe('needs_parent_review'); // question 2 is still undecided
+    // A parent may settle a question as unresolved; the scan job's recheck rule counts any override.
+    expect((await override(ids[1]!, 'unresolved')).status).toBe(200);
+    expect((await status()).status).toBe('needs_parent_review'); // question 3's result is stale
+    expect((await override(ids[2]!, 'incorrect')).status).toBe(200);
+    expect(await status()).toMatchObject({ status: 'ready', errorCode: null });
+    const [audit] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.audit_events
+       where action = 'homework.review_settled' and target_id = ${assignmentId}`;
+    expect(audit!.n).toBe(1);
+    // Overriding again on a ready scan changes nothing about its state.
+    expect((await override(ids[0]!, 'incorrect')).status).toBe(200);
+    expect((await status()).status).toBe('ready');
   });
 
   it('refuses other families’ questions and child callers', async () => {

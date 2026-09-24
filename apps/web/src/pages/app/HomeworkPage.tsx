@@ -1,9 +1,21 @@
-import { useCallback, useEffect, useId, useState, type FormEvent, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 import { Link } from 'react-router';
 import { z } from 'zod';
 import {
   CANCELLABLE_ASSIGNMENT_STATUSES,
   CORRECTABLE_ASSIGNMENT_STATUSES,
+  DEFAULT_HOMEWORK_UPLOAD_LIMITS,
+  FINALIZED_ASSIGNMENT_STATUSES,
+  HOMEWORK_READABLE_MIME_TYPES,
   OVERRIDE_REASON_MAX_LENGTH,
   TRANSCRIPTION_TEXT_MAX_LENGTH,
   assignmentDetailResponseSchema,
@@ -12,23 +24,28 @@ import {
   assignmentStateResponseSchema,
   correctTranscriptionResponseSchema,
   overrideResultResponseSchema,
+  uploadLimitsResponseSchema,
+  uploadPagesResponseSchema,
+  type AssignmentState,
   type AssignmentStatus,
   type AssignmentSummary,
   type GradedVerdict,
+  type HomeworkMimeType,
+  type HomeworkUploadLimits,
   type OverrideVerdict,
   type PageAllowance,
   type ParentQuestion,
   type QuestionSolution,
 } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 
 /**
- * Parent homework review (spec P5, P6, P14 "scan uploader / assignment review / solutions";
- * AC_UX_02, AC_GRADING_05, AC_GRADING_10). Parents see every processing state explained honestly,
- * the child's answers and verdicts, and — only after a server-verified PIN step-up — solutions.
- * Scanning itself happens in the mobile app; this page never pretends to upload.
+ * Parent homework (spec P5 "Parent selects child", P6, P14 "scan uploader / assignment review /
+ * solutions"; AC_UX_02, AC_GRADING_05, AC_GRADING_10). Parents can scan homework for the selected
+ * child by uploading page photos, see every processing state explained honestly, the child's answers
+ * and verdicts, and — only after a server-verified PIN step-up — solutions.
  */
 export default function HomeworkPage() {
   return (
@@ -54,8 +71,10 @@ const STATUS_COPY: Record<AssignmentStatus, { label: string; explain: (name: str
     draft: { label: 'Started', explain: () => 'Pages have not been added yet.' },
     uploading: {
       label: 'Uploading',
+      // RV-homework-7: only what the product supports. An interrupted upload can be finished from
+      // the scan screen that sent it while that screen is still open; otherwise cancel and rescan.
       explain: () =>
-        'Pages are being sent from the device. If it was interrupted, reopen the scan in the app to resume.',
+        'Pages are still being sent. If sending stopped, “Try again” on the scan screen that sent them finishes it while that screen is still open; otherwise cancel this scan and start a new one.',
     },
     queued: { label: 'Waiting', explain: () => 'Waiting to be read.' },
     extracting: { label: 'Reading', explain: () => 'Reading the pages.' },
@@ -82,9 +101,24 @@ const STATUS_COPY: Record<AssignmentStatus, { label: string; explain: (name: str
       explain: () =>
         'This scan could not be processed after several tries. Please start a new scan with clear photos.',
     },
-    cancelled: { label: 'Cancelled', explain: () => 'Cancelled. Its pages were removed.' },
+    cancelled: {
+      label: 'Cancelled',
+      explain: () =>
+        'Cancelled. Its page photos are deleted — right away, or within 30 days of upload if storage was briefly unreachable.',
+    },
     deleted: { label: 'Deleted', explain: () => 'Deleted.' },
   };
+
+/** Error codes whose meaning is more specific than the generic copy of their state. */
+function explainStatus(
+  assignment: { status: AssignmentStatus; errorCode: string | null },
+  name: string,
+): string {
+  if (assignment.status === 'failed_final' && assignment.errorCode === 'FORMAT_NEEDS_CONVERSION') {
+    return 'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back. Scan the pages again as JPEG or PNG photos.';
+  }
+  return STATUS_COPY[assignment.status].explain(name);
+}
 
 const VERDICT_COPY: Record<GradedVerdict, string> = {
   correct: '✓ Correct',
@@ -126,6 +160,39 @@ const textareaStyle = {
   border: '1px solid var(--muted)',
   fontFamily: 'inherit',
 } as const;
+
+// ---------------------------------------------------------------------------------------------
+// Data that stays on screen while it refreshes
+// ---------------------------------------------------------------------------------------------
+
+type RefreshingQuery<T> =
+  | { status: 'loading'; reload: () => void }
+  | { status: 'error'; error: ApiRequestError; reload: () => void }
+  | { status: 'ready'; data: T; refreshing: boolean; reload: () => void };
+
+/**
+ * Like useApiQuery, but a reload keeps the last loaded data on screen (RV-homework-8): a refresh
+ * after an action must not unmount the action's confirmation (role=status), shown solutions or open
+ * forms. The section is marked aria-busy while the reload runs. Callers key the component by what
+ * the query loads, so kept data never belongs to another child or scan.
+ */
+function useRefreshingQuery<T>(
+  load: (api: ApiClient) => Promise<T>,
+  deps: readonly unknown[],
+): RefreshingQuery<T> {
+  const query = useApiQuery(load, deps);
+  const [kept, setKept] = useState<{ data: T } | null>(null);
+  // Adjusting state while rendering (React's documented pattern for derived state); guarded so it
+  // settles after one extra render.
+  if (query.status === 'ready' && kept?.data !== query.data) setKept({ data: query.data });
+  const { reload } = query;
+  if (query.status === 'error') return { status: 'error', error: query.error, reload };
+  if (query.status === 'ready') {
+    return { status: 'ready', data: query.data, refreshing: false, reload };
+  }
+  if (kept) return { status: 'ready', data: kept.data, refreshing: true, reload };
+  return { status: 'loading', reload };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Action feedback
@@ -194,8 +261,9 @@ function HomeworkManager() {
     <>
       <h1>Homework</h1>
       <p>
-        Scans are made in the PencilLift app on a phone or tablet. Here you can follow each scan,
-        review answers, fix transcriptions and — after your parent PIN — see solutions.
+        Scan homework here by uploading photos of the pages, or in the PencilLift app on a paired
+        phone or tablet. Here you can follow each scan, review answers, fix transcriptions and —
+        after your parent PIN — see solutions.
       </p>
       {family.status === 'loading' ? <Loading /> : null}
       {family.status === 'error' ? (
@@ -231,7 +299,7 @@ function HomeworkManager() {
 }
 
 function ChildHomework({ child }: { child: FamilyChild }) {
-  const query = useApiQuery(
+  const query = useRefreshingQuery(
     (api) =>
       api.get(
         `/v1/assignments?childId=${encodeURIComponent(child.id)}`,
@@ -253,7 +321,7 @@ function ChildHomework({ child }: { child: FamilyChild }) {
           undefined,
           assignmentStateResponseSchema,
         );
-        return 'Scan cancelled. Its pages were removed and its page allowance released.';
+        return 'Scan cancelled and its page allowance released. Its page photos are being deleted.';
       })
       .then((ok) => {
         if (ok) reload();
@@ -267,13 +335,20 @@ function ChildHomework({ child }: { child: FamilyChild }) {
   return (
     <>
       {allowance ? <AllowanceCard allowance={allowance} name={child.nickname} /> : null}
+      <ScanUploader child={child} allowance={allowance} onChanged={reload} />
       <ActionFeedback feedback={action.feedback} what="Cancelling" />
-      <section className="card" aria-label="Scans" style={{ marginTop: 16 }}>
+      <section
+        className="card"
+        aria-label="Scans"
+        aria-busy={query.refreshing}
+        style={{ marginTop: 16 }}
+      >
         <h2>Scans for {child.nickname}</h2>
         {assignments.length === 0 ? (
           <p>
-            No scans for {child.nickname} yet. {child.nickname} can scan homework in the PencilLift
-            app on a paired phone or tablet; each scan appears here as it is processed.
+            No scans for {child.nickname} yet. Add one above, or {child.nickname} can scan homework
+            in the PencilLift app on a paired phone or tablet; each scan appears here as it is
+            processed.
           </p>
         ) : (
           <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
@@ -283,7 +358,7 @@ function ChildHomework({ child }: { child: FamilyChild }) {
                   {formatDate(a.createdAt)} · {a.pageCount} {a.pageCount === 1 ? 'page' : 'pages'} ·{' '}
                   {STATUS_COPY[a.status].label}
                 </strong>
-                <p style={{ margin: '4px 0' }}>{STATUS_COPY[a.status].explain(child.nickname)}</p>
+                <p style={{ margin: '4px 0' }}>{explainStatus(a, child.nickname)}</p>
                 <div style={buttonRow}>
                   <button
                     type="button"
@@ -324,22 +399,47 @@ function ChildHomework({ child }: { child: FamilyChild }) {
 }
 
 function AllowanceCard({ allowance, name }: { allowance: PageAllowance; name: string }) {
+  // RV-homework-6: no paid capacity (e.g. the subscription ended) or no paid slot for this child is
+  // not "used up": nothing changes next month until the plan does.
+  const noCapacity = allowance.familyPagesAllowed === 0;
+  const noSlot = !noCapacity && allowance.childHasPaidSlot === false;
   const childLeft = allowance.childPagesAllowed - allowance.childPagesUsed;
   const familyLeft = allowance.familyPagesAllowed - allowance.familyPagesUsed;
-  const exhausted = childLeft <= 0 || familyLeft <= 0;
+  const exhausted = !noCapacity && !noSlot && (childLeft <= 0 || familyLeft <= 0);
+  const pages = (n: number) => `${n} ${n === 1 ? 'page' : 'pages'}`;
   return (
     <section
-      className={exhausted ? 'notice' : 'card'}
+      className={noCapacity || noSlot || exhausted ? 'notice' : 'card'}
       aria-label="Page allowance"
       style={{ marginTop: 16 }}
     >
-      <p style={{ margin: 0 }}>
-        <strong>
-          {name}: {allowance.childPagesUsed} of {allowance.childPagesAllowed} pages used this month
-        </strong>{' '}
-        (family: {allowance.familyPagesUsed} of {allowance.familyPagesAllowed}). Scans still being
-        processed are counted; pages that could not be read are given back.
-      </p>
+      {noCapacity ? (
+        <p style={{ margin: 0 }}>
+          <strong>
+            {name}: {pages(allowance.childPagesUsed)} scanned this month. No paid page allowance
+            right now.
+          </strong>{' '}
+          The family plan has no paid child slots at the moment, so new scans are paused. Existing
+          homework and results stay available.{' '}
+          <Link to="/app/subscription">See your plan on the Subscription page</Link>.
+        </p>
+      ) : (
+        <p style={{ margin: 0 }}>
+          <strong>
+            {name}: {allowance.childPagesUsed} of {allowance.childPagesAllowed} pages used this
+            month
+          </strong>{' '}
+          (family: {allowance.familyPagesUsed} of {allowance.familyPagesAllowed}). Scans still being
+          processed are counted; pages that could not be read are given back.
+        </p>
+      )}
+      {noSlot ? (
+        <p style={{ margin: '8px 0 0' }}>
+          {name} doesn’t hold a paid child slot right now (for example after the plan changed to
+          fewer children), so new scans for {name} are paused. Existing homework and results stay
+          available. <Link to="/app/children">Manage child slots on the Children page</Link>.
+        </p>
+      ) : null}
       {exhausted ? (
         <p style={{ margin: '8px 0 0' }}>
           {name}’s page allowance for this month is used up, so new scans will wait until next
@@ -348,6 +448,528 @@ function AllowanceCard({ allowance, name }: { allowance: PageAllowance; name: st
         </p>
       ) : null}
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parent scan uploader (spec P5 "Parent selects child", P14 parent "scan uploader"; RV-homework-9)
+// ---------------------------------------------------------------------------------------------
+
+interface PickedPage {
+  readonly key: string;
+  readonly file: File;
+}
+
+/** Idempotency keys kept across retries so a retry resumes the same scan (AC_CAPTURE_01/06). */
+interface UploadAttempt {
+  readonly createKey: string;
+  readonly finalizeKey: string;
+  readonly assignmentId: string | null;
+}
+
+type UploadPhase = 'preparing' | 'uploading' | 'finishing';
+
+type SendState =
+  | { kind: 'idle' }
+  | { kind: 'running'; phase: UploadPhase; done: number; total: number }
+  | { kind: 'error'; message: string }
+  | { kind: 'sent' };
+
+/** The parent pressed "Stop sending". */
+class UploadStoppedError extends Error {}
+/** The scan was cancelled or deleted on the server; its pages can only be sent as a new scan. */
+class ScanStoppedError extends Error {}
+/** A PUT to a signed storage URL failed (page number and status only; never the signed URL). */
+class PageTransferError extends Error {
+  readonly pageNumber: number;
+  constructor(pageNumber: number) {
+    super('upload failed');
+    this.pageNumber = pageNumber;
+  }
+}
+
+const newKey = () => crypto.randomUUID();
+const newAttempt = (): UploadAttempt => ({
+  createKey: newKey(),
+  finalizeKey: newKey(),
+  assignmentId: null,
+});
+
+const TYPE_NAMES: Record<HomeworkMimeType, string> = {
+  'image/jpeg': 'JPEG',
+  'image/png': 'PNG',
+  'image/heic': 'HEIC photos',
+  'application/pdf': 'PDF study guides',
+};
+
+function toHex(bytes: Uint8Array): string {
+  let out = '';
+  for (const b of bytes) out += b.toString(16).padStart(2, '0');
+  return out;
+}
+
+function describeSize(bytes: number): string {
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function readableTypes(limits: HomeworkUploadLimits): HomeworkMimeType[] {
+  return limits.allowedMimeTypes.filter((t) => HOMEWORK_READABLE_MIME_TYPES.includes(t));
+}
+
+/** Checked before anything is sent; the server enforces the same limits either way. */
+function pageProblem(file: File, limits: HomeworkUploadLimits): string | null {
+  const readable: readonly string[] = readableTypes(limits);
+  if (!readable.includes(file.type)) return `${file.name} isn’t a JPEG or PNG photo.`;
+  if (file.size === 0) return `${file.name} is empty.`;
+  if (file.size > limits.maxPageBytes) {
+    return `${file.name} is larger than ${Math.floor(limits.maxPageBytes / (1024 * 1024))} MB.`;
+  }
+  return null;
+}
+
+/**
+ * Create (idempotent key) → register pages and receive signed URLs → PUT bytes straight to private
+ * storage → finalize (idempotent). Mirrors the child app's flow (apps/mobile/src/homework/upload.ts):
+ * the same attempt resumes an interrupted upload, and a scan whose finalize already committed is
+ * reported as sent instead of re-registered (RV-homework-4).
+ */
+async function sendParentScan(args: {
+  api: ApiClient;
+  childId: string;
+  pages: readonly PickedPage[];
+  attempt: UploadAttempt;
+  signal: AbortSignal;
+  onAttempt: (attempt: UploadAttempt) => void;
+  onProgress: (phase: UploadPhase, done: number) => void;
+}): Promise<AssignmentState> {
+  const { api, pages, signal } = args;
+  const stopIfAborted = () => {
+    if (signal.aborted) throw new UploadStoppedError();
+  };
+  const prepared: {
+    pageNumber: number;
+    mimeType: string;
+    bytes: Uint8Array<ArrayBuffer>;
+    sha256: string;
+  }[] = [];
+  for (const [i, page] of pages.entries()) {
+    stopIfAborted();
+    args.onProgress('preparing', i);
+    const bytes = new Uint8Array(await page.file.arrayBuffer());
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+    prepared.push({ pageNumber: i + 1, mimeType: page.file.type, bytes, sha256: toHex(digest) });
+  }
+  stopIfAborted();
+  const created = await api.send(
+    'POST',
+    '/v1/assignments',
+    { childId: args.childId, pageCount: pages.length, idempotencyKey: args.attempt.createKey },
+    assignmentStateResponseSchema,
+  );
+  const attempt: UploadAttempt = { ...args.attempt, assignmentId: created.assignment.id };
+  args.onAttempt(attempt);
+  if (FINALIZED_ASSIGNMENT_STATUSES.includes(created.assignment.status)) return created.assignment;
+  if (created.assignment.status === 'cancelled' || created.assignment.status === 'deleted') {
+    throw new ScanStoppedError();
+  }
+  const base = `/v1/assignments/${created.assignment.id}`;
+  stopIfAborted();
+  const registered = await api.send(
+    'POST',
+    `${base}/uploads`,
+    {
+      pages: prepared.map((p) => ({
+        pageNumber: p.pageNumber,
+        mimeType: p.mimeType,
+        byteSize: p.bytes.length,
+        sha256: p.sha256,
+      })),
+    },
+    uploadPagesResponseSchema,
+  );
+  let done = registered.uploads.filter((u) => u.alreadyUploaded).length;
+  args.onProgress('uploading', done);
+  for (const target of registered.uploads) {
+    if (target.alreadyUploaded) continue;
+    stopIfAborted();
+    const page = prepared.find((p) => p.pageNumber === target.pageNumber);
+    if (!page) throw new PageTransferError(target.pageNumber);
+    let response: Response;
+    try {
+      response = await fetch(target.uploadUrl, {
+        method: target.method,
+        body: page.bytes,
+        headers: { 'content-type': page.mimeType, 'x-upsert': 'false' },
+        signal,
+      });
+    } catch {
+      if (signal.aborted) throw new UploadStoppedError();
+      throw new PageTransferError(target.pageNumber);
+    }
+    if (!response.ok) throw new PageTransferError(target.pageNumber);
+    done += 1;
+    args.onProgress('uploading', done);
+  }
+  stopIfAborted();
+  args.onProgress('finishing', pages.length);
+  const finalized = await api.send(
+    'POST',
+    `${base}/finalize`,
+    { idempotencyKey: attempt.finalizeKey },
+    assignmentStateResponseSchema,
+  );
+  return finalized.assignment;
+}
+
+function parentUploadMessage(error: unknown): string {
+  if (error instanceof UploadStoppedError) {
+    return 'Stopped. Your pages are still selected.';
+  }
+  if (error instanceof ScanStoppedError) {
+    return 'That scan was cancelled. Your pages are still selected — send them again to start a new scan.';
+  }
+  if (error instanceof PageTransferError) {
+    return `Page ${error.pageNumber} didn’t finish uploading. Your pages are still selected — try again to send the rest.`;
+  }
+  if (error instanceof ApiRequestError) return error.message;
+  return 'Something went wrong. Your pages are still selected — please try again.';
+}
+
+function progressCopy(state: { phase: UploadPhase; done: number; total: number }): string {
+  switch (state.phase) {
+    case 'preparing':
+      return `Getting page ${Math.min(state.done + 1, state.total)} of ${state.total} ready…`;
+    case 'uploading':
+      return `Uploading page ${Math.min(state.done + 1, state.total)} of ${state.total}…`;
+    case 'finishing':
+      return 'Sending the scan to be read…';
+  }
+}
+
+/** Why new scans can’t start for this child right now, or null. Never offers a purchase. */
+function uploadBlockedReason(child: FamilyChild, allowance: PageAllowance | null): ReactNode {
+  const name = child.nickname;
+  if (child.status !== 'active') {
+    return (
+      <>
+        {name} needs a paid child slot before homework can be scanned. You can set that up on the{' '}
+        <Link to="/app/children">Children page</Link>.
+      </>
+    );
+  }
+  if (allowance === null) return null;
+  if (allowance.familyPagesAllowed === 0) {
+    return 'New scans are paused while the family plan has no paid child slots.';
+  }
+  if (allowance.childHasPaidSlot === false) {
+    return `New scans for ${name} are paused while ${name} doesn’t hold a paid child slot.`;
+  }
+  if (
+    allowance.childPagesUsed >= allowance.childPagesAllowed ||
+    allowance.familyPagesUsed >= allowance.familyPagesAllowed
+  ) {
+    return 'No pages are left for new scans this month.';
+  }
+  return null;
+}
+
+function ScanUploader({
+  child,
+  allowance,
+  onChanged,
+}: {
+  child: FamilyChild;
+  allowance: PageAllowance | null;
+  onChanged: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const blocked = uploadBlockedReason(child, allowance);
+  const name = child.nickname;
+  return (
+    <section className="card" aria-label="Add a scan" style={{ marginTop: 16 }}>
+      <h2>Scan homework for {name}</h2>
+      {blocked !== null ? (
+        <p style={{ margin: 0 }}>{blocked}</p>
+      ) : (
+        <>
+          <p style={{ margin: '0 0 8px' }}>
+            Upload photos of {name}’s homework pages from this device, in page order. Each scan is
+            read and checked, then appears in the list below.
+          </p>
+          <button
+            type="button"
+            className="btn secondary"
+            aria-expanded={open}
+            disabled={busy}
+            onClick={() => setOpen(!open)}
+          >
+            {open ? 'Close the uploader' : `Add a scan for ${name}`}
+          </button>
+          {open ? (
+            <UploadPanel childId={child.id} name={name} onChanged={onChanged} onBusy={setBusy} />
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+function UploadPanel({
+  childId,
+  name,
+  onChanged,
+  onBusy,
+}: {
+  childId: string;
+  name: string;
+  onChanged: () => void;
+  onBusy: (busy: boolean) => void;
+}) {
+  const { api } = useSession();
+  const [limits, setLimits] = useState<HomeworkUploadLimits>(DEFAULT_HOMEWORK_UPLOAD_LIMITS);
+  const [pages, setPages] = useState<PickedPage[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [state, setState] = useState<SendState>({ kind: 'idle' });
+  const attemptRef = useRef<UploadAttempt>(newAttempt());
+  const controllerRef = useRef<AbortController | null>(null);
+  const inputId = useId();
+  const limitsId = useId();
+
+  // The server's configured limits; the shipped defaults show until (or unless) they load. The
+  // server enforces its limits either way. Closing the uploader stops an upload in progress.
+  useEffect(() => {
+    let active = true;
+    api.get('/v1/assignments/limits', uploadLimitsResponseSchema).then(
+      (body) => {
+        if (active) setLimits(body.limits);
+      },
+      () => undefined,
+    );
+    return () => {
+      active = false;
+      controllerRef.current?.abort();
+    };
+  }, [api]);
+
+  const running = state.kind === 'running';
+  const readable = readableTypes(limits);
+  const notYet = limits.allowedMimeTypes.filter((t) => !readable.includes(t));
+  const problems = pages.map((p) => pageProblem(p.file, limits));
+  const canSend =
+    pages.length > 0 && pages.length <= limits.maxPages && problems.every((p) => p === null);
+
+  /** Resolves true when there was nothing to cancel or the server cancelled the scan. */
+  const cancelOnServer = (attempt: UploadAttempt): Promise<boolean> =>
+    attempt.assignmentId === null
+      ? Promise.resolve(true)
+      : api
+          .send(
+            'POST',
+            `/v1/assignments/${attempt.assignmentId}/cancel`,
+            undefined,
+            assignmentStateResponseSchema,
+          )
+          .then(
+            () => {
+              onChanged();
+              return true;
+            },
+            () => false,
+          );
+
+  /** Different pages make a different scan: an unfinished earlier one is cancelled (released). */
+  const changePages = (next: PickedPage[]) => {
+    void cancelOnServer(attemptRef.current);
+    attemptRef.current = newAttempt();
+    setState({ kind: 'idle' });
+    setPages(next);
+  };
+
+  const onPick = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    if (files.length === 0) return;
+    const room = Math.max(0, limits.maxPages - pages.length);
+    const added = files.slice(0, room).map((file) => ({ key: newKey(), file }));
+    const dropped = files.length - added.length;
+    changePages([...pages, ...added]);
+    setNotice(
+      dropped > 0
+        ? `Only ${limits.maxPages} pages fit in one scan, so ${dropped} ${dropped === 1 ? 'file was' : 'files were'} left out.`
+        : null,
+    );
+  };
+
+  const move = (index: number, delta: -1 | 1) => {
+    const next = [...pages];
+    const [page] = next.splice(index, 1);
+    if (!page) return;
+    next.splice(index + delta, 0, page);
+    changePages(next);
+  };
+
+  const remove = (index: number) => changePages(pages.filter((_, i) => i !== index));
+
+  const send = async () => {
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const total = pages.length;
+    setNotice(null);
+    setState({ kind: 'running', phase: 'preparing', done: 0, total });
+    onBusy(true);
+    try {
+      await sendParentScan({
+        api,
+        childId,
+        pages,
+        attempt: attemptRef.current,
+        signal: controller.signal,
+        onAttempt: (attempt) => {
+          attemptRef.current = attempt;
+        },
+        onProgress: (phase, done) => setState({ kind: 'running', phase, done, total }),
+      });
+      attemptRef.current = newAttempt();
+      setPages([]);
+      setState({ kind: 'sent' });
+      onChanged();
+    } catch (error) {
+      if (error instanceof UploadStoppedError || controller.signal.aborted) {
+        // Stop means stop: the server releases anything reserved for the unfinished scan.
+        const stopped = attemptRef.current;
+        attemptRef.current = newAttempt();
+        const cancelled = await cancelOnServer(stopped);
+        setState({
+          kind: 'error',
+          message: cancelled
+            ? parentUploadMessage(new UploadStoppedError())
+            : 'Stopped. Your pages are still selected. The unfinished scan couldn’t be cancelled just now — you can cancel it from the list below.',
+        });
+      } else {
+        // Keep the same attempt so "Try again" resumes; a scan stopped on the server needs a new one.
+        if (error instanceof ScanStoppedError) attemptRef.current = newAttempt();
+        setState({ kind: 'error', message: parentUploadMessage(error) });
+      }
+    } finally {
+      controllerRef.current = null;
+      onBusy(false);
+    }
+  };
+
+  const typeNames = readable.map((t) => TYPE_NAMES[t]).join(' or ');
+  return (
+    <div style={{ marginTop: 12 }}>
+      <p id={limitsId} style={{ margin: '0 0 8px' }}>
+        Up to {limits.maxPages} pages per scan, each{' '}
+        {Math.floor(limits.maxPageBytes / (1024 * 1024))} MB or smaller, as {typeNames} photos. Lay
+        each page flat in good light so every word shows.
+      </p>
+      {notYet.length > 0 ? (
+        <p style={{ margin: '0 0 8px' }}>
+          <strong>Not available yet:</strong> {notYet.map((t) => TYPE_NAMES[t]).join(' and ')}.
+          Reading them needs a file converter that isn’t running yet, so for now please use{' '}
+          {typeNames} photos of the pages.
+        </p>
+      ) : null}
+      <label htmlFor={inputId}>Choose page photos</label>
+      <input
+        id={inputId}
+        type="file"
+        accept={readable.join(',')}
+        multiple
+        aria-describedby={limitsId}
+        disabled={running || pages.length >= limits.maxPages}
+        onChange={onPick}
+      />
+      {notice ? (
+        <p role="status" style={{ margin: '8px 0 0' }}>
+          {notice}
+        </p>
+      ) : null}
+      {pages.length > 0 ? (
+        <ol aria-label="Pages to send" style={{ paddingLeft: 20 }}>
+          {pages.map((page, i) => (
+            <li key={page.key} style={{ margin: '8px 0' }}>
+              <span>
+                Page {i + 1}: {page.file.name} · {describeSize(page.file.size)}
+              </span>
+              {problems[i] ? (
+                <p style={{ color: 'var(--danger)', margin: '4px 0 0' }}>⚠ {problems[i]}</p>
+              ) : null}
+              {!running ? (
+                <div style={buttonRow}>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    aria-label={`Move page ${i + 1} up`}
+                    disabled={i === 0}
+                    onClick={() => move(i, -1)}
+                  >
+                    Up
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    aria-label={`Move page ${i + 1} down`}
+                    disabled={i === pages.length - 1}
+                    onClick={() => move(i, 1)}
+                  >
+                    Down
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    aria-label={`Remove page ${i + 1}`}
+                    onClick={() => remove(i)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      {state.kind === 'running' ? (
+        <div style={{ margin: '8px 0' }}>
+          <p role="status" style={{ margin: 0 }}>
+            {progressCopy(state)}
+          </p>
+          <progress max={state.total} value={state.done} aria-label="Upload progress" />
+          <div style={buttonRow}>
+            <button
+              type="button"
+              className="btn secondary"
+              onClick={() => controllerRef.current?.abort()}
+            >
+              Stop sending
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {state.kind === 'error' ? (
+        <div className="error" role="alert">
+          <p>{state.message}</p>
+        </div>
+      ) : null}
+      {state.kind === 'sent' ? (
+        <p role="status" style={{ color: 'var(--success)', fontWeight: 700 }}>
+          Sent! {name}’s scan is waiting to be read; it appears in the list below.
+        </p>
+      ) : null}
+      {pages.length > 0 && !running ? (
+        <div style={buttonRow}>
+          <button type="button" className="btn" disabled={!canSend} onClick={() => void send()}>
+            {state.kind === 'error'
+              ? 'Try again'
+              : `Send ${pages.length} ${pages.length === 1 ? 'page' : 'pages'}`}
+          </button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -364,7 +986,7 @@ function AssignmentDetail({
   childName: string;
   onChanged: () => void;
 }) {
-  const query = useApiQuery(
+  const query = useRefreshingQuery(
     (api) => api.get(`/v1/assignments/${assignmentId}`, assignmentDetailResponseSchema),
     [assignmentId],
   );
@@ -395,7 +1017,12 @@ function AssignmentDetail({
   };
 
   return (
-    <section className="card" aria-label="Scan details" style={{ marginTop: 16 }}>
+    <section
+      className="card"
+      aria-label="Scan details"
+      aria-busy={query.status === 'ready' && query.refreshing}
+      style={{ marginTop: 16 }}
+    >
       <h2>Scan details</h2>
       {query.status === 'loading' ? <Loading label="Loading scan…" /> : null}
       {query.status === 'error' ? (
@@ -405,7 +1032,7 @@ function AssignmentDetail({
         <>
           <p>
             {STATUS_COPY[query.data.assignment.status].label}:{' '}
-            {STATUS_COPY[query.data.assignment.status].explain(childName)}
+            {explainStatus(query.data.assignment, childName)}
           </p>
           {query.data.questions.length === 0 ? (
             <p>No questions have been read from this scan yet.</p>

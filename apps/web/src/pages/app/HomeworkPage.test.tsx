@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { cleanup, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import type {
   AssignmentDetailResponse,
@@ -158,6 +159,8 @@ function fakeApi(
   options: {
     get?: (path: string) => unknown;
     send?: (call: Call) => unknown;
+    /** Simulated network latency for GETs (a real reload renders its loading state). */
+    latencyMs?: number;
   } = {},
 ) {
   const gets: string[] = [];
@@ -174,6 +177,11 @@ function fakeApi(
       try {
         const value = options.get?.(path) ?? defaultGet(path);
         if (value instanceof Error) return Promise.reject(value);
+        if (options.latencyMs) {
+          return new Promise<void>((resolve) => setTimeout(resolve, options.latencyMs)).then(() =>
+            schema.parse(value),
+          );
+        }
         return Promise.resolve(schema.parse(value));
       } catch (error) {
         return Promise.reject(error instanceof Error ? error : new Error(String(error)));
@@ -201,6 +209,7 @@ function fakeApi(
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 const stepUp = () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403);
@@ -434,5 +443,316 @@ describe('HomeworkPage (spec P5, P6, P14; AC_UX_02, AC_GRADING_05, AC_GRADING_10
     expect(await screen.findByText(/allowance for this month is used up/i)).toBeTruthy();
     expect(screen.getByText(/existing homework and results stay available/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /buy|purchase|upgrade/i })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Parent scan uploader (spec P5 "Parent selects child", P14 "scan uploader"; RV-homework-9)
+// ---------------------------------------------------------------------------------------------
+
+const NEW_SCAN = '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d';
+const PAGE_IDS = ['2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e', '3c4d5e6f-7a8b-4c9d-8e1f-2a3b4c5d6e7f'];
+
+function state(status: AssignmentSummary['status'], pageCount = 2) {
+  return {
+    assignment: {
+      id: NEW_SCAN,
+      subjectId: null,
+      status,
+      pageCount,
+      createdAt: AT,
+      updatedAt: AT,
+    },
+  };
+}
+
+function file(name: string, type: string, text: string): File {
+  return new File([new TextEncoder().encode(text)], name, { type });
+}
+
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+
+/** Server responses for the capture routes; `create` decides what POST /v1/assignments returns. */
+function captureSend(create: () => unknown = () => state('draft')) {
+  return (call: Call): unknown => {
+    if (call.path === '/v1/assignments') return create();
+    if (call.path.endsWith('/uploads')) {
+      const pages = (call.body as { pages: { pageNumber: number }[] }).pages;
+      return {
+        ...state('uploading', pages.length),
+        uploads: pages.map((p, i) => ({
+          pageId: PAGE_IDS[i],
+          pageNumber: p.pageNumber,
+          uploadUrl: `https://storage.example.test/upload/${p.pageNumber}?token=t`,
+          method: 'PUT',
+          expiresAt: AT,
+          alreadyUploaded: false,
+        })),
+      };
+    }
+    if (call.path.endsWith('/finalize')) return state('queued');
+    if (call.path.endsWith('/cancel')) return state('cancelled');
+    return new Error(`unexpected ${call.method} ${call.path}`);
+  };
+}
+
+/** Records PUTs to signed URLs (stands in for the browser's fetch). */
+function stubStorage(respond: () => Promise<Response> = () => Promise.resolve(new Response(null))) {
+  const puts: { url: string; method: string; type: string; body: string }[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((url: string, init: RequestInit) => {
+      puts.push({
+        url,
+        method: init.method ?? 'GET',
+        type: new Headers(init.headers).get('content-type') ?? '',
+        body: new TextDecoder().decode(init.body as Uint8Array),
+      });
+      return respond();
+    }),
+  );
+  return puts;
+}
+
+async function openUploader() {
+  const card = await screen.findByRole('region', { name: 'Add a scan' });
+  await userEvent.click(within(card).getByRole('button', { name: 'Add a scan for Riley' }));
+  return card;
+}
+
+describe('parent scan uploader (spec P5, P14; RV-homework-9)', () => {
+  it('shows the limits first, lets the parent order pages, then creates, uploads and finalizes a scan', async () => {
+    const puts = stubStorage();
+    const { api, sends, gets } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    // Limits and the unavailable types are visible before anything is chosen (spec P5).
+    expect(within(card).getByText(/Up to 10 pages per scan, each 15 MB or smaller/)).toBeTruthy();
+    expect(within(card).getByText(/Not available yet:/).parentElement!.textContent).toMatch(
+      /HEIC photos and PDF study guides/,
+    );
+    const input = within(card).getByLabelText<HTMLInputElement>('Choose page photos');
+    expect(input.accept).toBe('image/jpeg,image/png');
+    await userEvent.upload(input, [
+      file('first.jpg', 'image/jpeg', 'first page'),
+      file('second.png', 'image/png', 'second page'),
+    ]);
+    const list = within(card).getByRole('list', { name: 'Pages to send' });
+    expect(
+      within(list)
+        .getAllByRole('listitem')
+        .map((li) => li.textContent),
+    ).toEqual([
+      expect.stringContaining('Page 1: first.jpg'),
+      expect.stringContaining('Page 2: second.png'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Move page 2 up' }));
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 2 pages' }));
+    expect(await within(card).findByText(/Sent! Riley’s scan is waiting to be read/)).toBeTruthy();
+
+    expect(sends.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'POST /v1/assignments',
+      `POST /v1/assignments/${NEW_SCAN}/uploads`,
+      `POST /v1/assignments/${NEW_SCAN}/finalize`,
+    ]);
+    // The parent names the selected child; the server checks it belongs to the family.
+    expect(sends[0]!.body).toMatchObject({ childId: RILEY, pageCount: 2 });
+    expect((sends[1]!.body as { pages: unknown[] }).pages).toEqual([
+      { pageNumber: 1, mimeType: 'image/png', byteSize: 11, sha256: sha('second page') },
+      { pageNumber: 2, mimeType: 'image/jpeg', byteSize: 10, sha256: sha('first page') },
+    ]);
+    // Bytes go straight to private storage with signed URLs, in the chosen order.
+    expect(puts).toEqual([
+      {
+        url: 'https://storage.example.test/upload/1?token=t',
+        method: 'PUT',
+        type: 'image/png',
+        body: 'second page',
+      },
+      {
+        url: 'https://storage.example.test/upload/2?token=t',
+        method: 'PUT',
+        type: 'image/jpeg',
+        body: 'first page',
+      },
+    ]);
+    // The scan list reloads so the new scan appears.
+    await waitFor(() =>
+      expect(gets.filter((p) => p.startsWith('/v1/assignments?'))).toHaveLength(2),
+    );
+  });
+
+  it('refuses unreadable or oversized files before sending anything', async () => {
+    stubStorage();
+    const { api, sends } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    const user = userEvent.setup({ applyAccept: false }); // "All files" in the picker
+    await user.upload(within(card).getByLabelText('Choose page photos'), [
+      file('guide.pdf', 'application/pdf', '%PDF-1.7'),
+    ]);
+    expect(within(card).getByText(/guide.pdf isn’t a JPEG or PNG photo/)).toBeTruthy();
+    const sendButton = within(card).getByRole<HTMLButtonElement>('button', { name: 'Send 1 page' });
+    expect(sendButton.disabled).toBe(true);
+    await user.click(within(card).getByRole('button', { name: 'Remove page 1' }));
+    expect(within(card).queryByRole('list', { name: 'Pages to send' })).toBeNull();
+    expect(sends).toHaveLength(0);
+  });
+
+  it('a retry after a lost finalize response reports the already-queued scan as sent', async () => {
+    const puts = stubStorage();
+    let finalizeLost = true;
+    let createStatus: AssignmentSummary['status'] = 'draft';
+    const send = captureSend(() => state(createStatus));
+    const { api, sends } = fakeApi({
+      send: (call) => {
+        if (call.path.endsWith('/finalize') && finalizeLost) {
+          // The server committed the finalize, but the response never arrived.
+          finalizeLost = false;
+          createStatus = 'queued';
+          return new ApiRequestError('NETWORK', 'You appear to be offline.', 0);
+        }
+        return send(call);
+      },
+    });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      file('page.jpg', 'image/jpeg', 'only page'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 1 page' }));
+    expect((await within(card).findByRole('alert')).textContent).toMatch(/offline/);
+    await userEvent.click(within(card).getByRole('button', { name: 'Try again' }));
+    expect(await within(card).findByText(/Sent!/)).toBeTruthy();
+    // Same create key both times; the retry never registers pages again.
+    expect(sends.map((c) => c.path)).toEqual([
+      '/v1/assignments',
+      `/v1/assignments/${NEW_SCAN}/uploads`,
+      `/v1/assignments/${NEW_SCAN}/finalize`,
+      '/v1/assignments',
+    ]);
+    expect(sends[3]!.body).toEqual(sends[0]!.body);
+    expect(puts).toHaveLength(1);
+  });
+
+  it('stop sending cancels the unfinished scan so its pages are released', async () => {
+    let release: () => void = () => undefined;
+    stubStorage(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = () => resolve(new Response(null));
+        }),
+    );
+    const { api, sends } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      file('a.jpg', 'image/jpeg', 'a'),
+      file('b.jpg', 'image/jpeg', 'b'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 2 pages' }));
+    expect(await within(card).findByText(/Uploading page 1 of 2/)).toBeTruthy();
+    expect(within(card).getByRole('progressbar', { name: 'Upload progress' })).toBeTruthy();
+    // While sending, the uploader cannot be closed or the pages changed.
+    expect(
+      within(card).getByRole<HTMLButtonElement>('button', { name: 'Close the uploader' }).disabled,
+    ).toBe(true);
+    await userEvent.click(within(card).getByRole('button', { name: 'Stop sending' }));
+    release();
+    expect((await within(card).findByRole('alert')).textContent).toMatch(
+      /Stopped. Your pages are still selected/,
+    );
+    expect(sends.map((c) => c.path)).toEqual([
+      '/v1/assignments',
+      `/v1/assignments/${NEW_SCAN}/uploads`,
+      `/v1/assignments/${NEW_SCAN}/cancel`,
+    ]);
+  });
+
+  it('explains why new scans can’t start instead of offering an uploader that would fail', async () => {
+    // A draft child (no paid slot yet): the reason and where to fix it, never a purchase button.
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? { ...family, children: [{ ...family.children[0]!, status: 'draft' }] }
+          : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const card = await screen.findByRole('region', { name: 'Add a scan' });
+    expect(
+      within(card).getByText(/needs a paid child slot before homework can be scanned/),
+    ).toBeTruthy();
+    expect(within(card).getByRole('link', { name: 'Children page' })).toBeTruthy();
+    expect(within(card).queryByRole('button')).toBeNull();
+    cleanup();
+
+    // A downgrade released Riley's slot: the allowance card says so; scanning is paused.
+    const released = fakeApi({
+      get: (path) =>
+        path.startsWith('/v1/assignments?')
+          ? {
+              ...list(),
+              allowance: { ...list().allowance!, childHasPaidSlot: false },
+            }
+          : undefined,
+    });
+    renderPage(<HomeworkPage />, { api: released.api });
+    const allowance = await screen.findByRole('region', { name: 'Page allowance' });
+    expect(within(allowance).getByText(/doesn’t hold a paid child slot right now/)).toBeTruthy();
+    expect(within(allowance).queryByText(/used up/i)).toBeNull();
+    const paused = screen.getByRole('region', { name: 'Add a scan' });
+    expect(within(paused).getByText(/New scans for Riley are paused/)).toBeTruthy();
+    expect(within(paused).queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('button', { name: /buy|purchase|upgrade/i })).toBeNull();
+  });
+});
+
+describe('honest follow-up states (RV-homework-6, 7, 8)', () => {
+  it('a scan that needs the file converter says so instead of asking for clearer photos', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path.startsWith('/v1/assignments?')
+          ? {
+              ...list(),
+              assignments: [
+                { ...summary(FINAL, 'failed_final'), errorCode: 'FORMAT_NEEDS_CONVERSION' },
+              ],
+            }
+          : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getByText(/can’t read PDF or HEIC files yet/)).toBeTruthy();
+    expect(within(scans).queryByText(/could not be processed after several tries/)).toBeNull();
+  });
+
+  it('the transcription-fix confirmation survives the refresh that follows it', async () => {
+    const { api, gets } = fakeApi({
+      latencyMs: 20,
+      send: () => ({
+        assignment: {
+          id: READY,
+          subjectId: null,
+          status: 'checking',
+          pageCount: 2,
+          createdAt: AT,
+          updatedAt: AT,
+        },
+        question: question({ correctedStudentAnswerText: '7/8', correctedAt: AT }),
+      }),
+    });
+    renderPage(<HomeworkPage />, { api });
+    const panel = await openReadyScan();
+    const q1 = await within(panel).findByRole('article', { name: 'Question 1' });
+    await userEvent.click(within(q1).getByRole('button', { name: 'Fix transcription' }));
+    const answer = within(q1).getByLabelText('Student answer as written');
+    await userEvent.clear(answer);
+    await userEvent.type(answer, '7/8');
+    await userEvent.click(within(q1).getByRole('button', { name: 'Save transcription' }));
+    await waitFor(() =>
+      expect(gets.filter((p) => p === `/v1/assignments/${READY}`).length).toBeGreaterThanOrEqual(2),
+    );
+    await waitFor(() => expect(screen.queryByText(/Loading/)).toBeNull());
+    expect(screen.getByText(/re-checking this question/)).toBeTruthy();
   });
 });
