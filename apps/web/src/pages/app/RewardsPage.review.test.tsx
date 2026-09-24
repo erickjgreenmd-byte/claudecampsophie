@@ -38,7 +38,9 @@ function overview(withPending: boolean): RewardsOverview {
         updatedAt: AT,
       },
     ],
-    children: [{ childId: RILEY, nickname: 'Riley', balance: withPending ? 0 : 10 }],
+    children: [
+      { childId: RILEY, nickname: 'Riley', balance: withPending ? 0 : 10, status: 'active' },
+    ],
     openRequests: withPending ? [{ ...request, state: 'pending', cancelledBy: null }] : [],
     recentRequests: withPending ? [] : [{ ...request, state: 'cancelled', cancelledBy: 'child' }],
   };

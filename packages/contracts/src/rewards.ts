@@ -179,6 +179,8 @@ export const rewardChildBalanceSchema = z.strictObject({
   childId: uuidSchema,
   nickname: z.string(),
   balance: balanceSchema,
+  /** Archived and draft profiles keep a readable balance (history, spec P11) but take no new rewards. */
+  status: z.enum(['draft', 'active', 'archived']),
 });
 export type RewardChildBalance = z.infer<typeof rewardChildBalanceSchema>;
 

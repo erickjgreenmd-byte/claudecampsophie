@@ -283,8 +283,8 @@ describe('parent reward catalog (spec P9)', () => {
     const overview = rewardsOverviewResponseSchema.parse(await json(res));
     expect(overview.rewards.map((r) => r.id)).toEqual([created.id]);
     expect(overview.children).toEqual([
-      { childId: f.children[0]!.id, nickname: 'Riley', balance: 15 },
-      { childId: f.children[1]!.id, nickname: 'Sam', balance: 0 },
+      { childId: f.children[0]!.id, nickname: 'Riley', balance: 15, status: 'active' },
+      { childId: f.children[1]!.id, nickname: 'Sam', balance: 0, status: 'active' },
     ]);
     expect(overview.openRequests).toHaveLength(1);
     expect(overview.openRequests[0]).toMatchObject({

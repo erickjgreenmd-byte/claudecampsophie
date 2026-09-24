@@ -185,8 +185,8 @@ function RewardsManager() {
             onShowHistory={setHistoryChild}
           />
           {historyChild ? <HistorySection child={historyChild} version={historyVersion} /> : null}
-          {data.children.length > 0 ? (
-            <AdjustmentSection childBalances={data.children} onChanged={refresh} />
+          {activeChildren(data.children).length > 0 ? (
+            <AdjustmentSection childBalances={activeChildren(data.children)} onChanged={refresh} />
           ) : null}
           <RewardsSection data={data} onChanged={refresh} />
         </div>
@@ -344,6 +344,15 @@ function RequestsSection({ data, onChanged }: { data: RewardsOverview; onChanged
 // Balances and history
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Children who can take new rewards and point adjustments. Archived and draft profiles keep a
+ * readable balance and history (spec P11) but are not offered in the forms (the API refuses new
+ * rewards for them).
+ */
+function activeChildren(children: RewardChildBalance[]): RewardChildBalance[] {
+  return children.filter((child) => child.status === 'active');
+}
+
 function BalancesSection({
   childBalances,
   selected,
@@ -377,6 +386,11 @@ function BalancesSection({
             >
               <strong>{child.nickname}</strong>
               <span>{pointsLabel(child.balance)}</span>
+              {child.status === 'active' ? null : (
+                <span style={{ color: 'var(--muted)' }}>
+                  ({child.status === 'archived' ? 'archived' : 'no paid slot'} — history only)
+                </span>
+              )}
               <button
                 type="button"
                 className="btn secondary"
@@ -668,7 +682,7 @@ function RewardsSection({ data, onChanged }: { data: RewardsOverview; onChanged:
                 <RewardForm
                   mode="edit"
                   reward={reward}
-                  childBalances={data.children}
+                  childBalances={activeChildren(data.children)}
                   onDone={(message) => {
                     setEditing(null);
                     setSaved({ kind: 'success', message });
@@ -712,7 +726,7 @@ function RewardsSection({ data, onChanged }: { data: RewardsOverview; onChanged:
       <h3>Add a reward</h3>
       <RewardForm
         mode="create"
-        childBalances={data.children}
+        childBalances={activeChildren(data.children)}
         onDone={(message) => {
           setSaved({ kind: 'success', message });
           onChanged();

@@ -289,8 +289,10 @@ export function rewardsRoutes(): Hono<AppEnv> {
           from public.rewards where family_id = ${familyId}
          order by active desc, point_cost, created_at`,
       // Every profile's balance, archived and draft included: earned points are history (P11).
-      children: await tx<{ id: string; nickname: string; balance: number }[]>`
-        select c.id, c.nickname, coalesce(b.balance, 0) as balance
+      children: await tx<
+        { id: string; nickname: string; balance: number; status: 'draft' | 'active' | 'archived' }[]
+      >`
+        select c.id, c.nickname, coalesce(b.balance, 0) as balance, c.status
           from public.child_profiles c
           left join public.point_balances b on b.child_id = c.id
          where c.family_id = ${familyId} and ${notBeingDeleted(tx, 'c.id')}
@@ -321,6 +323,7 @@ export function rewardsRoutes(): Hono<AppEnv> {
         childId: ch.id,
         nickname: ch.nickname,
         balance: ch.balance,
+        status: ch.status,
       })),
       openRequests: data.open.map(toParentRequest),
       recentRequests: data.recent.map(toParentRequest),

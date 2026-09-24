@@ -32,8 +32,8 @@ function overview(overrides: Partial<RewardsOverview> = {}): RewardsOverview {
       },
     ],
     children: [
-      { childId: RILEY, nickname: 'Riley', balance: 12 },
-      { childId: SAM, nickname: 'Sam', balance: 0 },
+      { childId: RILEY, nickname: 'Riley', balance: 12, status: 'active' },
+      { childId: SAM, nickname: 'Sam', balance: 0, status: 'active' },
     ],
     openRequests: [
       {
@@ -170,6 +170,30 @@ describe('RewardsPage (spec P9, P14; AC_UX_02)', () => {
     // Points are not money: the page says so and offers no payment action.
     expect(screen.getByText(/not money/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /pay|buy|purchase|cash/i })).toBeNull();
+  });
+
+  it('an archived child keeps a readable balance but is not offered for new rewards or adjustments', async () => {
+    const ARCHIVED = '5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d';
+    const { api } = fakeApi({
+      data: overview({
+        children: [
+          { childId: RILEY, nickname: 'Riley', balance: 12, status: 'active' },
+          { childId: ARCHIVED, nickname: 'Jordan', balance: 30, status: 'archived' },
+        ],
+      }),
+    });
+    renderPage(<RewardsPage />, { api });
+    const balances = await screen.findByRole('region', { name: 'Points balances' });
+    expect(within(balances).getByText('Jordan')).toBeTruthy();
+    expect(within(balances).getByText(/archived — history only/)).toBeTruthy();
+    const adjust = screen.getByRole('form', { name: 'Adjust points' });
+    const childOptions = within(within(adjust).getByLabelText('Child')).getAllByRole('option');
+    expect(childOptions.map((o) => o.textContent)).not.toContain('Jordan');
+    const add = screen.getByRole('form', { name: 'Add a reward' });
+    const audience = within(within(add).getByLabelText('Who can ask for it')).getAllByRole(
+      'option',
+    );
+    expect(audience.map((o) => o.textContent).join(' ')).not.toMatch(/Jordan/);
   });
 
   it('approving a request posts the decision and refreshes the list', async () => {
