@@ -84,7 +84,16 @@ async function applySelectedMigrations(sql: Sql): Promise<void> {
   }
 }
 
-export async function createTestDb(): Promise<TestDb> {
+export interface TestDbOptions {
+  /**
+   * The application clock to state in every transaction (pencillift.request_now), as the API
+   * does: jobs the database enqueues are then due at this clock (migration 0780). API tests pin
+   * their clock; without this, work enqueued inside the database would follow the real clock.
+   */
+  readonly requestNow?: () => Date;
+}
+
+export async function createTestDb(options: TestDbOptions = {}): Promise<TestDb> {
   const baseUrl = process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL;
   const admin = postgres(baseUrl, { max: 1, onnotice: () => undefined });
   const name = `pl_test_${randomBytes(6).toString('hex')}`;
@@ -108,6 +117,9 @@ export async function createTestDb(): Promise<TestDb> {
   ): Promise<T> {
     return (await sql.begin(async (tx) => {
       await tx`select set_config('request.jwt.claims', ${JSON.stringify(claims)}, true)`;
+      if (options.requestNow) {
+        await tx`select set_config('pencillift.request_now', ${options.requestNow().toISOString()}, true)`;
+      }
       await tx.unsafe(`set local role ${role}`);
       return fn(tx);
     })) as T;

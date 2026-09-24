@@ -1091,9 +1091,9 @@ export function learningRoutes(): Hono<AppEnv> {
     try {
       await deps.db.asService(
         (tx) => tx`
-          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
           values ('export_build', ${'export:' + exportId}, ${familyId}, ${set.child_id},
-                  ${JSON.stringify({ exportId, setId: set.id })}::text::jsonb)
+                  ${JSON.stringify({ exportId, setId: set.id })}::text::jsonb, ${deps.clock()})
           on conflict (idempotency_key) do nothing`,
       );
     } catch (error) {

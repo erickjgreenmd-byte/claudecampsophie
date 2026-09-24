@@ -49,14 +49,15 @@ export interface TestApi {
 }
 
 export async function createTestApi(overrides: Record<string, string> = {}): Promise<TestApi> {
-  const db = await createTestDb();
+  const now = { value: new Date('2026-09-24T15:00:00Z') };
+  // Direct SQL in tests states the pinned clock, as the API does (migration 0780, BUG-090).
+  const db = await createTestDb({ requestNow: () => now.value });
   const loaded = loadConfig({ ...TEST_ENV, ...overrides });
   if (!loaded.ok) throw new Error(`bad test config: ${JSON.stringify(loaded.errors)}`);
   const config = loaded.config;
   // The API under test uses the production client options (BUG-063): same factory as the Worker.
   const apiSql = createPostgresClient(db.url, { max: 4, onnotice: () => undefined });
   const apiDb = createDb(apiSql);
-  const now = { value: new Date('2026-09-24T15:00:00Z') };
   const logs: LogEvent[] = [];
   const providers = {
     consent: createDevelopmentConsentMock(),

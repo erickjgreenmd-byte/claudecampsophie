@@ -1,6 +1,6 @@
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
 import { MOCK_ENVIRONMENTS } from '../config.ts';
-import type { Tx } from '../db.ts';
+import { stateRequestInstant, type Tx } from '../db.ts';
 import type { AppDeps } from '../middleware/context.ts';
 import { runIdentityHousekeeping } from '../auth/housekeeping.ts';
 import {
@@ -630,10 +630,12 @@ export async function inactivitySweep(
       if (family.notified_at === null) {
         if (await sendInactivityNotice(deps, family, now)) notified += 1;
       } else {
-        const [row] = await deps.db.asService(
-          (tx) => tx<{ id: string | null }[]>`
-            select app.inactivity_delete_family(${family.id}, ${now}, ${idleBefore}, ${noticeBefore}) as id`,
-        );
+        const [row] = await deps.db.asService(async (tx) => {
+          // The purge job the function enqueues is due at the tick's clock (migration 0780).
+          await stateRequestInstant(tx, now);
+          return tx<{ id: string | null }[]>`
+            select app.inactivity_delete_family(${family.id}, ${now}, ${idleBefore}, ${noticeBefore}) as id`;
+        });
         if (row?.id) deleted += 1;
       }
     } catch {

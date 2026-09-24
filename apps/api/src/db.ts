@@ -33,6 +33,15 @@ export interface Db {
   asService<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
 }
 
+/**
+ * States the application's clock for this transaction (pencillift.request_now): jobs the database
+ * enqueues take it as their run_after (migration 0780), and child reads use it for release times
+ * (0650). Call before a SQL function that enqueues work.
+ */
+export async function stateRequestInstant(tx: Tx, now: Date): Promise<void> {
+  await tx`select set_config('pencillift.request_now', ${now.toISOString()}, true)`;
+}
+
 export function createDb(sql: Sql): Db {
   async function run<T>(
     role: string,

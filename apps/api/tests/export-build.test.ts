@@ -251,8 +251,8 @@ describe('progress and family data exports', () => {
       insert into public.data_exports (family_id, requested_by, kind, child_id)
       values (${fam.familyId}, ${fam.ownerId}, ${kind}, ${kind === 'family_data' ? null : fam.children[0]!.id}) returning id`;
     await api.db.sql`
-      insert into public.jobs (kind, idempotency_key, family_id, payload)
-      values ('export_build', ${'export:' + row!.id}, ${fam.familyId}, ${JSON.stringify({ exportId: row!.id })}::text::jsonb)`;
+      insert into public.jobs (kind, idempotency_key, family_id, payload, run_after)
+      values ('export_build', ${'export:' + row!.id}, ${fam.familyId}, ${JSON.stringify({ exportId: row!.id })}::text::jsonb, ${api.now.value})`;
     return row!.id;
   }
 
@@ -298,9 +298,9 @@ describe('progress and family data exports', () => {
       insert into public.data_exports (family_id, requested_by, kind, child_id)
       values (${fam.familyId}, ${fam.ownerId}, 'review_questions_pdf', ${fam.children[0]!.id}) returning id`;
     await api.db.sql`
-      insert into public.jobs (kind, idempotency_key, family_id, payload)
+      insert into public.jobs (kind, idempotency_key, family_id, payload, run_after)
       values ('export_build', ${'export:' + missing!.id}, ${fam.familyId},
-              ${JSON.stringify({ exportId: missing!.id, setId: randomUUID() })}::text::jsonb)`;
+              ${JSON.stringify({ exportId: missing!.id, setId: randomUUID() })}::text::jsonb, ${api.now.value})`;
     await runJobs(deps, { export_build: createExportBuildHandler({ upload: stubUpload }) });
     expect((await exportRow(missing!.id)).status).toBe('failed');
 
@@ -314,7 +314,7 @@ describe('progress and family data exports', () => {
     expect(first.retried).toBe(1);
     expect((await exportRow(id)).status).toBe('queued');
     await api.db
-      .sql`update public.jobs set run_after = now() - interval '1 minute' where idempotency_key = ${'export:' + id}`;
+      .sql`update public.jobs set run_after = ${new Date(api.now.value.getTime() - 60_000)} where idempotency_key = ${'export:' + id}`;
     api.now.value = new Date(Date.now() + 3_600_000);
     await runJobs(deps, { export_build: createExportBuildHandler({ upload: failing }) });
     expect((await exportRow(id)).status).toBe('failed');
@@ -332,8 +332,8 @@ describe('progress and family data exports', () => {
         insert into public.data_exports (family_id, requested_by, kind, child_id)
         values (${other.familyId}, ${other.ownerId}, ${kind}, ${childId}) returning id`;
       await api.db.sql`
-        insert into public.jobs (kind, idempotency_key, family_id, payload)
-        values ('export_build', ${'export:' + row!.id}, ${other.familyId}, ${JSON.stringify({ exportId: row!.id })}::text::jsonb)`;
+        insert into public.jobs (kind, idempotency_key, family_id, payload, run_after)
+        values ('export_build', ${'export:' + row!.id}, ${other.familyId}, ${JSON.stringify({ exportId: row!.id })}::text::jsonb, ${api.now.value})`;
       exports.push(row!.id);
     }
     await api.db.sql`
