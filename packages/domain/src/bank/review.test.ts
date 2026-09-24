@@ -107,5 +107,6 @@ describe('RV-learning-bank-3: the coverage report must not claim skills the bank
     // Actual: kindergarten lists science.earth_space and grade 2 lists reading.main_idea as
     // supported, but no curated item exists at those grades (fake content completion).
     expect(phantom).toEqual([]);
-  });
+    // 18 full-bank generations (~3 s on a loaded 4-CPU runner); same budget as bank.test.ts.
+  }, 60_000);
 });
