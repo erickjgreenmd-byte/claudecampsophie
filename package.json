@@ -1,0 +1,33 @@
+{
+  "name": "pencillift",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r --workspace-concurrency=2 run typecheck",
+    "lint": "eslint . --max-warnings=0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm -r --workspace-concurrency=1 run test",
+    "test:unit": "pnpm -r --filter=!@pencillift/db run test",
+    "test:db": "pnpm --filter @pencillift/db run test",
+    "finance:check": "python3 finance/cost_model.py --check && python3 finance/promo_school_model.py --check",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm finance:check",
+    "db:local": "bash scripts/dev-db.sh"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.2",
+    "@vitest/coverage-v8": "5.0.1",
+    "eslint": "10.11.0",
+    "fast-check": "4.10.2",
+    "prettier": "3.9.9",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.1",
+    "vitest": "5.0.1"
+  }
+}

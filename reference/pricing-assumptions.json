@@ -1,0 +1,1058 @@
+{
+  "as_of": "2026-09-14",
+  "currency": "USD",
+  "rates": {
+    "Terra": {
+      "input": 2,
+      "output": 12,
+      "id": "gpt-5.6-terra"
+    },
+    "Astra": {
+      "input": 10,
+      "output": 50,
+      "id": "gpt-6-astra"
+    },
+    "Luna": {
+      "input": 0.2,
+      "output": 1.2,
+      "id": "gpt-5.6-luna"
+    }
+  },
+  "defaults": {
+    "children": 2,
+    "pages_per_child": 40,
+    "daily_days": 30,
+    "daily_questions": 5,
+    "review_weeks": 4.333333333333333,
+    "review_subjects": 4,
+    "review_questions": 8,
+    "custom_daily_sets": 8,
+    "custom_explanations": 10,
+    "followups": 20,
+    "semantic_fraction": 0.2,
+    "escalation_fraction": 0.05,
+    "ai_reserve": 0.25,
+    "active_families": 1000,
+    "monthly_price": 39.99,
+    "store_fee": 0.15,
+    "revenuecat_rate": 0.01,
+    "revenuecat_threshold": 2500,
+    "marginal_infra": 0.25,
+    "consent_onboarding_cost": 5,
+    "consent_amortization_months": 12,
+    "support_per_family": 2
+  },
+  "fixed_monthly": [
+    {
+      "service": "Supabase Pro",
+      "usd": 25,
+      "kind": "Published starting price",
+      "source": "https://supabase.com/pricing"
+    },
+    {
+      "service": "Cloudflare Workers",
+      "usd": 5,
+      "kind": "Published paid minimum; additional queue/CPU usage possible",
+      "source": "https://developers.cloudflare.com/workers/platform/pricing/"
+    },
+    {
+      "service": "Expo EAS Starter",
+      "usd": 19,
+      "kind": "Published base; build/update overages possible",
+      "source": "https://expo.dev/pricing"
+    },
+    {
+      "service": "Resend Pro",
+      "usd": 20,
+      "kind": "Published base; 50,000 emails/month",
+      "source": "https://resend.com/pricing"
+    },
+    {
+      "service": "Monitoring allowance",
+      "usd": 20,
+      "kind": "Planning allowance, not a vendor quote",
+      "source": ""
+    },
+    {
+      "service": "Extra backups/staging allowance",
+      "usd": 20,
+      "kind": "Planning allowance, not a vendor quote",
+      "source": ""
+    },
+    {
+      "service": "Apple membership monthly allocation",
+      "usd": 8.25,
+      "kind": "Published $99/year",
+      "source": "https://developer.apple.com/programs/enroll/"
+    },
+    {
+      "service": "Domain renewal monthly allowance",
+      "usd": 1.6666666666666667,
+      "kind": "Planning allowance; actual purchased-domain renewal unknown",
+      "source": ""
+    }
+  ],
+  "operations": [
+    {
+      "stage": "Vision extraction",
+      "model": "Terra",
+      "count": "pages",
+      "input": 4000,
+      "output": 1200
+    },
+    {
+      "stage": "Private grading",
+      "model": "Terra",
+      "count": "pages",
+      "input": 2500,
+      "output": 2000
+    },
+    {
+      "stage": "Original child explanations",
+      "model": "Astra",
+      "count": "explanations",
+      "input": 1000,
+      "output": 1500
+    },
+    {
+      "stage": "Child follow-up coaching",
+      "model": "Astra",
+      "count": "followups",
+      "input": 1200,
+      "output": 500
+    },
+    {
+      "stage": "Custom daily practice sets",
+      "model": "Astra",
+      "count": "custom_daily",
+      "input": 1000,
+      "output": 1500
+    },
+    {
+      "stage": "Thursday review bundles",
+      "model": "Astra",
+      "count": "reviews",
+      "input": 2500,
+      "output": 4000
+    },
+    {
+      "stage": "Independent verification",
+      "model": "Terra",
+      "count": "verifications",
+      "input": 2000,
+      "output": 500
+    },
+    {
+      "stage": "Semantic practice checking",
+      "model": "Terra",
+      "count": "semantic",
+      "input": 1200,
+      "output": 300
+    },
+    {
+      "stage": "Difficult-case escalation",
+      "model": "Astra",
+      "count": "escalations",
+      "input": 4000,
+      "output": 2000
+    },
+    {
+      "stage": "Adult weekly summary/catalog match",
+      "model": "Luna",
+      "count": "summaries",
+      "input": 4000,
+      "output": 1000
+    }
+  ],
+  "notes": [
+    "All input includes estimated image tokens where applicable; output means all billed output, including reasoning.",
+    "Counts and tokens are planning assumptions, not measured model performance.",
+    "Daily sets are offered every day; most use approved reusable templates. Eight custom AI daily sets per child/month are assumed.",
+    "A Thursday bundle has four subjects x eight questions by default.",
+    "Verifier calls include each private grading, child explanation/follow-up, custom daily set and Thursday bundle.",
+    "Base has no paid web search, image generation, hosted code interpreter, live voice, tutor pay, SMS, or Amazon affiliate revenue.",
+    "No prompt-caching or Batch discount is assumed. ZDR/provider eligibility and exact costs remain account-specific.",
+    "Store and RevenueCat charges apply to revenue, not token consumption. Support/consent are separated from system runtime.",
+    "Fixed plan allocation assumes the purchased plans remain sufficient; measure MAU, compute, queue, storage and egress as usage grows."
+  ],
+  "computed_scenarios": {
+    "Light: one child": {
+      "ai_raw": 4.0664,
+      "ai_reserved": 5.083,
+      "fixed_total": 118.91666666666667,
+      "runtime": 5.4519166666666665,
+      "consent": 0.4166666666666667,
+      "store_fee": 3.7484999999999995,
+      "revenuecat_fee": 0.24989999999999998,
+      "cost_with_payment": 9.450316666666666,
+      "full_allowance": 11.866983333333334,
+      "contribution": 13.123016666666665,
+      "contribution_margin": 0.5251307189542483,
+      "lines": [
+        {
+          "stage": "Vision extraction",
+          "model": "Terra",
+          "count": "pages",
+          "input": 4000,
+          "output": 1200,
+          "calls": 20,
+          "cost": 0.448
+        },
+        {
+          "stage": "Private grading",
+          "model": "Terra",
+          "count": "pages",
+          "input": 2500,
+          "output": 2000,
+          "calls": 20,
+          "cost": 0.58
+        },
+        {
+          "stage": "Original child explanations",
+          "model": "Astra",
+          "count": "explanations",
+          "input": 1000,
+          "output": 1500,
+          "calls": 5,
+          "cost": 0.425
+        },
+        {
+          "stage": "Child follow-up coaching",
+          "model": "Astra",
+          "count": "followups",
+          "input": 1200,
+          "output": 500,
+          "calls": 10,
+          "cost": 0.37
+        },
+        {
+          "stage": "Custom daily practice sets",
+          "model": "Astra",
+          "count": "custom_daily",
+          "input": 1000,
+          "output": 1500,
+          "calls": 4,
+          "cost": 0.34
+        },
+        {
+          "stage": "Thursday review bundles",
+          "model": "Astra",
+          "count": "reviews",
+          "input": 2500,
+          "output": 4000,
+          "calls": 4.333333333333333,
+          "cost": 0.9749999999999999
+        },
+        {
+          "stage": "Independent verification",
+          "model": "Terra",
+          "count": "verifications",
+          "input": 2000,
+          "output": 500,
+          "calls": 43.33333333333333,
+          "cost": 0.4333333333333333
+        },
+        {
+          "stage": "Semantic practice checking",
+          "model": "Terra",
+          "count": "semantic",
+          "input": 1200,
+          "output": 300,
+          "calls": 57.73333333333333,
+          "cost": 0.34639999999999993
+        },
+        {
+          "stage": "Difficult-case escalation",
+          "model": "Astra",
+          "count": "escalations",
+          "input": 4000,
+          "output": 2000,
+          "calls": 1.0,
+          "cost": 0.14
+        },
+        {
+          "stage": "Adult weekly summary/catalog match",
+          "model": "Luna",
+          "count": "summaries",
+          "input": 4000,
+          "output": 1000,
+          "calls": 4.333333333333333,
+          "cost": 0.008666666666666666
+        }
+      ]
+    },
+    "Typical: two children": {
+      "ai_raw": 13.510133333333332,
+      "ai_reserved": 16.887666666666664,
+      "fixed_total": 118.91666666666667,
+      "runtime": 17.25658333333333,
+      "consent": 0.4166666666666667,
+      "store_fee": 5.9985,
+      "revenuecat_fee": 0.39990000000000003,
+      "cost_with_payment": 23.65498333333333,
+      "full_allowance": 26.071649999999998,
+      "contribution": 13.918350000000004,
+      "contribution_margin": 0.34804576144036015,
+      "lines": [
+        {
+          "stage": "Vision extraction",
+          "model": "Terra",
+          "count": "pages",
+          "input": 4000,
+          "output": 1200,
+          "calls": 80,
+          "cost": 1.792
+        },
+        {
+          "stage": "Private grading",
+          "model": "Terra",
+          "count": "pages",
+          "input": 2500,
+          "output": 2000,
+          "calls": 80,
+          "cost": 2.32
+        },
+        {
+          "stage": "Original child explanations",
+          "model": "Astra",
+          "count": "explanations",
+          "input": 1000,
+          "output": 1500,
+          "calls": 20,
+          "cost": 1.7
+        },
+        {
+          "stage": "Child follow-up coaching",
+          "model": "Astra",
+          "count": "followups",
+          "input": 1200,
+          "output": 500,
+          "calls": 40,
+          "cost": 1.48
+        },
+        {
+          "stage": "Custom daily practice sets",
+          "model": "Astra",
+          "count": "custom_daily",
+          "input": 1000,
+          "output": 1500,
+          "calls": 16,
+          "cost": 1.36
+        },
+        {
+          "stage": "Thursday review bundles",
+          "model": "Astra",
+          "count": "reviews",
+          "input": 2500,
+          "output": 4000,
+          "calls": 8.666666666666666,
+          "cost": 1.9499999999999997
+        },
+        {
+          "stage": "Independent verification",
+          "model": "Terra",
+          "count": "verifications",
+          "input": 2000,
+          "output": 500,
+          "calls": 164.66666666666669,
+          "cost": 1.6466666666666667
+        },
+        {
+          "stage": "Semantic practice checking",
+          "model": "Terra",
+          "count": "semantic",
+          "input": 1200,
+          "output": 300,
+          "calls": 115.46666666666665,
+          "cost": 0.6927999999999999
+        },
+        {
+          "stage": "Difficult-case escalation",
+          "model": "Astra",
+          "count": "escalations",
+          "input": 4000,
+          "output": 2000,
+          "calls": 4.0,
+          "cost": 0.56
+        },
+        {
+          "stage": "Adult weekly summary/catalog match",
+          "model": "Luna",
+          "count": "summaries",
+          "input": 4000,
+          "output": 1000,
+          "calls": 4.333333333333333,
+          "cost": 0.008666666666666666
+        }
+      ]
+    },
+    "Heavy: four children": {
+      "ai_raw": 41.5636,
+      "ai_reserved": 51.9545,
+      "fixed_total": 118.91666666666667,
+      "runtime": 52.32341666666667,
+      "consent": 0.4166666666666667,
+      "store_fee": 11.998499999999998,
+      "revenuecat_fee": 0.7998999999999999,
+      "cost_with_payment": 65.12181666666666,
+      "full_allowance": 67.53848333333332,
+      "contribution": 12.451516666666677,
+      "contribution_margin": 0.15566341626036603,
+      "lines": [
+        {
+          "stage": "Vision extraction",
+          "model": "Terra",
+          "count": "pages",
+          "input": 4000,
+          "output": 1200,
+          "calls": 240,
+          "cost": 5.376
+        },
+        {
+          "stage": "Private grading",
+          "model": "Terra",
+          "count": "pages",
+          "input": 2500,
+          "output": 2000,
+          "calls": 240,
+          "cost": 6.96
+        },
+        {
+          "stage": "Original child explanations",
+          "model": "Astra",
+          "count": "explanations",
+          "input": 1000,
+          "output": 1500,
+          "calls": 80,
+          "cost": 6.8
+        },
+        {
+          "stage": "Child follow-up coaching",
+          "model": "Astra",
+          "count": "followups",
+          "input": 1200,
+          "output": 500,
+          "calls": 160,
+          "cost": 5.92
+        },
+        {
+          "stage": "Custom daily practice sets",
+          "model": "Astra",
+          "count": "custom_daily",
+          "input": 1000,
+          "output": 1500,
+          "calls": 48,
+          "cost": 4.08
+        },
+        {
+          "stage": "Thursday review bundles",
+          "model": "Astra",
+          "count": "reviews",
+          "input": 2500,
+          "output": 4000,
+          "calls": 17.333333333333332,
+          "cost": 3.8999999999999995
+        },
+        {
+          "stage": "Independent verification",
+          "model": "Terra",
+          "count": "verifications",
+          "input": 2000,
+          "output": 500,
+          "calls": 545.3333333333333,
+          "cost": 5.453333333333333
+        },
+        {
+          "stage": "Semantic practice checking",
+          "model": "Terra",
+          "count": "semantic",
+          "input": 1200,
+          "output": 300,
+          "calls": 230.9333333333333,
+          "cost": 1.3855999999999997
+        },
+        {
+          "stage": "Difficult-case escalation",
+          "model": "Astra",
+          "count": "escalations",
+          "input": 4000,
+          "output": 2000,
+          "calls": 12.0,
+          "cost": 1.68
+        },
+        {
+          "stage": "Adult weekly summary/catalog match",
+          "model": "Luna",
+          "count": "summaries",
+          "input": 4000,
+          "output": 1000,
+          "calls": 4.333333333333333,
+          "cost": 0.008666666666666666
+        }
+      ]
+    }
+  },
+  "all_astra_base": {
+    "ai_raw": 35.9676,
+    "ai_reserved": 44.9595,
+    "fixed_total": 118.91666666666667,
+    "runtime": 45.32841666666666,
+    "consent": 0.4166666666666667,
+    "store_fee": 5.9985,
+    "revenuecat_fee": 0.39990000000000003,
+    "cost_with_payment": 51.726816666666664,
+    "full_allowance": 54.14348333333333,
+    "contribution": -14.153483333333327,
+    "contribution_margin": -0.35392556472451425,
+    "lines": [
+      {
+        "stage": "Vision extraction",
+        "model": "Astra",
+        "count": "pages",
+        "input": 4000,
+        "output": 1200,
+        "calls": 80,
+        "cost": 8.0
+      },
+      {
+        "stage": "Private grading",
+        "model": "Astra",
+        "count": "pages",
+        "input": 2500,
+        "output": 2000,
+        "calls": 80,
+        "cost": 10.0
+      },
+      {
+        "stage": "Original child explanations",
+        "model": "Astra",
+        "count": "explanations",
+        "input": 1000,
+        "output": 1500,
+        "calls": 20,
+        "cost": 1.7
+      },
+      {
+        "stage": "Child follow-up coaching",
+        "model": "Astra",
+        "count": "followups",
+        "input": 1200,
+        "output": 500,
+        "calls": 40,
+        "cost": 1.48
+      },
+      {
+        "stage": "Custom daily practice sets",
+        "model": "Astra",
+        "count": "custom_daily",
+        "input": 1000,
+        "output": 1500,
+        "calls": 16,
+        "cost": 1.36
+      },
+      {
+        "stage": "Thursday review bundles",
+        "model": "Astra",
+        "count": "reviews",
+        "input": 2500,
+        "output": 4000,
+        "calls": 8.666666666666666,
+        "cost": 1.9499999999999997
+      },
+      {
+        "stage": "Independent verification",
+        "model": "Astra",
+        "count": "verifications",
+        "input": 2000,
+        "output": 500,
+        "calls": 164.66666666666669,
+        "cost": 7.410000000000001
+      },
+      {
+        "stage": "Semantic practice checking",
+        "model": "Astra",
+        "count": "semantic",
+        "input": 1200,
+        "output": 300,
+        "calls": 115.46666666666665,
+        "cost": 3.1175999999999995
+      },
+      {
+        "stage": "Difficult-case escalation",
+        "model": "Astra",
+        "count": "escalations",
+        "input": 4000,
+        "output": 2000,
+        "calls": 4.0,
+        "cost": 0.56
+      },
+      {
+        "stage": "Adult weekly summary/catalog match",
+        "model": "Astra",
+        "count": "summaries",
+        "input": 4000,
+        "output": 1000,
+        "calls": 4.333333333333333,
+        "cost": 0.39
+      }
+    ]
+  },
+  "scale_typical": {
+    "10": {
+      "ai_raw": 13.510133333333332,
+      "ai_reserved": 16.887666666666664,
+      "fixed_total": 118.91666666666667,
+      "runtime": 29.029333333333334,
+      "consent": 0.4166666666666667,
+      "store_fee": 5.9985,
+      "revenuecat_fee": 0,
+      "cost_with_payment": 35.027833333333334,
+      "full_allowance": 37.444500000000005,
+      "contribution": 2.545499999999997,
+      "contribution_margin": 0.06365341335333825,
+      "lines": [
+        {
+          "stage": "Vision extraction",
+          "model": "Terra",
+          "count": "pages",
+          "input": 4000,
+          "output": 1200,
+          "calls": 80,
+          "cost": 1.792
+        },
+        {
+          "stage": "Private grading",
+          "model": "Terra",
+          "count": "pages",
+          "input": 2500,
+          "output": 2000,
+          "calls": 80,
+          "cost": 2.32
+        },
+        {
+          "stage": "Original child explanations",
+          "model": "Astra",
+          "count": "explanations",
+          "input": 1000,
+          "output": 1500,
+          "calls": 20,
+          "cost": 1.7
+        },
+        {
+          "stage": "Child follow-up coaching",
+          "model": "Astra",
+          "count": "followups",
+          "input": 1200,
+          "output": 500,
+          "calls": 40,
+          "cost": 1.48
+        },
+        {
+          "stage": "Custom daily practice sets",
+          "model": "Astra",
+          "count": "custom_daily",
+          "input": 1000,
+          "output": 1500,
+          "calls": 16,
+          "cost": 1.36
+        },
+        {
+          "stage": "Thursday review bundles",
+          "model": "Astra",
+          "count": "reviews",
+          "input": 2500,
+          "output": 4000,
+          "calls": 8.666666666666666,
+          "cost": 1.9499999999999997
+        },
+        {
+          "stage": "Independent verification",
+          "model": "Terra",
+          "count": "verifications",
+          "input": 2000,
+          "output": 500,
+          "calls": 164.66666666666669,
+          "cost": 1.6466666666666667
+        },
+        {
+          "stage": "Semantic practice checking",
+          "model": "Terra",
+          "count": "semantic",
+          "input": 1200,
+          "output": 300,
+          "calls": 115.46666666666665,
+          "cost": 0.6927999999999999
+        },
+        {
+          "stage": "Difficult-case escalation",
+          "model": "Astra",
+          "count": "escalations",
+          "input": 4000,
+          "output": 2000,
+          "calls": 4.0,
+          "cost": 0.56
+        },
+        {
+          "stage": "Adult weekly summary/catalog match",
+          "model": "Luna",
+          "count": "summaries",
+          "input": 4000,
+          "output": 1000,
+          "calls": 4.333333333333333,
+          "cost": 0.008666666666666666
+        }
+      ]
+    },
+    "100": {
+      "ai_raw": 13.510133333333332,
+      "ai_reserved": 16.887666666666664,
+      "fixed_total": 118.91666666666667,
+      "runtime": 18.32683333333333,
+      "consent": 0.4166666666666667,
+      "store_fee": 5.9985,
+      "revenuecat_fee": 0.39990000000000003,
+      "cost_with_payment": 24.72523333333333,
+      "full_allowance": 27.141899999999996,
+      "contribution": 12.848100000000006,
+      "contribution_margin": 0.32128282070517644,
+      "lines": [
+        {
+          "stage": "Vision extraction",
+          "model": "Terra",
+          "count": "pages",
+          "input": 4000,
+          "output": 1200,
+          "calls": 80,
+          "cost": 1.792
+        },
+        {
+          "stage": "Private grading",
+          "model": "Terra",
+          "count": "pages",
+          "input": 2500,
+          "output": 2000,
+          "calls": 80,
+          "cost": 2.32
+        },
+        {
+          "stage": "Original child explanations",
+          "model": "Astra",
+          "count": "explanations",
+          "input": 1000,
+          "output": 1500,
+          "calls": 20,
+          "cost": 1.7
+        },
+        {
+          "stage": "Child follow-up coaching",
+          "model": "Astra",
+          "count": "followups",
+          "input": 1200,
+          "output": 500,
+          "calls": 40,
+          "cost": 1.48
+        },
+        {
+          "stage": "Custom daily practice sets",
+          "model": "Astra",
+          "count": "custom_daily",
+          "input": 1000,
+          "output": 1500,
+          "calls": 16,
+          "cost": 1.36
+        },
+        {
+          "stage": "Thursday review bundles",
+          "model": "Astra",
+          "count": "reviews",
+          "input": 2500,
+          "output": 4000,
+          "calls": 8.666666666666666,
+          "cost": 1.9499999999999997
+        },
+        {
+          "stage": "Independent verification",
+          "model": "Terra",
+          "count": "verifications",
+          "input": 2000,
+          "output": 500,
+          "calls": 164.66666666666669,
+          "cost": 1.6466666666666667
+        },
+        {
+          "stage": "Semantic practice checking",
+          "model": "Terra",
+          "count": "semantic",
+          "input": 1200,
+          "output": 300,
+          "calls": 115.46666666666665,
+          "cost": 0.6927999999999999
+        },
+        {
+          "stage": "Difficult-case escalation",
+          "model": "Astra",
+          "count": "escalations",
+          "input": 4000,
+          "output": 2000,
+          "calls": 4.0,
+          "cost": 0.56
+        },
+        {
+          "stage": "Adult weekly summary/catalog match",
+          "model": "Luna",
+          "count": "summaries",
+          "input": 4000,
+          "output": 1000,
+          "calls": 4.333333333333333,
+          "cost": 0.008666666666666666
+        }
+      ]
+    },
+    "1000": {
+      "ai_raw": 13.510133333333332,
+      "ai_reserved": 16.887666666666664,
+      "fixed_total": 118.91666666666667,
+      "runtime": 17.25658333333333,
+      "consent": 0.4166666666666667,
+      "store_fee": 5.9985,
+      "revenuecat_fee": 0.39990000000000003,
+      "cost_with_payment": 23.65498333333333,
+      "full_allowance": 26.071649999999998,
+      "contribution": 13.918350000000004,
+      "contribution_margin": 0.34804576144036015,
+      "lines": [
+        {
+          "stage": "Vision extraction",
+          "model": "Terra",
+          "count": "pages",
+          "input": 4000,
+          "output": 1200,
+          "calls": 80,
+          "cost": 1.792
+        },
+        {
+          "stage": "Private grading",
+          "model": "Terra",
+          "count": "pages",
+          "input": 2500,
+          "output": 2000,
+          "calls": 80,
+          "cost": 2.32
+        },
+        {
+          "stage": "Original child explanations",
+          "model": "Astra",
+          "count": "explanations",
+          "input": 1000,
+          "output": 1500,
+          "calls": 20,
+          "cost": 1.7
+        },
+        {
+          "stage": "Child follow-up coaching",
+          "model": "Astra",
+          "count": "followups",
+          "input": 1200,
+          "output": 500,
+          "calls": 40,
+          "cost": 1.48
+        },
+        {
+          "stage": "Custom daily practice sets",
+          "model": "Astra",
+          "count": "custom_daily",
+          "input": 1000,
+          "output": 1500,
+          "calls": 16,
+          "cost": 1.36
+        },
+        {
+          "stage": "Thursday review bundles",
+          "model": "Astra",
+          "count": "reviews",
+          "input": 2500,
+          "output": 4000,
+          "calls": 8.666666666666666,
+          "cost": 1.9499999999999997
+        },
+        {
+          "stage": "Independent verification",
+          "model": "Terra",
+          "count": "verifications",
+          "input": 2000,
+          "output": 500,
+          "calls": 164.66666666666669,
+          "cost": 1.6466666666666667
+        },
+        {
+          "stage": "Semantic practice checking",
+          "model": "Terra",
+          "count": "semantic",
+          "input": 1200,
+          "output": 300,
+          "calls": 115.46666666666665,
+          "cost": 0.6927999999999999
+        },
+        {
+          "stage": "Difficult-case escalation",
+          "model": "Astra",
+          "count": "escalations",
+          "input": 4000,
+          "output": 2000,
+          "calls": 4.0,
+          "cost": 0.56
+        },
+        {
+          "stage": "Adult weekly summary/catalog match",
+          "model": "Luna",
+          "count": "summaries",
+          "input": 4000,
+          "output": 1000,
+          "calls": 4.333333333333333,
+          "cost": 0.008666666666666666
+        }
+      ]
+    }
+  },
+  "revision": 3,
+  "pricing_approved_on": "2026-09-15",
+  "approved_pricing": {
+    "currency": "USD",
+    "interval": "month",
+    "first_child_cents": 3999,
+    "additional_child_cents": 999,
+    "initial_supported_paid_children": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "monthly_totals_cents": {
+      "1": 3999,
+      "2": 4998,
+      "3": 5997,
+      "4": 6996
+    },
+    "exact_store_price_availability": "not_verified"
+  },
+  "historical_scenarios_notice": "defaults, computed_scenarios, all_astra_base and scale_typical preserve the original 2026-09-14 workload and example prices; they are not current approved plan prices.",
+  "current_defaults": {
+    "children": 2,
+    "pages_per_child": 40,
+    "daily_days": 30,
+    "daily_questions": 5,
+    "review_weeks": 4.333333333333333,
+    "review_subjects": 4,
+    "review_questions": 8,
+    "custom_daily_sets": 30,
+    "custom_explanations": 10,
+    "followups": 20,
+    "semantic_fraction": 0.2,
+    "escalation_fraction": 0.05,
+    "ai_reserve": 0.25,
+    "active_families": 1000,
+    "monthly_price": 49.98,
+    "store_fee": 0.15,
+    "revenuecat_rate": 0.01,
+    "revenuecat_threshold": 2500,
+    "marginal_infra": 0.25,
+    "consent_onboarding_cost": 5,
+    "consent_amortization_months": 12,
+    "support_per_family": 2,
+    "first_child_price": 39.99,
+    "additional_child_price": 9.99
+  },
+  "approved_price_scenarios": {
+    "1": {
+      "children": 1,
+      "monthly_price": 39.99,
+      "pages": 40,
+      "custom_daily_sets_per_child": 30,
+      "ai_raw": 8.8494,
+      "runtime": 11.430666666666667,
+      "payment_fees": 6.3984000000000005,
+      "full_allowance": 20.245733333333337,
+      "contribution_before_overhead": 19.744266666666665
+    },
+    "2": {
+      "children": 2,
+      "monthly_price": 49.98,
+      "pages": 80,
+      "custom_daily_sets_per_child": 30,
+      "ai_raw": 17.690133333333332,
+      "runtime": 22.481583333333333,
+      "payment_fees": 7.9967999999999995,
+      "full_allowance": 32.89505,
+      "contribution_before_overhead": 17.08495
+    },
+    "3": {
+      "children": 3,
+      "monthly_price": 59.97,
+      "pages": 120,
+      "custom_daily_sets_per_child": 30,
+      "ai_raw": 26.530866666666668,
+      "runtime": 33.5325,
+      "payment_fees": 9.5952,
+      "full_allowance": 45.54436666666666,
+      "contribution_before_overhead": 14.425633333333337
+    },
+    "4": {
+      "children": 4,
+      "monthly_price": 69.96,
+      "pages": 160,
+      "custom_daily_sets_per_child": 30,
+      "ai_raw": 35.3716,
+      "runtime": 44.583416666666665,
+      "payment_fees": 11.1936,
+      "full_allowance": 58.19368333333333,
+      "contribution_before_overhead": 11.766316666666661
+    }
+  },
+  "approved_price_original_8_set_comparison": {
+    "1": {
+      "children": 1,
+      "monthly_price": 39.99,
+      "pages": 40,
+      "custom_daily_sets_per_child": 8,
+      "ai_raw": 6.759399999999999,
+      "runtime": 8.818166666666666,
+      "payment_fees": 6.3984000000000005,
+      "full_allowance": 17.633233333333333,
+      "contribution_before_overhead": 22.35676666666667
+    },
+    "2": {
+      "children": 2,
+      "monthly_price": 49.98,
+      "pages": 80,
+      "custom_daily_sets_per_child": 8,
+      "ai_raw": 13.510133333333332,
+      "runtime": 17.25658333333333,
+      "payment_fees": 7.9967999999999995,
+      "full_allowance": 27.67005,
+      "contribution_before_overhead": 22.309949999999997
+    },
+    "3": {
+      "children": 3,
+      "monthly_price": 59.97,
+      "pages": 120,
+      "custom_daily_sets_per_child": 8,
+      "ai_raw": 20.260866666666665,
+      "runtime": 25.694999999999997,
+      "payment_fees": 9.5952,
+      "full_allowance": 37.70686666666666,
+      "contribution_before_overhead": 22.263133333333336
+    },
+    "4": {
+      "children": 4,
+      "monthly_price": 69.96,
+      "pages": 160,
+      "custom_daily_sets_per_child": 8,
+      "ai_raw": 27.011599999999998,
+      "runtime": 34.13341666666666,
+      "payment_fees": 11.1936,
+      "full_allowance": 47.74368333333333,
+      "contribution_before_overhead": 22.216316666666664
+    }
+  },
+  "current_scenario_notice": "Unmeasured sensitivity: 40 pages, 30 freshly generated daily sets, 10 original explanations and 20 follow-ups per child/month; other original token, verifier, fee and infrastructure assumptions retained. 1,000 paying families; zero ads or affiliate income. Final quotas and actual token use require a pilot."
+}

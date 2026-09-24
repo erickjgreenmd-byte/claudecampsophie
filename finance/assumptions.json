@@ -1,0 +1,111 @@
+{
+  "as_of": "2026-09-18",
+  "currency": "USD",
+  "status": "illustrative_unmeasured",
+  "approved_price_cents": [
+    3999,
+    4998,
+    5997,
+    6996
+  ],
+  "model_rates": {
+    "astra": {
+      "model_id": "gpt-6-astra",
+      "input_per_million": 10,
+      "output_per_million": 50
+    },
+    "terra": {
+      "model_id": "gpt-5.6-terra",
+      "input_per_million": 2,
+      "output_per_million": 12
+    },
+    "luna": {
+      "model_id": "gpt-5.6-luna",
+      "input_per_million": 0.2,
+      "output_per_million": 1.2
+    }
+  },
+  "model_rate_basis": {
+    "source": "https://developers.openai.com/api/docs/pricing",
+    "checked": "2026-09-18",
+    "evidence": "verified_public",
+    "unit": "USD per million tokens",
+    "mode": "standard short context",
+    "cache_assumed": false,
+    "residency_uplift_included": false
+  },
+  "workloads": {
+    "light": {
+      "pages": 20,
+      "explanations": 5,
+      "followups": 10,
+      "fresh_daily_sets": 30,
+      "thursday_subjects": 4
+    },
+    "typical": {
+      "pages": 40,
+      "explanations": 10,
+      "followups": 20,
+      "fresh_daily_sets": 30,
+      "thursday_subjects": 4
+    },
+    "heavy": {
+      "pages": 80,
+      "explanations": 20,
+      "followups": 40,
+      "fresh_daily_sets": 30,
+      "thursday_subjects": 4
+    }
+  },
+  "workload_evidence": "assumed; not observed percentiles or approved usage caps",
+  "ai_contingency": 0.25,
+  "semantic_share": 0.2,
+  "escalation_share": 0.05,
+  "revenuecat": {
+    "threshold_usd": 2500,
+    "rate": 0.01,
+    "threshold_equality": "conservatively charged at equality; verify actual account contract",
+    "source": "https://www.revenuecat.com/pricing",
+    "checked": "2026-09-18",
+    "evidence": "verified_public; account-specific terms unverified"
+  },
+  "stripe": {
+    "processing_rate": 0.029,
+    "billing_rate": 0.007,
+    "fixed_usd": 0.3,
+    "region": "US domestic cards",
+    "processing_source": "https://stripe.com/en-us/pricing",
+    "billing_source": "https://stripe.com/billing/pricing",
+    "checked": "2026-09-18",
+    "evidence": "verified_public; selected combined route is hypothetical",
+    "store_linkout_fees_included": false
+  },
+  "refund_allowance_rate": 0.01,
+  "support_per_family": 2,
+  "consent_one_time_assumption": 5,
+  "consent_allocation_months": 12,
+  "other_variable_per_family": 0.25,
+  "allowance_evidence": "assumed; actual quotes unknown; expenses not verified",
+  "family_mix": [
+    0.4,
+    0.3,
+    0.2,
+    0.1
+  ],
+  "commercial_revenue": 0,
+  "unpriced_costs": [
+    "implementation and owner time",
+    "consent setup and actual verification pricing",
+    "child-data/ZDR commercial terms",
+    "independent security and privacy review",
+    "educator validation",
+    "devices",
+    "marketing and acquisition",
+    "maintenance labor",
+    "scale-dependent infrastructure",
+    "tax/accounting treatment",
+    "payout timing and working capital"
+  ],
+  "net_profit": null,
+  "spending_authorization": null
+}

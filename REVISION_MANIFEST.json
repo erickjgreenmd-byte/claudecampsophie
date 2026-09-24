@@ -1,0 +1,18 @@
+{
+  "revision": 8,
+  "date": "2026-09-18",
+  "master_words": 21884,
+  "acceptance_checks": 153,
+  "source_master_sha256": "ff7ac3e217e83bed6085c3e6875094aa68f59909fdf411d691def0b468e8c29e",
+  "logo_sha256": "d4613136ed68ca99b0cd08b7ffb7f8cb14afc4ba1a2912a8e9890c5f33c2c039",
+  "app_implementation_status": "not implemented or tested by this rewrite",
+  "finance_status": "arithmetic verified; usage and allowances unmeasured",
+  "ecc_source_checked": "https://github.com/affaan-m/ECC",
+  "ecc_upstream_manifest_version_observed": "2.2.1",
+  "owner_ecc_installation_status": "unverified; prompt requires inspection",
+  "learning_status": "specified; not activated in the owner environment",
+  "master_sha256": "4d95f3b7abd3fcb8c2c55996755698a7d9f8a121f4c69e542ee06e7095f9122d",
+  "promo_financial_scenarios": 864,
+  "promo_status": "specified; arithmetic verified; providers and app unimplemented",
+  "donation_policy_status": "approved: one school per family; full-price monthly subscriptions only; any discounted period excluded"
+}

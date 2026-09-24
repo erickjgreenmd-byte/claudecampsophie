@@ -1,0 +1,83 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createTestDb, type TestDb } from './harness.ts';
+
+/**
+ * Schema-wide security invariants. These run against every migration, so a new table or function
+ * added by any area is checked automatically (spec E4 tenant isolation, AC_SECURITY_04).
+ */
+
+let db: TestDb;
+
+beforeAll(async () => {
+  db = await createTestDb();
+});
+
+afterAll(async () => {
+  await db?.drop();
+});
+
+describe('schema invariants', () => {
+  it('every table in the exposed public schema has row level security enabled', async () => {
+    const rows = await db.sql<{ table_name: string }[]>`
+      select c.relname as table_name
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relkind in ('r', 'p') and not c.relrowsecurity
+    `;
+    expect(rows.map((r) => r.table_name)).toEqual([]);
+  });
+
+  it('no client role holds privileges in the private schema', async () => {
+    const rows = await db.sql<{ grantee: string; table_name: string; privilege_type: string }[]>`
+      select grantee, table_name, privilege_type
+        from information_schema.role_table_grants
+       where table_schema = 'private' and grantee in ('anon', 'authenticated', 'pl_child', 'PUBLIC')
+    `;
+    expect(rows).toEqual([]);
+    const usage = await db.sql<{ role: string; has_usage: boolean }[]>`
+      select r.role, has_schema_privilege(r.role, 'private', 'USAGE') as has_usage
+        from (values ('anon'), ('authenticated'), ('pl_child')) as r(role)
+    `;
+    expect(usage.filter((u) => u.has_usage)).toEqual([]);
+  });
+
+  it('every SECURITY DEFINER function pins its search_path', async () => {
+    const rows = await db.sql<{ fn: string }[]>`
+      select n.nspname || '.' || p.proname as fn
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where p.prosecdef
+         and n.nspname in ('public', 'app', 'private')
+         and not exists (
+           select 1 from unnest(coalesce(p.proconfig, '{}')) cfg where cfg like 'search_path=%'
+         )
+    `;
+    expect(rows.map((r) => r.fn)).toEqual([]);
+  });
+
+  it('anon cannot execute any SECURITY DEFINER function except explicitly public ones', async () => {
+    const allowedForAnon = new Set<string>([]);
+    const rows = await db.sql<{ fn: string }[]>`
+      select n.nspname || '.' || p.proname as fn
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where p.prosecdef
+         and n.nspname in ('public', 'app', 'private')
+         and has_function_privilege('anon', p.oid, 'EXECUTE')
+    `;
+    expect(rows.map((r) => r.fn).filter((fn) => !allowedForAnon.has(fn))).toEqual([]);
+  });
+
+  it('pl_child has no write privilege on any public table unless explicitly allowlisted', async () => {
+    // Child writes go through API-owned SECURITY DEFINER functions. Add a table here only with a
+    // reviewed RLS policy that scopes the write to app.current_child_id().
+    const allowlisted = new Set<string>([]);
+    const rows = await db.sql<{ table_name: string; privilege_type: string }[]>`
+      select table_name, privilege_type
+        from information_schema.role_table_grants
+       where table_schema = 'public' and grantee = 'pl_child'
+         and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    `;
+    expect(rows.filter((r) => !allowlisted.has(r.table_name))).toEqual([]);
+  });
+});

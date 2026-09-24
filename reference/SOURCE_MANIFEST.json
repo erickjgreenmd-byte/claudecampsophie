@@ -1,0 +1,42 @@
+{
+  "compiled": "2026-09-18",
+  "status": "Instructions and source assets only; no app has been built by this packaging task.",
+  "sources": [
+    {
+      "filename": "PencilLift_Master_Build_Prompt.md",
+      "sha256": "be3093843b3409770a93abc1cbcc23839248dfeecdf8e0cec91418fafd2101ec",
+      "bytes": 58138
+    },
+    {
+      "filename": "PencilLift_Child_Pricing.md",
+      "sha256": "b9bfed1004679a44b75b788706607aa9938a70c489982800506ce09bdc57c9f4",
+      "bytes": 5867
+    },
+    {
+      "filename": "PencilLift_Monetization_Plan.md",
+      "sha256": "ddc5c96d5d16dd7ed62cb625d0de0a5d0ac753ea70758ba31964302cc9227eeb",
+      "bytes": 8446
+    },
+    {
+      "filename": "PencilLift_Acceptance_Checklist.md",
+      "sha256": "f080b31ebae68f37f8f023116fbf35e2161e25149e90838e94c756302bbab525",
+      "bytes": 15483
+    },
+    {
+      "filename": "PencilLift_Costs_and_Launch.md",
+      "sha256": "9858320463d04989bf95fef4518e04b02f6f9d1520e6c04d0624150120298db3",
+      "bytes": 19423
+    },
+    {
+      "filename": "brand/BRAND_GUIDE.md",
+      "sha256": "f745c3a0d15a67dbf0765c3b45bd23a36b04b87c768ccaa4d65d2a150a490023",
+      "bytes": 4072
+    },
+    {
+      "filename": "Owner_Setup_Checklist.md",
+      "sha256": "41ad07967da2777cfbbc7a076508250721b94e0996b86a600801118f6a34b739",
+      "bytes": 5689
+    }
+  ],
+  "approved_logo_sha256": "d4613136ed68ca99b0cd08b7ffb7f8cb14afc4ba1a2912a8e9890c5f33c2c039"
+}

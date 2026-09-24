@@ -1,0 +1,21 @@
+# Owner-supplied specification package: preserved byte-for-byte (see REVISION_MANIFEST.json)
+PencilLift_Claude_Code_Master_Prompt.md
+Acceptance_Register.md
+Audit_Notes.md
+ECC_Execution_and_Learning.md
+Owner_Actions.md
+START_HERE.md
+School_and_Monthly_Promotions.md
+REVISION_MANIFEST.json
+reference/
+templates/
+brand/
+finance/
+docs/
+*.md
+pnpm-lock.yaml
+node_modules/
+dist/
+coverage/
+.expo/
+.wrangler/
