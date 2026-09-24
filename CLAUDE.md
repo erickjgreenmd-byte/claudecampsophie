@@ -15,6 +15,10 @@ Spec: `PencilLift_Claude_Code_Master_Prompt.md` **Revision 8** (authoritative, p
 | One package | `pnpm --filter @pencillift/<name> run test` / `typecheck` |
 | Lint / format | `pnpm lint` / `pnpm format` |
 | Finance arithmetic | `pnpm finance:check` |
+| Pre-commit gate (fail-fast, no filters) | `scripts/verify.sh` (whole repo) or `scripts/verify.sh --only api,db` |
+| Secret scan (tracked files) | `node scripts/scan-secrets.mjs` |
+| Worker bundle dry run | `cd apps/api && npx wrangler deploy --dry-run --outdir <dir>` |
+| Web build / Expo web smoke | `pnpm --filter @pencillift/web build` / `cd apps/mobile && npx expo export --platform web` |
 
 ## Rules
 
@@ -27,6 +31,11 @@ Spec: `PencilLift_Claude_Code_Master_Prompt.md` **Revision 8** (authoritative, p
 - Meaningful defects: reproduce → failing regression → fix → retest → review → lesson
   (`docs/Bug_Ledger.md`, `docs/Lessons_Learned.md`).
 - No secrets, real child data or raw homework in code, fixtures, logs or docs. Synthetic names only.
+- JSON into Postgres: `${JSON.stringify(x)}::text::jsonb` or `tx.json(x)`, never a bare `::jsonb` (L-006).
+- Mobile token sources come only from `apps/mobile/src/lib/app-session.ts`; never add a second child
+  token refresher (L-007).
+- Shared registration points (`apps/api/src/app.ts`, `apps/web/src/routes.tsx`, contracts index, domain
+  package exports, migrations numbering) are changed by the lead only.
 
 ## Records (read on resume, reconcile with Git/CI)
 
