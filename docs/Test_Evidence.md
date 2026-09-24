@@ -9,7 +9,11 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | Run | Commit | Result | Steps |
 |---|---|---|---|
 | [#3](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35967486861) | `c71786a` | **success** (07:02–07:07 UTC, 2026-09-24) | install (frozen lockfile) → format → secret scan → lint → typecheck → all tests incl. real Postgres 16 service (2 min 9 s) → finance arithmetic → gate audit with per-package test floors (`scripts/test-minimums.json`) — every step ran and passed |
-| #1, #2 | `e067f32`, `d609f85` | cancelled (superseded by the next push; `cancel-in-progress`) | — |
+| [#24](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35988504627) | `13bb3dc` | **success** (10:39–10:45 UTC) | every step above plus the new release-artifact secret scan (web build, Worker dry run, Expo web export, native public config; negative control) |
+| [#18](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35983581731) | `b6e9998` | **failure** — web: one sponsor-card viewability test (BUG-083, a test race reproduced locally 1 in 12 under load; fixed in `48430c5`) | all other steps passed up to the web tests |
+| [#17](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35977752017) | `8872b98` | **success** (08:51–08:57 UTC) | every step |
+| #15 | `c51ed37` | **success** | every step |
+| #1, #2 and every run superseded by a newer push | — | cancelled (`cancel-in-progress`) | — |
 
 CI first ran on this branch at `e067f32`, when pushes to `claude/**` were added to the triggers; before that it
 had never executed (it triggered only on pull requests and `main`).
