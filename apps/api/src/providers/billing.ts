@@ -144,6 +144,15 @@ export function createRevenueCatProvider(
 // Stripe (optional adult web billing; disabled by default)
 // ---------------------------------------------------------------------------------------------
 
+const stripeChargeSchema = z.object({
+  invoice: z.string().nullable().optional(),
+  payment_intent: z.string().nullable().optional(),
+});
+
+const stripeInvoicePaymentsSchema = z.object({
+  data: z.array(z.object({ invoice: z.string().nullable().optional() })),
+});
+
 export function createStripeClient(
   secretKey: string,
   fetchImpl: typeof fetch = fetch,
@@ -174,11 +183,11 @@ export function createStripeClient(
         { headers },
       );
       if (!charge.ok) throw new Error(`Stripe charge lookup failed with ${charge.status}`);
-      const body = (await charge.json()) as { invoice?: unknown; payment_intent?: unknown };
-      if (typeof body.invoice === 'string') return body.invoice;
+      const body = stripeChargeSchema.safeParse(await charge.json());
+      if (!body.success) throw new Error('Unexpected Stripe charge shape');
+      if (body.data.invoice) return body.data.invoice;
       // Newer API versions link invoices to payments through invoice payments.
-      const intent =
-        paymentIntentId ?? (typeof body.payment_intent === 'string' ? body.payment_intent : null);
+      const intent = paymentIntentId ?? body.data.payment_intent ?? null;
       if (!intent) return null;
       const payments = await fetchImpl(
         `https://api.stripe.com/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=${encodeURIComponent(intent)}`,
@@ -186,9 +195,9 @@ export function createStripeClient(
       );
       if (!payments.ok)
         throw new Error(`Stripe invoice payment lookup failed with ${payments.status}`);
-      const list = (await payments.json()) as { data?: { invoice?: unknown }[] };
-      const invoice = list.data?.[0]?.invoice;
-      return typeof invoice === 'string' ? invoice : null;
+      const list = stripeInvoicePaymentsSchema.safeParse(await payments.json());
+      if (!list.success) throw new Error('Unexpected Stripe invoice payment shape');
+      return list.data.data[0]?.invoice ?? null;
     },
   };
 }

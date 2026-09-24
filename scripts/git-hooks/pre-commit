@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Versioned pre-commit gate (BUG-024, lesson L-004): a commit cannot go through when a staged file
+# fails lint or formatting, or when the secret scan fails. Enabled with:
+#   git config core.hooksPath scripts/git-hooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
+lintable=()
+formattable=()
+for f in "${staged[@]}"; do
+  case "$f" in
+    *.ts | *.tsx | *.js | *.mjs) lintable+=("$f"); formattable+=("$f") ;;
+    *.json | *.css | *.yml | *.yaml) formattable+=("$f") ;;
+  esac
+done
+if [ "${#formattable[@]}" -gt 0 ]; then npx prettier --check "${formattable[@]}"; fi
+if [ "${#lintable[@]}" -gt 0 ]; then npx eslint --max-warnings=0 --no-warn-ignored "${lintable[@]}"; fi
+node scripts/scan-secrets.mjs

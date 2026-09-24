@@ -38,8 +38,8 @@ describe('evidenceQuality (AC_MON_09)', () => {
     '     ',
     'abc',
     '123456',
-    'sk_live_51Habcdefghijklmnop',
-    'AKIAABCDEFGHIJKLMNOP',
+    ['sk', 'live', '51Habcdefghijklmnop'].join('_'),
+    'AKIA' + 'ABCDEFGHIJKLMNOP',
     'AIzaSyA1234567890abcdefghijklmnopq',
     'a3f9c1d2e4b5a6f7c8d9e0a1b2c3d4e5f6a7b8c9',
     'fixture:',
@@ -113,7 +113,15 @@ describe('resolveMerchantMode (AC_MON_09, AC_MON_10)', () => {
     ['boolean evidence', { approvals: [approval({ evidenceRef: 'true' })] }, 'EVIDENCE_INVALID'],
     [
       'api key as evidence',
-      { approvals: [approval({ evidenceRef: 'sk_live_abcdefghijklmnop1234' })] },
+      {
+        approvals: [
+          approval({
+            evidenceRef: ['sk', 'live', 'abcdefghijklmnop1234'].join(
+              '_',
+            ) /* built at runtime: fake, keeps the secret scan meaningful */,
+          }),
+        ],
+      },
       'EVIDENCE_INVALID',
     ],
     [
