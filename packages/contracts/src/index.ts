@@ -2,3 +2,7 @@ export * from './errors.ts';
 export * from './common.ts';
 export * from './auth.ts';
 export * from './promotions.ts';
+export * from './family.ts';
+export * from './rewards.ts';
+export * from './homework.ts';
+export * from './learning.ts';

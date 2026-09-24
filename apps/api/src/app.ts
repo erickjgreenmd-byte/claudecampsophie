@@ -7,6 +7,14 @@ import { healthRoutes } from './routes/health.ts';
 import { adultRoutes } from './routes/adult.ts';
 import { childAuthRoutes } from './routes/child-auth.ts';
 import { familyRoutes } from './routes/family.ts';
+import { rewardsRoutes } from './routes/rewards.ts';
+import { homeworkRoutes } from './routes/homework.ts';
+import { guardiansRoutes } from './routes/guardians.ts';
+import { privacyRoutes } from './routes/privacy.ts';
+import { learningRoutes } from './routes/learning.ts';
+import { promotionsRoutes } from './routes/promotions.ts';
+import { adminPromotionsRoutes } from './routes/admin-promotions.ts';
+import { webhooksRoutes } from './routes/webhooks.ts';
 
 /** Max JSON body accepted by any route (uploads use signed storage URLs, never the API body). */
 export const MAX_JSON_BYTES = 64 * 1024;
@@ -106,6 +114,15 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   app.route('/v1/adult', adultRoutes());
   app.route('/v1/child', childAuthRoutes());
   app.route('/v1', familyRoutes());
+  // Feature verticals. Each module owns its paths under the prefix shown.
+  app.route('/v1', rewardsRoutes()); // /v1/rewards*, /v1/child/rewards*, /v1/points*
+  app.route('/v1', homeworkRoutes()); // /v1/assignments*, /v1/child/assignments*, /v1/questions*
+  app.route('/v1', guardiansRoutes()); // /v1/guardians*, /v1/invitations*, /v1/consent*
+  app.route('/v1', privacyRoutes()); // /v1/deletion*, /v1/exports*, /v1/safety-reports*, /v1/child/reports*
+  app.route('/v1', learningRoutes()); // /v1/subjects*, /v1/schedules*, /v1/test-dates*, /v1/child/practice*
+  app.route('/v1', promotionsRoutes()); // /v1/schools*, /v1/family/school*, /v1/family/promotions*
+  app.route('/v1/admin', adminPromotionsRoutes()); // /v1/admin/promo-*, campaigns, schools, payouts
+  app.route('/webhooks', webhooksRoutes()); // /webhooks/revenuecat, /webhooks/stripe
   return app;
 }
 
