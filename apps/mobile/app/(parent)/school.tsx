@@ -4,6 +4,12 @@ import { randomUUID } from 'expo-crypto';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { formatUsd, priceTable } from '@pencillift/domain';
 import { colors } from '@pencillift/ui-tokens';
+import { billingProblem, loadBillingStatus } from '../../src/billing/actions.ts';
+import { runStoreOfferStep } from '../../src/billing/offer-step.ts';
+import {
+  createNativeBillingStore,
+  createNativeOfferRedemptionStore,
+} from '../../src/billing/revenuecat.ts';
 import { devicePlatform } from '../../src/family/runtime.ts';
 import {
   Body,
@@ -45,13 +51,17 @@ import {
   chooseSchoolPrompt,
   CONTRIBUTION_LINES,
   historyRows,
-  NATIVE_STORE_STEP_AVAILABLE,
   nextActionLine,
   ONE_SCHOOL_RULE,
   schoolPlace,
   STATE_LABEL,
   STORE_NAME,
 } from '../../src/promotions/view-model.ts';
+import {
+  storeOfferRequest,
+  storeStepView,
+  type StoreStepView,
+} from '../../src/promotions/store-step.ts';
 
 /**
  * Parent School and promotions (spec P17 parent interfaces; AC_PROMO_14, AC_UX_01/02). One school
@@ -69,7 +79,11 @@ export default function SchoolScreen() {
   );
 }
 
-const display = { nativeStoreStepAvailable: NATIVE_STORE_STEP_AVAILABLE };
+/**
+ * The native offer step exists when this build has a RevenueCat public key for this platform's
+ * store (P17 "Provider integration"). Without it, codes are previewed but never reserved.
+ */
+const display = { nativeStoreStepAvailable: createNativeBillingStore().available };
 
 function SchoolAndPromotions({ api }: { api: ApiClient }) {
   const [historyVersion, setHistoryVersion] = useState(0);
@@ -281,6 +295,31 @@ function PromoCard({ api, onRedeemed }: { api: ApiClient; onRedeemed: () => void
     key: string;
   } | null>(null);
   const [result, setResult] = useState<PromoRedemption | null>(null);
+  const [storeStep, setStoreStep] = useState<StoreStepView | null>(null);
+  const [storeBusy, setStoreBusy] = useState(false);
+
+  /** /submitted first, then the store's own redemption step; never claims the discount. */
+  const openStore = async (redemption: PromoRedemption) => {
+    const request = storeOfferRequest(redemption);
+    if (!request || !display.nativeStoreStepAvailable) return;
+    setStoreBusy(true);
+    try {
+      const { billingRef } = await loadBillingStatus(api);
+      const outcome = await runStoreOfferStep({
+        ...request,
+        api,
+        store: createNativeOfferRedemptionStore(billingRef),
+      });
+      setStoreStep(storeStepView(outcome));
+      if (outcome.kind === 'waiting_for_store' || outcome.kind === 'store_step_failed') {
+        setResult(outcome.redemption);
+      }
+    } catch (error) {
+      setStoreStep({ message: billingProblem(error).message, canRetry: true });
+    } finally {
+      setStoreBusy(false);
+    }
+  };
 
   if (!channel) {
     return (
@@ -295,6 +334,7 @@ function PromoCard({ api, onRedeemed }: { api: ApiClient; onRedeemed: () => void
     setProblem(null);
     setPreview(null);
     setResult(null);
+    setStoreStep(null);
     const request: PromoRequest = {
       code,
       channel,
@@ -358,6 +398,7 @@ function PromoCard({ api, onRedeemed }: { api: ApiClient; onRedeemed: () => void
             setResult(r);
             setCode('');
             onRedeemed();
+            void openStore(r);
           }}
         />
       ) : null}
@@ -365,7 +406,18 @@ function PromoCard({ api, onRedeemed }: { api: ApiClient; onRedeemed: () => void
         <Notice>
           <Heading>Redemption status</Heading>
           <Body>{STATE_LABEL[result.state]}</Body>
-          {nextActionLine(result, display) ? <Body>{nextActionLine(result, display)}</Body> : null}
+          {storeStep ? (
+            <Body>{storeStep.message}</Body>
+          ) : nextActionLine(result, display) ? (
+            <Body>{nextActionLine(result, display)}</Body>
+          ) : null}
+          {storeStep?.canRetry ? (
+            <Button
+              label={storeBusy ? 'Opening…' : 'Open the store again'}
+              busy={storeBusy}
+              onPress={() => void openStore(result)}
+            />
+          ) : null}
         </Notice>
       ) : null}
     </Card>

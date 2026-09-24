@@ -14,13 +14,6 @@ import type {
  * imports, no clock; amounts come from the API as integer cents.
  */
 
-/**
- * Decision: App Store / Google Play offers must be applied through the store's own offer sheet
- * (RevenueCat), which this app version does not include yet. Until it does, codes are previewed but
- * never reserved from the app, so no reservation is left that nothing can complete.
- */
-export const NATIVE_STORE_STEP_AVAILABLE = false;
-
 export interface DisplayOptions {
   /** IANA zone for dates; the device zone when omitted (tests pass one for determinism). */
   readonly timeZone?: string | undefined;
