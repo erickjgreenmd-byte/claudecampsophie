@@ -7,7 +7,11 @@ import { loadConfig, type ApiConfig } from '../src/config.ts';
 import { createDb, type Db } from '../src/db.ts';
 import type { LogEvent } from '../src/middleware/context.ts';
 import { createDbRateLimiter } from '../src/middleware/rate-limit.ts';
-import { createDevelopmentConsentMock } from '../src/providers/index.ts';
+import {
+  createDevelopmentConsentMock,
+  createMemoryStorageMock,
+  createOutboxEmailMock,
+} from '../src/providers/index.ts';
 
 export const TEST_JWT_SECRET = 'test-supabase-jwt-secret-with-at-least-32-chars!!';
 export const TEST_ISSUER = 'https://test-project.supabase.co/auth/v1';
@@ -28,6 +32,11 @@ export interface TestApi {
   app: ReturnType<typeof createApp>;
   logs: LogEvent[];
   now: { value: Date };
+  providers: {
+    consent: ReturnType<typeof createDevelopmentConsentMock>;
+    storage: ReturnType<typeof createMemoryStorageMock>;
+    email: ReturnType<typeof createOutboxEmailMock>;
+  };
   request(
     path: string,
     init?: { method?: string; token?: string; body?: unknown; headers?: Record<string, string> },
@@ -43,6 +52,11 @@ export async function createTestApi(overrides: Record<string, string> = {}): Pro
   const apiDb = createDb(db.sql);
   const now = { value: new Date('2026-09-24T15:00:00Z') };
   const logs: LogEvent[] = [];
+  const providers = {
+    consent: createDevelopmentConsentMock(),
+    storage: createMemoryStorageMock(),
+    email: createOutboxEmailMock(),
+  };
   const app = createApp({
     config,
     db: apiDb,
@@ -50,7 +64,7 @@ export async function createTestApi(overrides: Record<string, string> = {}): Pro
     random: cryptoRandom,
     verifyParentToken: createParentVerifier(config),
     rateLimiter: createDbRateLimiter(apiDb),
-    providers: { consent: createDevelopmentConsentMock() },
+    providers,
     log: (e) => logs.push(e),
   });
   return {
@@ -60,6 +74,7 @@ export async function createTestApi(overrides: Record<string, string> = {}): Pro
     app,
     logs,
     now,
+    providers,
     request(path, init = {}) {
       const headers: Record<string, string> = { ...init.headers };
       if (init.token) headers.authorization = `Bearer ${init.token}`;

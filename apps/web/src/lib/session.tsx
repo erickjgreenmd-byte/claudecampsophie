@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
-import { createApiClient, type ApiClient, ApiRequestError } from '@pencillift/contracts';
+import { createApiClient, type ApiClient, ApiRequestError } from '@pencillift/contracts/client';
 import { unconfiguredAuth, type AuthAdapter, type ParentSession } from './auth.ts';
 import { readWebConfig, type WebConfig } from './config.ts';
 import { Loading, Notice } from '../components/states.tsx';

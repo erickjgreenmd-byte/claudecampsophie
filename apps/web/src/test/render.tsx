@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { createMemoryRouter, RouterProvider } from 'react-router';
-import type { ApiClient } from '@pencillift/contracts';
+import type { ApiClient } from '@pencillift/contracts/client';
 import type { AuthAdapter } from '../lib/auth.ts';
 import { SessionProvider } from '../lib/session.tsx';
 

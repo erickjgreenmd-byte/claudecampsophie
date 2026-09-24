@@ -4,7 +4,11 @@ import { createParentVerifier } from './auth/parent.ts';
 import { loadConfig } from './config.ts';
 import { createDb } from './db.ts';
 import { createDbRateLimiter } from './middleware/rate-limit.ts';
-import { createDevelopmentConsentMock } from './providers/index.ts';
+import {
+  createDevelopmentConsentMock,
+  createMemoryStorageMock,
+  createOutboxEmailMock,
+} from './providers/index.ts';
 import { cryptoRandom } from '@pencillift/domain';
 
 /**
@@ -68,7 +72,12 @@ export default {
       random: cryptoRandom,
       verifyParentToken: createParentVerifier(config),
       rateLimiter: createDbRateLimiter(db),
-      providers: { consent: createDevelopmentConsentMock() },
+      // Real Supabase Storage / email adapters replace these once credentials exist (docs/Connections.md).
+      providers: {
+        consent: createDevelopmentConsentMock(),
+        storage: createMemoryStorageMock(),
+        email: createOutboxEmailMock(),
+      },
       log: (event) => console.log(JSON.stringify(event)),
     });
     const response = await app.fetch(request, env);

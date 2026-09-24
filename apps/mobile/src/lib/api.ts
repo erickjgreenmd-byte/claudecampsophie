@@ -1,5 +1,5 @@
 import Constants from 'expo-constants';
-import { createApiClient, type ApiClient, type TokenSource } from '@pencillift/contracts';
+import { createApiClient, type ApiClient, type TokenSource } from '@pencillift/contracts/client';
 
 /** API base URL compiled into the bundle (public; see app.config.ts). */
 export function apiBaseUrl(): string {
