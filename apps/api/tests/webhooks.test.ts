@@ -233,7 +233,7 @@ describe('promotion reconciliation (AC_PROMO_07/08/09)', () => {
       values (${tpl!.id}, '2026-09', ${tpl!.id + ':2026-09'}, 50, '{1,2,3,4}', '{existing}', 10, 100000,
         '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'active') returning id`;
     const [code] = await api.db.sql<{ id: string }[]>`
-      insert into public.promo_codes (campaign_id, code_normalized) values (${camp!.id}, ${'ABCDEFGHJK' + String.fromCharCode(48 + Math.floor(Math.random() * 10))}) returning id`;
+      insert into public.promo_codes (campaign_id, code_normalized) values (${camp!.id}, ${generatePromoCode(cryptoRandom).normalized}) returning id`;
     const [row] = await api.db.sql<{ id: string }[]>`
       insert into public.promo_redemptions (family_id, campaign_id, code_id, channel, target_period_key, target_period_start, state,
         idempotency_key, paid_slots, percent_off, regular_cents, discount_cents, charged_cents, redeemed_by)
@@ -272,6 +272,26 @@ describe('promotion reconciliation (AC_PROMO_07/08/09)', () => {
     const benefit = await api.db
       .sql`select provider_period_id from public.promo_benefit_periods where redemption_id = ${id}`;
     expect(benefit).toHaveLength(1);
+  });
+
+  it('a store promo discount with no PencilLift redemption is flagged for reconciliation', async () => {
+    const fam = await seedFamily(api.db, { childCount: 2 });
+    const ref = await billingRef(fam);
+    api.providers.subscriptions.state.set(ref, [snapshot(ref)]);
+    await postRc(rcEvent(ref, { price_in_purchased_currency: 24.49, period_type: 'PROMOTIONAL' }));
+    const flags = await api.db.sql<{ action: string; metadata: { channel: string } }[]>`
+      select action, metadata from public.audit_events
+       where family_id = ${fam.familyId} and action = 'promo.unmatched_discount'`;
+    expect(flags).toHaveLength(1);
+    expect(flags[0]!.metadata.channel).toBe('app_store');
+    // Full-price periods are never flagged.
+    const other = await seedFamily(api.db, { childCount: 2 });
+    const otherRef = await billingRef(other);
+    api.providers.subscriptions.state.set(otherRef, [snapshot(otherRef)]);
+    await postRc(rcEvent(otherRef));
+    const none = await api.db.sql`
+      select 1 from public.audit_events where family_id = ${other.familyId} and action = 'promo.unmatched_discount'`;
+    expect(none).toHaveLength(0);
   });
 
   it('a full-price renewal of the targeted period rejects the in-flight redemption', async () => {

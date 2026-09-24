@@ -149,7 +149,7 @@ export async function runGeneration(
         await tx`
         insert into public.audit_events (actor_kind, action, target_type, target_id, metadata)
         values ('system', 'promo.campaign_generated', 'promo_campaign', ${campaign.id},
-                ${JSON.stringify({ generationKey: plan.generationKey, codes: codes.length })}::jsonb)
+                ${JSON.stringify({ generationKey: plan.generationKey, codes: codes.length })}::text::jsonb)
       `;
         return {
           campaignId: campaign.id,
@@ -270,7 +270,7 @@ export async function runDonationAccrual(
           throw new Error('Accrual references a period outside the evaluated window');
         const rows = await tx`
           insert into public.donation_accruals (family_id, school_id, donation_month, amount_cents, billing_period_id, eligibility_snapshot)
-          values (${familyId}, ${a.schoolId}, ${a.donationMonth}, ${a.amountCents}, ${billingPeriodId}, ${JSON.stringify(a.snapshot)}::jsonb)
+          values (${familyId}, ${a.schoolId}, ${a.donationMonth}, ${a.amountCents}, ${billingPeriodId}, ${JSON.stringify(a.snapshot)}::text::jsonb)
           on conflict do nothing
           returning id
         `;

@@ -80,4 +80,27 @@ describe('schema invariants', () => {
     `;
     expect(rows.filter((r) => !allowlisted.has(r.table_name))).toEqual([]);
   });
+
+  it('[BUG-008] every jsonb column rejects scalar JSON (double-encoded strings fail loudly)', async () => {
+    const unchecked = await db.sql<{ col: string }[]>`
+      select c.table_schema || '.' || c.table_name || '.' || c.column_name as col
+        from information_schema.columns c
+        join information_schema.tables t
+          on t.table_schema = c.table_schema and t.table_name = c.table_name and t.table_type = 'BASE TABLE'
+       where c.table_schema in ('public', 'private') and c.data_type = 'jsonb'
+         and not exists (
+           select 1 from pg_constraint k
+            where k.contype = 'c'
+              and k.conrelid = (quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass
+              and pg_get_constraintdef(k.oid) like '%jsonb_typeof(' || c.column_name || ')%')
+    `;
+    expect(unchecked).toEqual([]);
+    const fam = await db.sql<{ id: string }[]>`select gen_random_uuid() as id`;
+    await expect(
+      db.sql`insert into public.audit_events (actor_kind, action, target_id, metadata)
+             values ('system', 'test.shape', ${fam[0]!.id}, ${JSON.stringify({ a: 1 })}::jsonb)`,
+    ).rejects.toThrow(/json_shape/);
+    await db.sql`insert into public.audit_events (actor_kind, action, target_id, metadata)
+                 values ('system', 'test.shape', ${fam[0]!.id}, ${JSON.stringify({ a: 1 })}::text::jsonb)`;
+  });
 });

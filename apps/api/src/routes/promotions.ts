@@ -342,7 +342,7 @@ export function promotionsRoutes(): Hono<AppEnv> {
         await tx`
           insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
           values (${familyId}, ${parent.userId}, 'parent', 'school.designated', 'school', ${schoolId},
-                  ${JSON.stringify({ effectiveFromMonth: plan.value.effectiveFromMonth })}::jsonb)
+                  ${JSON.stringify({ effectiveFromMonth: plan.value.effectiveFromMonth })}::text::jsonb)
         `;
       }
       return familySchoolBody(c, tx, familyId);
@@ -420,7 +420,7 @@ export function promotionsRoutes(): Hono<AppEnv> {
         await tx`
           insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
           values (${familyId}, ${parent.userId}, 'parent', 'promo.redeemed', 'promo_redemption', ${row!.id},
-                  ${JSON.stringify({ channel: quote.channel, percentOff: quote.percentOff })}::jsonb)
+                  ${JSON.stringify({ channel: quote.channel, percentOff: quote.percentOff })}::text::jsonb)
         `;
         return { row: row!, offerIds: ctx.offerIds };
       });

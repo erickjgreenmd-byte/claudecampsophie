@@ -445,6 +445,16 @@ export async function reconcilePromotionsForPeriod(
       rejected.push(r.id);
     }
   }
+  if (discounted && matching.length === 0) {
+    // A store-applied promo discount with no PencilLift redemption (e.g. a shared App Store code
+    // redeemed outside the app). The charged amount already zeroes the donation for this period;
+    // flag it so the owner reconciles campaign caps/budget instead of silently under-counting.
+    await tx`
+      insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+      values (${familyId}, 'system', 'promo.unmatched_discount', 'billing_period', ${period.providerPeriodId},
+              ${JSON.stringify({ channel: period.channel, periodStart: period.periodStart.toISOString() })}::text::jsonb)
+    `;
+  }
   return { confirmed, rejected };
 }
 

@@ -52,7 +52,7 @@ async function audit(
 ) {
   await tx`
     insert into public.audit_events (actor_user_id, actor_kind, action, target_type, target_id, metadata)
-    values (${c.var.parent.userId}, 'admin', ${action}, ${targetType}, ${targetId}, ${JSON.stringify(metadata)}::jsonb)
+    values (${c.var.parent.userId}, 'admin', ${action}, ${targetType}, ${targetId}, ${JSON.stringify(metadata)}::text::jsonb)
   `;
 }
 
