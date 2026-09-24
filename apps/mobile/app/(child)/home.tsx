@@ -23,6 +23,12 @@ const ACTIONS: readonly { label: string; hint: string; href: Href }[] = [
     hint: 'See what went well and what to try again',
     href: '/(child)/results',
   },
+  {
+    label: 'Today’s practice',
+    hint: 'A few questions to practice today',
+    href: '/(child)/practice',
+  },
+  { label: 'My weekly review', hint: 'Short review sections by subject', href: '/(child)/review' },
   { label: 'My rewards', hint: 'See your points and rewards', href: '/(child)/rewards' },
   {
     label: 'Get help',

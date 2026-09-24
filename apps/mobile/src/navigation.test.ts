@@ -33,12 +33,13 @@ const screens = files(appDir)
 /** String literals shaped like a route: '/', '/pair', '/(parent)/plan'. */
 const ROUTE_LITERAL = /['"`](\/(?:\((?:parent|child)\)\/)?(?:[a-z][a-z-]*)?)['"`]/g;
 
+function literalsIn(file: string): string[] {
+  return [...readFileSync(file, 'utf8').matchAll(ROUTE_LITERAL)].map((m) => m[1]!);
+}
+
 function routeLiterals(): { route: string; file: string }[] {
   return [...files(appDir), ...files(srcDir)].flatMap((file) =>
-    [...readFileSync(file, 'utf8').matchAll(ROUTE_LITERAL)].map((m) => ({
-      route: m[1]!,
-      file: relative(join(appDir, '..'), file),
-    })),
+    literalsIn(file).map((route) => ({ route, file: relative(join(appDir, '..'), file) })),
   );
 }
 
@@ -56,10 +57,24 @@ describe('mobile navigation integrity', () => {
     expect(broken).toEqual([]);
   });
 
-  it('every screen is reachable from some route literal', () => {
-    const linked = new Set(routeLiterals().flatMap(({ route }) => resolve(route)));
-    const orphans = screens.filter((s) => s !== '/' && !linked.has(s));
-    expect(orphans).toEqual([]);
+  it('every screen is reachable from the app entry', () => {
+    // Edges: the routes each screen file names. Routes named in src/ modules (entry redirects,
+    // shared action lists) count as reachable from the entry, since screens import them. Two
+    // screens that only link to each other stay unreachable.
+    const edges = new Map<string, string[]>();
+    for (const file of files(appDir)) {
+      const from = screenRoute(file);
+      if (from) edges.set(from, literalsIn(file).flatMap(resolve));
+    }
+    const reached = new Set<string>();
+    const queue = ['/', ...files(srcDir).flatMap(literalsIn).flatMap(resolve)];
+    while (queue.length > 0) {
+      const next = queue.pop()!;
+      if (reached.has(next)) continue;
+      reached.add(next);
+      queue.push(...(edges.get(next) ?? []));
+    }
+    expect(screens.filter((s) => !reached.has(s))).toEqual([]);
   });
 
   it('the parent home links to every parent tool screen', () => {
