@@ -35,6 +35,7 @@ import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
 import type { Tx } from '../db.ts';
 import type { StorageProvider } from '../providers/index.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
+import { ImageFormatError, stripImageMetadata } from '../services/image-metadata.ts';
 import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
 
 /**
@@ -545,7 +546,18 @@ class ScanRun {
       } catch {
         throw new RetryableFailure('STORAGE_READ_FAILED');
       }
-      images.push(imagePart(page.mime_type as 'image/jpeg' | 'image/png', toBase64(bytes)));
+      let clean: Uint8Array;
+      try {
+        // Location/camera metadata never leaves our systems (spec P4); content that is not the
+        // declared image type is never forwarded "as is".
+        clean = stripImageMetadata(bytes, page.mime_type);
+      } catch (error) {
+        if (!(error instanceof ImageFormatError)) throw error;
+        await this.transition('needs_rescan', 'IMAGE_UNREADABLE');
+        await this.settleReservation('unreadable');
+        return;
+      }
+      images.push(imagePart(page.mime_type as 'image/jpeg' | 'image/png', toBase64(clean)));
     }
 
     const extraction = await this.stage<typeof PROMPTS.extraction.outputSchema>(

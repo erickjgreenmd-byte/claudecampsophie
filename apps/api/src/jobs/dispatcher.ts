@@ -1,5 +1,6 @@
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
 import type { AppDeps } from '../middleware/context.ts';
+import { applySnapshots } from '../services/billing-sync.ts';
 import { runDonationAccrual, runGeneration } from '../services/p17-jobs.ts';
 
 /**
@@ -55,6 +56,9 @@ export interface TickReport {
   donationAccruals: number;
   expiredReservations: number;
   retentionPurgedPages: number;
+  spendAlerts: number;
+  entitlementsReconciled: number;
+  inactivity: { notified: number; deleted: number };
   jobs: { succeeded: number; retried: number; deadLettered: number };
 }
 
@@ -167,6 +171,161 @@ export async function expireStaleReservations(deps: JobDeps): Promise<number> {
   return rows.length;
 }
 
+/**
+ * Spend alerts (spec F4): once per threshold (default 50/80/100%) of the owner's monthly AI budget.
+ * No budget row means no alerts — the owner's cap is never invented (docs/Owner_Actions.md #9).
+ */
+export async function recordSpendAlerts(deps: JobDeps): Promise<number[]> {
+  const now = deps.clock();
+  const periodKey = now.toISOString().slice(0, 7);
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  return deps.db.asService(async (tx) => {
+    const [budget] = await tx<
+      {
+        id: string;
+        budget_micros: string;
+        thresholds: number[];
+        alerted: number[];
+        spent: string;
+      }[]
+    >`
+      select b.id, b.budget_micros::text, b.alert_thresholds_percent as thresholds,
+             b.alerted_thresholds_percent as alerted,
+             coalesce((select sum(cost_micros) from public.ai_usage_events
+                        where created_at >= ${monthStart}), 0)::text as spent
+        from public.spend_budgets b
+       where b.scope = 'global' and b.period_key = ${periodKey}
+       for update
+    `;
+    if (!budget) return [];
+    const spent = BigInt(budget.spent);
+    const cap = BigInt(budget.budget_micros);
+    const crossed = budget.thresholds
+      .filter((t) => !budget.alerted.includes(t) && spent * 100n >= cap * BigInt(t))
+      .sort((a, b) => a - b);
+    if (crossed.length === 0) return [];
+    await tx`
+      update public.spend_budgets
+         set alerted_thresholds_percent = ${[...budget.alerted, ...crossed]}::smallint[]
+       where id = ${budget.id}
+    `;
+    for (const threshold of crossed) {
+      await tx`
+        insert into public.audit_events (actor_kind, action, target_type, target_id, metadata)
+        values ('system', 'spend.threshold_crossed', 'spend_budget', ${budget.id},
+                ${JSON.stringify({ periodKey, thresholdPercent: threshold })}::text::jsonb)
+      `;
+      deps.log({
+        level: threshold >= 100 ? 'error' : 'warn',
+        event: 'spend_threshold_crossed',
+        code: `P${threshold}`,
+      });
+    }
+    return crossed;
+  });
+}
+
+/**
+ * Entitlement safety net (spec P11): webhooks can be lost, so entitlements that are stale (not
+ * fetched for a day) or past their period end are re-fetched from the provider and reconciled.
+ */
+export async function reconcileStaleEntitlements(deps: JobDeps, limit = 25): Promise<number> {
+  const now = deps.clock();
+  const staleBefore = new Date(now.getTime() - 86_400_000);
+  const families = await deps.db.asService(
+    (tx) => tx<{ id: string; billing_ref: string }[]>`
+      select f.id, f.billing_ref from public.families f
+       where f.deleted_at is null and exists (
+         select 1 from public.family_entitlements e
+          where e.family_id = f.id and e.status not in ('expired', 'revoked')
+            and (e.fetched_at < ${staleBefore} or e.period_end < ${now})
+       )
+       order by f.id
+       limit ${limit}
+    `,
+  );
+  let reconciled = 0;
+  for (const family of families) {
+    try {
+      const snapshots = await deps.providers.subscriptions.fetchSubscriptions(
+        family.billing_ref,
+        now,
+      );
+      await deps.db.asService(async (tx) => {
+        await tx`select 1 from public.families where id = ${family.id} for update`;
+        await applySnapshots(tx, family.id, snapshots, deps.config.billingEnvironment, now);
+      });
+      reconciled += 1;
+    } catch {
+      // One provider failure never stops the sweep; the next tick retries this family.
+      deps.log({ level: 'warn', event: 'entitlement_reconcile_failed' });
+    }
+  }
+  return reconciled;
+}
+
+/**
+ * Inactivity retention (spec P4). Disabled unless the owner enabled it. A family with no adult or
+ * child activity for `inactivityMonths` gets one notice; if nothing happens for
+ * `inactivityNoticeDays` after that, it is tombstoned and purged like a parent deletion. Any activity
+ * (a parent request stamps last_seen_at and clears the notice) stops the process.
+ */
+export async function inactivitySweep(
+  deps: JobDeps,
+  limit = 50,
+): Promise<{ notified: number; deleted: number }> {
+  if (!deps.config.flags.inactivityDeletionEnabled) return { notified: 0, deleted: 0 };
+  const now = deps.clock();
+  const idleBefore = new Date(now);
+  idleBefore.setUTCMonth(idleBefore.getUTCMonth() - deps.config.inactivityMonths);
+  const noticeBefore = new Date(now.getTime() - deps.config.inactivityNoticeDays * 86_400_000);
+  const candidates = await deps.db.asService(
+    (tx) => tx<{ id: string; created_by: string; notified_at: Date | null }[]>`
+      select f.id, f.created_by, f.inactivity_notified_at as notified_at
+        from public.families f
+       where f.deleted_at is null
+         and greatest(
+           f.created_at,
+           coalesce((select max(last_seen_at) from public.family_memberships m where m.family_id = f.id), f.created_at),
+           coalesce((select max(created_at) from public.assignments a where a.family_id = f.id), f.created_at),
+           coalesce((select max(created_at) from public.attempts t where t.family_id = f.id), f.created_at)
+         ) < ${idleBefore}
+       order by f.id
+       limit ${limit}
+    `,
+  );
+  let notified = 0;
+  let deleted = 0;
+  for (const family of candidates) {
+    if (family.notified_at === null) {
+      const [contact] = await deps.db.asService(
+        (tx) => tx<{ email: string | null; email_verified: boolean }[]>`
+          select email, email_verified from app.adult_auth_email(${family.created_by})`,
+      );
+      await deps.db.asService(async (tx) => {
+        await tx`update public.families set inactivity_notified_at = ${now} where id = ${family.id}`;
+        await tx`
+          insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
+          values (${family.id}, 'system', 'retention.inactivity_notice', 'family', ${family.id})`;
+      });
+      if (contact?.email && contact.email_verified) {
+        await deps.providers.email
+          .send({
+            to: contact.email,
+            templateKey: 'inactivity_notice',
+            params: { days: String(deps.config.inactivityNoticeDays) },
+          })
+          .catch(() => deps.log({ level: 'warn', event: 'inactivity_notice_send_failed' }));
+      }
+      notified += 1;
+    } else if (family.notified_at < noticeBefore) {
+      await deps.db.asService((tx) => tx`select app.inactivity_delete_family(${family.id})`);
+      deleted += 1;
+    }
+  }
+  return { notified, deleted };
+}
+
 export async function runScheduledTick(
   deps: JobDeps,
   handlers: Readonly<Record<string, JobHandler>> = DEFAULT_HANDLERS,
@@ -190,12 +349,22 @@ export async function runScheduledTick(
   }
   const expiredReservations = await expireStaleReservations(deps);
   const retentionPurgedPages = await purgeExpiredScans(deps);
+  const spendAlerts = (await recordSpendAlerts(deps)).length;
+  const entitlementsReconciled = await reconcileStaleEntitlements(deps);
+  // The inactivity scan aggregates activity across tables, so it runs once a day (03:00 UTC tick).
+  const inactivity =
+    now.getUTCHours() === 3 && now.getUTCMinutes() < 5
+      ? await inactivitySweep(deps)
+      : { notified: 0, deleted: 0 };
   const jobs = await runJobs(deps, handlers);
   const report = {
     generatedCampaigns,
     donationAccruals,
     expiredReservations,
     retentionPurgedPages,
+    spendAlerts,
+    entitlementsReconciled,
+    inactivity,
     jobs,
   };
   deps.log({ level: 'info', event: 'scheduled_tick' });

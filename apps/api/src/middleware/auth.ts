@@ -16,8 +16,38 @@ export const requireParent: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (!token) throw new ApiError('UNAUTHENTICATED', 'Sign in to continue');
   const principal = await c.var.deps.verifyParentToken(token);
   c.set('parent', principal);
+  await markParentSeen(c.var.deps, principal.userId);
   await next();
 };
+
+/**
+ * Inactivity retention needs to know when an adult last used the service (spec P4). Stamped at most
+ * once a day per adult; a failure here never blocks the request.
+ */
+async function markParentSeen(deps: AppEnv['Variables']['deps'], userId: string): Promise<void> {
+  try {
+    const stamped = await deps.db.asService(
+      (tx) => tx`
+        update public.family_memberships set last_seen_at = ${deps.clock()}
+         where user_id = ${userId} and status = 'active'
+           and (last_seen_at is null or last_seen_at < ${deps.clock()}::timestamptz - interval '1 day')
+        returning family_id
+      `,
+    );
+    // A notice only goes to families idle for months, so a returning adult is always re-stamped here.
+    if (stamped.length === 0) return;
+    await deps.db.asService(
+      (tx) => tx`
+        update public.families f set inactivity_notified_at = null
+          from public.family_memberships m
+         where m.family_id = f.id and m.user_id = ${userId} and m.status = 'active'
+           and f.inactivity_notified_at is not null and f.deleted_at is null
+      `,
+    );
+  } catch {
+    deps.log({ level: 'warn', event: 'parent_seen_update_failed' });
+  }
+}
 
 /**
  * Requires a live paired child session. The token proves identity; the DB check proves the session,

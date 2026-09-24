@@ -263,7 +263,32 @@ async function queuedScan(
   return { fam, assignmentId: a!.id, reservationId: r!.id, jobId: j!.id };
 }
 
-const readObject = () => Promise.resolve(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]));
+/** Structurally valid synthetic JPEG (SOI, JFIF, Exif, quant table, frame, scan, EOI). */
+function syntheticJpeg(): Uint8Array {
+  const seg = (marker: number, payload: number[]) => [
+    0xff,
+    marker,
+    0,
+    payload.length + 2,
+    ...payload,
+  ];
+  const text = (t: string) => Array.from(t, (ch) => ch.charCodeAt(0));
+  return new Uint8Array([
+    0xff,
+    0xd8,
+    ...seg(0xe0, text('JFIF\0')),
+    ...seg(0xe1, text('Exif\0\0GPSLatitude')),
+    ...seg(0xdb, [0, ...new Array<number>(64).fill(1)]),
+    ...seg(0xc0, [8, 0, 1, 0, 1, 1, 1, 0x11, 0]),
+    ...seg(0xda, [1, 1, 0, 0, 0x3f, 0]),
+    0x12,
+    0x34,
+    0xff,
+    0xd9,
+  ]);
+}
+
+const readObject = () => Promise.resolve(syntheticJpeg());
 
 function handlerFor(client: ResponsesClient): Record<string, JobHandler> {
   return {
@@ -466,6 +491,39 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
     });
     expect(await results(scan.assignmentId)).toEqual([]);
     expect(client.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+  });
+
+  it('location metadata never reaches the model; a malformed image asks for a retake', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    await runJobs(deps, handlerFor(client));
+    const extraction = client.requests.find((r) => r.outputName === 'homework_extraction')!;
+    for (const part of extraction.input) {
+      if (part.type !== 'input_image') continue;
+      const bytes = atob(part.image_url.replace(/^data:image\/jpeg;base64,/, ''));
+      expect(bytes).not.toContain('Exif');
+      expect(bytes).not.toContain('GPSLatitude');
+    }
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+
+    const broken = await queuedScan({ pages: 1 });
+    const second = scriptedModel({ questions: WORKSHEET });
+    await runJobs(deps, {
+      scan_process: createScanProcessHandler({
+        ai: second,
+        readObject: () => Promise.resolve(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])),
+        sleep: () => Promise.resolve(),
+      }),
+    });
+    expect(second.requests).toHaveLength(0);
+    expect(await assignment(broken.assignmentId)).toEqual({
+      status: 'needs_rescan',
+      error_code: 'IMAGE_UNREADABLE',
+    });
+    expect(await reservation(broken.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'unreadable',
+    });
   });
 
   it('a verifier disagreement goes to a grown-up, never silently to "wrong"', async () => {

@@ -53,7 +53,7 @@ export interface EmailProvider {
   /** `templateKey` selects reviewed copy; `params` must never contain child homework or answers. */
   send(input: {
     to: string;
-    templateKey: 'guardian_invitation' | 'deletion_received' | 'export_ready';
+    templateKey: 'guardian_invitation' | 'deletion_received' | 'export_ready' | 'inactivity_notice';
     params: Record<string, string>;
   }): Promise<{ messageId: string }>;
 }

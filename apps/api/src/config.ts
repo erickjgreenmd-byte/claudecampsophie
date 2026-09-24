@@ -47,7 +47,13 @@ export interface ApiConfig {
     readonly stripeWebBillingEnabled: boolean;
     /** School payout transfers — disabled until real recipient details exist (spec P17). */
     readonly payoutTransfersEnabled: boolean;
+    /** Inactivity notice + deletion (spec P4) — off until the owner approves the period. */
+    readonly inactivityDeletionEnabled: boolean;
   };
+  /** Months without family activity before the inactivity notice (proposed 12). */
+  readonly inactivityMonths: number;
+  /** Days between the notice and deletion when nothing happens (proposed 30). */
+  readonly inactivityNoticeDays: number;
   readonly zdrEvidence: ZdrEvidence | null;
   readonly corsOrigins: readonly string[];
   readonly webhooks: {
@@ -144,7 +150,10 @@ export function loadConfig(
     flags: {
       stripeWebBillingEnabled: env.OPTIONAL_STRIPE_WEB_BILLING_ENABLED === 'true',
       payoutTransfersEnabled: env.PAYOUT_TRANSFERS_ENABLED === 'true',
+      inactivityDeletionEnabled: env.INACTIVITY_DELETION_ENABLED === 'true',
     },
+    inactivityMonths: positiveInt(env, 'INACTIVITY_MONTHS', 12, errors),
+    inactivityNoticeDays: positiveInt(env, 'INACTIVITY_NOTICE_DAYS', 30, errors),
     zdrEvidence,
     corsOrigins: (env.CORS_ORIGINS ?? '')
       .split(',')

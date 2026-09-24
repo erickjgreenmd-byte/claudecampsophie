@@ -11,13 +11,16 @@ import {
 import {
   DEFAULT_HANDLERS,
   expireStaleReservations,
+  inactivitySweep,
+  reconcileStaleEntitlements,
+  recordSpendAlerts,
   purgeExpiredScans,
   runJobs,
   runScheduledTick,
   type JobDeps,
   type JobHandler,
 } from '../src/jobs/dispatcher.ts';
-import { createTestApi, type TestApi } from './helpers.ts';
+import { createTestApi, parentToken, type TestApi } from './helpers.ts';
 
 let api: TestApi;
 let deps: JobDeps;
@@ -333,5 +336,160 @@ describe('scheduled tick', () => {
       select count(*)::int as n from public.promo_campaigns c join public.promo_campaign_templates t on t.id = c.template_id
        where t.name = 'Monthly tick' and c.campaign_month = '2026-09'`;
     expect(row!.n).toBe(1);
+  });
+});
+
+describe('spend alerts (spec F4, AC_FIN_09)', () => {
+  it('fires each threshold once and never without an owner budget', async () => {
+    expect(await recordSpendAlerts(deps)).toEqual([]); // no budget row: nothing is invented
+    const adminId = await seedOwnerAdmin(api.db);
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', 1000000, ${adminId})`;
+    const spend = (micros: number) => api.db.sql`
+      insert into public.ai_usage_events (stage, model_id, prompt_version, status, input_tokens, output_tokens, latency_ms, cost_micros, rate_table_version, created_at)
+      values ('grading', 'gpt-5.6-terra', 'grading.v1', 'succeeded', 10, 10, 5, ${micros}, 'test', ${api.now.value})`;
+    await spend(600_000);
+    expect(await recordSpendAlerts(deps)).toEqual([50]);
+    expect(await recordSpendAlerts(deps)).toEqual([]);
+    await spend(450_000);
+    expect(await recordSpendAlerts(deps)).toEqual([80, 100]);
+    const [alerts] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.audit_events where action = 'spend.threshold_crossed'`;
+    expect(alerts!.n).toBe(3);
+    expect(api.logs.some((l) => l.event === 'spend_threshold_crossed' && l.level === 'error')).toBe(
+      true,
+    );
+  });
+});
+
+describe('entitlement safety net (spec P11: lost webhooks)', () => {
+  it('re-fetches stale entitlements; one provider failure does not stop the sweep', async () => {
+    await api.db.sql`
+      insert into public.store_product_mappings (channel, product_id, environment, paid_slots)
+      values ('app_store', 'pl_family_2', 'sandbox', 2) on conflict do nothing`;
+    const seed = async () => {
+      const fam = await seedFamily(api.db, { childCount: 0 });
+      const [f] = await api.db.sql<{ billing_ref: string }[]>`
+        select billing_ref from public.families where id = ${fam.familyId}`;
+      const ref = f!.billing_ref;
+      await api.db.sql`
+        insert into public.family_capacity (family_id, paid_slots, managing_channel)
+        values (${fam.familyId}, 2, 'app_store')`;
+      await api.db.sql`
+        insert into public.family_entitlements (family_id, channel, provider_subscription_id, product_id, paid_slots, status,
+          environment, period_start, period_end, provider_updated_at, fetched_at)
+        values (${fam.familyId}, 'app_store', ${`rc:${ref}:app_store:pl_family_2`}, 'pl_family_2', 2, 'active', 'sandbox',
+                '2026-08-10T00:00:00Z', '2026-09-10T00:00:00Z', '2026-08-10T00:00:00Z', '2026-09-20T00:00:00Z')`;
+      return { fam, ref };
+    };
+    const lapsed = await seed();
+    const broken = await seed();
+    api.providers.subscriptions.state.set(lapsed.ref, [
+      {
+        channel: 'app_store',
+        providerSubscriptionId: `rc:${lapsed.ref}:app_store:pl_family_2`,
+        productId: 'pl_family_2',
+        status: 'expired',
+        periodStart: new Date('2026-08-10T00:00:00Z'),
+        periodEnd: new Date('2026-09-10T00:00:00Z'),
+        autoRenew: false,
+        environment: 'sandbox',
+        providerUpdatedAt: new Date('2026-09-10T00:00:00Z'),
+        fetchedAt: api.now.value,
+      },
+    ]);
+    const original = api.providers.subscriptions.fetchSubscriptions.bind(
+      api.providers.subscriptions,
+    );
+    const flaky: JobDeps = {
+      ...deps,
+      providers: {
+        ...api.providers,
+        subscriptions: {
+          ...api.providers.subscriptions,
+          fetchSubscriptions: (ref, now) =>
+            ref === broken.ref ? Promise.reject(new Error('provider down')) : original(ref, now),
+        },
+      },
+    };
+    expect(await reconcileStaleEntitlements(flaky)).toBeGreaterThanOrEqual(1);
+    const [row] = await api.db.sql<{ status: string; paid_slots: number }[]>`
+      select e.status, c.paid_slots from public.family_entitlements e
+        join public.family_capacity c on c.family_id = e.family_id
+       where e.family_id = ${lapsed.fam.familyId}`;
+    expect(row).toEqual({ status: 'expired', paid_slots: 0 });
+    const [untouched] = await api.db.sql<{ status: string }[]>`
+      select status from public.family_entitlements where family_id = ${broken.fam.familyId}`;
+    expect(untouched!.status).toBe('active');
+    expect(api.logs.some((l) => l.event === 'entitlement_reconcile_failed')).toBe(true);
+  });
+});
+
+describe('inactivity retention (spec P4; disabled until the owner approves the period)', () => {
+  const enabled = (): JobDeps => ({
+    ...deps,
+    config: { ...api.config, flags: { ...api.config.flags, inactivityDeletionEnabled: true } },
+  });
+
+  async function idleFamily() {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    await api.db
+      .sql`update public.families set created_at = '2025-08-01T00:00:00Z' where id = ${fam.familyId}`;
+    return fam;
+  }
+
+  it('does nothing while disabled', async () => {
+    const fam = await idleFamily();
+    expect(await inactivitySweep(deps)).toEqual({ notified: 0, deleted: 0 });
+    const [row] = await api.db.sql<{ notified: Date | null }[]>`
+      select inactivity_notified_at as notified from public.families where id = ${fam.familyId}`;
+    expect(row!.notified).toBeNull();
+  });
+
+  it('notifies once, then deletes after the notice period if nothing happens', async () => {
+    const idle = await idleFamily();
+    const active = await seedFamily(api.db, { childCount: 1 }); // created now: not idle
+    const outboxBefore = api.providers.email.outbox.length;
+    const first = await inactivitySweep(enabled());
+    expect(first.notified).toBeGreaterThanOrEqual(1);
+    expect(api.providers.email.outbox.length).toBeGreaterThan(outboxBefore);
+    expect(api.providers.email.outbox.at(-1)!.templateKey).toBe('inactivity_notice');
+    expect((await inactivitySweep(enabled())).deleted).toBe(0); // still inside the notice period
+
+    api.now.value = new Date(api.now.value.getTime() + 31 * 86_400_000);
+    try {
+      expect((await inactivitySweep(enabled())).deleted).toBeGreaterThanOrEqual(1);
+    } finally {
+      api.now.value = new Date(api.now.value.getTime() - 31 * 86_400_000);
+    }
+    const rows = await api.db.sql<{ id: string; deleted: boolean }[]>`
+      select id, deleted_at is not null as deleted from public.families where id = any(${[idle.familyId, active.familyId]})`;
+    expect(Object.fromEntries(rows.map((r) => [r.id, r.deleted]))).toEqual({
+      [idle.familyId]: true,
+      [active.familyId]: false,
+    });
+    const [job] = await api.db.sql<{ status: string }[]>`
+      select status from public.jobs where family_id = ${idle.familyId} and kind = 'deletion_purge'`;
+    expect(job!.status).toBe('queued');
+  });
+
+  it('any parent activity after the notice cancels the deletion', async () => {
+    const fam = await idleFamily();
+    await inactivitySweep(enabled());
+    const token = await parentToken(fam.ownerId);
+    expect((await api.request('/v1/family', { token })).status).toBe(200);
+    const [row] = await api.db.sql<{ notified: Date | null }[]>`
+      select inactivity_notified_at as notified from public.families where id = ${fam.familyId}`;
+    expect(row!.notified).toBeNull();
+    api.now.value = new Date(api.now.value.getTime() + 31 * 86_400_000);
+    try {
+      await inactivitySweep(enabled());
+    } finally {
+      api.now.value = new Date(api.now.value.getTime() - 31 * 86_400_000);
+    }
+    const [still] = await api.db.sql<{ deleted_at: Date | null }[]>`
+      select deleted_at from public.families where id = ${fam.familyId}`;
+    expect(still!.deleted_at).toBeNull();
   });
 });
