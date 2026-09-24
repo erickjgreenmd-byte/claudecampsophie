@@ -38,6 +38,9 @@ export interface ApiConfig {
     readonly consent: 'development_mock' | 'configured';
     readonly billing: 'development_mock' | 'revenuecat';
     readonly ai: 'development_mock' | 'openai';
+    readonly storage: 'development_mock' | 'supabase';
+    /** No transactional email adapter exists yet; invitations go to a development outbox. */
+    readonly email: 'development_mock';
   };
   readonly flags: {
     /** Optional adult web billing (spec P11) — disabled until the owner decides launch policy. */
@@ -130,9 +133,13 @@ export function loadConfig(
     pairingCodeTtlSeconds: positiveInt(env, 'PAIRING_CODE_TTL_SECONDS', 600, errors),
     programTimezone,
     providers: {
-      consent: env.CONSENT_PROVIDER ? 'configured' : 'development_mock',
+      // No real consent adapter is implemented yet, so nothing can mark consent as configured;
+      // naming an unknown provider is a configuration error rather than a silent mock.
+      consent: consentProvider(env.CONSENT_PROVIDER, errors),
       billing: env.REVENUECAT_SECRET_API_KEY ? 'revenuecat' : 'development_mock',
       ai: env.OPENAI_API_KEY ? 'openai' : 'development_mock',
+      storage: env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY ? 'supabase' : 'development_mock',
+      email: 'development_mock',
     },
     flags: {
       stripeWebBillingEnabled: env.OPTIONAL_STRIPE_WEB_BILLING_ENABLED === 'true',
@@ -150,6 +157,19 @@ export function loadConfig(
     billingEnvironment: environment === 'production' ? 'production' : 'sandbox',
   };
   return errors.length ? { ok: false, errors } : { ok: true, config };
+}
+
+/** Consent adapters implemented in this codebase (none yet: owner action #7 selects the provider). */
+const CONSENT_ADAPTERS: ReadonlySet<string> = new Set<string>();
+
+function consentProvider(
+  value: string | undefined,
+  errors: ConfigError[],
+): 'development_mock' | 'configured' {
+  if (!value) return 'development_mock';
+  if (CONSENT_ADAPTERS.has(value)) return 'configured';
+  errors.push({ name: 'CONSENT_PROVIDER', problem: `no adapter is implemented for "${value}"` });
+  return 'development_mock';
 }
 
 export interface ReadinessItem {
@@ -185,6 +205,16 @@ export function productionReadiness(config: ApiConfig): ReadinessItem[] {
       'zdr_evidence',
       config.zdrEvidence !== null,
       'Documented ZDR approval reference required before under-13 data reaches AI',
+    ),
+    item(
+      'storage_provider',
+      config.providers.storage === 'supabase',
+      'Private homework storage (Supabase Storage); the in-memory mock loses files',
+    ),
+    item(
+      'email_provider',
+      false,
+      'Transactional email adapter not implemented; guardian invitations use a development outbox',
     ),
     item(
       'parent_jwt_keys',

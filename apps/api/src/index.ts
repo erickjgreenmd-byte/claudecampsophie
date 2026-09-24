@@ -8,6 +8,7 @@ import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/disp
 import { createScanProcessHandler, storageReader } from './jobs/scan-process.ts';
 import type { AppDeps } from './middleware/context.ts';
 import { createDbRateLimiter } from './middleware/rate-limit.ts';
+import { createSupabaseStorage } from './providers/supabase-storage.ts';
 import {
   createDevelopmentConsentMock,
   createMemoryStorageMock,
@@ -49,8 +50,11 @@ function buildRuntime(env: WorkerEnv): RuntimeResult {
   if (!loaded.ok)
     return { ok: false, code: 'NOT_CONFIGURED', message: 'Service is not configured' };
   const config = loaded.config;
-  if (config.environment === 'production' && config.providers.consent !== 'configured') {
-    // AC_DEPLOY_07: production never serves with the development consent mock.
+  if (
+    config.environment === 'production' &&
+    (config.providers.consent !== 'configured' || config.providers.storage !== 'supabase')
+  ) {
+    // AC_DEPLOY_07: production never serves with the development consent or storage mocks.
     return { ok: false, code: 'BLOCKED_EXTERNAL', message: 'Service is not ready' };
   }
   const sql = postgres(env.HYPERDRIVE.connectionString, {
@@ -66,10 +70,18 @@ function buildRuntime(env: WorkerEnv): RuntimeResult {
     random: cryptoRandom,
     verifyParentToken: createParentVerifier(config),
     rateLimiter: createDbRateLimiter(db),
-    // Real Supabase Storage / email adapters replace these once credentials exist (docs/Connections.md).
+    // Consent and email adapters do not exist yet (docs/Connections.md); storage uses Supabase when set.
     providers: {
       consent: createDevelopmentConsentMock(),
-      storage: createMemoryStorageMock(),
+      storage:
+        config.providers.storage === 'supabase' &&
+        typeof env.SUPABASE_URL === 'string' &&
+        typeof env.SUPABASE_SERVICE_ROLE_KEY === 'string'
+          ? createSupabaseStorage({
+              supabaseUrl: env.SUPABASE_URL,
+              serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+            })
+          : createMemoryStorageMock(),
       email: createOutboxEmailMock(),
       subscriptions:
         typeof env.REVENUECAT_SECRET_API_KEY === 'string'
