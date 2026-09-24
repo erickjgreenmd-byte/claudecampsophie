@@ -7,7 +7,7 @@ import { createMobileApi } from '../lib/api.ts';
 import type { ModeEffects } from '../lib/mode.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { createChildSession } from './child-session.ts';
-import { clearAdultCaches, parentTokenSource } from './parent-session.ts';
+import { clearAdultCaches, parentTokenSource, stepUpTokenSource } from './parent-session.ts';
 import {
   BIOMETRIC_ENABLED_KEY,
   BIOMETRIC_PIN_KEY,
@@ -36,9 +36,18 @@ export const childSession = createChildSession({
 /** Child API client (bearer = the paired child's in-memory access token). */
 export const childApi: ApiClient = createMobileApi(childSession.accessToken);
 
-/** Parent API client, or null while parent sign-in is not connected on this device. */
+/**
+ * Parent API client for parent DATA, or null while parent sign-in is not connected on this device.
+ * Its token source is empty in child mode, so calls from child mode fail closed.
+ */
 export function parentApi(): ApiClient | null {
   const source = parentTokenSource();
+  return source ? createMobileApi(source) : null;
+}
+
+/** Client for POST /v1/adult/unlock and /v1/adult/lock only (works in child mode, by design). */
+export function stepUpApi(): ApiClient | null {
+  const source = stepUpTokenSource();
   return source ? createMobileApi(source) : null;
 }
 
@@ -89,7 +98,7 @@ export const modeEffects: ModeEffects = {
     router.replace('/(child)/home');
   },
   async relockOnServer() {
-    const api = parentApi();
+    const api = stepUpApi();
     if (api) await lockParentArea(api);
   },
   async setScreenPrivacy(enabled) {

@@ -34,11 +34,10 @@ export function parentSourceOutsideChildMode(
  * The app's single session layer (spec P3). It is the ONLY place that hands out token sources:
  * - child: the one refresh-rotating child session (a second refresher would trip the server's
  *   reuse detection and revoke the device);
- * - parent: the Supabase session, registered only while a parent is signed in. The parent data
- *   screens (privacy/exports, rewards approvals) get a source that is empty in child mode. The
- *   family source also serves the PIN unlock that leads OUT of child mode (and the relock), so it
- *   cannot be emptied here until family/runtime.ts gives the unlock its own step-up client; the
- *   family screens stay gated by `useParentAccess` meanwhile.
+ * - parent: the Supabase session, registered only while a parent is signed in. Every parent data
+ *   source (family, privacy/exports, rewards approvals) is empty in child mode, so a parent data
+ *   call made from child mode fails closed at the data layer. Only the step-up source (the PIN
+ *   unlock that leads OUT of child mode, and the relock) keeps the raw session.
  * It also relocks the parent area whenever the app leaves the foreground in parent mode.
  */
 export function initAppSession(): () => void {
@@ -49,7 +48,7 @@ export function initAppSession(): () => void {
   const unwatch = parentAuth.watch((signedIn) => {
     const source = signedIn ? parentAuth.tokenSource : null;
     const gated = source ? parentSourceOutsideChildMode(source, readMode) : null;
-    registerParentTokenSource(source);
+    registerParentTokenSource(gated, { stepUp: source });
     registerRewardsTokenSources({ parent: gated });
     registerPrivacyTokenSources({ parent: gated });
     if (!signedIn) {

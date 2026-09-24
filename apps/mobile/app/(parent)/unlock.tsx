@@ -9,7 +9,7 @@ import {
   biometricPinStore,
   biometricsSupported,
   modeEffects,
-  parentApi,
+  stepUpApi,
 } from '../../src/family/runtime.ts';
 import {
   Body,
@@ -37,7 +37,7 @@ import {
  * the keychain behind the OS prompt; the server still verifies it. The unlock is short-lived.
  */
 export default function UnlockScreen() {
-  const api = useMemo(() => parentApi(), []);
+  const api = useMemo(() => stepUpApi(), []);
   const [pin, setPin] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);

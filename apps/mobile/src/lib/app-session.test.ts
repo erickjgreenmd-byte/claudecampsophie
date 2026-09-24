@@ -1,7 +1,7 @@
 // Session layer wiring (spec P3, AC_ACCESS_07). Native modules and the Supabase client are replaced
 // by labeled vitest mocks; the token strings are synthetic.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parentTokenSource } from '../family/parent-session.ts';
+import { parentTokenSource, stepUpTokenSource } from '../family/parent-session.ts';
 import { parentPrivacyTokenSource } from '../privacy/session.ts';
 import { parentRewardsTokenSource } from '../rewards/session.ts';
 import { STORAGE_KEYS } from './mode.ts';
@@ -89,7 +89,11 @@ describe('parent token sources and child mode (review note b, AC_ACCESS_07)', ()
       expect(await privacy!()).toBeNull();
       expect(await rewards!()).toBeNull();
 
-      // The family source still serves the PIN unlock that leads out of child mode.
+      // The family data source fails closed too (GET /v1/family, /v1/devices, ...); only the
+      // step-up source still serves the PIN unlock that leads out of child mode, and the relock.
+      expect(await parentTokenSource()!()).toBeNull();
+      expect(await stepUpTokenSource()!()).toBe('parent-token-mock');
+      fake.keychain.set(STORAGE_KEYS.mode, 'parent');
       expect(await parentTokenSource()!()).toBe('parent-token-mock');
     } finally {
       stop();
@@ -103,6 +107,7 @@ describe('parent token sources and child mode (review note b, AC_ACCESS_07)', ()
       expect(fake.storeForgets).toBe(0);
       fake.onAuthChange?.(false);
       expect(parentTokenSource()).toBeNull();
+      expect(stepUpTokenSource()).toBeNull();
       expect(parentPrivacyTokenSource()).toBeNull();
       expect(parentRewardsTokenSource()).toBeNull();
       expect(fake.storeForgets).toBe(1);
