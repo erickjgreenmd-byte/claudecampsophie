@@ -269,9 +269,13 @@ export async function applySnapshots(
   let records = await loadRecords(tx, familyId);
   // A provider timestamp later than our own observation time (clock skew or bad data) would make
   // every later genuine observation, including a refund, look stale (RV-entitlements-1). Clamp it.
-  const bounded = snapshots.map((s) =>
-    s.providerUpdatedAt.getTime() > now.getTime() ? { ...s, providerUpdatedAt: now } : s,
-  );
+  // The domain also rejects providerUpdatedAt > fetchedAt and fetchedAt > now, so bound both.
+  const bounded = snapshots.map((s) => {
+    const fetchedAt = s.fetchedAt.getTime() > now.getTime() ? now : s.fetchedAt;
+    const providerUpdatedAt =
+      s.providerUpdatedAt.getTime() > fetchedAt.getTime() ? fetchedAt : s.providerUpdatedAt;
+    return { ...s, fetchedAt, providerUpdatedAt };
+  });
   for (const snapshot of bounded) {
     records = [
       ...reconcileEntitlements(records, snapshot, mappings, runtimeEnvironment, now).records,
