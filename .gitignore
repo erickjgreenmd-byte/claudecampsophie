@@ -12,6 +12,9 @@ web-build/
 .env.*
 !.env.example
 .dev.vars
+# Wrangler also reads per-environment files (.dev.vars.<env>); only the example is committed.
+.dev.vars.*
+!.dev.vars.example
 .DS_Store
 *.tsbuildinfo
 test-results/

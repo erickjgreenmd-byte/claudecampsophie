@@ -794,6 +794,81 @@ describe('reviewed catalog and link checks (spec P10, AC_MON_12)', () => {
       .sql`select count(*)::int as n from public.audit_events where action = 'monetization.catalog_link_checked' and target_id = ${itemId}`;
     expect(audit[0]!.n).toBe(4);
   });
+
+  // LRD-2 (race): the check reads the URL, awaits the network, then writes. A URL replaced in
+  // between must not inherit the old URL's result (0770's trigger sees only the URL change itself).
+  it('never records a result for a merchant URL that changed while the check ran (409)', async () => {
+    const oldUrl = 'https://www.amazon.com/dp/B000RACEOK';
+    const newUrl = 'https://www.amazon.com/dp/B000RACENW';
+    const item = catalogItemSchema.parse(
+      await ok(
+        await admin('/catalog', 'POST', {
+          ...resourceInput,
+          stableKey: 'race-strips',
+          merchantUrl: oldUrl,
+        }),
+        201,
+      ),
+    );
+    // The old URL answers 200, but only after an admin has replaced it.
+    setLinkCheckFetchForTests(async (url, init) => {
+      calls.push({ url, method: init.method });
+      await ok(await admin(`/catalog/${item.id}`, 'PATCH', { merchantUrl: newUrl }));
+      return { status: 200 };
+    });
+    let raced: Response;
+    try {
+      raced = await admin(`/catalog/${item.id}/link-check`, 'POST');
+    } finally {
+      setLinkCheckFetchForTests(null);
+    }
+    const racedBody = await json<Partial<ErrorBody> & { status?: string }>(raced);
+    expect({ status: raced.status, body: racedBody.error?.code ?? racedBody.status }).toEqual({
+      status: 409,
+      body: 'CONFLICT',
+    });
+    expect(calls).toEqual([{ url: oldUrl, method: 'HEAD' }]);
+    const row = async () =>
+      (
+        await api.db.sql<
+          {
+            merchant_url: string;
+            availability: string;
+            last_link_check_status: string | null;
+            last_link_check_at: Date | null;
+          }[]
+        >`
+          select merchant_url, availability, last_link_check_status, last_link_check_at
+            from public.resource_catalog where id = ${item.id}`
+      )[0];
+    expect(await row()).toEqual({
+      merchant_url: newUrl,
+      availability: 'unknown',
+      last_link_check_status: null,
+      last_link_check_at: null,
+    });
+    const [audited] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.audit_events
+       where action = 'monetization.catalog_link_checked' and target_id = ${item.id}`;
+    expect(audited!.n).toBe(0);
+
+    // Running it again checks the new URL and records that result.
+    setLinkCheckFetchForTests(stub(404));
+    try {
+      const again = linkCheckResponseSchema.parse(
+        await ok(await admin(`/catalog/${item.id}/link-check`, 'POST')),
+      );
+      expect(again).toMatchObject({ status: 'broken', availability: 'unavailable' });
+    } finally {
+      setLinkCheckFetchForTests(null);
+    }
+    expect(calls.at(-1)).toEqual({ url: newUrl, method: 'HEAD' });
+    expect(await row()).toMatchObject({
+      merchant_url: newUrl,
+      availability: 'unavailable',
+      last_link_check_status: 'broken',
+    });
+  });
 });
 
 describe('revenue imports, adjustments and reporting (AC_MON_16..18)', () => {

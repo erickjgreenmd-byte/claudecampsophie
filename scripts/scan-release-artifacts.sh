@@ -10,9 +10,11 @@
 #    documented public shape. Real release values never exist in CI; these make the bundles carry
 #    the variables the way a release build does, so the scan's public-value allowlist is exercised
 #    on real output. The scan must pass.
-# 2. Negative control: the web portal and the app config again, with a fake service-role key and a
-#    fake secret key in the publishable-key variables. The scan must find them. If a build stops
-#    embedding these variables where the scan looks, or the scan stops seeing them, this fails.
+# 2. Negative control: the web portal and the app config again, with a fake service-role key, a
+#    fake Supabase secret key, a fake Stripe test-mode secret key and a fake database URL with its
+#    password in public build variables. The scan must fail and name each planted detector. If a
+#    build stops embedding these variables where the scan looks, or the scan stops seeing one of
+#    them (LRD-3: test-mode keys and database URLs once passed unseen), this fails.
 #
 # The fake values are assembled at run time, so no credential-shaped literal is tracked.
 set -euo pipefail
@@ -35,6 +37,8 @@ const values = {
   FAKE_ANON_KEY: jwt("anon"),
   FAKE_SERVICE_ROLE_KEY: jwt(["service", "role"].join("_")),
   FAKE_SECRET_KEY: ["sb", "secret", "FAKEfakeFAKEfake0000"].join("_"),
+  FAKE_STRIPE_TEST_KEY: ["sk", "test", "FAKEfakeFAKEfake0000"].join("_"),
+  FAKE_DATABASE_URL: ["postgres://postgres:", "Fake", "Passw0rd", "0000", "@db.fakeprojectref00000a.supabase.co:5432/postgres"].join(""),
   FAKE_IOS_KEY: ["appl", "FAKEfakeFAKEfake00"].join("_"),
   FAKE_ANDROID_KEY: ["goog", "FAKEfakeFAKEfake00"].join("_"),
 };
@@ -57,7 +61,9 @@ public_env=(
 leaked_env=(
   "${public_env[@]}"
   VITE_SUPABASE_PUBLISHABLE_KEY="$FAKE_SERVICE_ROLE_KEY"
+  VITE_API_BASE_URL="$FAKE_STRIPE_TEST_KEY"
   EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY="$FAKE_SECRET_KEY"
+  EXPO_PUBLIC_PORTAL_URL="$FAKE_DATABASE_URL"
 )
 
 build_web() { # <out> <env...>
@@ -86,12 +92,24 @@ node scripts/scan-secrets.mjs --artifacts "$out/web" "$out/worker" "$out/expo-we
 echo "▶ negative control: a secret in a public build variable must fail the scan"
 build_web "$out/control/web" "${leaked_env[@]}"
 app_config "$out/control/app-config" "${leaked_env[@]}"
-for dir in "$out/control/web" "$out/control/app-config"; do
-  status=0
-  node scripts/scan-secrets.mjs --artifacts "$dir" || status=$?
+control() { # <dir> <detector>...  the scan must fail and name every planted detector
+  local dir="$1"
+  shift
+  local status=0 output
+  output=$(node scripts/scan-secrets.mjs --artifacts "$dir" 2>&1) || status=$?
+  printf '%s\n' "$output"
   if [ "$status" != 1 ]; then
-    echo "✗ negative control: the planted key in $dir was not found (scan exit $status)" >&2
+    echo "✗ negative control: the planted keys in $dir were not found (scan exit $status)" >&2
     exit 1
   fi
-done
+  local detector
+  for detector in "$@"; do
+    if ! grep -qF ": $detector" <<<"$output"; then
+      echo "✗ negative control: the planted $detector in $dir was not found" >&2
+      exit 1
+    fi
+  done
+}
+control "$out/control/web" "service-role JWT" "Stripe test secret"
+control "$out/control/app-config" "Supabase secret key" "database URL with password"
 echo "✓ release artifact scan passed; the planted keys were found (expected findings above)"

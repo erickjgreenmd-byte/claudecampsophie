@@ -1059,18 +1059,22 @@ export function adminMonetizationRoutes(): Hono<AppEnv> {
     // Checks the canonical untagged URL only: a check never counts as a click or sets a cookie.
     const result = await checkMerchantLink(deps.config, current.merchant_url);
     await deps.db.asService(async (tx) => {
-      if (result.status !== 'skipped') {
-        await tx`
-          update public.resource_catalog
-             set availability = ${result.availability}, last_link_check_at = ${deps.clock()},
-                 last_link_check_status = ${result.status}
-           where id = ${id}
-        `;
-      } else {
-        await tx`
-          update public.resource_catalog set last_link_check_at = ${deps.clock()}, last_link_check_status = 'skipped'
-           where id = ${id}
-        `;
+      // The result belongs to the URL that was checked: a URL replaced while the request was out
+      // (0770 already reset its check) never inherits it (LRD-2 race).
+      const written =
+        result.status !== 'skipped'
+          ? await tx`
+              update public.resource_catalog
+                 set availability = ${result.availability}, last_link_check_at = ${deps.clock()},
+                     last_link_check_status = ${result.status}
+               where id = ${id} and merchant_url is not distinct from ${current.merchant_url}
+            `
+          : await tx`
+              update public.resource_catalog set last_link_check_at = ${deps.clock()}, last_link_check_status = 'skipped'
+               where id = ${id} and merchant_url is not distinct from ${current.merchant_url}
+            `;
+      if (written.count === 0) {
+        throw new ApiError('CONFLICT', 'The merchant link changed during the check; run it again');
       }
       await audit(tx, c, 'monetization.catalog_link_checked', 'resource', id, {
         status: result.status,

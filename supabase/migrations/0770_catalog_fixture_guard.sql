@@ -20,7 +20,9 @@
 -- - (resources) claims availability the catalog's own link check never confirmed. The admin API
 --   only ever sets 'available' together with last_link_check_status = 'ok', so any other
 --   'available' merchant row was seeded around the reviewed workflow (AI and seeds must not invent
---   availability, spec P10).
+--   availability, spec P10). A check belongs to the URL it checked: changing merchant_url clears
+--   availability and the check (resource_catalog_check_reset below), so a new URL is never served
+--   on the previous URL's result (LRD-2).
 -- It is live when it can be served: resources not retired, approvals pending or approved, store
 -- mappings active, provider offers ready, sponsors active, sponsor campaigns from review until they
 -- end (in review, scheduled, active or paused; a campaign is fake when its creative or sponsor is).
@@ -158,6 +160,32 @@ as $$
   select 'sponsor_campaigns', count(*)::integer
     from public.sponsor_campaigns c where app.sponsor_campaign_is_fake(c)
 $$;
+
+-- ---------------------------------------------------------------------------------------------
+-- A link check belongs to the URL it checked
+-- ---------------------------------------------------------------------------------------------
+
+-- Any writer that changes merchant_url (the admin PATCH, a seed, an operator) leaves the row
+-- unchecked: availability 'unknown' and no check, whatever else the same statement set, so only a
+-- check of the new URL can claim availability again. Named to fire before
+-- resource_catalog_fixture_guard (same-event triggers fire in name order), which then judges the
+-- row that will be stored.
+create or replace function app.reset_link_check_on_url_change() returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.merchant_url is distinct from old.merchant_url then
+    new.availability := 'unknown';
+    new.last_link_check_status := null;
+    new.last_link_check_at := null;
+  end if;
+  return new;
+end
+$$;
+
+create trigger resource_catalog_check_reset before update on public.resource_catalog
+  for each row execute function app.reset_link_check_on_url_change();
 
 -- ---------------------------------------------------------------------------------------------
 -- The production mark: one row, written only by the owner (migration role), never by the API

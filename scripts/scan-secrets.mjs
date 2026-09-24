@@ -36,7 +36,10 @@ function* matches(text, re, anchored) {
 const PATTERNS = [
   ['private key block', /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/g, false],
   ['Stripe live secret', /sk_live_[0-9A-Za-z]{16,}/g, true],
-  ['Stripe restricted key', /rk_live_[0-9A-Za-z]{16,}/g, true],
+  // Test-mode keys are secrets too: this project's Stripe account runs in test mode
+  // (docs/Connections.md), so they are the keys it actually holds (LRD-3).
+  ['Stripe test secret', /sk_test_[0-9A-Za-z]{16,}/g, true],
+  ['Stripe restricted key', /rk_(?:live|test)_[0-9A-Za-z]{16,}/g, true],
   ['Stripe webhook secret', /whsec_[0-9A-Za-z]{24,}/g, true],
   ['OpenAI key', /sk-(?:proj-)?[A-Za-z0-9_-]{32,}/g, true],
   ['AWS access key', /AKIA[0-9A-Z]{16}\b/g, true],
@@ -101,10 +104,71 @@ const DOCUMENTED_PUBLIC = [
 const isDocumentedPublic = (value) => DOCUMENTED_PUBLIC.some(([, matches]) => matches(value));
 
 /**
- * Every detector hit in `text` as { index, name }. `artifact` adds the built-artifact rules: any
- * signed JWT except a documented public one.
+ * A connection string with an inline password (DATABASE_URL is a documented server secret; LRD-3).
+ * Groups: 1 password, 2 host. The user may be empty ("redis://:password@host"). A password or host
+ * cannot contain a quote, backslash (an escape in a string literal) or whitespace.
  */
-function findSecrets(text, { artifact }) {
+const DATABASE_URL =
+  /(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?):\/\/[^\s:/?#@'"`\\]*:([^\s/?#@'"`\\]+)@(\[[^\]\s'"`\\]*\]|[^\s:/?#'"`\\]+)/gi;
+
+/**
+ * Hosts that never hold a real deployment's data: this machine (local development and CI) and the
+ * names reserved for documentation and testing (RFC 2606, RFC 6761).
+ */
+const LOCAL_OR_RESERVED_HOST =
+  /^(?:localhost|[a-z0-9.-]+\.localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1?\]|host\.docker\.internal|(?:[a-z0-9-]+\.)*(?:example\.(?:com|net|org)|example|test|invalid))\.?$/i;
+
+/** A documentation placeholder standing in for the password, never a password itself. */
+const PLACEHOLDER_PASSWORD =
+  /^(?:\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|<[^>]*>|\[[^\]]*\]|\{\{?[^}]*\}\}?|%[A-Za-z_]+%|\*+|x+|\.{3}|password|passwd|pass|pwd|secret|changeme|your[-_]?password)$/i;
+
+/**
+ * A `data:` URI whose payload is base64 (any media type and parameters). Bundlers inline small
+ * assets, fonts and workers this way, so a value in the payload is invisible to the text rules.
+ */
+const DATA_URI =
+  /data:(?:[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+)?(?:;[a-z0-9!#$&^_.+-]+=[^;,\s'"`]*)*;base64,([A-Za-z0-9+/_-]{16,}={0,2})/gi;
+const DATA_URI_SUFFIX = ' in base64 data URI';
+const MAX_DATA_URI_DEPTH = 2;
+
+/**
+ * Texts to scan in a decoded data URI payload. An inline source map is read like a .map file: its
+ * embedded sources and its other fields, never `mappings` (base64 VLQ position data).
+ */
+function dataUriTexts(bytes) {
+  const text = bytes.subarray(0, 8192).includes(0)
+    ? bytes.toString('latin1')
+    : bytes.toString('utf8');
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return [text];
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return [text];
+  const maps = Array.isArray(value.sections) ? value.sections.map((s) => s?.map ?? {}) : [value];
+  if (!maps.some((m) => typeof m?.mappings === 'string')) return [text];
+  const texts = [];
+  for (const m of maps) {
+    const { mappings: _mappings, sourcesContent, ...rest } = m ?? {};
+    texts.push(JSON.stringify(rest));
+    for (const source of Array.isArray(sourcesContent) ? sourcesContent : []) {
+      if (typeof source === 'string') texts.push(source);
+    }
+  }
+  if (Array.isArray(value.sections)) {
+    const { sections: _sections, ...top } = value;
+    texts.push(JSON.stringify(top));
+  }
+  return texts;
+}
+
+/**
+ * Every detector hit in `text` as { index, name }. `artifact` adds the built-artifact rules: any
+ * signed JWT except a documented public one. Base64 data URIs are decoded and scanned too (to
+ * `MAX_DATA_URI_DEPTH` levels); their hits are reported at the URI.
+ */
+function findSecrets(text, { artifact, depth = 0 }) {
   const hits = [];
   for (const [name, re, anchored] of PATTERNS) {
     for (const m of matches(text, re, anchored)) {
@@ -118,6 +182,23 @@ function findSecrets(text, { artifact }) {
     if (role === 'service_role') hits.push({ index: m.index, name: 'service-role JWT' });
     else if (artifact && !isDocumentedPublic(m[0]))
       hits.push({ index: m.index, name: 'signed JWT' });
+  }
+  for (const m of matches(text, DATABASE_URL, true)) {
+    const [, password, host] = m;
+    if (LOCAL_OR_RESERVED_HOST.test(host) || PLACEHOLDER_PASSWORD.test(password)) continue;
+    hits.push({ index: m.index, name: 'database URL with password' });
+  }
+  if (depth < MAX_DATA_URI_DEPTH) {
+    // Collected first: the scan of a payload reuses DATA_URI, whose lastIndex this loop depends on.
+    const uris = [...matches(text, DATA_URI, true)].map((m) => ({ index: m.index, payload: m[1] }));
+    for (const { index, payload } of uris) {
+      for (const inner of dataUriTexts(Buffer.from(payload, 'base64'))) {
+        for (const hit of findSecrets(inner, { artifact, depth: depth + 1 })) {
+          const name = hit.name.endsWith(DATA_URI_SUFFIX) ? hit.name : hit.name + DATA_URI_SUFFIX;
+          hits.push({ index, name });
+        }
+      }
+    }
   }
   const seen = new Set();
   return hits

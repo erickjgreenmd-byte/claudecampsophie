@@ -604,27 +604,31 @@ describe('consent (spec P3, AC_ACCESS_01/02)', () => {
   });
 });
 
-describe('production refuses a mock consent provider (spec P3)', () => {
-  let prod: TestApi;
+for (const APP_ENV of ['production', 'staging'] as const) {
+  // Lead update (final review, LRD-1 defense line): the mock is refused outside development and
+  // test, not only in production, like every other consent gate.
+  describe(`${APP_ENV} refuses a mock consent provider (spec P3)`, () => {
+    let prod: TestApi;
 
-  beforeAll(async () => {
-    prod = await createTestApi({ APP_ENV: 'production' });
-  });
-
-  afterAll(async () => {
-    await prod?.close();
-  });
-
-  it('does not start consent with the development mock in production', async () => {
-    const family = await seedFamily(prod.db, { childCount: 0 });
-    const res = await prod.request('/v1/consent/start', {
-      method: 'POST',
-      token: await parentToken(family.ownerId),
-      body: {},
+    beforeAll(async () => {
+      prod = await createTestApi({ APP_ENV });
     });
-    expect(res.status).toBe(503);
-    expect((await errorOf(res)).code).toBe('NOT_CONFIGURED');
-    const rows = await prod.db.sql`select 1 from public.consent_records`;
-    expect(rows.length).toBe(0);
+
+    afterAll(async () => {
+      await prod?.close();
+    });
+
+    it(`does not start consent with the development mock in ${APP_ENV}`, async () => {
+      const family = await seedFamily(prod.db, { childCount: 0 });
+      const res = await prod.request('/v1/consent/start', {
+        method: 'POST',
+        token: await parentToken(family.ownerId),
+        body: {},
+      });
+      expect(res.status).toBe(503);
+      expect((await errorOf(res)).code).toBe('NOT_CONFIGURED');
+      const rows = await prod.db.sql`select 1 from public.consent_records`;
+      expect(rows.length).toBe(0);
+    });
   });
-});
+}

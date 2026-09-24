@@ -544,7 +544,10 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
     if (!row) throw new ApiError('NOT_FOUND', 'School not found');
     const zone = c.var.deps.config.programTimezone;
     const [counts] = await c.var.deps.db.asParent(c.var.parent, async (tx) => {
-      // A school viewer is served only in the program zone this transaction states (0740, BUG-074).
+      // States the program zone, which 0740 (BUG-074) requires of every caller but the owner. This
+      // route is owner-admin only (requireOwnerAdmin above); no API route serves school viewers
+      // yet, so one calling the function directly is refused (LRD-6). A school-facing report route
+      // must state the zone the same way.
       await tx`select set_config('pencillift.program_zone', ${zone}, true)`;
       return tx<
         {

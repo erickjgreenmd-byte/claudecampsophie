@@ -16,8 +16,11 @@ enabled = true
 [triggers]
 crons = ["*/5 * * * *"]
 
+# No APP_ENV at the top level (LRD-5): a `wrangler deploy` without --env gets none, and the Worker
+# answers 503 NOT_CONFIGURED instead of running as development with every labeled mock. Only
+# [env.staging.vars] and [env.production.vars] set it. `wrangler dev` reads it from the gitignored
+# apps/api/.dev.vars (copy .dev.vars.example), which a deploy never uploads.
 [vars]
-APP_ENV = "development"
 PROGRAM_TIMEZONE = "UTC"
 
 [[hyperdrive]]

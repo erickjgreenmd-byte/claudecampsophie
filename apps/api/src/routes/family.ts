@@ -4,6 +4,7 @@ import { isValidIanaZone } from '@pencillift/domain';
 import { uuidSchema } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
 import { generatePairingCode, pairingCodeHash } from '../auth/pairing.ts';
+import { acceptsTestProviderConsent } from '../config.ts';
 import type { Tx } from '../db.ts';
 import { ApiError, businessRule } from '../errors.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
@@ -140,6 +141,9 @@ export function familyRoutes(): Hono<AppEnv> {
     const hashHex = toHex(await pairingCodeHash(deps.config.hashPepper, code));
     const expiresAt = new Date(now.getTime() + deps.config.pairingCodeTtlSeconds * 1000);
     await deps.db.asService(async (tx) => {
+      // Child row first, as the insert trigger (0720) does: a code row locked before the child row
+      // deadlocks with an overlapping request (BUG-106).
+      await tx`select 1 from public.child_profiles where id = ${childId.data} for no key update`;
       // One live code per child: older unused codes stop working.
       await tx`update private.child_pairing_codes set consumed_at = ${now} where child_id = ${childId.data} and consumed_at is null`;
       await tx`
@@ -160,7 +164,8 @@ export function familyRoutes(): Hono<AppEnv> {
     if (!childId.success) throw new ApiError('NOT_FOUND', 'Child not found');
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
-    const allowTestProvider = deps.config.environment !== 'production';
+    // A development-mock consent record counts only where that mock may be wired (LRD-1).
+    const allowTestProvider = acceptsTestProviderConsent(deps.config.environment);
     const result = await deps.db.asService(async (tx) => {
       // Serialize with other slot changes for this family (two guardians, two devices).
       await tx`select 1 from public.families where id = ${familyId} for update`;

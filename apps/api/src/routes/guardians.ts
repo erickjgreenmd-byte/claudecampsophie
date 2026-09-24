@@ -15,6 +15,7 @@ import {
   type ConsentStatus,
 } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
+import { MOCK_ENVIRONMENTS } from '../config.ts';
 import type { Tx } from '../db.ts';
 import { ApiError, businessRule, isUniqueViolation, pgErrorCode } from '../errors.ts';
 import { assertRecentUnlock, requireParent } from '../middleware/auth.ts';
@@ -561,8 +562,9 @@ export function guardiansRoutes(): Hono<AppEnv> {
     const membership = await callerMembership(c);
     await readJson(c, consentStartRequestSchema);
     const provider = deps.providers.consent;
-    // Defense in depth: production readiness already blocks a mock, but never record one there.
-    if (provider.isMock && deps.config.environment === 'production') {
+    // Defense in depth: the Worker never wires a mock outside development/test (selectConsentProvider),
+    // but a mock consent record is never written there either.
+    if (provider.isMock && !MOCK_ENVIRONMENTS.has(deps.config.environment)) {
       throw new ApiError('NOT_CONFIGURED', 'Verifiable parental consent is not available yet');
     }
     const now = deps.clock();

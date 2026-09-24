@@ -36,6 +36,8 @@ function scan(...targets: string[]) {
   const result = spawnSync(process.execPath, [SCANNER, '--artifacts', ...targets], {
     cwd: ROOT,
     encoding: 'utf8',
+    // A scanner that stops terminating (a regex loop) fails here instead of stalling the suite.
+    timeout: 60_000,
   });
   return { status: result.status, output: `${result.stdout}${result.stderr}` };
 }
@@ -297,6 +299,99 @@ describe('artifact secret scan: encodings, compression and links (AC_SECURITY_04
     expect(result.status).toBe(1);
     expect(result.output).toContain('strings-le.txt (UTF-16):1:5: Stripe live secret');
     expect(result.output).toContain('strings-be.txt (UTF-16):1:5: Stripe live secret');
+  });
+});
+
+/**
+ * LRD-3: the project's own server secrets in the shapes it will actually hold passed the artifact
+ * scan: Stripe test-mode secret and restricted keys (docs/Connections.md: Stripe runs in test mode
+ * with STRIPE_SECRET_KEY), a database connection string with its password (DATABASE_URL is a
+ * documented server secret), and any detector's value inside a base64 data: URI (bundlers inline
+ * small assets and workers that way).
+ */
+describe('artifact secret scan: test-mode keys, database URLs and data URIs (LRD-3)', () => {
+  const password = ['Sup3r', 'S3cret', 'Passw0rd'].join('');
+  const LRD = {
+    stripeTest: ['sk', 'test', '51HfakeFAKEfake0000FAKEfake'].join('_'),
+    stripeRestrictedTest: ['rk', 'test', '51HfakeFAKEfake0000FAKEfake'].join('_'),
+    databaseUrl: `postgres://postgres:${password}@db.fakeprojectref00000a.supabase.co:5432/postgres`,
+    poolerUrl: `postgresql://postgres.fakeprojectref00000a:${password}@aws-0-us-east-1.pooler.supabase.com:6543/postgres`,
+  };
+  const base64 = (text: string) => Buffer.from(text).toString('base64');
+
+  it('finds each shape and names it, never printing the value', () => {
+    const dir = artifactDir({
+      'a.js': `const k="${LRD.stripeTest}";`,
+      'b.js': `const k="${LRD.stripeRestrictedTest}";`,
+      'c.js': `const db="${LRD.databaseUrl}";`,
+      'd.js': `const db='${LRD.poolerUrl}';`,
+      'e.js': `new Worker("data:text/javascript;base64,${base64(`const k="${FAKE.serviceRole}";`)}");`,
+      'f.css': `a{background:url(data:application/octet-stream;charset=utf-8;base64,${base64(`x=${FAKE.stripeLive}`)})}`,
+      'g.js': `const w="data:text/javascript;base64,${base64(`const db="${LRD.databaseUrl}";`)}";`,
+      // A worker that inlines an asset: a data URI inside a data URI (this looped the scanner once).
+      'h.js': `const w="data:text/javascript;base64,${base64(`const i="data:text/plain;base64,${base64(`k=${LRD.stripeTest}`)}";`)}";`,
+    });
+    const result = scan(dir);
+    expect(result.status).toBe(1);
+    for (const finding of [
+      'a.js:1:10: Stripe test secret',
+      'b.js:1:10: Stripe restricted key',
+      'c.js:1:11: database URL with password',
+      'd.js:1:11: database URL with password',
+      'e.js:1:13: service-role JWT in base64 data URI',
+      'f.css:1:18: Stripe live secret in base64 data URI',
+      'g.js:1:10: database URL with password in base64 data URI',
+      'h.js:1:10: Stripe test secret in base64 data URI',
+    ]) {
+      expect(result.output).toContain(finding);
+    }
+    for (const value of [...Object.values(LRD), password, FAKE.serviceRole, FAKE.stripeLive]) {
+      expect(result.output).not.toContain(value);
+    }
+  });
+
+  it('leaves local and placeholder database URLs, clean data URIs and inline source map positions alone', () => {
+    const map = {
+      version: 3,
+      sources: ['../src/clean.ts'],
+      sourcesContent: ['export const ok = 1;\n'],
+      names: [],
+      // VLQ position data can look like a key; it is never a secret (as for .map files).
+      mappings: `;;${FAKE.aws};AAAA`,
+    };
+    const dir = artifactDir({
+      'local.js': [
+        'const a="postgres://postgres:postgres@127.0.0.1:5432/postgres";',
+        'const b="postgresql://postgres:postgres@localhost:54322/postgres";',
+        'const c="postgres://app@db.internal.pencillift.net:5432/app";',
+        'const d="postgres://postgres:[YOUR-PASSWORD]@db.fakeprojectref00000a.supabase.co:5432/postgres";',
+        'const e="postgres://postgres:${DB_PASSWORD}@db.fakeprojectref00000a.supabase.co/postgres";',
+        'const f="postgres://postgres:<password>@db.fakeprojectref00000a.supabase.co/postgres";',
+        `const g="postgres://postgres:${password}@db.example.com/postgres";`,
+      ].join('\n'),
+      'img.css': `a{background:url(data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0, 0, 13]).toString('base64')})}`,
+      'inline-map.js': `export{};\n//# sourceMappingURL=data:application/json;base64,${base64(JSON.stringify(map))}`,
+    });
+    const result = scan(dir);
+    expect(result).toMatchObject({ status: 0 });
+  });
+
+  it('the tracked-file scan finds them too', () => {
+    const dir = artifactDir({
+      'config.ts': `export const stripe = "${LRD.stripeTest}";\nexport const db = "${LRD.databaseUrl}";\n`,
+      'local.ts': 'export const db = "postgres://postgres:postgres@127.0.0.1:5432/postgres";\n',
+    });
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('init', '-q');
+    git('add', '.');
+    for (const args of [[], ['--staged']]) {
+      const r = spawnSync(process.execPath, [SCANNER, ...args], { cwd: dir, encoding: 'utf8' });
+      const output = `${r.stdout}${r.stderr}`;
+      expect({ args, status: r.status }).toEqual({ args, status: 1 });
+      expect(output).toContain('config.ts:1: Stripe test secret');
+      expect(output).toContain('config.ts:2: database URL with password');
+      expect(output).not.toContain('local.ts');
+    }
   });
 });
 

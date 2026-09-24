@@ -1,25 +1,41 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createMockResponsesClient } from '@pencillift/ai';
 import { createTestDb, type TestDb } from '@pencillift/db/testing';
-import { grantAdultUnlock, seedFamily, seedOwnerAdmin } from '@pencillift/db/testing/fixtures';
+import {
+  grantAdultUnlock,
+  seedChild,
+  seedFamily,
+  seedOwnerAdmin,
+} from '@pencillift/db/testing/fixtures';
+import { cryptoRandom } from '@pencillift/domain';
+import { generateSkillItems, seededRandom } from '@pencillift/domain/bank';
 import { createApp } from '../src/app.ts';
+import { createParentVerifier } from '../src/auth/parent.ts';
 import {
   CONSENT_ADAPTERS,
+  acceptsTestProviderConsent,
   loadConfig,
   productionReadiness,
   type ApiConfig,
 } from '../src/config.ts';
-import {
+import worker, {
   CONSENT_ADAPTER_FACTORIES,
   buildRuntime,
   selectBillingProviders,
   selectConsentProvider,
+  selectStorageAndEmail,
   type WorkerEnv,
 } from '../src/index.ts';
-import { reconcileStaleEntitlements } from '../src/jobs/dispatcher.ts';
+import { reconcileStaleEntitlements, type JobDeps } from '../src/jobs/dispatcher.ts';
+import { loadChildContext, personalizeItems } from '../src/jobs/learning-jobs.ts';
+import { createDbRateLimiter } from '../src/middleware/rate-limit.ts';
 import type { ConsentProvider } from '../src/providers/index.ts';
 import { hmacSha256, toHex } from '../src/security/crypto.ts';
-import { TEST_ENV, parentToken } from './helpers.ts';
+import { TEST_ENV, createTestApi, parentToken, type TestApi } from './helpers.ts';
 
 /**
  * Worker runtime wiring (AC_DEPLOY_07): the consent provider the Worker serves with follows the
@@ -575,5 +591,496 @@ describe("the Worker's own database client serves the billing and revenue routes
     // One ad-free family: the bound array has an element and its adults leave the cohort.
     expect(await summary()).toBe(before - adults!.n);
     expect(await report()).toBe(before - adults!.n);
+  });
+});
+
+/**
+ * LRD-4: a storage configuration the adapter refuses (SUPABASE_URL that is not an https URL, a
+ * service key too short to be one) threw out of buildRuntime. The Worker's fetch then rejected
+ * (an unstructured platform 500) and scheduled() threw without its log line. Configuration errors
+ * fail closed with the structured NOT_CONFIGURED instead, and name the setting.
+ */
+describe('a malformed configuration is NOT_CONFIGURED, never an exception (LRD-4, LRD-5)', () => {
+  const MALFORMED_STORAGE: [string, Record<string, string>, string][] = [
+    [
+      'SUPABASE_URL is not a URL',
+      { SUPABASE_URL: 'not a url', SUPABASE_SERVICE_ROLE_KEY: 'service-role-test-value' },
+      'SUPABASE_URL',
+    ],
+    [
+      'SUPABASE_URL is plain http to a remote host',
+      {
+        SUPABASE_URL: 'http://example.supabase.co',
+        SUPABASE_SERVICE_ROLE_KEY: 'service-role-test-value',
+      },
+      'SUPABASE_URL',
+    ],
+    [
+      'SUPABASE_SERVICE_ROLE_KEY is too short to be a key',
+      { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'short' },
+      'SUPABASE_SERVICE_ROLE_KEY',
+    ],
+  ];
+
+  it('buildRuntime answers NOT_CONFIGURED and loadConfig names the setting', () => {
+    for (const APP_ENV of ['staging', 'test']) {
+      for (const [label, vars, name] of MALFORMED_STORAGE) {
+        let outcome: unknown;
+        try {
+          outcome = build({ APP_ENV, ...vars });
+        } catch (error) {
+          outcome = `threw ${error instanceof Error ? error.message : String(error)}`;
+        }
+        expect({ APP_ENV, label, outcome }).toEqual({
+          APP_ENV,
+          label,
+          outcome: { ok: false, code: 'NOT_CONFIGURED', message: 'Service is not configured' },
+        });
+        const loaded = loadConfig({ ...TEST_ENV, APP_ENV, ...vars });
+        expect({ label, names: loaded.ok ? [] : loaded.errors.map((e) => e.name) }).toEqual({
+          label,
+          names: [name],
+        });
+      }
+    }
+  });
+
+  it('local development may still use plain http to its own machine', () => {
+    const built = build({
+      APP_ENV: 'development',
+      SUPABASE_URL: 'http://127.0.0.1:54321',
+      SUPABASE_SERVICE_ROLE_KEY: 'service-role-test-value',
+    });
+    if (!built.ok) throw new Error(`development should build: ${built.code}`);
+    expect(built.runtime.deps.providers.storage.isMock).toBe(false);
+  });
+
+  it("the Worker's fetch answers a structured 503 and scheduled() logs scheduled_not_configured", async () => {
+    const workerEnv = env({ APP_ENV: 'staging', ...MALFORMED_STORAGE[0]![1] });
+    const ctx = { waitUntil: () => undefined };
+    let res: Response | string;
+    try {
+      res = await worker.fetch(
+        new Request('https://api.pencillift.test/v1/health'),
+        workerEnv,
+        ctx,
+      );
+    } catch (error) {
+      res = `threw ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (typeof res === 'string') throw new Error(`fetch should answer, it ${res}`);
+    expect({ status: res.status, body: (await res.json()) as unknown }).toEqual({
+      status: 503,
+      body: {
+        error: {
+          code: 'NOT_CONFIGURED',
+          message: 'Service is not configured',
+          requestId: 'config',
+        },
+      },
+    });
+
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await worker.scheduled({}, workerEnv, ctx);
+      expect(log.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        expect.stringContaining('scheduled_not_configured'),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  /**
+   * LRD-5: loadConfig defaulted a missing APP_ENV to development, so a deployed Worker whose vars
+   * lost APP_ENV wired every labeled mock, including the consent mock that verifies anything.
+   */
+  it('the Worker refuses to build without an explicit APP_ENV', () => {
+    const { APP_ENV: _omitted, ...withoutAppEnv } = TEST_ENV;
+    for (const vars of [withoutAppEnv, { ...withoutAppEnv, APP_ENV: '' }]) {
+      const result = buildRuntime({ HYPERDRIVE, ...vars });
+      if (result.ok) opened.push(result.runtime.sql);
+      expect(result).toEqual({
+        ok: false,
+        code: 'NOT_CONFIGURED',
+        message: 'Service is not configured',
+      });
+      const loaded = loadConfig(vars);
+      expect(loaded.ok ? [] : loaded.errors.map((e) => e.name)).toEqual(['APP_ENV']);
+    }
+  });
+
+  /**
+   * LRD-5 follow-up: wrangler.toml's top-level [vars] set APP_ENV = "development", so
+   * `wrangler deploy` without --env shipped a development Worker with every labeled mock. APP_ENV
+   * now lives only in the [env.<name>.vars] tables and, for `wrangler dev`, in the gitignored
+   * apps/api/.dev.vars (committed template: .dev.vars.example), which a deploy never uploads.
+   */
+  it('a deploy without --env carries no APP_ENV and serves NOT_CONFIGURED', () => {
+    const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+    const { tables, appEnvIn } = wranglerVars(toml);
+    expect(appEnvIn).toEqual(['env.staging.vars', 'env.production.vars']);
+    const { APP_ENV: _omitted, ...secrets } = TEST_ENV;
+    const bare = buildRuntime({ HYPERDRIVE, ...secrets, ...tables['vars'] });
+    if (bare.ok) opened.push(bare.runtime.sql);
+    expect(bare).toEqual({
+      ok: false,
+      code: 'NOT_CONFIGURED',
+      message: 'Service is not configured',
+    });
+    for (const name of ['staging', 'production']) {
+      const loaded = loadConfig({ ...secrets, ...tables[`env.${name}.vars`] });
+      expect(loaded.ok ? loaded.config.environment : loaded.errors).toBe(name);
+    }
+    const example = readFileSync(new URL('../.dev.vars.example', import.meta.url), 'utf8');
+    expect(example).toMatch(/^APP_ENV=development$/m);
+    const ignored = readFileSync(new URL('../../../.gitignore', import.meta.url), 'utf8');
+    expect(ignored.split('\n').map((l) => l.trim())).toContain('.dev.vars');
+  });
+
+  /*
+   * LRD-4 has three fail-closed layers. Each is tested on its own, so removing one fails a test even
+   * while the others still produce the 503: (1) loadConfig names the setting (above); (2)
+   * selectStorageAndEmail answers NOT_CONFIGURED when the adapter refuses a value loadConfig let
+   * through; (3) buildRuntime answers NOT_CONFIGURED for any other construction error and logs only
+   * the error class.
+   */
+  it('layer 2: storage selection answers NOT_CONFIGURED when the adapter refuses a value', () => {
+    const accepted = config({ APP_ENV: 'staging', ...REAL_STORAGE });
+    expect(accepted.providers.storage).toBe('supabase');
+    const refused = [
+      { ...REAL_STORAGE, SUPABASE_URL: 'not a url' },
+      { ...REAL_STORAGE, SUPABASE_SERVICE_ROLE_KEY: 'short' },
+    ];
+    for (const vars of refused) {
+      let outcome: unknown;
+      try {
+        outcome = selectStorageAndEmail(accepted, { HYPERDRIVE, ...vars });
+      } catch (error) {
+        outcome = `threw ${error instanceof Error ? error.message : String(error)}`;
+      }
+      expect(outcome).toEqual({
+        ok: false,
+        code: 'NOT_CONFIGURED',
+        message: 'Service is not configured',
+      });
+    }
+    // The control: the values loadConfig accepted build the real adapter.
+    expect(selectStorageAndEmail(accepted, { HYPERDRIVE, ...REAL_STORAGE })).toMatchObject({
+      ok: true,
+      storage: { isMock: false },
+    });
+  });
+
+  it('layer 3: buildRuntime answers NOT_CONFIGURED for any other construction error and logs only its class', () => {
+    const value = 'lrd4-configured-value-never-logged';
+    const bindings: unknown[] = [
+      undefined,
+      {
+        get connectionString(): string {
+          throw new TypeError(`bad binding ${value}`);
+        },
+      },
+    ];
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      for (const binding of bindings) {
+        log.mockClear();
+        let outcome: unknown;
+        try {
+          outcome = buildRuntime({ ...TEST_ENV, HYPERDRIVE: binding } as unknown as WorkerEnv);
+        } catch (error) {
+          outcome = `threw ${error instanceof Error ? error.message : String(error)}`;
+        }
+        expect(outcome).toEqual({
+          ok: false,
+          code: 'NOT_CONFIGURED',
+          message: 'Service is not configured',
+        });
+        expect(log.mock.calls.map((c) => String(c[0]))).toEqual([
+          JSON.stringify({ level: 'error', event: 'runtime_not_configured', error: 'TypeError' }),
+        ]);
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
+/**
+ * The string vars of each wrangler.toml vars table ('vars' is the top level, 'env.<name>.vars' a
+ * named environment), and every table in which a non-comment line mentions APP_ENV.
+ */
+function wranglerVars(toml: string): {
+  tables: Record<string, Record<string, string>>;
+  appEnvIn: string[];
+} {
+  const tables: Record<string, Record<string, string>> = {};
+  const appEnvIn: string[] = [];
+  let table = '<top level>';
+  for (const raw of toml.split('\n')) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    const header = /^\[{1,2}([^\]]+)\]{1,2}$/.exec(line);
+    if (header) {
+      table = header[1]!.trim();
+      continue;
+    }
+    if (line.includes('APP_ENV')) appEnvIn.push(table);
+    const pair = /^([A-Z][A-Z0-9_]*)\s*=\s*"([^"]*)"$/.exec(line);
+    if (pair && (table === 'vars' || /^env\.[a-z]+\.vars$/.test(table))) {
+      (tables[table] ??= {})[pair[1]!] = pair[2]!;
+    }
+  }
+  return { tables, appEnvIn };
+}
+
+/**
+ * LRD-1: BUG-067 stopped a staging Worker from wiring the development consent mock, but the capture
+ * gate still accepted a consent record the mock wrote (is_test_provider) everywhere except
+ * production. Such a record in a staging database (written before BUG-067, by a development Worker
+ * pointed at it, or by a seed) unlocked homework capture. Only development and test accept it.
+ */
+describe('staging never treats a development-mock consent record as verified consent (LRD-1)', () => {
+  let api: TestApi;
+  beforeAll(async () => {
+    api = await createTestApi();
+  });
+  afterAll(async () => {
+    await api?.close();
+  });
+
+  it('only development and test accept a test-provider consent record', () => {
+    const environments = ['development', 'test', 'staging', 'production'] as const;
+    expect(Object.fromEntries(environments.map((e) => [e, acceptsTestProviderConsent(e)]))).toEqual(
+      { development: true, test: true, staging: false, production: false },
+    );
+  });
+
+  /** The same database and providers, served by a Worker configured for `APP_ENV`. */
+  function appFor(APP_ENV: string) {
+    const cfg = config({ APP_ENV });
+    return createApp({
+      config: cfg,
+      db: api.apiDb,
+      clock: () => api.now.value,
+      random: cryptoRandom,
+      verifyParentToken: createParentVerifier(cfg),
+      rateLimiter: createDbRateLimiter(api.apiDb),
+      providers: api.providers,
+      log: (e) => api.logs.push(e),
+    });
+  }
+
+  it('create, resumed upload and finalize refuse it in staging and production', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const childId = fam.children[0]!.id;
+    // Exactly the row the labeled development consent mock writes.
+    await api.db.sql`
+      insert into public.consent_records
+        (family_id, adult_user_id, provider, provider_reference, method, purpose, policy_version, status,
+         is_test_provider, verified_at)
+      values (${fam.familyId}, ${fam.ownerId}, 'development_mock', ${`mock-consent-${fam.familyId}`},
+              'development_mock', 'child_data_processing', 'v1', 'verified', true, to_timestamp(0))`;
+    await api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${fam.familyId}, 1, 'app_store')`;
+    await api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id)
+      values (${fam.familyId}, ${childId})`;
+    const token = await parentToken(fam.ownerId);
+    const call = async (app: ReturnType<typeof createApp>, path: string, body: unknown) => {
+      const res = await app.request(path, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const text = await res.text();
+      const rule = (JSON.parse(text) as { error?: { rule?: string } }).error?.rule ?? null;
+      return { status: res.status, rule, json: () => JSON.parse(text) as Record<string, unknown> };
+    };
+    const createBody = () => ({ childId, pageCount: 1, idempotencyKey: randomUUID() });
+
+    // A test Worker accepts the record (the control), and registers one page.
+    const test = appFor('test');
+    const created = await call(test, '/v1/assignments', createBody());
+    expect({ status: created.status, rule: created.rule }).toEqual({ status: 201, rule: null });
+    const id = (created.json() as { assignment: { id: string } }).assignment.id;
+    const pages = [
+      {
+        pageNumber: 1,
+        mimeType: 'image/jpeg',
+        byteSize: 250_000,
+        sha256: createHash('sha256').update(`lrd-1-${id}`).digest('hex'),
+      },
+    ];
+    const uploaded = await call(test, `/v1/assignments/${id}/uploads`, { pages });
+    expect(uploaded.status).toBe(200);
+    const [page] = await api.db.sql<{ storage_path: string }[]>`
+      select storage_path from public.source_pages where assignment_id = ${id}`;
+    api.providers.storage.put(page!.storage_path, new Uint8Array(250_000));
+
+    for (const APP_ENV of ['staging', 'production']) {
+      const app = appFor(APP_ENV);
+      const outcomes = {
+        create: await call(app, '/v1/assignments', createBody()),
+        resume: await call(app, `/v1/assignments/${id}/uploads`, { pages }),
+        finalize: await call(app, `/v1/assignments/${id}/finalize`, {
+          idempotencyKey: randomUUID(),
+        }),
+      };
+      expect({
+        APP_ENV,
+        ...Object.fromEntries(
+          Object.entries(outcomes).map(([step, o]) => [step, [o.status, o.rule]]),
+        ),
+      }).toEqual({
+        APP_ENV,
+        create: [422, 'CONSENT_REQUIRED'],
+        resume: [422, 'CONSENT_REQUIRED'],
+        finalize: [422, 'CONSENT_REQUIRED'],
+      });
+    }
+    const [row] = await api.db.sql<{ status: string; jobs: number }[]>`
+      select a.status, (select count(*)::int from public.jobs j where j.idempotency_key like ${`scan:${id}:%`}) as jobs
+        from public.assignments a where a.id = ${id}`;
+    expect(row).toEqual({ status: 'uploading', jobs: 0 });
+  });
+
+  /** Exactly the row the labeled development consent mock writes. */
+  async function mockConsent(fam: { familyId: string; ownerId: string }) {
+    await api.db.sql`
+      insert into public.consent_records
+        (family_id, adult_user_id, provider, provider_reference, method, purpose, policy_version, status,
+         is_test_provider, verified_at)
+      values (${fam.familyId}, ${fam.ownerId}, 'development_mock', ${`mock-consent-${fam.familyId}`},
+              'development_mock', 'child_data_processing', 'v1', 'verified', true, to_timestamp(0))`;
+  }
+
+  it('child activation refuses it in staging and production (a test Worker accepts it)', async () => {
+    const fam = await seedFamily(api.db, { childCount: 0 });
+    await mockConsent(fam);
+    await api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${fam.familyId}, 1, 'app_store')`;
+    const riley = await seedChild(api.db, fam.familyId, 'Riley', 'draft');
+    const session = randomUUID();
+    await grantAdultUnlock(api.db, fam.ownerId, session, 3600);
+    const token = await parentToken(fam.ownerId, { sessionId: session });
+    const activate = async (APP_ENV: string) => {
+      const res = await appFor(APP_ENV).request(`/v1/children/${riley.id}/activate`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const body = (await res.json()) as { error?: { rule?: string } };
+      const [child] = await api.db.sql<{ status: string }[]>`
+        select status from public.child_profiles where id = ${riley.id}`;
+      return { status: res.status, rule: body.error?.rule ?? null, child: child!.status };
+    };
+    expect({
+      staging: await activate('staging'),
+      production: await activate('production'),
+    }).toEqual({
+      staging: { status: 422, rule: 'CONSENT_REQUIRED', child: 'draft' },
+      production: { status: 422, rule: 'CONSENT_REQUIRED', child: 'draft' },
+    });
+    // The control: the same record, family and slot activate the child in a test Worker.
+    expect(await activate('test')).toEqual({ status: 200, rule: null, child: 'active' });
+  });
+
+  it('AI re-theming in the learning jobs makes no AI call on it in staging', async () => {
+    // Staging spends only under an owner budget; this one leaves room for the control's call.
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', 1000000000, ${await seedOwnerAdmin(api.db)})`;
+    const wordProblems = generateSkillItems('math.word_problems', {
+      random: seededRandom('lrd-1'),
+      grade: 3,
+      category: 'standard',
+      count: 2,
+    });
+    const staging: JobDeps = {
+      db: api.apiDb,
+      config: config({ APP_ENV: 'staging' }),
+      clock: () => api.now.value,
+      random: cryptoRandom,
+      providers: api.providers,
+      log: (e) => api.logs.push(e),
+    };
+    const personalize = async (fam: { familyId: string; children: { id: string }[] }) => {
+      // LABELED MOCK client: it records the requests it would have sent and answers nothing useful.
+      const client = createMockResponsesClient(() => ({
+        kind: 'ok',
+        text: JSON.stringify({ intro: null, items: [] }),
+        usage: { inputTokens: 900, cachedInputTokens: 0, outputTokens: 20 },
+        modelId: 'gpt-6-astra',
+        latencyMs: 5,
+      }));
+      const ctx = await api.apiDb.asService((tx) =>
+        loadChildContext(tx, fam.familyId, fam.children[0]!.id),
+      );
+      const from = api.logs.length;
+      await personalizeItems(
+        staging,
+        { ai: client, sleep: () => Promise.resolve() },
+        ctx!,
+        wordProblems,
+        'daily_set',
+        [],
+      );
+      const skipped = api.logs
+        .slice(from)
+        .filter((e) => e.event === 'practice_ai_skipped')
+        .map((e) => e.code);
+      return { calls: client.requests.length, skipped };
+    };
+
+    const mockOnly = await seedFamily(api.db, { childCount: 1 });
+    await mockConsent(mockOnly);
+    expect(await personalize(mockOnly)).toEqual({ calls: 0, skipped: ['CONSENT_REQUIRED'] });
+
+    // The control: a record from a real provider passes the consent gate in staging.
+    const real = await seedFamily(api.db, { childCount: 1 });
+    await api.db.sql`
+      insert into public.consent_records
+        (family_id, adult_user_id, provider, method, purpose, policy_version, status, is_test_provider, verified_at)
+      values (${real.familyId}, ${real.ownerId}, 'acme-consent', 'acme', 'child_data_processing', 'v1',
+              'verified', false, now())`;
+    const control = await personalize(real);
+    expect(control.skipped).not.toContain('CONSENT_REQUIRED');
+    expect(control.calls).toBeGreaterThan(0);
+  });
+
+  it('every consent gate in the API decides test-provider records with acceptsTestProviderConsent', () => {
+    const srcDir = fileURLToPath(new URL('../src/', import.meta.url));
+    const files = readdirSync(srcDir, { recursive: true, encoding: 'utf8' }).filter(
+      (f) => f.endsWith('.ts') && !f.endsWith('services/consent.ts'),
+    );
+    const gates: Record<string, string[]> = {};
+    for (const file of files) {
+      const source = readFileSync(`${srcDir}${file}`, 'utf8');
+      if (!source.includes('hasVerifiedConsent(')) continue;
+      gates[file] = [...source.matchAll(/allowTestProvider\s*[:=]\s*([^,;\n]+)/g)].map((m) =>
+        m[1]!.trim(),
+      );
+    }
+    // The four child-data gates at the time of writing; a new one joins the check automatically.
+    expect(Object.keys(gates)).toEqual(
+      expect.arrayContaining([
+        'routes/family.ts',
+        'routes/homework.ts',
+        'jobs/scan-process.ts',
+        'jobs/learning-jobs.ts',
+      ]),
+    );
+    const offending = Object.fromEntries(
+      Object.entries(gates).map(([file, values]) => [
+        file,
+        values.length === 0
+          ? ['<no allowTestProvider>']
+          : values.filter((v) => !v.startsWith('acceptsTestProviderConsent(')),
+      ]),
+    );
+    expect(offending).toEqual(Object.fromEntries(Object.keys(gates).map((f) => [f, []])));
   });
 });

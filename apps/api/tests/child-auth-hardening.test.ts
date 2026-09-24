@@ -1,4 +1,6 @@
+import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { DEFAULT_DATABASE_URL } from '@pencillift/db/testing';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { cryptoRandom } from '@pencillift/domain';
 import { createApp, MAX_JSON_BYTES } from '../src/app.ts';
@@ -264,6 +266,47 @@ describe('pairing codes (RV-lead-identity-access-7, review note e)', () => {
     const paired: number[] = [];
     for (const { code } of codes) paired.push((await pair(code, '203.0.113.41')).status);
     expect(paired.sort()).toEqual([201, 404, 404]);
+  });
+
+  it('a "new code" request takes the child row before any code row, so overlapping requests never deadlock (BUG-106)', async () => {
+    const { childId, token } = await familyWithActiveChild();
+    expect((await newCode(token, childId)).status).toBe(201); // one live code exists
+    const url = new URL(process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL);
+    url.pathname = `/${api.db.name}`;
+    const other = postgres(url.toString(), { max: 1, onnotice: () => undefined });
+    let request: Promise<Response> | undefined;
+    try {
+      // A concurrent "new code" insert paused inside its trigger: it holds the child row and next
+      // retires the live code. The request must wait for the child row without holding that code.
+      const outcome = await other
+        .begin(async (tx) => {
+          await tx`select 1 from public.child_profiles where id = ${childId} for no key update`;
+          request = newCode(token, childId);
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline) {
+            const [row] = await tx<{ n: number }[]>`
+              select count(*)::int as n from pg_stat_activity
+               where datname = current_database() and pid <> pg_backend_pid()
+                 and wait_event_type = 'Lock'`;
+            if (row!.n >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          await tx`
+            update private.child_pairing_codes set consumed_at = ${api.now.value}
+             where child_id = ${childId} and consumed_at is null`;
+          return 'retired';
+        })
+        .catch((error: unknown) => (error as { code?: string }).code ?? 'error');
+      expect(outcome).toBe('retired');
+      expect((await request!).status).toBe(201);
+    } finally {
+      await request?.catch(() => undefined);
+      await other.end();
+    }
+    const [live] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from private.child_pairing_codes
+       where child_id = ${childId} and consumed_at is null`;
+    expect(live!.n).toBe(1);
   });
 
   it('archiving ends unredeemed codes even when the child is never re-activated', async () => {

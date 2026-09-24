@@ -11,6 +11,11 @@
 -- client cannot set a pencillift.* setting through the Data API. A school viewer's call must use
 -- exactly that zone, so a direct client call is refused. The owner (exact figures) may pass any
 -- zone. Same signature, grants, authorization and suppression as 0730.
+--
+-- Today the only caller that states the zone is the owner-only GET /v1/admin/schools/:id/report;
+-- no API route serves school viewers yet, so they cannot read these counts at all (LRD-6). A
+-- school-facing report route must state the zone the same way; supabase/tests/school_report.test.ts
+-- states it itself to stand in for that route.
 
 -- The zone the API stated for this transaction, or null when none was stated.
 create or replace function app.program_calendar_zone() returns text

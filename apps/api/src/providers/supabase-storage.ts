@@ -55,13 +55,32 @@ export class StorageRequestError extends Error {
   }
 }
 
-function assertBaseUrl(raw: string): string {
-  const url = new URL(raw);
+/** Service-role and secret keys are far longer; anything shorter is a placeholder or a typo. */
+export const MIN_STORAGE_SERVICE_KEY_LENGTH = 20;
+
+/**
+ * Why `raw` cannot be the project URL, or null when it can: https, or plain http only to this
+ * machine (local development). config.ts reports the same problem as a configuration error, so a
+ * Worker never reaches the adapter with a value it would refuse (LRD-4).
+ */
+export function storageUrlProblem(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return 'must be an https URL';
+  }
   const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
   if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) {
-    throw new Error('Supabase Storage URL must use https');
+    return 'must be an https URL';
   }
-  return `${url.origin}/storage/v1`;
+  return null;
+}
+
+function assertBaseUrl(raw: string): string {
+  const problem = storageUrlProblem(raw);
+  if (problem) throw new Error(`Supabase Storage URL ${problem}`);
+  return `${new URL(raw).origin}/storage/v1`;
 }
 
 /** Encodes an object path segment by segment and refuses traversal or empty segments. */
@@ -79,7 +98,9 @@ export function encodeObjectPath(path: string): string {
 
 export function createSupabaseStorage(options: SupabaseStorageOptions): StorageProvider {
   const base = assertBaseUrl(options.supabaseUrl);
-  if (options.serviceRoleKey.length < 20) throw new Error('Supabase service key is missing');
+  if (options.serviceRoleKey.length < MIN_STORAGE_SERVICE_KEY_LENGTH) {
+    throw new Error('Supabase service key is missing');
+  }
   const bucket = encodeURIComponent(options.bucket ?? 'homework');
   const fetchImpl = options.fetchImpl ?? fetch;
   const clock = options.clock ?? (() => new Date());

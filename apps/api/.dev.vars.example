@@ -1,0 +1,6 @@
+# Local `wrangler dev` only (LRD-5). Copy to apps/api/.dev.vars, which is gitignored and never
+# uploaded by `wrangler deploy`. APP_ENV is deliberately absent from the top-level [vars] in
+# wrangler.toml, so a deploy without --env answers 503 NOT_CONFIGURED instead of running as
+# development with the labeled mocks. Never put real secrets or child data here; see
+# docs/Deployment_Runbook.md section 2 for the names the Worker reads.
+APP_ENV=development

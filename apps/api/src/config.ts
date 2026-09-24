@@ -2,6 +2,7 @@ import { validateZdrEvidence } from '@pencillift/ai';
 import { isValidIanaZone } from '@pencillift/domain';
 import { SAFETY_TEMPLATES_APPROVED, SAFETY_TEMPLATES_STATUS } from '@pencillift/domain/safety';
 import type { Db } from './db.ts';
+import { MIN_STORAGE_SERVICE_KEY_LENGTH, storageUrlProblem } from './providers/supabase-storage.ts';
 
 /**
  * Runtime configuration. Only names appear in source; values come from Worker secrets/vars.
@@ -127,9 +128,16 @@ export function loadConfig(
   env: Record<string, string | undefined>,
 ): { ok: true; config: ApiConfig } | { ok: false; errors: ConfigError[] } {
   const errors: ConfigError[] = [];
-  const environment = (env.APP_ENV ?? 'development') as Environment;
+  // Never defaulted (LRD-5): a Worker whose vars lost APP_ENV used to run as development, with the
+  // consent mock that verifies anything, the billing mocks, memory storage and the email outbox.
+  const environment = (env.APP_ENV ?? '') as Environment;
   if (!['development', 'test', 'staging', 'production'].includes(environment)) {
-    errors.push({ name: 'APP_ENV', problem: 'must be development, test, staging or production' });
+    errors.push({
+      name: 'APP_ENV',
+      problem: env.APP_ENV
+        ? 'must be development, test, staging or production'
+        : 'required: development, test, staging or production',
+    });
   }
   const jwksUrl = env.SUPABASE_JWKS_URL ?? null;
   const jwtSecret = env.SUPABASE_JWT_SECRET ? encoder.encode(env.SUPABASE_JWT_SECRET) : null;
@@ -145,6 +153,22 @@ export function loadConfig(
   const programTimezone = env.PROGRAM_TIMEZONE ?? 'UTC';
   if (!isValidIanaZone(programTimezone)) {
     errors.push({ name: 'PROGRAM_TIMEZONE', problem: 'must be a valid IANA zone' });
+  }
+
+  // A storage value the adapter would refuse is a configuration error here (LRD-4), so the Worker
+  // answers NOT_CONFIGURED instead of throwing while it builds the adapter.
+  if (env.SUPABASE_URL) {
+    const problem = storageUrlProblem(env.SUPABASE_URL);
+    if (problem) errors.push({ name: 'SUPABASE_URL', problem });
+  }
+  if (
+    env.SUPABASE_SERVICE_ROLE_KEY &&
+    env.SUPABASE_SERVICE_ROLE_KEY.length < MIN_STORAGE_SERVICE_KEY_LENGTH
+  ) {
+    errors.push({
+      name: 'SUPABASE_SERVICE_ROLE_KEY',
+      problem: `must be the project's service key (at least ${MIN_STORAGE_SERVICE_KEY_LENGTH} characters)`,
+    });
   }
 
   const zdrEvidence =
@@ -205,6 +229,16 @@ export const MOCK_ENVIRONMENTS: ReadonlySet<Environment> = new Set<Environment>(
   'development',
   'test',
 ]);
+
+/**
+ * Whether a consent record written by a test provider (the labeled development mock,
+ * is_test_provider) counts as verified consent: only where that mock may be wired (LRD-1). Staging
+ * never wires it (BUG-067), so a record it wrote in a staging database is never consent there.
+ * Every child-data gate passes this to services/consent.ts hasVerifiedConsent.
+ */
+export function acceptsTestProviderConsent(environment: Environment): boolean {
+  return MOCK_ENVIRONMENTS.has(environment);
+}
 
 /** Without credentials: the labeled mock in development/test, no provider anywhere else. */
 function mockOrUnavailable(environment: Environment): 'development_mock' | 'unavailable' {

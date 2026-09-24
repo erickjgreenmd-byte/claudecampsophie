@@ -213,30 +213,62 @@ function createUnavailableEmail(): EmailProvider {
   };
 }
 
-/** Explicit storage and email selection: labeled mocks only in development and test. */
+/**
+ * Explicit storage and email selection: labeled mocks only in development and test. A value the
+ * adapter refuses is NOT_CONFIGURED, never an exception out of buildRuntime (LRD-4); loadConfig
+ * reports the same values first.
+ */
 export function selectStorageAndEmail(
   config: ApiConfig,
   env: WorkerEnv,
-): { storage: StorageProvider; email: EmailProvider } {
+): { ok: true; storage: StorageProvider; email: EmailProvider } | RuntimeFailure {
   const mocksAllowed = MOCK_ENVIRONMENTS.has(config.environment);
-  const storage =
+  let storage: StorageProvider;
+  if (
     config.providers.storage === 'supabase' &&
     typeof env.SUPABASE_URL === 'string' &&
     typeof env.SUPABASE_SERVICE_ROLE_KEY === 'string'
-      ? createSupabaseStorage({
-          supabaseUrl: env.SUPABASE_URL,
-          serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
-        })
-      : mocksAllowed
-        ? createMemoryStorageMock()
-        : createUnavailableStorage();
+  ) {
+    try {
+      storage = createSupabaseStorage({
+        supabaseUrl: env.SUPABASE_URL,
+        serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+      });
+    } catch {
+      return NOT_CONFIGURED;
+    }
+  } else {
+    storage = mocksAllowed ? createMemoryStorageMock() : createUnavailableStorage();
+  }
   // No transactional email adapter exists yet (docs/Connections.md, Owner action #14).
   const email = mocksAllowed ? createOutboxEmailMock() : createUnavailableEmail();
-  return { storage, email };
+  return { ok: true, storage, email };
 }
 
-/** Builds the per-invocation dependencies shared by HTTP requests and Cron Triggers. */
+/**
+ * Builds the per-invocation dependencies shared by HTTP requests and Cron Triggers. A provider
+ * constructor that refuses a configured value answers NOT_CONFIGURED like any other configuration
+ * error (LRD-4): fetch() then serves the structured 503 and scheduled() logs
+ * scheduled_not_configured, instead of an unstructured platform error.
+ */
 export function buildRuntime(env: WorkerEnv): RuntimeResult {
+  try {
+    return buildRuntimeOrThrow(env);
+  } catch (error) {
+    // The error class only: a message can quote the configured value.
+    console.log(
+      JSON.stringify({
+        level: 'error',
+        event: 'runtime_not_configured',
+        error: error instanceof Error ? error.name : typeof error,
+      }),
+    );
+    return NOT_CONFIGURED;
+  }
+}
+
+function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
+  // APP_ENV is never defaulted (LRD-5): without it loadConfig fails and nothing is served.
   const loaded = loadConfig(stringEnv(env));
   if (!loaded.ok) return NOT_CONFIGURED;
   const config = loaded.config;
@@ -251,7 +283,10 @@ export function buildRuntime(env: WorkerEnv): RuntimeResult {
   if (!consent.ok) return consent;
   const billing = selectBillingProviders(config, env);
   if (!billing.ok) return billing;
-  // One client configuration for the Worker and the tests (BUG-063: array parameters need types).
+  const storageAndEmail = selectStorageAndEmail(config, env);
+  if (!storageAndEmail.ok) return storageAndEmail;
+  // Last, so a refused configuration never opens a client. One client configuration for the
+  // Worker and the tests (BUG-063: array parameters need types).
   const sql = createPostgresClient(env.HYPERDRIVE.connectionString);
   const db = createDb(sql);
   const deps: AppDeps = {
@@ -263,7 +298,8 @@ export function buildRuntime(env: WorkerEnv): RuntimeResult {
     rateLimiter: createDbRateLimiter(db),
     providers: {
       consent: consent.provider,
-      ...selectStorageAndEmail(config, env),
+      storage: storageAndEmail.storage,
+      email: storageAndEmail.email,
       subscriptions: billing.subscriptions,
       stripe: billing.stripe,
     },
