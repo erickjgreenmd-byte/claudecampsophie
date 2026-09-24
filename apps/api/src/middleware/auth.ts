@@ -1,5 +1,6 @@
 import type { Context, MiddlewareHandler } from 'hono';
 import { verifyChildAccessToken } from '../auth/child.ts';
+import { withLiveSessionCheck } from '../auth/parent.ts';
 import { ApiError } from '../errors.ts';
 import type { AppEnv } from './context.ts';
 
@@ -10,13 +11,20 @@ function bearer(c: Context<AppEnv>): string | null {
   return token.length > 0 && token.length < 8192 ? token : null;
 }
 
-/** Requires a verified parent (Supabase) token. Child tokens are rejected here. */
+/**
+ * Requires a verified parent (Supabase) token whose auth session is still signed in. Child tokens
+ * are rejected here. A signed-out session (Supabase deletes its auth.sessions row) stops working at
+ * once instead of when the access token expires (spec P3: logout invalidates access). createApp
+ * already installs the session-checked verifier; wrapping again is a no-op and keeps this
+ * middleware safe with deps built elsewhere.
+ */
 export const requireParent: MiddlewareHandler<AppEnv> = async (c, next) => {
   const token = bearer(c);
   if (!token) throw new ApiError('UNAUTHENTICATED', 'Sign in to continue');
-  const principal = await c.var.deps.verifyParentToken(token);
+  const { deps } = c.var;
+  const principal = await withLiveSessionCheck(deps.verifyParentToken, deps.db)(token);
   c.set('parent', principal);
-  await markParentSeen(c.var.deps, principal.userId);
+  await markParentSeen(deps, principal.userId);
   await next();
 };
 
@@ -86,15 +94,25 @@ export async function assertOwnerAdmin(c: Context<AppEnv>): Promise<void> {
   if (!row?.ok) throw new ApiError('FORBIDDEN', 'Owner administration requires an MFA session');
 }
 
-/** Returns the caller's active family id or throws NOT_FOUND. */
+/**
+ * Returns the caller's active family id or throws NOT_FOUND. An adult has at most one active
+ * membership (unique index, migration 0720); if that ever fails to hold the request is refused
+ * rather than acting on an arbitrary family.
+ */
 export async function currentFamilyId(c: Context<AppEnv>): Promise<string> {
   const rows = await c.var.deps.db.asParent(
     c.var.parent,
     (tx) => tx<{ family_id: string }[]>`
       select family_id from public.family_memberships
        where user_id = ${c.var.parent.userId} and status = 'active'
+       order by accepted_at, id
+       limit 2
     `,
   );
+  if (rows.length > 1) {
+    c.var.deps.log({ level: 'error', event: 'multiple_active_families' });
+    throw new ApiError('CONFLICT', 'Your account is linked to more than one family');
+  }
   const familyId = rows[0]?.family_id;
   if (!familyId) throw new ApiError('NOT_FOUND', 'Create your family first');
   return familyId;

@@ -49,3 +49,37 @@ export function isUniqueViolation(error: unknown, constraint?: string): boolean 
     (constraint === undefined || pgConstraint(error) === constraint)
   );
 }
+
+/**
+ * Database invariants whose violation is an expected, explainable outcome on any route (the schema
+ * is the guarantee; route code may not have checked first, e.g. under a race). Keyed by the
+ * constraint/index name so an unrelated violation never gets a misleading message.
+ */
+const KNOWN_CONSTRAINTS: Readonly<Record<string, () => ApiError>> = {
+  // 0720: one active family per adult (create_family, invitation acceptance, retries).
+  family_memberships_one_active_family_per_user: () =>
+    new ApiError('CONFLICT', 'You already have a family'),
+  // 0720: families.timezone must be an IANA zone on every write path.
+  families_timezone_iana: () => new ApiError('VALIDATION_FAILED', 'Invalid time zone'),
+  // 0720: a pairing code is only issued for an active child (checked again under the row lock).
+  child_pairing_codes_child_active: () =>
+    businessRule('CHILD_NOT_ACTIVE', 'Assign a paid slot to this child before pairing a device'),
+};
+
+/** Maps a violation of a known schema invariant to its API error; undefined for anything else. */
+export function knownConstraintError(error: unknown): ApiError | undefined {
+  const code = pgErrorCode(error);
+  if (code !== '23505' && code !== '23514') return undefined;
+  const constraint = pgConstraint(error);
+  const make = constraint === undefined ? undefined : KNOWN_CONSTRAINTS[constraint];
+  return make?.();
+}
+
+/**
+ * Lock contention the database resolved by aborting this transaction (deadlock, serialization
+ * failure, lock timeout). Nothing was written; the same request can simply be retried.
+ */
+export function isTransientDbError(error: unknown): boolean {
+  const code = pgErrorCode(error);
+  return code === '40P01' || code === '40001' || code === '55P03';
+}

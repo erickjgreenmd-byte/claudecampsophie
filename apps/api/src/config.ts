@@ -1,4 +1,6 @@
+import { validateZdrEvidence } from '@pencillift/ai';
 import { isValidIanaZone } from '@pencillift/domain';
+import type { Db } from './db.ts';
 
 /**
  * Runtime configuration. Only names appear in source; values come from Worker secrets/vars.
@@ -187,8 +189,40 @@ export interface ReadinessItem {
   readonly detail: string;
 }
 
+/** Facts the readiness report needs beyond configuration. */
+export interface ReadinessFacts {
+  /** The instant being reported on (the ZDR verification date may not be after it). */
+  readonly now: Date;
+  /**
+   * Whether the owner has set the global AI spend cap for `now`'s UTC month (spec F4: the cap is
+   * never invented). Unknown (not looked up) reads as blocked.
+   */
+  readonly spendBudgetForCurrentMonth?: boolean;
+}
+
+/** UTC calendar month key used by public.spend_budgets.period_key, e.g. "2026-09". */
+export function utcPeriodKey(now: Date): string {
+  return now.toISOString().slice(0, 7);
+}
+
+/** Looks up the database facts for the owner readiness report. */
+export async function loadReadinessFacts(db: Db, now: Date): Promise<ReadinessFacts> {
+  const [row] = await db.asService(
+    (tx) => tx<{ present: boolean }[]>`
+      select exists (
+        select 1 from public.spend_budgets
+         where scope = 'global' and period_key = ${utcPeriodKey(now)}
+      ) as present
+    `,
+  );
+  return { now, spendBudgetForCurrentMonth: row?.present === true };
+}
+
 /** AC_DEPLOY_07 / AC_RELEASE_02: what would block serving real families. */
-export function productionReadiness(config: ApiConfig): ReadinessItem[] {
+export function productionReadiness(
+  config: ApiConfig,
+  facts: ReadinessFacts = { now: new Date() },
+): ReadinessItem[] {
   const item = (check: string, ok: boolean, detail: string): ReadinessItem => ({
     check,
     status: ok ? 'ready' : 'blocked',
@@ -212,8 +246,14 @@ export function productionReadiness(config: ApiConfig): ReadinessItem[] {
     ),
     item(
       'zdr_evidence',
-      config.zdrEvidence !== null,
-      'Documented ZDR approval reference required before under-13 data reaches AI',
+      // The same validation the enforcing child-data gate applies (packages/ai checkChildDataGate).
+      validateZdrEvidence(config.zdrEvidence, facts.now).ok,
+      'Documented ZDR approval reference and a past verification date required before under-13 data reaches AI',
+    ),
+    item(
+      'ai_spend_budget',
+      facts.spendBudgetForCurrentMonth === true,
+      `Owner-set AI spend cap for ${utcPeriodKey(facts.now)} (UTC); set each month's cap before it starts`,
     ),
     item(
       'storage_provider',
@@ -238,6 +278,6 @@ export function productionReadiness(config: ApiConfig): ReadinessItem[] {
   ];
 }
 
-export function isProductionReady(config: ApiConfig): boolean {
-  return productionReadiness(config).every((r) => r.status === 'ready');
+export function isProductionReady(config: ApiConfig, facts?: ReadinessFacts): boolean {
+  return productionReadiness(config, facts).every((r) => r.status === 'ready');
 }

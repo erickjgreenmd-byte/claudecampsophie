@@ -60,17 +60,34 @@ export function checkChildDataGate(
   if (!input.containsChildPersonalData) return ok({ zdrReference: null });
   // Mock providers never send data anywhere; development/test may exercise flows without ZDR.
   if (input.providerIsMock && input.environment !== 'production') return ok({ zdrReference: null });
-  const evidence = input.zdrEvidence;
+  const evidence = validateZdrEvidence(input.zdrEvidence, input.now);
+  if (!evidence.ok) {
+    if (evidence.error.code === 'ZDR_EVIDENCE_REQUIRED' && !mayIncludeUnder13(input.ageBand)) {
+      return err(
+        'ZDR_EVIDENCE_REQUIRED',
+        'Personal data of minors needs documented zero-data-retention approval',
+      );
+    }
+    return evidence;
+  }
+  return ok({ zdrReference: evidence.value.reference });
+}
+
+/**
+ * The evidence check shared by the enforcing gate above and the owner readiness report, so
+ * readiness never says "ready" for evidence the gate would refuse (RV-lead-identity-access-4).
+ * A documented reference (not a switch-like word) and a parseable verification date not in the
+ * future at `now`.
+ */
+export function validateZdrEvidence(
+  evidence: ZdrEvidence | null,
+  now: Date,
+): Result<{ readonly reference: string }, 'ZDR_EVIDENCE_REQUIRED' | 'ZDR_EVIDENCE_INVALID'> {
   if (evidence === null) {
-    return mayIncludeUnder13(input.ageBand)
-      ? err(
-          'ZDR_EVIDENCE_REQUIRED',
-          'Child personal data needs documented zero-data-retention approval',
-        )
-      : err(
-          'ZDR_EVIDENCE_REQUIRED',
-          'Personal data of minors needs documented zero-data-retention approval',
-        );
+    return err(
+      'ZDR_EVIDENCE_REQUIRED',
+      'Child personal data needs documented zero-data-retention approval',
+    );
   }
   const verified = Date.parse(evidence.verifiedAt);
   const reference = evidence.reference.trim();
@@ -78,12 +95,12 @@ export function checkChildDataGate(
     reference.length < 6 ||
     PLACEHOLDER_REFERENCES.has(reference.toLowerCase()) ||
     Number.isNaN(verified) ||
-    verified > input.now.getTime()
+    verified > now.getTime()
   ) {
     return err(
       'ZDR_EVIDENCE_INVALID',
       'The zero-data-retention evidence is incomplete or dated in the future',
     );
   }
-  return ok({ zdrReference: evidence.reference });
+  return ok({ reference: evidence.reference });
 }

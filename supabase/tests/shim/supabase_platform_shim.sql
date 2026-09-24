@@ -27,6 +27,27 @@ create table if not exists auth.users (
   raw_user_meta_data jsonb not null default '{}'::jsonb
 );
 
+-- Supabase Auth sessions (column names and types as in GoTrue's auth.sessions). GoTrue inserts a
+-- row at sign-in and deletes it on sign-out; access tokens carry its id as the `session_id` claim.
+do $$ begin create type auth.aal_level as enum ('aal1', 'aal2', 'aal3');
+exception when duplicate_object then null; end $$;
+
+create table if not exists auth.sessions (
+  id uuid not null primary key,
+  user_id uuid not null references auth.users (id) on delete cascade,
+  created_at timestamptz,
+  updated_at timestamptz,
+  factor_id uuid,
+  aal auth.aal_level,
+  not_after timestamptz,
+  refreshed_at timestamp without time zone,
+  user_agent text,
+  ip inet,
+  tag text
+);
+create index if not exists sessions_user_id_idx on auth.sessions (user_id);
+create index if not exists sessions_not_after_idx on auth.sessions (not_after desc);
+
 create or replace function auth.jwt() returns jsonb
 language sql stable
 as $$

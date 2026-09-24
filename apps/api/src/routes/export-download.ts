@@ -8,10 +8,17 @@ import type { AppEnv } from '../middleware/context.ts';
 const DOWNLOAD_URL_SECONDS = 60;
 
 /**
- * Download of a finished export (spec P4 export, P8 "answer-key export requires recent parent
- * reauthentication and a distinct protected route"). Parent only, own family only; the answer-key
- * kind additionally needs a recent adult unlock. The file itself stays in private storage; the
- * response is a short-lived signed URL, never the bytes or a durable link.
+ * The one export a child may be handed on a shared device: the printable practice questions, which
+ * never contain answers or other children's data. Every other kind holds private family data.
+ */
+const CHILD_SAFE_EXPORT_KINDS: ReadonlySet<string> = new Set(['review_questions_pdf']);
+
+/**
+ * Download of a finished export (spec P3 "recent reauthentication server-side for ... exports",
+ * P4 export, P8 "answer-key export requires recent parent reauthentication and a distinct
+ * protected route"). Parent only, own family only, and a recent adult unlock for every kind except
+ * the child-safe questions sheet (RV-lead-identity-access-3). The file itself stays in private
+ * storage; the response is a short-lived signed URL, never the bytes or a durable link.
  */
 export function exportDownloadRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
@@ -31,7 +38,7 @@ export function exportDownloadRoutes(): Hono<AppEnv> {
       `,
     );
     if (!row) throw new ApiError('NOT_FOUND', 'Export not found');
-    if (row.kind === 'review_answer_key_pdf') await assertRecentUnlock(c);
+    if (!CHILD_SAFE_EXPORT_KINDS.has(row.kind)) await assertRecentUnlock(c);
     const now = deps.clock();
     if (row.status !== 'ready' || !row.storage_path) {
       throw new ApiError('CONFLICT', 'This export is not ready yet');

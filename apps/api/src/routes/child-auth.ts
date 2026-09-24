@@ -7,24 +7,37 @@ import type { ChildPrincipal, Tx } from '../db.ts';
 import { ApiError } from '../errors.ts';
 import { requireChild } from '../middleware/auth.ts';
 import type { AppDeps, AppEnv } from '../middleware/context.ts';
-import { enforceRateLimit, RATE_RULES } from '../middleware/rate-limit.ts';
+import {
+  clientNetworkKey,
+  clientSiteKey,
+  enforceRateLimit,
+  RATE_RULES,
+  rateLimitedError,
+} from '../middleware/rate-limit.ts';
 import { randomToken, sha256Hex, toHex } from '../security/crypto.ts';
 
+/**
+ * Session and refresh-token lifetimes are stored and compared with the database clock: the
+ * session is checked by app.current_child_id() (now()), so it must be written with now() too
+ * (RV-lead-identity-access-8: one clock per comparison).
+ */
 async function issueRefreshToken(
   tx: Tx,
   deps: AppDeps,
   sessionId: string,
-  now: Date,
 ): Promise<{ token: string; id: string }> {
   const token = randomToken();
   const hashHex = await sha256Hex(token);
-  const expiresAt = new Date(now.getTime() + deps.config.childRefreshTtlSeconds * 1000);
   const [row] = await tx<{ id: string }[]>`
     insert into private.child_refresh_tokens (session_id, token_hash, issued_at, expires_at)
-    values (${sessionId}, decode(${hashHex}, 'hex'), ${now}, ${expiresAt}) returning id
+    values (${sessionId}, decode(${hashHex}, 'hex'), now(),
+            now() + make_interval(secs => ${deps.config.childRefreshTtlSeconds}))
+    returning id
   `;
   return { token, id: row!.id };
 }
+
+const PAIR_FAILURES_KEY = 'pair-fail:global';
 
 async function tokenResponse(
   deps: AppDeps,
@@ -49,12 +62,33 @@ export function childAuthRoutes(): Hono<AppEnv> {
   r.post('/pair', async (c) => {
     const { deps } = c.var;
     const now = deps.clock();
-    const ip = c.req.header('cf-connecting-ip') ?? 'unknown';
-    await enforceRateLimit(deps.rateLimiter, `pair:${ip}`, RATE_RULES.pairingRedeemPerIp, now);
+    const address = c.req.header('cf-connecting-ip');
+    // Every attempt counts per client network (IPv4 address / IPv6 /64).
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `pair:${clientNetworkKey(address)}`,
+      RATE_RULES.pairingRedeemPerNetwork,
+      now,
+    );
     const body = await readJson(c, childPairRequestSchema);
     const code = normalizePairingCode(body.code);
     if (!code)
       throw new ApiError('NOT_FOUND', 'That code did not work. Ask a grown-up for a new one.');
+    // A guess reserves its unit of the service-wide failure budget before it runs, so guesses in
+    // flight count. A used-up budget pauses only sites that already have a failed or running guess
+    // this hour, so spending it cannot stop every other family pairing (RV-lead-identity-access-6).
+    const budget = RATE_RULES.pairingRedeemFailuresGlobal;
+    const siteKey = `pair-fail:${clientSiteKey(address)}`;
+    const reservation = await deps.rateLimiter.reserveShared(
+      PAIR_FAILURES_KEY,
+      siteKey,
+      budget,
+      now,
+    );
+    if (reservation.exhausted) {
+      deps.log({ level: 'error', event: 'pairing_failure_budget_exhausted' });
+    }
+    if (!reservation.allowed) throw rateLimitedError(reservation.retryAfterSeconds);
     const hashHex = toHex(await pairingCodeHash(deps.config.hashPepper, code));
 
     const result = await deps.db.asService(async (tx) => {
@@ -75,12 +109,13 @@ export function childAuthRoutes(): Hono<AppEnv> {
         insert into public.child_devices (family_id, child_id, label, platform)
         values (${claimed.family_id}, ${claimed.child_id}, ${body.deviceLabel}, ${body.platform}) returning id
       `;
-      const sessionExpires = new Date(now.getTime() + deps.config.childRefreshTtlSeconds * 1000);
       const [session] = await tx<{ id: string }[]>`
         insert into public.child_sessions (family_id, child_id, device_id, created_at, expires_at)
-        values (${claimed.family_id}, ${claimed.child_id}, ${device!.id}, ${now}, ${sessionExpires}) returning id
+        values (${claimed.family_id}, ${claimed.child_id}, ${device!.id}, now(),
+                now() + make_interval(secs => ${deps.config.childRefreshTtlSeconds}))
+        returning id
       `;
-      const refresh = await issueRefreshToken(tx, deps, session!.id, now);
+      const refresh = await issueRefreshToken(tx, deps, session!.id);
       const [child] = await tx<
         { nickname: string }[]
       >`select nickname from public.child_profiles where id = ${claimed.child_id}`;
@@ -99,8 +134,17 @@ export function childAuthRoutes(): Hono<AppEnv> {
         nickname: child!.nickname,
       };
     });
+    // A failed (or aborted) guess keeps its reserved units.
     if (!result)
       throw new ApiError('NOT_FOUND', 'That code did not work. Ask a grown-up for a new one.');
+    // A success is not a failed guess: give both units back. The device is already paired, so a
+    // failure here only leaves the budget conservatively spent and must not fail the response.
+    try {
+      await deps.rateLimiter.release(PAIR_FAILURES_KEY, budget, now);
+      await deps.rateLimiter.release(siteKey, budget, now);
+    } catch {
+      deps.log({ level: 'warn', event: 'pairing_budget_release_failed' });
+    }
     return c.json(
       await tokenResponse(deps, result.principal, result.refreshToken, result.nickname, now),
       201,
@@ -118,16 +162,15 @@ export function childAuthRoutes(): Hono<AppEnv> {
           id: string;
           session_id: string;
           used_at: Date | null;
-          expires_at: Date;
           family_id: string;
           child_id: string;
           live: boolean;
           nickname: string;
         }[]
       >`
-        select t.id, t.session_id, t.used_at, t.expires_at, s.family_id, s.child_id, c.nickname,
-               (s.revoked_at is null and s.expires_at > ${now} and d.revoked_at is null
-                and c.status = 'active' and f.deleted_at is null) as live
+        select t.id, t.session_id, t.used_at, s.family_id, s.child_id, c.nickname,
+               (t.expires_at > now() and s.revoked_at is null and s.expires_at > now()
+                and d.revoked_at is null and c.status = 'active' and f.deleted_at is null) as live
           from private.child_refresh_tokens t
           join public.child_sessions s on s.id = t.session_id
           join public.child_devices d on d.id = s.device_id
@@ -146,14 +189,14 @@ export function childAuthRoutes(): Hono<AppEnv> {
         `;
         return { kind: 'reused' as const };
       }
-      if (!row.live || row.expires_at <= now) return { kind: 'invalid' as const };
+      if (!row.live) return { kind: 'invalid' as const };
       await enforceRateLimit(
         deps.rateLimiter,
         `refresh:${row.session_id}`,
         RATE_RULES.childRefreshPerSession,
         now,
       );
-      const next = await issueRefreshToken(tx, deps, row.session_id, now);
+      const next = await issueRefreshToken(tx, deps, row.session_id);
       await tx`update private.child_refresh_tokens set used_at = ${now}, replaced_by = ${next.id} where id = ${row.id}`;
       return {
         kind: 'ok' as const,

@@ -1,6 +1,10 @@
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import type { z } from 'zod';
-import { ApiError, pgErrorCode } from './errors.ts';
+import { loadReadinessFacts, productionReadiness } from './config.ts';
+import { ApiError, isTransientDbError, knownConstraintError, pgErrorCode } from './errors.ts';
+import { withLiveSessionCheck } from './auth/parent.ts';
+import { assertOwnerAdmin, requireParent } from './middleware/auth.ts';
 import type { AppDeps, AppEnv } from './middleware/context.ts';
 import { toBase64Url, randomBytes } from './security/crypto.ts';
 import { healthRoutes } from './routes/health.ts';
@@ -23,7 +27,13 @@ import { adminMonetizationRoutes } from './routes/admin-monetization.ts';
 /** Max JSON body accepted by any route (uploads use signed storage URLs, never the API body). */
 export const MAX_JSON_BYTES = 64 * 1024;
 
-export function createApp(deps: AppDeps): Hono<AppEnv> {
+export function createApp(appDeps: AppDeps): Hono<AppEnv> {
+  // Every parent token check, in requireParent and in routes that verify tokens themselves (the
+  // homework capture routes), also confirms the Supabase session is still signed in (spec P3).
+  const deps: AppDeps = {
+    ...appDeps,
+    verifyParentToken: withLiveSessionCheck(appDeps.verifyParentToken, appDeps.db),
+  };
   const app = new Hono<AppEnv>();
 
   app.use('*', async (c, next) => {
@@ -41,8 +51,6 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
       c.header('Vary', 'Origin');
       return c.body(null, 204);
     }
-    const length = Number(c.req.header('content-length') ?? '0');
-    if (length > MAX_JSON_BYTES) throw new ApiError('PAYLOAD_TOO_LARGE', 'Request is too large');
     await next();
     if (allowed) {
       c.header('Access-Control-Allow-Origin', origin);
@@ -63,9 +71,30 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     });
   });
 
-  app.onError((error, c) => {
+  // The JSON limit counts the bytes actually received, so a streamed (chunked) body without a
+  // Content-Length header is refused too instead of being buffered and parsed whole.
+  app.use(
+    '*',
+    bodyLimit({
+      maxSize: MAX_JSON_BYTES,
+      onError: () => {
+        throw new ApiError('PAYLOAD_TOO_LARGE', 'Request is too large');
+      },
+    }),
+  );
+
+  app.onError((thrown, c) => {
     const requestId = c.var.requestId ?? 'unknown';
+    const error = expectedError(thrown) ?? thrown;
     if (error instanceof ApiError) {
+      if (error.code === 'PROVIDER_UNAVAILABLE' && !(thrown instanceof ApiError)) {
+        deps.log({
+          level: 'warn',
+          event: 'db_transient_conflict',
+          requestId,
+          code: pgErrorCode(thrown) ?? 'unknown',
+        });
+      }
       if (error.retryAfterSeconds !== undefined)
         c.header('Retry-After', String(error.retryAfterSeconds));
       c.header('Cache-Control', 'no-store');
@@ -114,6 +143,14 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     ),
   );
 
+  // Owner readiness (AC_DEPLOY_07). Registered before healthRoutes(), whose config-only handler for
+  // the same path it supersedes: this one adds database facts (this month's AI spend cap).
+  app.get('/v1/admin/readiness', requireParent, async (c) => {
+    await assertOwnerAdmin(c);
+    const { config, db, clock } = c.var.deps;
+    const facts = await loadReadinessFacts(db, clock());
+    return c.json({ environment: config.environment, checks: productionReadiness(config, facts) });
+  });
   app.route('/', healthRoutes());
   app.route('/v1/adult', adultRoutes());
   app.route('/v1/child', childAuthRoutes());
@@ -132,6 +169,22 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   app.route('/v1/admin', adminMonetizationRoutes()); // /v1/admin/monetization/*
   app.route('/webhooks', webhooksRoutes()); // /webhooks/revenuecat, /webhooks/stripe
   return app;
+}
+
+/**
+ * Database outcomes that are expected on any route: a known schema invariant (named constraint) or
+ * lock contention the database resolved by aborting the transaction (safe to retry).
+ */
+function expectedError(error: Error): ApiError | undefined {
+  if (error instanceof ApiError) return undefined;
+  const known = knownConstraintError(error);
+  if (known) return known;
+  if (isTransientDbError(error)) {
+    return new ApiError('PROVIDER_UNAVAILABLE', 'The service is busy. Please try again.', {
+      retryAfterSeconds: 1,
+    });
+  }
+  return undefined;
 }
 
 /** Parses and validates a JSON body with a strict contract schema. */
