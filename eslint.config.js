@@ -18,6 +18,8 @@ export default tseslint.config(
       'apps/mobile/metro.config.js',
       '**/*.config.js',
       '**/*.config.cjs',
+      '**/vitest.config.ts',
+      '**/vite.config.ts',
     ],
   },
   js.configs.recommended,
