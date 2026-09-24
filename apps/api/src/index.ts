@@ -3,7 +3,9 @@ import { createApp } from './app.ts';
 import { createParentVerifier } from './auth/parent.ts';
 import { loadConfig } from './config.ts';
 import { createDb } from './db.ts';
-import { runScheduledTick } from './jobs/dispatcher.ts';
+import { createOpenAiResponsesClient } from '@pencillift/ai';
+import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/dispatcher.ts';
+import { createScanProcessHandler, storageReader } from './jobs/scan-process.ts';
 import type { AppDeps } from './middleware/context.ts';
 import { createDbRateLimiter } from './middleware/rate-limit.ts';
 import {
@@ -112,8 +114,20 @@ export default {
       return;
     }
     const { deps, sql } = built.runtime;
+    const handlers: Record<string, JobHandler> = { ...DEFAULT_HANDLERS };
+    if (typeof env.OPENAI_API_KEY === 'string' && env.OPENAI_API_KEY.length > 0) {
+      // Without a real key scans stay queued and readiness reports AI as blocked; they are never
+      // processed by a mock in a deployed environment.
+      handlers.scan_process = createScanProcessHandler({
+        ai: createOpenAiResponsesClient({
+          apiKey: env.OPENAI_API_KEY,
+          ...(typeof env.OPENAI_PROJECT === 'string' ? { project: env.OPENAI_PROJECT } : {}),
+        }),
+        readObject: storageReader(deps.providers.storage),
+      });
+    }
     try {
-      await runScheduledTick(deps);
+      await runScheduledTick(deps, handlers);
     } finally {
       ctx.waitUntil(sql.end({ timeout: 5 }));
     }

@@ -82,6 +82,7 @@ export const verificationOutputSchema = z.strictObject({
       agrees: z.boolean(),
       verdict: z.enum(['correct', 'incorrect', 'unresolved', 'unanswered', 'rubric']),
       reason: z.string().max(1000),
+      confidence: level,
     }),
   ),
 });

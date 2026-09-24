@@ -66,13 +66,13 @@ export const PROMPTS = {
   },
   verification: {
     id: 'verification',
-    version: 'verification.v1',
+    version: 'verification.v2',
     stage: 'verification',
     outputName: 'independent_verification',
     outputSchema: verificationOutputSchema,
     instructions: [
       'You independently re-check proposed verdicts for K-8 homework. Solve each question yourself before comparing.',
-      'Report whether you agree and your own verdict; if the question cannot be decided from the data, use "unresolved".',
+      'Report whether you agree, your own verdict and how confident you are; if the question cannot be decided from the data, use "unresolved".',
       DATA_RULE,
     ].join(' '),
   },
