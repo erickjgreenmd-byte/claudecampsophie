@@ -44,7 +44,7 @@ Principals:
 | Principal | How it authenticates | DB role used by API | Notes |
 |---|---|---|---|
 | Parent / guardian | Supabase Auth JWT (verified email; optional MFA) verified by the API against Supabase JWKS | `authenticated` with `request.jwt.claims` = verified claims | Family access only via active `family_memberships`. |
-| Recently unlocked adult | Parent JWT + server-verified PIN/biometric step-up → row in `private.adult_unlocks` (short TTL, bound to the Supabase `session_id`) | `authenticated` | Required server-side for solutions, answer-key exports, rewards approval, purchases/capacity, guardian changes, deletion. |
+| Recently unlocked adult | Parent JWT + server-verified PIN/biometric step-up → row in `private.adult_unlocks` (short TTL written with the database clock, bound to the Supabase `session_id`) | `authenticated` | Required server-side for solutions, every data export download except the child-safe question sheet, rewards approval and parent point spending, purchases/capacity, guardian changes, pairing codes, deletion. PIN attempts are serialized per adult (row lock); PIN reset and change revoke other sessions' unlocks. |
 | Child | Parent-issued single-use pairing code → API-issued child access token (short-lived, signed with an API-only key) + rotating opaque refresh token stored hashed | `pl_child` with API-set claims `{role:'pl_child', child_id, family_id, child_session_id}` | Not a Supabase auth user. The child token is not a Supabase JWT, so PostgREST rejects it; `pl_child` is never granted to the PostgREST authenticator. RLS re-checks that the child session is live. |
 | Owner admin | Parent JWT with `aal = aal2` + row in `admin_users` | `authenticated` | Least privilege; admin views expose aggregates, never casual child-content browsing. |
 | Jobs / webhooks | Worker secret | `service_role` (bypasses RLS) | Privileged handlers independently verify family membership / ownership of every referenced row (E4 tenant isolation). |
@@ -52,6 +52,10 @@ Principals:
 Rules:
 
 - Never trust a role, family ID, price, slot count or child ID from a request body; derive from verified claims and the database.
+- Sign-out ends API access: a trigger on `auth.sessions` records ended sessions (migration 0720) and every parent token check, installed once on the shared verifier in `createApp`, requires `app.auth_session_active`, failing closed. Hosted Supabase must allow the trigger (Owner Action 20).
+- One clock per check: an expiry that SQL compares with `now()` (unlocks, child sessions) is written with `now()` in SQL, never from the request clock.
+- Invariants routes rely on are enforced in the schema and mapped by constraint name in `errors.ts`: one active family per adult, one live pairing code per child, IANA family time zones.
+- Mobile: the session layer (`apps/mobile/src/lib/app-session.ts`) registers parent data token sources that are empty in child mode; only the step-up source (PIN unlock and relock) keeps the raw session.
 - Supabase service-role keys, AI keys, webhook secrets and signing keys exist only in Worker secrets. The mobile/web bundles contain only the Supabase URL + publishable anon key and the API base URL.
 - Parent solutions live in schema `private` (not exposed through PostgREST, no grants to `anon`/`authenticated`/`pl_child`) and are read only through a `SECURITY DEFINER` function that checks membership **and** a recent adult unlock.
 - Every family-scoped table carries `family_id` and has RLS enabled. Supabase grants table privileges to `anon`/`authenticated` by default in `public`, so a table without RLS is a data leak; the test shim reproduces that default.
@@ -62,7 +66,7 @@ Rules:
 - Core helper functions (migration 0001): `app.current_user_id()`, `app.is_family_member(family uuid)`, `app.is_family_owner(family uuid)`, `app.has_recent_adult_unlock()`, `app.current_child_id()`, `app.current_child_family_id()`, `app.is_owner_admin()`, `app.prevent_mutation()` (trigger for append-only ledgers).
 - Families are tombstoned (`deleted_at`) before purge; helper functions treat tombstoned families as inaccessible, and job/webhook handlers must refuse to write into tombstoned families (no resurrection).
 - Financial and learning ledgers are append-only (`app.prevent_mutation()` trigger); corrections are new adjustment rows.
-- Migration files: `NNNN_area.sql`, applied in lexicographic order. Areas: `0001_core_identity`, `0100_learning`, `0200_billing`, `0300_promotions_schools`, `0400_rewards`, `0500_monetization`, `0600_operations`. An area migration may reference only `0001` and lower-numbered areas it explicitly depends on (`0300` depends on `0200`).
+- Migration files: `NNNN_area.sql`, applied in lexicographic order. Areas: `0001_core_identity`, `0100_learning`, `0200_billing`, `0300_promotions_schools`, `0400_rewards`, `0600_operations` … `0720_identity_hardening` (monetization is `0640`, learning runtime `0650`). Until any shared environment applies a migration it may be edited in place; after that, changes are new migrations only. `0710` and `0720` redefine deletion, purge, inactivity and rate-limit functions: later migrations must start from those versions. An area migration may reference only `0001` and lower-numbered areas it explicitly depends on (`0300` depends on `0200`).
 - Tests run against real Postgres 16 via `@pencillift/db/testing` (fresh database per file, Supabase shim, real `SET ROLE` + claims). `PL_MIGRATIONS_ONLY=0001,0300` limits applied files while authoring; CI applies all.
 
 ## 5. Billing and entitlements (spec P11, E2)
@@ -70,6 +74,7 @@ Rules:
 - One opaque family billing identity (`families.billing_ref`, e.g. `fam_…`) is the RevenueCat `appUserID` and the Stripe customer metadata key for every guardian of the family.
 - One normalized server entitlement ledger (`family_entitlements`) is the only source of truth for paid capacity. RevenueCat (Apple/Google) and Stripe (optional, disabled by default) feed it through authenticated webhooks → dedupe by provider event ID → fetch current provider state → upsert. Out-of-order events cannot regress state because reconciliation uses fetched provider state, not the event order.
 - Paid capacity tiers map from verified store product IDs (`store_product_mappings`), never from client input. Local booleans never unlock service.
+- Every reconciliation path (webhook, `POST /v1/billing/sync`, the scheduled stale-entitlement sweep) runs one whole-family routine, `reconcileFamilyBilling` in `services/billing-sync.ts`, from a complete provider fetch: a subscription the provider no longer lists is revoked, former holders of a newly claimed purchase are re-verified, children whose slot a verified change released return to draft, and open capacity requests settle. RevenueCat TRANSFER events re-verify every family they name.
 - Pricing shown at checkout, due-now and proration come from the store/provider; the app displays the approved list totals only as the regular recurring price.
 
 ## 6. P17 promotions, schools and donations
@@ -85,6 +90,9 @@ Rules:
 - Child-data calls are hard-blocked unless a recorded ZDR approval (evidence reference + verification date) exists for the configured project; an env boolean alone fails closed.
 - Every prompt/schema is versioned; outputs are validated against strict schemas; child-facing packets pass the answer-leak guard and fail closed to a reviewed template.
 - A test double adapter exists and identifies itself as a mock; production readiness rejects it.
+- Spend ceiling: every AI stage (scan and learning) takes a hold for its upper-bound cost under the monthly budget row lock before it runs, so concurrent workers cannot overshoot the owner's cap; no budget row means no cap (readiness blocks until the owner sets this month's).
+- Answer protection covers the key that decided the verdict (the model-free prompt key when present); keys that disagree, or cannot be parsed into a protectable form, fall back to the reviewed template. An unevaluated restatement of a computation is never graded correct.
+- Scan work re-checks family, child, deletion request and consent before each AI stage and inside each write batch; deletion moves in-flight assignments to `deleted`.
 
 ## 8. Explicitly rejected alternatives
 
