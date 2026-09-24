@@ -5,6 +5,8 @@ import { loadConfig } from './config.ts';
 import { createDb } from './db.ts';
 import { createOpenAiResponsesClient } from '@pencillift/ai';
 import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/dispatcher.ts';
+import { createExportBuildHandler } from './jobs/export-build.ts';
+import { createLearningHandlers } from './jobs/learning-jobs.ts';
 import { createScanProcessHandler, storageReader } from './jobs/scan-process.ts';
 import type { AppDeps } from './middleware/context.ts';
 import { createDbRateLimiter } from './middleware/rate-limit.ts';
@@ -126,15 +128,25 @@ export default {
       return;
     }
     const { deps, sql } = built.runtime;
-    const handlers: Record<string, JobHandler> = { ...DEFAULT_HANDLERS };
-    if (typeof env.OPENAI_API_KEY === 'string' && env.OPENAI_API_KEY.length > 0) {
+    const ai =
+      typeof env.OPENAI_API_KEY === 'string' && env.OPENAI_API_KEY.length > 0
+        ? createOpenAiResponsesClient({
+            apiKey: env.OPENAI_API_KEY,
+            ...(typeof env.OPENAI_PROJECT === 'string' ? { project: env.OPENAI_PROJECT } : {}),
+          })
+        : null;
+    const handlers: Record<string, JobHandler> = {
+      ...DEFAULT_HANDLERS,
+      // Practice sets are built from the original bank; the AI only re-themes them when a key,
+      // consent and the child-data gate allow it, so these run with or without a key.
+      ...createLearningHandlers(ai ? { ai } : {}),
+      export_build: createExportBuildHandler(),
+    };
+    if (ai) {
       // Without a real key scans stay queued and readiness reports AI as blocked; they are never
       // processed by a mock in a deployed environment.
       handlers.scan_process = createScanProcessHandler({
-        ai: createOpenAiResponsesClient({
-          apiKey: env.OPENAI_API_KEY,
-          ...(typeof env.OPENAI_PROJECT === 'string' ? { project: env.OPENAI_PROJECT } : {}),
-        }),
+        ai,
         readObject: storageReader(deps.providers.storage),
       });
     }
