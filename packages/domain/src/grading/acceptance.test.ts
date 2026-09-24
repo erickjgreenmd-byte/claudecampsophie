@@ -425,13 +425,25 @@ const CASES: Case[] = [
   },
 
   // --- AC_CAPTURE_03: exponent placement from transcription ----------------------------------
+  // [RV-grading-1] An unevaluated power is not a final answer: "Evaluate 3²" answered "3²" copies
+  // the question (spec P5: deterministic checks decide acceptance, so a deterministic "correct"
+  // is final). These rows were `correct` before that fix; they now expect UNEVALUATED_EXPRESSION.
+  // Exponent placement is still proven: parse.test.ts pins 2³ = 8, 3² = 9 and 10⁻² = 1/100, a
+  // juxtaposition misread ("3²" as 32) would be incorrect VALUE_MISMATCH here, and the
+  // requireSimplestForm rows below reach the value comparison (a misread value is VALUE_MISMATCH,
+  // the right value NOT_SIMPLIFIED).
   {
     name: 'superscript exponent',
     question: num('2³', '8'),
-    verdict: 'correct',
-    reason: 'EXACT_MATCH',
+    verdict: 'unresolved',
+    reason: 'UNEVALUATED_EXPRESSION',
   },
-  { name: 'three squared', question: num('3²', '9'), verdict: 'correct', reason: 'EXACT_MATCH' },
+  {
+    name: 'three squared',
+    question: num('3²', '9'),
+    verdict: 'unresolved',
+    reason: 'UNEVALUATED_EXPRESSION',
+  },
   {
     name: 'juxtaposed digits are not an exponent',
     question: num('32', '9'),
@@ -441,8 +453,32 @@ const CASES: Case[] = [
   {
     name: 'negative superscript exponent',
     question: num('10⁻²', '0.01'),
-    verdict: 'correct',
-    reason: 'EXACT_MATCH',
+    verdict: 'unresolved',
+    reason: 'UNEVALUATED_EXPRESSION',
+  },
+  {
+    name: 'superscript exponent value reaches the comparison (2³ = 8)',
+    question: num('2³', '8', { requireSimplestForm: true }),
+    verdict: 'incorrect',
+    reason: 'NOT_SIMPLIFIED',
+  },
+  {
+    name: 'superscript square value reaches the comparison (3² = 9, not 32)',
+    question: num('3²', '9', { requireSimplestForm: true }),
+    verdict: 'incorrect',
+    reason: 'NOT_SIMPLIFIED',
+  },
+  {
+    name: 'negative superscript value reaches the comparison (10⁻² = 0.01)',
+    question: num('10⁻²', '0.01', { requireSimplestForm: true }),
+    verdict: 'incorrect',
+    reason: 'NOT_SIMPLIFIED',
+  },
+  {
+    name: 'misread superscript value is a mismatch, not "not simplified"',
+    question: num('3²', '32', { requireSimplestForm: true }),
+    verdict: 'incorrect',
+    reason: 'VALUE_MISMATCH',
   },
   {
     name: 'stacked fraction transcription',

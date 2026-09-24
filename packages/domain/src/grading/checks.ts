@@ -20,7 +20,14 @@ import {
   type Rational,
 } from './rational.ts';
 import { collapseWhitespace, foldQuotes, isBlankAnswer, stripInvisible } from './text.ts';
-import { convertValue, lookupUnit, parseQuantityDetailed } from './units.ts';
+import {
+  convertValue,
+  lookupUnit,
+  parseQuantityDetailed,
+  type QuantityOptions,
+  type UnitDefinition,
+} from './units.ts';
+import { isAbsent, isIterable, stringList } from './untrusted.ts';
 import { outcome, type CheckResult } from './verdicts.ts';
 
 // =============================================================================================
@@ -56,24 +63,68 @@ type PreparedTolerance =
 
 type Comparison = 'match' | 'within_tolerance' | 'not_rounded' | 'mismatch';
 
-/** Answer keys may come from extraction models, so a malformed key is data, not a crash. */
-function prepareTolerance(tolerance: Tolerance | undefined): PreparedTolerance | null {
-  if (tolerance === undefined) return { kind: 'exact' };
-  switch (tolerance.kind) {
+/**
+ * Answer keys may come from extraction models, so a malformed key is data, not a crash. A null
+ * tolerance (strict structured outputs' "absent") is exact; a wrongly typed one is invalid.
+ */
+function prepareTolerance(tolerance: unknown): PreparedTolerance | null {
+  if (isAbsent(tolerance)) return { kind: 'exact' };
+  if (typeof tolerance !== 'object') return null;
+  const candidate = tolerance as { readonly kind?: unknown; value?: unknown; places?: unknown };
+  switch (candidate.kind) {
     case 'exact':
-      return tolerance;
+      return { kind: 'exact' };
     case 'absolute': {
-      const parsed = parseMathAnswer(tolerance.value);
+      if (typeof candidate.value !== 'string') return null;
+      const parsed = parseMathAnswer(candidate.value);
       if (!parsed.ok || parsed.value.num < 0n) return null;
       return { kind: 'absolute', value: parsed.value };
     }
-    case 'round_to_places':
-      return Number.isSafeInteger(tolerance.places) && Math.abs(tolerance.places) <= MAX_EXPONENT
-        ? tolerance
+    case 'round_to_places': {
+      const places = candidate.places;
+      return typeof places === 'number' &&
+        Number.isSafeInteger(places) &&
+        Math.abs(places) <= MAX_EXPONENT
+        ? { kind: 'round_to_places', places }
         : null;
+    }
     default:
       return null;
   }
+}
+
+interface PreparedKey {
+  readonly value: Rational;
+  /** null: a plain-number key. */
+  readonly unit: UnitDefinition | null;
+  readonly tolerance: PreparedTolerance;
+}
+
+const PERCENT_UNIT = lookupUnit('percent');
+
+/**
+ * Validates and normalizes an answer key; null when it is malformed. Decision: a key whose value is
+ * written with a percent sign ("25%", "1/2%") is a key in percent, exactly like
+ * { value: "25", unit: "%" }, so a bare "25" or "0.25" and the tolerance/rounding scale are judged
+ * the same way whichever way the extractor encoded it. A percent value with another unit is invalid.
+ */
+function prepareKey(expected: NumericExpected): PreparedKey | null {
+  if (typeof expected !== 'object' || expected === null) return null;
+  if (typeof expected.value !== 'string') return null;
+  const parsed = parseMathAnswerDetailed(expected.value);
+  const tolerance = prepareTolerance(expected.tolerance);
+  if (!parsed.ok || tolerance === null) return null;
+  const unitText: unknown = expected.unit;
+  let unit: UnitDefinition | null = null;
+  if (!isAbsent(unitText)) {
+    if (typeof unitText !== 'string') return null;
+    unit = lookupUnit(unitText);
+    if (unit === null) return null;
+  }
+  const { value, form } = parsed.value;
+  if (form.kind !== 'percent') return { value, unit, tolerance };
+  if (PERCENT_UNIT === null || (unit !== null && unit.id !== PERCENT_UNIT.id)) return null;
+  return { value: multiplyRational(value, rational(100n)), unit: PERCENT_UNIT, tolerance };
 }
 
 /**
@@ -101,6 +152,13 @@ function compareValues(student: Rational, key: Rational, tolerance: PreparedTole
   }
 }
 
+/**
+ * Decision: an unevaluated expression ("347 × 29", "37 ÷ 5", "3²", "2 + 1/2") is not a final
+ * answer. It may simply restate the question, and a deterministic "correct" is final (resolve.ts
+ * rule 1), so it is unresolved UNEVALUATED_EXPRESSION for a model or a grown-up with the question
+ * in view. With requireSimplestForm it is NOT_SIMPLIFIED as before (VALUE_MISMATCH if the value is
+ * wrong). Single numbers (integers, decimals, fractions, mixed numbers, percents) are graded.
+ */
 function judge(
   student: Rational,
   key: Rational,
@@ -109,6 +167,9 @@ function judge(
   requireSimplestForm: boolean,
   convertedUnit: boolean,
 ): CheckResult {
+  if (form.kind === 'expression' && !requireSimplestForm) {
+    return outcome('unresolved', 'UNEVALUATED_EXPRESSION');
+  }
   const comparison = compareValues(student, key, tolerance);
   switch (comparison) {
     case 'mismatch':
@@ -147,13 +208,12 @@ function percentReadingMatches(
  */
 export function checkNumericAnswer({ studentAnswer, expected }: NumericAnswerInput): CheckResult {
   if (isBlankAnswer(studentAnswer)) return outcome('unanswered', 'BLANK');
-  if (typeof expected.value !== 'string') return outcome('unresolved', 'INVALID_ANSWER_KEY');
-  const key = parseMathAnswer(expected.value);
-  const tolerance = prepareTolerance(expected.tolerance);
-  if (!key.ok || tolerance === null) return outcome('unresolved', 'INVALID_ANSWER_KEY');
+  const key = prepareKey(expected);
+  if (key === null) return outcome('unresolved', 'INVALID_ANSWER_KEY');
+  const { tolerance, unit: keyUnit } = key;
   const requireSimplestForm = expected.requireSimplestForm === true;
 
-  if (expected.unit === undefined) {
+  if (keyUnit === null) {
     const parsed = parseMathAnswerDetailed(studentAnswer);
     if (!parsed.ok) {
       const quantity = parseQuantityDetailed(studentAnswer);
@@ -171,9 +231,10 @@ export function checkNumericAnswer({ studentAnswer, expected }: NumericAnswerInp
       : result;
   }
 
-  const keyUnit = lookupUnit(expected.unit);
-  if (keyUnit === null) return outcome('unresolved', 'INVALID_ANSWER_KEY');
-  const parsed = parseQuantityDetailed(studentAnswer);
+  // A capacity key tells us that a bare "oz" in the answer is a fluid ounce ("8 oz" for 1 cup).
+  const quantityOptions: QuantityOptions =
+    keyUnit.dimension === 'volume' ? { ounces: 'fluid' } : {};
+  const parsed = parseQuantityDetailed(studentAnswer, quantityOptions);
   if (!parsed.ok) return outcome('unresolved', parsed.error.code);
   const student = parsed.value;
 
@@ -193,6 +254,11 @@ export function checkNumericAnswer({ studentAnswer, expected }: NumericAnswerInp
       percentReadingMatches(result, student.value, key.value, tolerance)
       ? outcome('unresolved', 'AMBIGUOUS_PERCENT')
       : result;
+  }
+  // Decision: a key in bare "oz" answered with a capacity ("1 cup", "8 fl oz") may be a key that
+  // meant fluid ounces; a person decides rather than a false WRONG_UNIT_DIMENSION.
+  if (keyUnit.id === 'oz' && student.dimension === 'volume') {
+    return outcome('unresolved', 'AMBIGUOUS_UNIT');
   }
   if (student.dimension !== keyUnit.dimension) return outcome('incorrect', 'WRONG_UNIT_DIMENSION');
   if (student.unit === keyUnit.id) {
@@ -222,22 +288,34 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-function validDivisionKey(expected: DivisionExpected): boolean {
-  if (!isNonNegativeInteger(expected.quotient) || !isNonNegativeInteger(expected.remainder)) {
-    return false;
-  }
-  if (expected.divisor === undefined) return true;
-  return (
-    isNonNegativeInteger(expected.divisor) &&
-    expected.divisor > 0 &&
-    expected.remainder < expected.divisor
-  );
+interface DivisionKey {
+  readonly quotient: number;
+  readonly remainder: number;
+  readonly divisor: number | undefined;
+}
+
+/** A null divisor (strict structured outputs' "absent") means the divisor is not known. */
+function divisionKey(expected: DivisionExpected): DivisionKey | null {
+  if (typeof expected !== 'object' || expected === null) return null;
+  const { quotient, remainder } = expected;
+  if (!isNonNegativeInteger(quotient) || !isNonNegativeInteger(remainder)) return null;
+  const divisor: unknown = expected.divisor;
+  if (isAbsent(divisor)) return { quotient, remainder, divisor: undefined };
+  return isNonNegativeInteger(divisor) && divisor > 0 && remainder < divisor
+    ? { quotient, remainder, divisor }
+    : null;
+}
+
+/** An unevaluated expression ("37 ÷ 5", "3 + 4") restates the problem; see `judge`. */
+function unevaluated(form: AnswerForm): boolean {
+  return form.kind === 'expression';
 }
 
 function wholeNumber(text: string): Rational | 'not_whole' | CheckResult {
-  const parsed = parseMathAnswer(text);
+  const parsed = parseMathAnswerDetailed(text);
   if (!parsed.ok) return outcome('unresolved', parsed.error.code);
-  const value = parsed.value;
+  if (unevaluated(parsed.value.form)) return outcome('unresolved', 'UNEVALUATED_EXPRESSION');
+  const value = parsed.value.value;
   return isIntegerRational(value) && value.num >= 0n ? value : 'not_whole';
 }
 
@@ -247,11 +325,12 @@ export function checkDivisionWithRemainder(
   expected: DivisionExpected,
 ): CheckResult {
   if (isBlankAnswer(studentAnswer)) return outcome('unanswered', 'BLANK');
-  if (!validDivisionKey(expected)) return outcome('unresolved', 'INVALID_ANSWER_KEY');
+  const key = divisionKey(expected);
+  if (key === null) return outcome('unresolved', 'INVALID_ANSWER_KEY');
   if (studentAnswer.length > MAX_ANSWER_LENGTH) return outcome('unresolved', 'INPUT_TOO_LONG');
   const text = stripInvisible(normalizeMathText(studentAnswer)).trim();
-  const quotient = rational(expected.quotient);
-  const remainder = rational(expected.remainder);
+  const quotient = rational(key.quotient);
+  const remainder = rational(key.remainder);
 
   const match = REMAINDER_FORM.exec(text);
   if (match !== null) {
@@ -260,7 +339,7 @@ export function checkDivisionWithRemainder(
     if (typeof q === 'object' && 'verdict' in q) return q;
     if (typeof r === 'object' && 'verdict' in r) return r;
     if (q === 'not_whole' || r === 'not_whole') return outcome('unresolved', 'INVALID_SYNTAX');
-    if (expected.divisor !== undefined && compareRational(r, rational(expected.divisor)) >= 0) {
+    if (key.divisor !== undefined && compareRational(r, rational(key.divisor)) >= 0) {
       return outcome('incorrect', 'REMAINDER_NOT_LESS_THAN_DIVISOR');
     }
     return equalsRational(q, quotient) && equalsRational(r, remainder)
@@ -268,18 +347,21 @@ export function checkDivisionWithRemainder(
       : outcome('incorrect', 'VALUE_MISMATCH');
   }
 
-  const parsed = parseMathAnswer(text);
+  const parsed = parseMathAnswerDetailed(text);
   if (!parsed.ok) return outcome('unresolved', parsed.error.code);
-  const value = parsed.value;
+  // "37 ÷ 5" for 37 ÷ 5, or "35 ÷ 5" for 35 ÷ 5: the problem restated is not an answer, on the
+  // quotient path or the alternative-method path.
+  if (unevaluated(parsed.value.form)) return outcome('unresolved', 'UNEVALUATED_EXPRESSION');
+  const value = parsed.value.value;
   if (isIntegerRational(value)) {
     if (!equalsRational(value, quotient)) return outcome('incorrect', 'VALUE_MISMATCH');
-    return expected.remainder === 0
+    return key.remainder === 0
       ? outcome('correct', 'EXACT_MATCH')
       : outcome('incorrect', 'MISSING_REMAINDER');
   }
   // Alternative valid method (spec P5): a mixed number or decimal equal to q + r/d.
-  if (expected.divisor === undefined) return outcome('unresolved', 'NEEDS_DIVISOR');
-  const exact = addRational(quotient, rational(expected.remainder, expected.divisor));
+  if (key.divisor === undefined) return outcome('unresolved', 'NEEDS_DIVISOR');
+  const exact = addRational(quotient, rational(key.remainder, key.divisor));
   return equalsRational(value, exact)
     ? outcome('correct', 'EQUIVALENT_VALUE')
     : outcome('incorrect', 'VALUE_MISMATCH');
@@ -310,9 +392,12 @@ export function normalizeChoice(text: string): string | null {
   return /^[a-z]$/i.test(core) ? core.toUpperCase() : null;
 }
 
-function letterSet(letters: Iterable<string>): Set<string> | null {
+/** Null when any entry is not a single letter, or the value is not a list at all (malformed key). */
+function letterSet(letters: unknown): Set<string> | null {
+  if (!isIterable(letters)) return null;
   const set = new Set<string>();
   for (const letter of letters) {
+    if (typeof letter !== 'string') return null;
     const normalized = normalizeChoice(letter);
     if (normalized === null) return null;
     set.add(normalized);
@@ -331,8 +416,9 @@ export function checkMultipleChoice(
 ): CheckResult {
   if (isBlankAnswer(studentAnswer)) return outcome('unanswered', 'BLANK');
   const key = letterSet(expectedLetters);
-  const valid = options.validLetters === undefined ? null : letterSet(options.validLetters);
-  if (key === null || key.size === 0 || (options.validLetters !== undefined && valid === null)) {
+  const validLetters: unknown = options.validLetters;
+  const valid = isAbsent(validLetters) ? null : letterSet(validLetters);
+  if (key === null || key.size === 0 || (!isAbsent(validLetters) && valid === null)) {
     return outcome('unresolved', 'INVALID_ANSWER_KEY');
   }
   if (valid !== null && [...key].some((letter) => !valid.has(letter))) {
@@ -391,10 +477,16 @@ function unexpectedCharacters(student: string, allowed: readonly string[]): bool
 export function checkSpelling(studentAnswer: string, expected: SpellingExpected): CheckResult {
   if (isBlankAnswer(studentAnswer)) return outcome('unanswered', 'BLANK');
   if (studentAnswer.length > MAX_ANSWER_LENGTH) return outcome('unresolved', 'INPUT_TOO_LONG');
+  if (typeof expected !== 'object' || expected === null || typeof expected.target !== 'string') {
+    return outcome('unresolved', 'INVALID_ANSWER_KEY');
+  }
+  const acceptedVariants: unknown = expected.acceptedVariants;
+  const variantList = isAbsent(acceptedVariants) ? [] : stringList(acceptedVariants);
+  if (variantList === null) return outcome('unresolved', 'INVALID_ANSWER_KEY');
   const caseSensitive = expected.caseSensitive === true;
   const target = normalizeSpelling(expected.target, caseSensitive);
   if (target === '') return outcome('unresolved', 'INVALID_ANSWER_KEY');
-  const variants = (expected.acceptedVariants ?? [])
+  const variants = variantList
     .map((variant) => normalizeSpelling(variant, caseSensitive))
     .filter((variant) => variant !== '');
   const student = normalizeSpelling(studentAnswer, caseSensitive);
@@ -423,7 +515,10 @@ function normalizeShortText(text: string): string {
  */
 export function checkExactText(studentAnswer: string, expected: ExactTextExpected): CheckResult {
   if (isBlankAnswer(studentAnswer)) return outcome('unanswered', 'BLANK');
-  const accepted = expected.accepted.map(normalizeShortText).filter((text) => text !== '');
+  const acceptedList =
+    typeof expected === 'object' && expected !== null ? stringList(expected.accepted) : null;
+  if (acceptedList === null) return outcome('unresolved', 'INVALID_ANSWER_KEY');
+  const accepted = acceptedList.map(normalizeShortText).filter((text) => text !== '');
   if (accepted.length === 0) return outcome('unresolved', 'INVALID_ANSWER_KEY');
   if (studentAnswer.length > MAX_ANSWER_LENGTH) {
     return outcome(

@@ -34,7 +34,9 @@ export const GRADING_REASONS = [
   // unresolved: parse/unit failures, then checker-specific reasons
   ...QUANTITY_ERROR_CODES,
   'INVALID_ANSWER_KEY',
+  'UNEVALUATED_EXPRESSION',
   'UNEXPECTED_UNIT',
+  'AMBIGUOUS_UNIT',
   'AMBIGUOUS_PERCENT',
   'NEEDS_DIVISOR',
   'UNRECOGNIZED_CHOICE',

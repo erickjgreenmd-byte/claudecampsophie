@@ -48,6 +48,7 @@ export {
   type Dimension,
   type Quantity,
   type QuantityErrorCode,
+  type QuantityOptions,
   type UnitDefinition,
   type UnitId,
 } from './units.ts';

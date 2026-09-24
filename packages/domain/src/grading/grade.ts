@@ -12,6 +12,7 @@ import {
   type SpellingExpected,
 } from './checks.ts';
 import { isBlankAnswer } from './text.ts';
+import { isAbsent } from './untrusted.ts';
 import { outcome, type GradeOutcome, type GradeVerdict } from './verdicts.ts';
 
 export const ANSWER_KINDS = [
@@ -44,13 +45,14 @@ export const CAPTURE_ISSUES = [
 ] as const;
 export type CaptureIssue = (typeof CAPTURE_ISSUES)[number];
 
-const RESCAN_ISSUES: ReadonlySet<string> = new Set([
+const RESCAN_ISSUES: ReadonlySet<unknown> = new Set([
   'blur',
   'glare',
   'rotated',
   'cut_off',
   'unreadable',
 ]);
+const KNOWN_ISSUES: ReadonlySet<unknown> = new Set(CAPTURE_ISSUES);
 
 interface QuestionBase {
   /** Transcribed student answer (untrusted data). */
@@ -76,21 +78,48 @@ export type ObjectiveQuestion =
   | (QuestionBase & { readonly kind: 'open_response' })
   | (QuestionBase & { readonly kind: 'writing' });
 
+interface CaptureNeeds {
+  readonly rescan: boolean;
+  readonly sourcePassage: boolean;
+  readonly answerSourceUncertain: boolean;
+  readonly answerMappingUncertain: boolean;
+}
+
 /**
- * Capture problems win over any grade (AC_CAPTURE_04). Decision: an issue value outside the
- * known list is treated as a rescan request (fail closed), and rescan outranks the other issues
+ * Every capture need of one item, not just the one that decides its verdict, so the worksheet can
+ * ask for a rescan and a missing passage in the same round. Decision: an issue value outside the
+ * known list, or a captureIssues value that is not a list, is a rescan request (fail closed);
+ * null/undefined (strict structured outputs' "absent") means no issues.
+ */
+function captureNeeds(issues: unknown): CaptureNeeds | null {
+  if (isAbsent(issues)) return null;
+  if (!Array.isArray(issues)) {
+    return {
+      rescan: true,
+      sourcePassage: false,
+      answerSourceUncertain: false,
+      answerMappingUncertain: false,
+    };
+  }
+  const list: readonly unknown[] = issues;
+  if (list.length === 0) return null;
+  return {
+    rescan: list.some((issue) => RESCAN_ISSUES.has(issue) || !KNOWN_ISSUES.has(issue)),
+    sourcePassage: list.includes('missing_passage'),
+    answerSourceUncertain: list.includes('answer_source_uncertain'),
+    answerMappingUncertain: list.includes('answer_mapping_uncertain'),
+  };
+}
+
+/**
+ * Capture problems win over any grade (AC_CAPTURE_04). Decision: rescan outranks the other issues
  * because nothing else can be judged on an unreadable page.
  */
-function captureOutcome(issues: readonly string[] | undefined): GradeOutcome | null {
-  if (issues === undefined || issues.length === 0) return null;
-  const known = new Set<string>(CAPTURE_ISSUES);
-  if (issues.some((issue) => RESCAN_ISSUES.has(issue) || !known.has(issue))) {
-    return outcome('unresolved', 'NEEDS_RESCAN');
-  }
-  if (issues.includes('missing_passage')) return outcome('unresolved', 'NEEDS_SOURCE_PASSAGE');
-  if (issues.includes('answer_source_uncertain')) {
-    return outcome('unresolved', 'ANSWER_SOURCE_UNCERTAIN');
-  }
+function captureOutcome(needs: CaptureNeeds | null): GradeOutcome | null {
+  if (needs === null) return null;
+  if (needs.rescan) return outcome('unresolved', 'NEEDS_RESCAN');
+  if (needs.sourcePassage) return outcome('unresolved', 'NEEDS_SOURCE_PASSAGE');
+  if (needs.answerSourceUncertain) return outcome('unresolved', 'ANSWER_SOURCE_UNCERTAIN');
   return outcome('unresolved', 'ANSWER_MAPPING_UNCERTAIN');
 }
 
@@ -101,7 +130,7 @@ function captureOutcome(issues: readonly string[] | undefined): GradeOutcome | n
  * more precise than asking a model to grade nothing.
  */
 export function gradeObjectiveQuestion(question: ObjectiveQuestion): GradeOutcome {
-  const capture = captureOutcome(question.captureIssues);
+  const capture = captureOutcome(captureNeeds(question.captureIssues));
   if (capture !== null) return capture;
   switch (question.kind) {
     case 'numeric':
@@ -116,7 +145,7 @@ export function gradeObjectiveQuestion(question: ObjectiveQuestion): GradeOutcom
       return checkMultipleChoice(
         question.studentAnswer,
         question.expected.letters,
-        question.expected.validLetters === undefined
+        isAbsent(question.expected.validLetters)
           ? {}
           : { validLetters: question.expected.validLetters },
       );
@@ -206,6 +235,7 @@ export function gradeWorksheet(
     unanswered: 0,
     rubric: 0,
   };
+  const needs = ordered.map((item) => captureNeeds(item.question.captureIssues));
   const results = ordered.map((item): WorksheetResult => {
     const graded = gradeObjectiveQuestion(item.question);
     counts[graded.verdict] += 1;
@@ -220,7 +250,9 @@ export function gradeWorksheet(
   return ok({
     results,
     counts,
-    needsRescan: results.some((r) => r.reason === 'NEEDS_RESCAN'),
-    needsSourcePassage: results.some((r) => r.reason === 'NEEDS_SOURCE_PASSAGE'),
+    // From every item's capture needs, not its single deciding reason: an item that is blurred
+    // AND depends on a missing passage asks for both at once.
+    needsRescan: needs.some((n) => n?.rescan === true),
+    needsSourcePassage: needs.some((n) => n?.sourcePassage === true),
   });
 }

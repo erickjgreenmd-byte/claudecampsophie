@@ -108,6 +108,15 @@ export interface DetailedQuantity extends Quantity {
   readonly form: AnswerForm;
 }
 
+export interface QuantityOptions {
+  /**
+   * How a bare "oz" / "ounce(s)" is read. 'weight' (default): the avoirdupois ounce. 'fluid': a
+   * fluid ounce, for capacity answers; in US customary usage "oz" for a capacity is a fluid ounce
+   * ("1 cup = 8 oz"). "fl oz" is always a fluid ounce.
+   */
+  readonly ounces?: 'weight' | 'fluid';
+}
+
 // ---------------------------------------------------------------------------------------------
 // Unit table
 // ---------------------------------------------------------------------------------------------
@@ -344,7 +353,22 @@ function resolveUnit(text: string): UnitDefinition {
   return unit;
 }
 
-function parseSegments(segments: readonly Segment[]): DetailedQuantity {
+/**
+ * Decision: with `ounces: 'fluid'` a bare "oz" is a fluid ounce, but only when no other part of the
+ * answer is a weight: "1 lb 4 oz" stays a weight (and is judged as one), "1 cup 2 oz" is 10 fl oz.
+ */
+function readOunces(
+  pairs: readonly { text: string; unit: UnitDefinition }[],
+  options: QuantityOptions,
+): readonly { text: string; unit: UnitDefinition }[] {
+  if (options.ounces !== 'fluid') return pairs;
+  const weightPart = pairs.some((p) => p.unit.dimension === 'mass' && p.unit.id !== 'oz');
+  if (weightPart) return pairs;
+  const fluid = unitById('fl_oz');
+  return pairs.map((pair) => (pair.unit.id === 'oz' ? { ...pair, unit: fluid } : pair));
+}
+
+function parseSegments(segments: readonly Segment[], options: QuantityOptions): DetailedQuantity {
   const first = segments[0];
   if (first === undefined) fail('EMPTY_INPUT', 'answer is empty');
   if (first.kind === 'unit') fail('INVALID_SYNTAX', 'unit appears before the number');
@@ -355,10 +379,11 @@ function parseSegments(segments: readonly Segment[]): DetailedQuantity {
   if (segments.length % 2 === 1) {
     fail('AMBIGUOUS_FORMAT', 'number after the last unit has no unit');
   }
-  const pairs: { text: string; unit: UnitDefinition }[] = [];
+  const written: { text: string; unit: UnitDefinition }[] = [];
   for (let i = 0; i < segments.length; i += 2) {
-    pairs.push({ text: segments[i]!.text, unit: resolveUnit(segments[i + 1]!.text) });
+    written.push({ text: segments[i]!.text, unit: resolveUnit(segments[i + 1]!.text) });
   }
+  const pairs = readOunces(written, options);
   const dimension = pairs[0]!.unit.dimension;
   if (pairs.some((p) => p.unit.dimension !== dimension)) {
     fail('INCONSISTENT_UNITS', 'units of different kinds in one answer');
@@ -414,7 +439,10 @@ function compound(pairs: readonly { text: string; unit: UnitDefinition }[]): Det
 }
 
 /** Like parseQuantity, plus how the number was written (for simplest-form checks). */
-export function parseQuantityDetailed(text: string): Result<DetailedQuantity, QuantityErrorCode> {
+export function parseQuantityDetailed(
+  text: string,
+  options: QuantityOptions = {},
+): Result<DetailedQuantity, QuantityErrorCode> {
   if (text.length > MAX_ANSWER_LENGTH) {
     return err('INPUT_TOO_LONG', `answer exceeds ${MAX_ANSWER_LENGTH} characters`);
   }
@@ -425,8 +453,8 @@ export function parseQuantityDetailed(text: string): Result<DetailedQuantity, Qu
   if (normalized === '') return err('EMPTY_INPUT', 'answer is empty');
   try {
     const prefix = CURRENCY_PREFIX.exec(normalized);
-    if (prefix === null) return ok(parseSegments(segment(normalized)));
-    return ok(dollarPrefixed(prefix[1] ?? '', normalized.slice(prefix[0].length)));
+    if (prefix === null) return ok(parseSegments(segment(normalized), options));
+    return ok(dollarPrefixed(prefix[1] ?? '', normalized.slice(prefix[0].length), options));
   } catch (error) {
     if (error instanceof QuantityFailure) return err(error.code, error.message);
     throw error;
@@ -434,11 +462,11 @@ export function parseQuantityDetailed(text: string): Result<DetailedQuantity, Qu
 }
 
 /** "$1.50", "-$5", "$5 dollars". "$150 cents" names two currency units and is ambiguous. */
-function dollarPrefixed(sign: string, rest: string): DetailedQuantity {
+function dollarPrefixed(sign: string, rest: string, options: QuantityOptions): DetailedQuantity {
   if (SIGN_CHARS.has(Array.from(rest)[0] ?? '') && sign !== '') {
     fail('INVALID_SYNTAX', 'two signs around a currency symbol');
   }
-  const parsed = parseSegments(segment(rest));
+  const parsed = parseSegments(segment(rest), options);
   if (parsed.unit !== null) {
     if (parsed.dimension !== 'currency') {
       fail('INCONSISTENT_UNITS', 'currency symbol with a non-currency unit');

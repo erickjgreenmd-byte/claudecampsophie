@@ -359,6 +359,12 @@ const SINGLE_NUMBER_KINDS: ReadonlySet<AnswerFormKind> = new Set([
   'mixed_number',
   'percent',
 ]);
+/** Forms a percent sign may turn into a single percent value (not a mixed number or percent). */
+const PERCENT_OPERAND_KINDS: ReadonlySet<AnswerFormKind> = new Set([
+  'integer',
+  'decimal',
+  'fraction',
+]);
 
 function bigAbs(value: bigint): bigint {
   return value < 0n ? -value : value;
@@ -451,36 +457,40 @@ class Parser {
   }
 
   /**
-   * Decision: "2-1/2" (no spaces) is how many people write the mixed number 2½, but as an
-   * expression it is 3/2. The two readings differ, so it is AMBIGUOUS_FORMAT, never guessed.
+   * Decision: "2-1/2", "2-½" and "2-¹⁄₂" (no space before the fraction) are how many people
+   * write the mixed number 2½ (and hardware/measurement notation: "2-½ in"), but as an expression
+   * each is 3/2. The two readings differ, so they are AMBIGUOUS_FORMAT, never guessed.
    */
   private rejectHyphenatedMixedNumber(): void {
     const minus = this.peek();
     const before = this.tokens[this.pos - 1];
-    const numerator = this.peek(1);
+    const fraction = this.peek(1);
     if (
-      isIntegerLiteral(before) &&
-      minus !== undefined &&
-      !minus.spaceBefore &&
-      isIntegerLiteral(numerator) &&
-      !numerator.spaceBefore &&
-      isOp(this.peek(2), '/') &&
-      isIntegerLiteral(this.peek(3))
+      !isIntegerLiteral(before) ||
+      minus === undefined ||
+      minus.spaceBefore ||
+      fraction === undefined ||
+      fraction.spaceBefore
     ) {
-      fail('AMBIGUOUS_FORMAT', 'hyphenated mixed number');
+      return;
     }
+    const glyph = fraction.kind === 'vulgar';
+    const written =
+      isIntegerLiteral(fraction) && isOp(this.peek(2), '/') && isIntegerLiteral(this.peek(3));
+    if (glyph || written) fail('AMBIGUOUS_FORMAT', 'hyphenated mixed number');
   }
 
   private term(depth: number): Node {
-    let left = this.unary(depth, true);
+    let left = this.unary(depth, true, false);
     for (;;) {
       const token = this.peek();
       if (token?.kind !== 'op' || (token.op !== '*' && token.op !== '/' && token.op !== '÷')) {
         return left;
       }
       this.pos++;
+      const division = token.op !== '*';
       // A mixed number may be a factor ("3 × 2 1/2") but not a divisor ("1/2 1/2" is ambiguous).
-      const right = this.unary(depth, token.op === '*');
+      const right = this.unary(depth, !division, division);
       if (token.op === '*') {
         left = {
           kind: 'binary',
@@ -490,20 +500,46 @@ class Parser {
         continue;
       }
       if (right.value.num === 0n) fail('DIVISION_BY_ZERO', 'division by zero');
-      left = {
+      const quotient: Node = {
         kind: 'binary',
         value: bounded(divideRational(left.value, right.value)),
         form: token.op === '/' ? writtenFractionForm(left, right) : EXPRESSION_FORM,
       };
+      left = isOp(this.peek(), '%') ? this.fractionPercent(quotient) : quotient;
     }
   }
 
-  private unary(depth: number, allowMixed: boolean): Node {
+  /**
+   * Decision: "1/2%" is one half percent (1/200), exactly like "½%", "(1/2)%" and
+   * parseQuantity("1/2%"); it is never read as 1 ÷ 2% = 50. A percent sign after any other
+   * division ("6 ÷ 2%", "1.5/2%", "3 × 1/2%") has two readings that differ, so it is
+   * AMBIGUOUS_FORMAT, never guessed.
+   */
+  private fractionPercent(quotient: Node): Node {
+    this.pos++;
+    if (this.options.percent === 'reject') {
+      fail('UNSUPPORTED_EXPRESSION', 'percent notation is not accepted here');
+    }
+    if (quotient.form.kind !== 'fraction') {
+      fail('AMBIGUOUS_FORMAT', 'percent sign after a division');
+    }
+    return {
+      kind: 'percent',
+      value: bounded(divideRational(quotient.value, rational(100n))),
+      form: { kind: 'percent', reduced: quotient.form.reduced },
+    };
+  }
+
+  /**
+   * `divisor`: this operand is the right-hand side of "/" or "÷". A percent sign after it is then
+   * left for `term`, which decides whether it applies to the whole fraction ("1/2%").
+   */
+  private unary(depth: number, allowMixed: boolean, divisor: boolean): Node {
     if (depth >= MAX_NESTING_DEPTH) fail('TOO_COMPLEX', 'answer is nested too deeply');
     const token = this.peek();
     if (token?.kind === 'op' && (token.op === '-' || token.op === '+')) {
       this.pos++;
-      const operand = this.unary(depth + 1, allowMixed);
+      const operand = this.unary(depth + 1, allowMixed, divisor);
       // Decision: "-2^2" is -4 in algebra but 4 in spreadsheets; never guess.
       if (token.op === '-' && operand.kind === 'power') {
         fail('AMBIGUOUS_FORMAT', 'minus sign before an unparenthesized power');
@@ -515,16 +551,16 @@ class Parser {
         form: singleNumber ? operand.form : EXPRESSION_FORM,
       };
     }
-    return this.power(depth, allowMixed);
+    return this.power(depth, allowMixed, divisor);
   }
 
-  private power(depth: number, allowMixed: boolean): Node {
-    const base = this.postfix(depth, allowMixed);
+  private power(depth: number, allowMixed: boolean, divisor: boolean): Node {
+    const base = this.postfix(depth, allowMixed, divisor);
     const token = this.peek();
     let exponent: Rational;
     if (isOp(token, '^')) {
       this.pos++;
-      const node = this.unary(depth + 1, false);
+      const node = this.unary(depth + 1, false, false);
       // Decision: "2^3^2" is 512 by the math convention but 64 in many calculators; never guess.
       if (node.kind === 'power') fail('AMBIGUOUS_FORMAT', 'chained exponents need parentheses');
       exponent = node.value;
@@ -544,19 +580,24 @@ class Parser {
     return { kind: 'power', value: applyPower(base.value, exponent), form: EXPRESSION_FORM };
   }
 
-  private postfix(depth: number, allowMixed: boolean): Node {
+  /**
+   * Postfix percent. Decision: a percent of a single number ("50%", "12.5%", "½%", "(1/2)%") is a
+   * percent-form value (one number, not an unevaluated expression); a percent of anything else
+   * ("(1+1)%") is an expression.
+   */
+  private postfix(depth: number, allowMixed: boolean, divisor: boolean): Node {
     const node = this.primary(depth, allowMixed);
-    if (!isOp(this.peek(), '%')) return node;
+    if (!isOp(this.peek(), '%') || divisor) return node;
     this.pos++;
     if (this.options.percent === 'reject') {
       fail('UNSUPPORTED_EXPRESSION', 'percent notation is not accepted here');
     }
     if (node.kind === 'mixed') fail('AMBIGUOUS_FORMAT', 'percent applied to a mixed number');
-    const literal = node.kind === 'integer' || node.kind === 'decimal';
+    const single = PERCENT_OPERAND_KINDS.has(node.form.kind);
     return {
       kind: 'percent',
       value: bounded(divideRational(node.value, rational(100n))),
-      form: literal ? { kind: 'percent', reduced: true } : EXPRESSION_FORM,
+      form: single ? { kind: 'percent', reduced: node.form.reduced } : EXPRESSION_FORM,
     };
   }
 
