@@ -187,6 +187,13 @@ function isBlank(answer: string | null): boolean {
   return answer === null || answer.trim().length === 0;
 }
 
+/** True when a model key is a single written value (7, 3/4, 0.5), not an expression like 3 × 4. */
+function plainValueKey(key: string | null | undefined): boolean {
+  if (!key) return false;
+  const parsed = parseMathAnswerDetailed(key);
+  return parsed.ok && parsed.value.form.kind !== 'expression';
+}
+
 /** Builds a deterministic question from a key; null when the key cannot be represented safely. */
 export function objectiveQuestion(
   kind: AnswerKind,
@@ -1049,13 +1056,24 @@ class ScanRun {
             confidence: CONFIDENCE[v.confidence],
           }
         : undefined;
-      const resolution = resolveGrading({
-        ...(deterministic ? { deterministic } : {}),
-        primary: primaryJudgment,
-        ...(verifier ? { verifier } : {}),
-        // Escalation to a stronger model is not wired yet; unsettled items go to parent review.
-        escalationBudgetRemaining: 0,
-      });
+      // RV-grading-1 at scan level: an answer that only restates the computation ('35 ÷ 5' for
+      // '35 ÷ 5 =') is not a final answer. When the key is a plain value (the prompt-computed key,
+      // or a model key that is not itself an expression), no model agreement may grade it
+      // correct; a grown-up decides. Prompts that ask for an expression keep an expression key.
+      const restatesComputation =
+        deterministicReason === 'UNEVALUATED_EXPRESSION' ||
+        (promptKey === null &&
+          keyedOutcome?.reason === 'UNEVALUATED_EXPRESSION' &&
+          plainValueKey(primary.correctAnswer));
+      const resolution = restatesComputation
+        ? ({ final: 'needs_parent_review', route: 'parent_review', disagreement: false } as const)
+        : resolveGrading({
+            ...(deterministic ? { deterministic } : {}),
+            primary: primaryJudgment,
+            ...(verifier ? { verifier } : {}),
+            // Escalation to a stronger model is not wired yet; unsettled items go to parent review.
+            escalationBudgetRemaining: 0,
+          });
       return this.graded(
         q,
         resolution.final,

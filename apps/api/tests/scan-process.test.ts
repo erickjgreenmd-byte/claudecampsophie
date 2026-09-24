@@ -553,6 +553,59 @@ describe('scan processing (AC_CAPTURE_06, AC_GRADING_01/03/04/06, AC_ACCESS_03)'
     expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
   });
 
+  it('restating a computation is never graded correct, even when both models say so (RV-grading-1)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '6',
+      prompt: '35 ÷ 5 =',
+      answer: '35 ÷ 5',
+      kind: 'numeric',
+      key: '7',
+      // Both models are confidently wrong: the answer only restates the problem.
+      primary: { verdict: 'correct', confidence: 'high' },
+      verifier: { verdict: 'correct', confidence: 'high' },
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [q] })));
+    const [row] = await results(scan.assignmentId);
+    expect(row!.verdict).not.toBe('correct');
+    expect(['incorrect', 'needs_parent_review']).toContain(row!.verdict);
+  });
+
+  it('a word problem answered with its unevaluated computation goes to a grown-up (model key path)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '8',
+      prompt: 'Sam shares 35 apples equally among 5 bags. How many apples go in each bag?',
+      answer: '35 ÷ 5',
+      kind: 'numeric',
+      key: '7',
+      primary: { verdict: 'correct', confidence: 'high' },
+      verifier: { verdict: 'correct', confidence: 'high' },
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [q] })));
+    const [row] = await results(scan.assignmentId);
+    expect(row).toMatchObject({ verdict: 'needs_parent_review', route: 'parent_review' });
+  });
+
+  it('an expression is still accepted where the prompt asks for one (no prompt-computed key)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const q: ScriptedQuestion = {
+      page: 1,
+      number: '7',
+      prompt: 'Write an expression for 3 groups of 4 apples.',
+      answer: '3 × 4',
+      kind: 'numeric',
+      key: '3 × 4',
+      primary: { verdict: 'correct', confidence: 'high' },
+      verifier: { verdict: 'correct', confidence: 'high' },
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [q] })));
+    const [row] = await results(scan.assignmentId);
+    expect(row!.verdict).toBe('correct');
+  });
+
   it('without verified consent nothing is sent to the model and the allowance is released', async () => {
     const scan = await queuedScan({ withConsent: false });
     const client = scriptedModel({ questions: WORKSHEET });
