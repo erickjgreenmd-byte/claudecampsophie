@@ -266,8 +266,78 @@ export const pointsHistoryResponseSchema = z.strictObject({
 export type PointsHistory = z.infer<typeof pointsHistoryResponseSchema>;
 
 // ---------------------------------------------------------------------------------------------
+// Parent: family earning rules (spec P9 "configurable earning rules"; AC_REWARDS_01)
+// ---------------------------------------------------------------------------------------------
+
+/** One rule awards 0–100 points (reward_rules checks, domain MAX_POINTS_PER_AWARD). */
+export const REWARD_RULE_POINTS_MAX = 100;
+/**
+ * Decision: answers faster than the family's minimum response time earn nothing. Parents choose
+ * 0.5–60 s, never less than 0.5 s (migration 0750 floor, domain MIN_RESPONSE_THRESHOLD_MS): with
+ * blank answers never earning and one award per question and per set, that floor keeps rapid
+ * retries from farming points at the lowest setting too.
+ */
+export const REWARD_RULE_MIN_RESPONSE_MS_MIN = 500;
+export const REWARD_RULE_MIN_RESPONSE_MS_MAX = 60_000;
+
+const rulePointsSchema = z.number().int().min(0).max(REWARD_RULE_POINTS_MAX);
+
+export const familyRewardRulesSchema = z.strictObject({
+  /** Points for a meaningful try, earned even when the answer is wrong (once per question). */
+  attemptPoints: rulePointsSchema,
+  /** Extra points when the first try is right without help (once per question). */
+  independentCorrectBonus: rulePointsSchema,
+  /** Points for finishing a practice set with meaningful work on every question (once per set). */
+  setCompletionPoints: rulePointsSchema,
+  /** Blank answers, and answers faster than this, earn nothing (anti-farming). */
+  minMeaningfulResponseMs: z
+    .number()
+    .int()
+    .min(REWARD_RULE_MIN_RESPONSE_MS_MIN)
+    .max(REWARD_RULE_MIN_RESPONSE_MS_MAX),
+});
+export type FamilyRewardRules = z.infer<typeof familyRewardRulesSchema>;
+
+/** PUT body: the complete rules (a full replacement, so a retried save is idempotent). */
+export const updateRewardRulesRequestSchema = familyRewardRulesSchema;
+export type UpdateRewardRulesRequest = z.infer<typeof updateRewardRulesRequestSchema>;
+
+export const rewardRulesResponseSchema = z.strictObject({
+  /** The rules that apply to the next award. */
+  rules: familyRewardRulesSchema,
+  /** The P9 suggested starting rules (what a family earns on until it changes them). */
+  suggested: familyRewardRulesSchema,
+  /** When the family last changed its rules; null = never (the suggested rules apply). */
+  updatedAt: isoDateTimeSchema.nullable(),
+});
+export type RewardRulesResponse = z.infer<typeof rewardRulesResponseSchema>;
+
+export const rewardRulesUpdateResponseSchema = z.strictObject({
+  rules: familyRewardRulesSchema,
+  suggested: familyRewardRulesSchema,
+  updatedAt: isoDateTimeSchema.nullable(),
+  /** False when exactly these rules were already in place (idempotent retry; nothing changed). */
+  changed: z.boolean(),
+});
+export type RewardRulesUpdateResponse = z.infer<typeof rewardRulesUpdateResponseSchema>;
+
+// ---------------------------------------------------------------------------------------------
 // Child: explicit allowlisted fields only (no family ids, creators, reasons or sibling data)
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * The family's published point values in child terms. Deliberately without the minimum response
+ * time: a child told the exact threshold could simply wait it out before guessing.
+ */
+export const childEarningRulesSchema = z.strictObject({
+  /** Points for trying a practice question, even when it isn't right yet (once per question). */
+  pointsPerTry: rulePointsSchema,
+  /** Extra points for getting it right on the first try without help (once per question). */
+  firstTryBonus: rulePointsSchema,
+  /** Points for finishing a practice set (once per set). */
+  setCompletionPoints: rulePointsSchema,
+});
+export type ChildEarningRules = z.infer<typeof childEarningRulesSchema>;
 
 export const childRewardSchema = z.strictObject({
   id: uuidSchema,
@@ -295,6 +365,8 @@ export const childRewardsResponseSchema = z.strictObject({
   rewards: z.array(childRewardSchema),
   /** Open requests first, then the most recent (at most 50). */
   requests: z.array(childRewardRequestSchema),
+  /** How points are earned in this family ("How you earn points"). */
+  earningRules: childEarningRulesSchema,
 });
 export type ChildRewards = z.infer<typeof childRewardsResponseSchema>;
 

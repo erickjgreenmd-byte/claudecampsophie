@@ -66,7 +66,12 @@ describe('request ids (idempotent retries, AC_REWARDS_02)', () => {
 
 describe('child actions', () => {
   it('loads from the child endpoint only', async () => {
-    const api = fakeApi(() => ({ balance: 0, rewards: [], requests: [] }));
+    const api = fakeApi(() => ({
+      balance: 0,
+      rewards: [],
+      requests: [],
+      earningRules: { pointsPerTry: 2, firstTryBonus: 3, setCompletionPoints: 5 },
+    }));
     await loadChildRewards(api);
     expect(api.calls).toEqual([{ method: 'GET', path: '/v1/child/rewards', body: undefined }]);
   });

@@ -5,11 +5,14 @@ import {
   pointsAdjustmentRequestSchema,
   rewardDecisionRequestSchema,
   updateRewardRequestSchema,
+  updateRewardRulesRequestSchema,
   uuidSchema,
+  type ChildEarningRules,
   type ChildReward,
   type ChildRewardRequest,
   type ChildRewardRequestResponse,
   type ChildRewards,
+  type FamilyRewardRules,
   type ParentRewardRequest,
   type PointsAdjustmentResponse,
   type PointsHistory,
@@ -17,8 +20,15 @@ import {
   type Reward,
   type RewardDecisionResponse,
   type RewardRequestState,
+  type RewardRulesResponse,
+  type RewardRulesUpdateResponse,
   type RewardsOverview,
 } from '@pencillift/contracts';
+import {
+  DEFAULT_REWARD_RULES,
+  MIN_RESPONSE_THRESHOLD_MS,
+  validateRules,
+} from '@pencillift/domain/rewards';
 import { readJson } from '../app.ts';
 import type { ChildPrincipal, Tx } from '../db.ts';
 import { ApiError, businessRule, isUniqueViolation, pgErrorCode } from '../errors.ts';
@@ -39,6 +49,8 @@ import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
  * requesting a reward, and decline/cancel releases them exactly once. There is deliberately no
  * endpoint that awards points (learning awards are a server-side job owned by the learning vertical)
  * and none that ties points to ads, sponsor/affiliate clicks, purchases or referrals (AC_MON_13).
+ * Parents publish the family's earning rules here (P9 "configurable earning rules", AC_REWARDS_01);
+ * the practice answer route applies them to the next award, and past awards are never recomputed.
  *
  * Every parent request runs as `authenticated` and every child request as `pl_child`, so RLS and
  * column grants are an independent second layer; no handler here uses the service role for data.
@@ -137,6 +149,86 @@ function toChildRequest(row: ChildRequestRow): ChildRewardRequest {
     decidedAt: isoOrNull(row.decided_at),
     fulfilledAt: isoOrNull(row.fulfilled_at),
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Earning rules (spec P9, AC_REWARDS_01)
+// ---------------------------------------------------------------------------------------------
+
+interface RulePointsRow {
+  attempt_points: number;
+  independent_correct_bonus: number;
+  set_completion_points: number;
+}
+
+interface RewardRulesRow extends RulePointsRow {
+  min_meaningful_response_ms: number;
+  updated_at: Date;
+}
+
+/** The P9 suggested starting rules: what a family earns on until it publishes its own. */
+const SUGGESTED_RULES: FamilyRewardRules = {
+  attemptPoints: DEFAULT_REWARD_RULES.attemptPoints,
+  independentCorrectBonus: DEFAULT_REWARD_RULES.independentCorrectBonus,
+  setCompletionPoints: DEFAULT_REWARD_RULES.setCompletionPoints,
+  minMeaningfulResponseMs: DEFAULT_REWARD_RULES.minMeaningfulResponseMs,
+};
+
+/**
+ * The rules the practice answer route applies to the next award (routes/learning.ts
+ * mapRewardsRules): the family's row with the threshold clamped to the 500 ms floor, or the
+ * suggested rules when there is no valid row. Migration 0750 keeps every stored row valid, so this
+ * is the stored row; the same clamp and fallback are repeated so the published and the applied
+ * rules cannot drift apart. A child's read has no threshold column (0750 column grant), so only the
+ * point values are checked for it.
+ */
+function effectiveRules(
+  row: (RulePointsRow & { min_meaningful_response_ms?: number }) | undefined,
+): FamilyRewardRules {
+  if (!row) return SUGGESTED_RULES;
+  const parsed = validateRules({
+    attemptPoints: row.attempt_points,
+    independentCorrectBonus: row.independent_correct_bonus,
+    setCompletionPoints: row.set_completion_points,
+    minMeaningfulResponseMs: Math.max(
+      MIN_RESPONSE_THRESHOLD_MS,
+      row.min_meaningful_response_ms ?? SUGGESTED_RULES.minMeaningfulResponseMs,
+    ),
+    maxAwardsPerQuestionInstance: 1,
+  });
+  if (!parsed.ok) return SUGGESTED_RULES;
+  return {
+    attemptPoints: parsed.value.attemptPoints,
+    independentCorrectBonus: parsed.value.independentCorrectBonus,
+    setCompletionPoints: parsed.value.setCompletionPoints,
+    minMeaningfulResponseMs: parsed.value.minMeaningfulResponseMs,
+  };
+}
+
+function toRulesResponse(row: RewardRulesRow | undefined): RewardRulesResponse {
+  return {
+    rules: effectiveRules(row),
+    suggested: SUGGESTED_RULES,
+    updatedAt: row ? iso(row.updated_at) : null,
+  };
+}
+
+/** Child DTO: the three point values only; the anti-farming threshold is never shown to a child. */
+function toChildEarningRules(row: RulePointsRow | undefined): ChildEarningRules {
+  const rules = effectiveRules(row);
+  return {
+    pointsPerTry: rules.attemptPoints,
+    firstTryBonus: rules.independentCorrectBonus,
+    setCompletionPoints: rules.setCompletionPoints,
+  };
+}
+
+async function readRules(tx: Tx, familyId: string): Promise<RewardRulesRow | undefined> {
+  const [row] = await tx<RewardRulesRow[]>`
+    select attempt_points, independent_correct_bonus, set_completion_points,
+           min_meaningful_response_ms, updated_at
+      from public.reward_rules where family_id = ${familyId}`;
+  return row;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -524,6 +616,48 @@ export function rewardsRoutes(): Hono<AppEnv> {
     return c.json(body);
   });
 
+  // Earning rules (spec P9 "configurable earning rules"; AC_REWARDS_01). Any adult of the family
+  // may read them; changing them needs the same recent PIN step-up as every other reward or points
+  // change, because the rules decide what a child earns (a child on a signed-in parent device must
+  // not be able to raise them). Owner and guardian alike, as for adjustments and decisions.
+  r.get('/reward-rules', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const familyId = await currentFamilyId(c);
+    const row = await deps.db.asParent(parent, (tx) => readRules(tx, familyId));
+    return c.json(toRulesResponse(row));
+  });
+
+  r.put('/reward-rules', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const familyId = await currentFamilyId(c);
+    await assertRecentUnlock(c);
+    const body = await readJson(c, updateRewardRulesRequestSchema);
+    let result: { changed: boolean; row: RewardRulesRow | undefined };
+    try {
+      result = await deps.db.asParent(parent, async (tx) => {
+        // The RPC re-checks membership, the step-up and the limits in the database, upserts (the
+        // same rules again are a no-op) and audits a real change in this transaction (0750). It
+        // only changes the rules for awards computed from now on; the ledger is never rewritten.
+        const [saved] = await tx<{ changed: boolean }[]>`
+          select public.parent_set_reward_rules(
+            ${familyId}, ${body.attemptPoints}, ${body.independentCorrectBonus},
+            ${body.setCompletionPoints}, ${body.minMeaningfulResponseMs}) as changed`;
+        return { changed: saved?.changed === true, row: await readRules(tx, familyId) };
+      });
+    } catch (error) {
+      if (pgErrorCode(error) === '22023')
+        throw new ApiError('VALIDATION_FAILED', 'Check the points and the minimum answer time');
+      if (pgErrorCode(error) === 'P0002')
+        throw new ApiError('NOT_FOUND', 'Create your family first');
+      mapRewardsDbError(error, 'parent');
+    }
+    const response: RewardRulesUpdateResponse = {
+      ...toRulesResponse(result.row),
+      changed: result.changed,
+    };
+    return c.json(response);
+  });
+
   // -------------------------------------------------------------------------------------------
   // Child (paired device). Identity comes only from the verified child session.
   // -------------------------------------------------------------------------------------------
@@ -548,6 +682,10 @@ export function rewardsRoutes(): Hono<AppEnv> {
          where r.child_id = ${child.childId}
          order by (r.state in ('pending', 'approved')) desc, r.requested_at desc, r.id
          limit ${CHILD_REQUESTS_LIMIT}`,
+      // Column grant (0750): the point values only; the threshold is not readable by pl_child.
+      rules: await tx<RulePointsRow[]>`
+        select attempt_points, independent_correct_bonus, set_completion_points
+          from public.reward_rules where family_id = ${child.familyId}`,
     }));
     const body: ChildRewards = {
       balance: data.balance,
@@ -558,6 +696,7 @@ export function rewardsRoutes(): Hono<AppEnv> {
         instructions: w.instructions,
       })),
       requests: data.requests.map(toChildRequest),
+      earningRules: toChildEarningRules(data.rules[0]),
     };
     return c.json(body);
   });

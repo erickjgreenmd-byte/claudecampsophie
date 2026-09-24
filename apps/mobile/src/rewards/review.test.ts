@@ -33,6 +33,7 @@ function childData(overrides: Partial<ChildRewards> = {}): ChildRewards {
       },
     ],
     requests: [],
+    earningRules: { pointsPerTry: 2, firstTryBonus: 3, setCompletionPoints: 5 },
     ...overrides,
   };
 }

@@ -317,7 +317,13 @@ describe('child rewards view and isolation (AC_ACCESS_05)', () => {
     expect(res.status).toBe(200);
     const raw = await json<Record<string, unknown>>(res);
     const body = childRewardsResponseSchema.parse(raw);
-    expect(Object.keys(raw).sort()).toEqual(['balance', 'requests', 'rewards']);
+    expect(Object.keys(raw).sort()).toEqual(['balance', 'earningRules', 'requests', 'rewards']);
+    // Spec P9 published rules, point values only (the anti-farming threshold stays server-side).
+    expect(Object.keys(raw.earningRules as object).sort()).toEqual([
+      'firstTryBonus',
+      'pointsPerTry',
+      'setCompletionPoints',
+    ]);
     expect(body.balance).toBe(await balance(fam, 0));
     const ids = body.rewards.map((r) => r.id);
     expect(ids).toContain(forAll);
@@ -724,6 +730,7 @@ describe('no commercial point sources (AC_MON_13, spec P16.4)', () => {
       [
         'GET /child/rewards',
         'GET /points/history',
+        'GET /reward-rules',
         'GET /rewards',
         'PATCH /rewards/:id',
         'POST /child/reward-requests/:id/cancel',
@@ -731,6 +738,7 @@ describe('no commercial point sources (AC_MON_13, spec P16.4)', () => {
         'POST /points/adjustments',
         'POST /reward-requests/:id/decision',
         'POST /rewards',
+        'PUT /reward-rules',
       ].sort(),
     );
     for (const route of routes) {

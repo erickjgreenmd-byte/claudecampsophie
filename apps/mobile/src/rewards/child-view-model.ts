@@ -1,4 +1,4 @@
-import type { ChildRewards, RewardRequestState } from '@pencillift/contracts';
+import type { ChildEarningRules, ChildRewards, RewardRequestState } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 
 /**
@@ -35,9 +35,17 @@ export interface ChildRequestRow {
   readonly cancelA11yLabel: string;
 }
 
+/** "How you earn points": the family's published earning rules in child words (spec P9). */
+export interface ChildEarningView {
+  readonly heading: string;
+  readonly lines: readonly string[];
+  readonly note: string;
+}
+
 export interface ChildRewardsView {
   readonly balanceLabel: string;
   readonly encouragement: string;
+  readonly earning: ChildEarningView;
   readonly rewards: readonly ChildRewardCard[];
   readonly requests: readonly ChildRequestRow[];
   readonly emptyRewardsMessage: string | null;
@@ -55,6 +63,31 @@ const STATUS_LABEL: Record<RewardRequestState, string> = {
   declined: 'Not this time – your points are back',
   cancelled: 'Cancelled – your points are back',
 };
+
+/**
+ * Decision: a rule worth 0 points is left out rather than shown as "0 points", and nothing here
+ * promises points for every try: awards are capped per question and per set, and blank or rushed
+ * answers earn nothing (P9 anti-farming). The exact minimum answer time is never shown (the API
+ * does not send it), so the note says "rushed" instead of a number a child could wait out.
+ */
+export function buildEarningView(rules: ChildEarningRules): ChildEarningView {
+  const lines: string[] = [];
+  if (rules.pointsPerTry > 0)
+    lines.push(
+      `Give a practice question a real try: ${pointsText(rules.pointsPerTry)}, even if it isn’t right yet.`,
+    );
+  if (rules.firstTryBonus > 0)
+    lines.push(`Get it right on your first try: ${pointsText(rules.firstTryBonus)} extra.`);
+  if (rules.setCompletionPoints > 0)
+    lines.push(`Finish a practice set: ${pointsText(rules.setCompletionPoints)}.`);
+  if (lines.length === 0)
+    lines.push('Practice doesn’t earn points right now. Ask a grown-up about it.');
+  return {
+    heading: 'How you earn points',
+    lines,
+    note: 'Take your time. Each question earns points once, and rushed or empty answers don’t earn points.',
+  };
+}
 
 export function buildChildRewardsView(data: ChildRewards): ChildRewardsView {
   const { balance } = data;
@@ -94,6 +127,7 @@ export function buildChildRewardsView(data: ChildRewards): ChildRewardsView {
       balance === 0
         ? 'Finishing your practice can earn points. You’ve got this!'
         : 'Great work! Keep practicing to reach your next reward.',
+    earning: buildEarningView(data.earningRules),
     rewards,
     requests,
     emptyRewardsMessage:

@@ -2,7 +2,7 @@ import { cleanup, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
-import type { PointsHistory, RewardsOverview } from '@pencillift/contracts';
+import type { PointsHistory, RewardRulesResponse, RewardsOverview } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { unconfiguredAuth } from '../../lib/auth.ts';
 import { renderPage } from '../../test/render.tsx';
@@ -97,6 +97,23 @@ const history: PointsHistory = {
   totals: { awarded: 15, adjustments: -3, reserved: 0, released: 0, net: 12 },
 };
 
+/** The family earning rules the page also loads (covered by RewardsPage.rules.test.tsx). */
+const rules: RewardRulesResponse = {
+  rules: {
+    attemptPoints: 2,
+    independentCorrectBonus: 3,
+    setCompletionPoints: 5,
+    minMeaningfulResponseMs: 1500,
+  },
+  suggested: {
+    attemptPoints: 2,
+    independentCorrectBonus: 3,
+    setCompletionPoints: 5,
+    minMeaningfulResponseMs: 1500,
+  },
+  updatedAt: null,
+};
+
 interface Call {
   method: string;
   path: string;
@@ -117,7 +134,12 @@ function fakeApi(
     get: <S extends z.ZodType>(path: string, schema: S) => {
       gets.push(path);
       try {
-        const value = options.get ? options.get(path) : (options.data ?? overview());
+        const value =
+          path === '/v1/reward-rules'
+            ? rules
+            : options.get
+              ? options.get(path)
+              : (options.data ?? overview());
         if (value instanceof Error) return Promise.reject(value);
         return Promise.resolve(schema.parse(value));
       } catch (error) {

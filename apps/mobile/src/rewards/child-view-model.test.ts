@@ -48,6 +48,7 @@ function data(overrides: Partial<ChildRewards> = {}): ChildRewards {
         fulfilledAt: null,
       },
     ],
+    earningRules: { pointsPerTry: 2, firstTryBonus: 3, setCompletionPoints: 5 },
     ...overrides,
   };
 }
@@ -57,6 +58,9 @@ function generatedCopy(view: ReturnType<typeof buildChildRewardsView>): string[]
   return [
     view.balanceLabel,
     view.encouragement,
+    view.earning.heading,
+    ...view.earning.lines,
+    view.earning.note,
     view.emptyRewardsMessage ?? '',
     view.emptyRequestsMessage ?? '',
     ...view.rewards.flatMap((r) => [r.costLabel, r.progressLabel, r.askLabel, r.askA11yLabel]),
@@ -98,6 +102,15 @@ describe('child rewards view model (spec P9, P14)', () => {
         expect(text).not.toMatch(CHILD_COPY_FORBIDDEN);
       }
     }
+    for (const earningRules of [
+      { pointsPerTry: 0, firstTryBonus: 0, setCompletionPoints: 0 },
+      { pointsPerTry: 1, firstTryBonus: 1, setCompletionPoints: 1 },
+      { pointsPerTry: 100, firstTryBonus: 100, setCompletionPoints: 100 },
+    ]) {
+      for (const text of generatedCopy(buildChildRewardsView(data({ earningRules })))) {
+        expect(text).not.toMatch(CHILD_COPY_FORBIDDEN);
+      }
+    }
     expect(buildChildRewardsView(data({ balance: 1 })).balanceLabel).toBe('You have 1 point');
     expect(buildChildRewardsView(data({ balance: 0 })).encouragement).toMatch(/practice/i);
     // Awards are capped per question and per set (P9): never promise points for every attempt.
@@ -105,6 +118,45 @@ describe('child rewards view model (spec P9, P14)', () => {
       expect(buildChildRewardsView(data({ balance })).encouragement).not.toMatch(
         /\b(every|all|any|always)\b/i,
       );
+    }
+  });
+
+  it('shows how points are earned from the family’s published rules (spec P9, AC_REWARDS_01)', () => {
+    const { earning } = buildChildRewardsView(data());
+    expect(earning.heading).toBe('How you earn points');
+    expect(earning.lines).toEqual([
+      'Give a practice question a real try: 2 points, even if it isn’t right yet.',
+      'Get it right on your first try: 3 points extra.',
+      'Finish a practice set: 5 points.',
+    ]);
+    // The caps and the anti-farming rule, in child words.
+    expect(earning.note).toMatch(/each question earns points once/i);
+    expect(earning.note).toMatch(/rushed or empty answers don’t earn points/i);
+  });
+
+  it('follows changed rules: singular for 1 point, rules worth 0 are left out', () => {
+    const one = buildChildRewardsView(
+      data({ earningRules: { pointsPerTry: 1, firstTryBonus: 0, setCompletionPoints: 7 } }),
+    ).earning;
+    expect(one.lines).toEqual([
+      'Give a practice question a real try: 1 point, even if it isn’t right yet.',
+      'Finish a practice set: 7 points.',
+    ]);
+    const none = buildChildRewardsView(
+      data({ earningRules: { pointsPerTry: 0, firstTryBonus: 0, setCompletionPoints: 0 } }),
+    ).earning;
+    expect(none.lines).toEqual([
+      'Practice doesn’t earn points right now. Ask a grown-up about it.',
+    ]);
+  });
+
+  it('never promises points for every try and never states the answer-time threshold', () => {
+    const { earning } = buildChildRewardsView(
+      data({ earningRules: { pointsPerTry: 4, firstTryBonus: 6, setCompletionPoints: 9 } }),
+    );
+    for (const text of [...earning.lines, earning.note]) {
+      expect(text).not.toMatch(/\b(every|all|any|always)\b/i);
+      expect(text).not.toMatch(/\b(seconds?|ms|milliseconds?)\b/i);
     }
   });
 

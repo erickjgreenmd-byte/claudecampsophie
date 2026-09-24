@@ -46,11 +46,29 @@ function overview(withPending: boolean): RewardsOverview {
   };
 }
 
+/** The family earning rules the page also loads (suggested values; not under review here). */
+const RULES = {
+  rules: {
+    attemptPoints: 2,
+    independentCorrectBonus: 3,
+    setCompletionPoints: 5,
+    minMeaningfulResponseMs: 1500,
+  },
+  suggested: {
+    attemptPoints: 2,
+    independentCorrectBonus: 3,
+    setCompletionPoints: 5,
+    minMeaningfulResponseMs: 1500,
+  },
+  updatedAt: null,
+};
+
 function fakeApi(options: { get: (n: number) => unknown; send: () => unknown }) {
   const gets: string[] = [];
   const api: Partial<ApiClient> = {
     get: <S extends z.ZodType>(path: string, schema: S) => {
       gets.push(path);
+      if (path === '/v1/reward-rules') return Promise.resolve(schema.parse(RULES));
       const value = options.get(gets.filter((p) => p === path).length);
       if (value instanceof Error) return Promise.reject(value);
       return Promise.resolve(schema.parse(value));

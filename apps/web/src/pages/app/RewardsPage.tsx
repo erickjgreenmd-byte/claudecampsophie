@@ -5,19 +5,26 @@ import {
   POINTS_REASON_MAX_LENGTH,
   REWARD_INSTRUCTIONS_MAX_LENGTH,
   REWARD_POINT_COST_MAX,
+  REWARD_RULE_MIN_RESPONSE_MS_MAX,
+  REWARD_RULE_MIN_RESPONSE_MS_MIN,
+  REWARD_RULE_POINTS_MAX,
   REWARD_TITLE_MAX_LENGTH,
   pointsAdjustmentResponseSchema,
   pointsHistoryResponseSchema,
   rewardDecisionResponseSchema,
   rewardResponseSchema,
+  rewardRulesResponseSchema,
+  rewardRulesUpdateResponseSchema,
   rewardTextContainsLink,
   rewardsOverviewResponseSchema,
+  type FamilyRewardRules,
   type ParentRewardRequest,
   type PointsHistoryEntry,
   type PointsLedgerKind,
   type Reward,
   type RewardChildBalance,
   type RewardDecisionAction,
+  type RewardRulesResponse,
   type RewardsOverview,
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
@@ -189,6 +196,7 @@ function RewardsManager() {
             <AdjustmentSection childBalances={activeChildren(data.children)} onChanged={refresh} />
           ) : null}
           <RewardsSection data={data} onChanged={refresh} />
+          <RulesSection />
         </div>
       ) : null}
     </>
@@ -904,6 +912,282 @@ function RewardForm(
             Cancel
           </button>
         ) : null}
+      </div>
+    </form>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// How points are earned (spec P9 "configurable earning rules"; AC_REWARDS_01)
+// ---------------------------------------------------------------------------------------------
+
+function secondsText(ms: number): string {
+  const seconds = ms / 1000;
+  return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
+}
+
+/** The published rules and caps as sentences, so no rule is shown as a bare number. */
+function ruleSentences(rules: FamilyRewardRules): string[] {
+  return [
+    rules.attemptPoints > 0
+      ? `${pointsLabel(rules.attemptPoints)} for each meaningful try at a practice question, even when the answer is wrong.`
+      : 'A try on its own earns no points.',
+    rules.independentCorrectBonus > 0
+      ? `${pointsLabel(rules.independentCorrectBonus)} extra when the first try is right without help.`
+      : 'No extra points for a right first try.',
+    rules.setCompletionPoints > 0
+      ? `${pointsLabel(rules.setCompletionPoints)} for finishing a daily practice set or weekly review with a real try at every question.`
+      : 'No points for finishing a practice set.',
+    `Blank answers, and answers given in under ${secondsText(rules.minMeaningfulResponseMs)}, earn nothing.`,
+    'Each question earns its points once, and each set earns its finishing points once, however many times it is tried.',
+  ];
+}
+
+function RulesSection() {
+  const headingId = useId();
+  const query = useApiQuery((api) => api.get('/v1/reward-rules', rewardRulesResponseSchema), []);
+  // The rules returned by the last save; shown without another round trip.
+  const [saved, setSaved] = useState<RewardRulesResponse | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const data = saved ?? (query.status === 'ready' ? query.data : null);
+
+  return (
+    <section className="card" style={sectionStyle} aria-labelledby={headingId}>
+      <h2 id={headingId}>How points are earned</h2>
+      <p>
+        Your family’s rules for practice points. Your children see them on their rewards screen. A
+        change applies to points earned from then on; points already earned never change.
+      </p>
+      {data === null && query.status === 'loading' ? (
+        <Loading label="Loading how points are earned…" />
+      ) : null}
+      {data === null && query.status === 'error' ? (
+        <ErrorState message={query.error.message} onRetry={query.reload} />
+      ) : null}
+      {data ? (
+        <>
+          <ul>
+            {ruleSentences(data.rules).map((sentence) => (
+              <li key={sentence}>{sentence}</li>
+            ))}
+          </ul>
+          <p style={{ color: 'var(--muted)' }}>
+            {data.updatedAt === null
+              ? 'These are the suggested starting rules.'
+              : `Last changed on ${formatDate(data.updatedAt)}.`}
+          </p>
+          <ActionFeedback feedback={feedback} />
+          {editing ? (
+            <RulesForm
+              current={data.rules}
+              suggested={data.suggested}
+              onSaved={(result, message) => {
+                setSaved(result);
+                setEditing(false);
+                setFeedback({ kind: 'success', message });
+              }}
+              onCancel={() => setEditing(false)}
+            />
+          ) : (
+            <div style={buttonRow}>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => {
+                  setFeedback(null);
+                  setEditing(true);
+                }}
+              >
+                Change how points are earned
+              </button>
+            </div>
+          )}
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+type RuleField = keyof FamilyRewardRules;
+type RuleValues = Record<RuleField, string>;
+type RuleProblem = { field: RuleField; message: string };
+
+const RULE_POINT_FIELDS: readonly {
+  key: Exclude<RuleField, 'minMeaningfulResponseMs'>;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    key: 'attemptPoints',
+    label: 'Points for each try',
+    hint: 'Earned once per question for a real try, even when the answer is wrong.',
+  },
+  {
+    key: 'independentCorrectBonus',
+    label: 'Bonus when the first try is right',
+    hint: 'Added once per question when the first try is right without help.',
+  },
+  {
+    key: 'setCompletionPoints',
+    label: 'Points for finishing a practice set',
+    hint: 'Earned once per daily set or weekly review when every question had a real try.',
+  },
+];
+
+function toRuleValues(rules: FamilyRewardRules): RuleValues {
+  return {
+    attemptPoints: String(rules.attemptPoints),
+    independentCorrectBonus: String(rules.independentCorrectBonus),
+    setCompletionPoints: String(rules.setCompletionPoints),
+    minMeaningfulResponseMs: String(rules.minMeaningfulResponseMs / 1000),
+  };
+}
+
+/** Mirrors the API contract (whole points 0–100; 0.5–60 s) so mistakes are explained before sending. */
+function parseRuleValues(values: RuleValues): FamilyRewardRules | RuleProblem {
+  const points: Partial<FamilyRewardRules> = {};
+  for (const field of RULE_POINT_FIELDS) {
+    const raw = values[field.key].trim();
+    const amount = Number(raw);
+    if (!/^\d+$/.test(raw) || amount > REWARD_RULE_POINTS_MAX) {
+      return {
+        field: field.key,
+        message: `${field.label}: enter a whole number from 0 to ${REWARD_RULE_POINTS_MAX}.`,
+      };
+    }
+    points[field.key] = amount;
+  }
+  const rawSeconds = values.minMeaningfulResponseMs.trim().replace(',', '.');
+  const ms = Math.round(Number(rawSeconds) * 1000);
+  if (
+    rawSeconds === '' ||
+    !Number.isFinite(ms) ||
+    ms < REWARD_RULE_MIN_RESPONSE_MS_MIN ||
+    ms > REWARD_RULE_MIN_RESPONSE_MS_MAX
+  ) {
+    return {
+      field: 'minMeaningfulResponseMs',
+      message: `Minimum answer time: enter a time from ${REWARD_RULE_MIN_RESPONSE_MS_MIN / 1000} to ${REWARD_RULE_MIN_RESPONSE_MS_MAX / 1000} seconds. It can’t be shorter, so quick guesses never earn points.`,
+    };
+  }
+  return {
+    attemptPoints: points.attemptPoints ?? 0,
+    independentCorrectBonus: points.independentCorrectBonus ?? 0,
+    setCompletionPoints: points.setCompletionPoints ?? 0,
+    minMeaningfulResponseMs: ms,
+  };
+}
+
+function RulesForm({
+  current,
+  suggested,
+  onSaved,
+  onCancel,
+}: {
+  current: FamilyRewardRules;
+  suggested: FamilyRewardRules;
+  onSaved: (rules: RewardRulesResponse, message: string) => void;
+  onCancel: () => void;
+}) {
+  const { api } = useSession();
+  const { busy, feedback, run } = useAction();
+  const ids: Record<RuleField, string> = {
+    attemptPoints: useId(),
+    independentCorrectBonus: useId(),
+    setCompletionPoints: useId(),
+    minMeaningfulResponseMs: useId(),
+  };
+  const hintIds: Record<RuleField, string> = {
+    attemptPoints: useId(),
+    independentCorrectBonus: useId(),
+    setCompletionPoints: useId(),
+    minMeaningfulResponseMs: useId(),
+  };
+  const errorId = useId();
+  const [values, setValues] = useState<RuleValues>(() => toRuleValues(current));
+  const [problem, setProblem] = useState<RuleProblem | null>(null);
+
+  const change = (field: RuleField, value: string) => setValues((v) => ({ ...v, [field]: value }));
+  const describedBy = (field: RuleField) =>
+    problem?.field === field ? `${hintIds[field]} ${errorId}` : hintIds[field];
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const parsed = parseRuleValues(values);
+    if ('field' in parsed) {
+      setProblem(parsed);
+      return;
+    }
+    setProblem(null);
+    void run('save', async () => {
+      const result = await api.send(
+        'PUT',
+        '/v1/reward-rules',
+        parsed,
+        rewardRulesUpdateResponseSchema,
+      );
+      const message = result.changed
+        ? 'Saved. The new rules apply to points earned from now on; points already earned don’t change.'
+        : 'No changes: these rules were already in place.';
+      onSaved(
+        { rules: result.rules, suggested: result.suggested, updatedAt: result.updatedAt },
+        message,
+      );
+      return message;
+    });
+  };
+
+  return (
+    <form aria-label="Edit how points are earned" onSubmit={submit} noValidate>
+      {RULE_POINT_FIELDS.map((field) => (
+        <div key={field.key}>
+          <label htmlFor={ids[field.key]}>{field.label}</label>
+          <p id={hintIds[field.key]} style={{ margin: 0, color: 'var(--muted)' }}>
+            {field.hint}
+          </p>
+          <input
+            id={ids[field.key]}
+            inputMode="numeric"
+            value={values[field.key]}
+            onChange={(e) => change(field.key, e.target.value)}
+            aria-describedby={describedBy(field.key)}
+            aria-invalid={problem?.field === field.key}
+          />
+        </div>
+      ))}
+      <label htmlFor={ids.minMeaningfulResponseMs}>Minimum answer time (seconds)</label>
+      <p id={hintIds.minMeaningfulResponseMs} style={{ margin: 0, color: 'var(--muted)' }}>
+        Blank answers, and answers faster than this, earn nothing. At least{' '}
+        {secondsText(REWARD_RULE_MIN_RESPONSE_MS_MIN)}, so quick guesses can’t collect points.
+      </p>
+      <input
+        id={ids.minMeaningfulResponseMs}
+        inputMode="decimal"
+        value={values.minMeaningfulResponseMs}
+        onChange={(e) => change('minMeaningfulResponseMs', e.target.value)}
+        aria-describedby={describedBy('minMeaningfulResponseMs')}
+        aria-invalid={problem?.field === 'minMeaningfulResponseMs'}
+      />
+      <FieldError id={errorId} message={problem?.message ?? null} />
+      <ActionFeedback feedback={feedback?.kind === 'error' ? feedback : null} />
+      <div style={buttonRow}>
+        <button type="submit" className="btn" disabled={busy !== null}>
+          Save rules
+        </button>
+        <button
+          type="button"
+          className="btn secondary"
+          onClick={() => {
+            setValues(toRuleValues(suggested));
+            setProblem(null);
+          }}
+        >
+          Use the suggested rules
+        </button>
+        <button type="button" className="btn secondary" onClick={onCancel}>
+          Cancel
+        </button>
       </div>
     </form>
   );

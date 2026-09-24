@@ -32,9 +32,10 @@ type ScreenState =
   | { status: 'ready'; data: ChildRewards };
 
 /**
- * Child "My rewards" screen (spec P9, P14). Shows the child's own points, the rewards a grown-up
- * offers them, and their requests. No prices, purchases, ads or wallet language; asking reserves
- * points and a grown-up decides. Logic lives in src/rewards (unit-tested).
+ * Child "My rewards" screen (spec P9, P14). Shows the child's own points, how points are earned
+ * (the family's published rules), the rewards a grown-up offers them, and their requests. No
+ * prices, purchases, ads or wallet language; asking reserves points and a grown-up decides. Logic
+ * lives in src/rewards (unit-tested).
  */
 export default function ChildRewardsScreen() {
   const tokenSource = childRewardsTokenSource();
@@ -142,6 +143,18 @@ export default function ChildRewardsScreen() {
             <View style={styles.balanceCard} accessible accessibilityLabel={view.balanceLabel}>
               <Text style={styles.balance}>{view.balanceLabel}</Text>
               <Text style={styles.body}>{view.encouragement}</Text>
+            </View>
+
+            <Text accessibilityRole="header" style={styles.heading}>
+              {view.earning.heading}
+            </Text>
+            <View style={styles.card}>
+              {view.earning.lines.map((line) => (
+                <Text key={line} style={styles.body}>
+                  {line}
+                </Text>
+              ))}
+              <Text style={styles.muted}>{view.earning.note}</Text>
             </View>
 
             {notice ? (
