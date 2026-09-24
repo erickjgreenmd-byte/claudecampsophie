@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   adminSafetyReportsResponseSchema,
   childReportResponseSchema,
@@ -15,7 +15,8 @@ import {
   seedOwnerAdmin,
   type SeededFamily,
 } from '@pencillift/db/testing/fixtures';
-import { deletionPurgeHandler, type JobRow } from '../src/jobs/dispatcher.ts';
+import { deletionPurgeHandler, type JobDeps, type JobRow } from '../src/jobs/dispatcher.ts';
+import { createExportBuildHandler } from '../src/jobs/export-build.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
 
 // Privacy vertical: deletion, exports and safety reports (spec P4, P8, P10, P14, E4 Deletion;
@@ -104,24 +105,37 @@ async function seedQuestion(
   return { questionId: q!.id, feedbackId: f!.id };
 }
 
-/** Runs the real deletion purge job for a deletion request (what the scheduled tick would do). */
-async function runPurge(deletionId: string): Promise<void> {
+function jobDeps(): JobDeps {
+  return {
+    db: api.apiDb,
+    config: api.config,
+    clock: () => api.now.value,
+    random: cryptoRandom,
+    providers: api.providers,
+    log: () => undefined,
+  };
+}
+
+async function jobByKey(key: string): Promise<JobRow> {
   const [job] = await api.db.sql<JobRow[]>`
     select id, kind, family_id, child_id, payload, attempts, max_attempts
-      from public.jobs where idempotency_key = ${'deletion:' + deletionId}`;
+      from public.jobs where idempotency_key = ${key}`;
   expect(job).toBeDefined();
-  await deletionPurgeHandler(
-    {
-      db: api.apiDb,
-      config: api.config,
-      clock: () => api.now.value,
-      random: cryptoRandom,
-      providers: api.providers,
-      log: () => undefined,
-    },
-    job!,
-  );
+  return job!;
 }
+
+/** Runs the real deletion purge job for a deletion request (what the scheduled tick would do). */
+async function runPurge(deletionId: string): Promise<void> {
+  await deletionPurgeHandler(jobDeps(), await jobByKey('deletion:' + deletionId));
+}
+
+/** The real export builder; the signed upload is a labeled test double writing to mock storage. */
+const buildExport = createExportBuildHandler({
+  upload: (path) => {
+    api.providers.storage.objects.add(path);
+    return Promise.resolve();
+  },
+});
 
 async function countRows(table: string, where: string, value: string): Promise<number> {
   const [row] = await api.db.sql.unsafe<{ n: number }[]>(
@@ -291,6 +305,174 @@ describe('deletion requests (spec P4, E4 Deletion; AC_ACCESS_10, AC_SECURITY_05)
 
   it('GET /v1/deletion needs a parent token', async () => {
     expect((await api.request('/v1/deletion')).status).toBe(401);
+  });
+
+  it('another guardian of a deleted family sees its deletion; a removed guardian does not', async () => {
+    // RV-privacy-5 (spec P14 deleted-account state): the tombstoned family is invisible to RLS, so
+    // the list is read for the verified caller's own active memberships only.
+    const { family, token: t } = await unlockedFamily(1);
+    const guardian = async (status: 'active' | 'revoked'): Promise<string> => {
+      const userId = await api.db.createUser();
+      await api.db.sql`
+        insert into public.family_memberships (family_id, user_id, role, invited_by, status, revoked_at)
+        values (${family.familyId}, ${userId}, 'guardian', ${family.ownerId}, ${status},
+                ${status === 'revoked' ? new Date() : null})`;
+      return parentToken(userId);
+    };
+    const staying = await guardian('active');
+    const removed = await guardian('revoked');
+    const res = await api.request('/v1/deletion', {
+      method: 'POST',
+      token: t,
+      body: { scope: 'family' },
+    });
+    expect(res.status).toBe(202);
+    const { deletion } = deletionRequestResponseSchema.parse(await res.json());
+
+    const seen = async (who: string) =>
+      deletionRequestsResponseSchema
+        .parse(await (await api.request('/v1/deletion', { token: who })).json())
+        .requests.map((r) => [r.id, r.scope, r.status]);
+    expect(await seen(staying)).toEqual([[deletion.id, 'family', 'requested']]);
+    expect(await seen(removed)).toEqual([]);
+    expect((await seen(otherToken)).map(([id]) => id)).not.toContain(deletion.id);
+
+    // The purge revokes the remaining membership; the requester still follows it to completion.
+    await runPurge(deletion.id);
+    expect(await seen(t)).toEqual([[deletion.id, 'family', 'completed']]);
+    expect(await seen(staying)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Exports and deletion (spec P4 "stop processing immediately", "purge ... derivatives")
+// ---------------------------------------------------------------------------------------------
+
+describe('export files and deletion (spec P4, E4 Deletion; AC_ACCESS_10)', () => {
+  /** Requests an export and runs the real builder for it; returns its id. */
+  async function builtExport(t: string, body: unknown): Promise<string> {
+    const res = await api.request('/v1/exports', { method: 'POST', token: t, body });
+    expect(res.status).toBe(202);
+    const { export: created } = await json<{ export: { id: string } }>(res);
+    await buildExport(jobDeps(), await jobByKey('export:' + created.id));
+    return created.id;
+  }
+
+  async function stored(id: string): Promise<{ status: string; storage_path: string | null }> {
+    const [row] = await api.db.sql<{ status: string; storage_path: string | null }[]>`
+      select status, storage_path from public.data_exports where id = ${id}`;
+    expect(row).toBeDefined();
+    return row!;
+  }
+
+  async function listed(t: string): Promise<Record<string, string>> {
+    const { exports } = dataExportsResponseSchema.parse(
+      await (await api.request('/v1/exports', { token: t })).json(),
+    );
+    return Object.fromEntries(exports.map((e) => [e.id, e.status]));
+  }
+
+  const download = async (t: string, id: string) =>
+    (await api.request(`/v1/exports/${id}/download`, { token: t })).status;
+
+  it('a child deletion withdraws that child’s and the family-wide exports at once, not a sibling’s', async () => {
+    const { family, token: t } = await unlockedFamily(2);
+    const [riley, sam] = family.children.map((c) => c.id);
+    const whole = await builtExport(t, { kind: 'family_data' });
+    const rileys = await builtExport(t, { kind: 'progress_csv', childId: riley });
+    const sams = await builtExport(t, { kind: 'progress_csv', childId: sam });
+    const paths = {
+      whole: (await stored(whole)).storage_path!,
+      rileys: (await stored(rileys)).storage_path!,
+      sams: (await stored(sams)).storage_path!,
+    };
+    expect(await listed(t)).toEqual({ [whole]: 'ready', [rileys]: 'ready', [sams]: 'ready' });
+
+    const del = await api.request('/v1/deletion', {
+      method: 'POST',
+      token: t,
+      body: { scope: 'child', childId: riley },
+    });
+    expect(del.status).toBe(202);
+
+    // Before any purge runs: every file holding Riley's data is gone and refused; Sam's is not.
+    expect(await listed(t)).toEqual({ [whole]: 'expired', [rileys]: 'expired', [sams]: 'ready' });
+    expect([await download(t, whole), await download(t, rileys), await download(t, sams)]).toEqual([
+      409, 409, 200,
+    ]);
+    const objects = api.providers.storage.objects;
+    expect([objects.has(paths.whole), objects.has(paths.rileys), objects.has(paths.sams)]).toEqual([
+      false,
+      false,
+      true,
+    ]);
+    expect((await stored(whole)).storage_path).toBeNull();
+  });
+
+  it('a family deletion removes every export file of the family before the purge runs', async () => {
+    const { family, token: t } = await unlockedFamily(1);
+    const id = await builtExport(t, { kind: 'progress_pdf' });
+    const path = (await stored(id)).storage_path!;
+    expect(api.providers.storage.objects.has(path)).toBe(true);
+    const del = await api.request('/v1/deletion', {
+      method: 'POST',
+      token: t,
+      body: { scope: 'family' },
+    });
+    expect(del.status).toBe(202);
+    expect(api.providers.storage.objects.has(path)).toBe(false);
+    expect(await stored(id)).toEqual({ status: 'expired', storage_path: null });
+    expect(
+      [...api.providers.storage.objects].filter((p) => p.startsWith(`exports/${family.familyId}/`)),
+    ).toEqual([]);
+  });
+
+  it('if removing a file fails, the deletion is still accepted and the export stays refused', async () => {
+    const { family, token: t } = await unlockedFamily(1);
+    const id = await builtExport(t, { kind: 'family_data' });
+    const path = (await stored(id)).storage_path!;
+    const remove = vi
+      .spyOn(api.providers.storage, 'remove')
+      .mockRejectedValueOnce(new Error('synthetic storage outage'));
+    let deletionId: string;
+    try {
+      const del = await api.request('/v1/deletion', {
+        method: 'POST',
+        token: t,
+        body: { scope: 'child', childId: family.children[0]!.id },
+      });
+      expect(del.status).toBe(202);
+      deletionId = deletionRequestResponseSchema.parse(await del.json()).deletion.id;
+    } finally {
+      remove.mockRestore();
+    }
+    // Refused for download at once; the path is kept so the purge can still remove the file.
+    expect(await stored(id)).toEqual({ status: 'expired', storage_path: path });
+    expect(await listed(t)).toEqual({ [id]: 'expired' });
+    expect(await download(t, id)).toBe(409);
+    expect(api.logs.map((l) => l.event)).toContain('export_withdraw_failed');
+
+    await runPurge(deletionId);
+    expect(api.providers.storage.objects.has(path)).toBe(false);
+  });
+
+  it('GET /v1/exports shows ready until expires_at and expired from that instant', async () => {
+    // RV-privacy-8: the list matches the download route, which refuses the file from expires_at.
+    const { token: t } = await unlockedFamily(1);
+    const id = await builtExport(t, { kind: 'progress_csv' });
+    const [row] = await api.db.sql<{ expires_at: Date }[]>`
+      select expires_at from public.data_exports where id = ${id}`;
+    const start = api.now.value;
+    try {
+      api.now.value = new Date(row!.expires_at.getTime() - 1);
+      expect(await listed(t)).toEqual({ [id]: 'ready' });
+      expect(await download(t, id)).toBe(200);
+      api.now.value = row!.expires_at;
+      expect(await listed(t)).toEqual({ [id]: 'expired' });
+      expect(await download(t, id)).toBe(409);
+    } finally {
+      api.now.value = start;
+    }
   });
 });
 

@@ -39,9 +39,10 @@ import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
  * - The deletion and export RPCs (migrations 0600/0620) run as the caller: they re-check membership
  *   and the recent adult unlock inside the database.
  * - `asService` (bypasses RLS) is used only where the caller's role has no grant: job enqueueing,
- *   parent report inserts that must carry the derived child id, the requester's own deletion history
- *   after the family is tombstoned, and admin report updates. Every such statement is explicitly
- *   scoped to ids the handler verified first.
+ *   parent report inserts that must carry the derived child id, withdrawing exports on deletion,
+ *   the caller's deletion history after the family is tombstoned (their own requests and those of a
+ *   tombstoned family they still belong to), and admin report updates. Every such statement is
+ *   explicitly scoped to ids the handler verified first.
  *
  * Middleware is attached per route (not with `use`), because this router is mounted at /v1 next to
  * other verticals and a wildcard here would run on their paths too.
@@ -61,7 +62,8 @@ export const CHILD_REPORT_THANKS =
 /**
  * Decision: the admin workflow is forward-only. open → triaged | escalated | resolved;
  * triaged → escalated | resolved; escalated → resolved; resolved is final (a new concern is a new
- * report). Serious safety concerns follow the escalation path documented in the runbook.
+ * report). Serious safety concerns (`upsetting`, `unsafe_content`) follow the escalation steps in
+ * docs/Deployment_Runbook.md, section "Safety reports: moderation and escalation".
  */
 const REPORT_TRANSITIONS: Readonly<Record<SafetyReportStatus, readonly SafetyReportStatus[]>> = {
   open: ['triaged', 'escalated', 'resolved'],
@@ -136,12 +138,25 @@ function toDeletion(row: DeletionRow): DeletionRequest {
   };
 }
 
-function toExport(row: ExportRow): DataExport {
+/**
+ * The status a parent sees at `now`. A finished export past `expires_at` is reported as expired,
+ * matching the download route, which refuses it from that instant (spec P14 honest states,
+ * RV-privacy-8); the stored row is only rewritten by a deletion or a cleanup job.
+ */
+function exportStatusAt(
+  row: Pick<ExportRow, 'status' | 'expires_at'>,
+  now: Date,
+): DataExport['status'] {
+  if (row.status === 'ready' && row.expires_at !== null && row.expires_at <= now) return 'expired';
+  return row.status;
+}
+
+function toExport(row: ExportRow, now: Date): DataExport {
   return {
     id: row.id,
     kind: row.kind,
     childId: row.child_id,
-    status: row.status,
+    status: exportStatusAt(row, now),
     createdAt: row.created_at.toISOString(),
     expiresAt: iso(row.expires_at),
   };
@@ -216,6 +231,62 @@ async function assertFamilyChild(
   if (rows.length === 0) throw new ApiError('NOT_FOUND', 'Child not found');
 }
 
+/**
+ * Decision (spec P4 "Deletion requests should stop processing immediately" and "Purge active
+ * uploads, derivatives ..."; E4 "purge owned derivatives"; RV-privacy-3, RV-privacy-4): a deletion
+ * withdraws every finished export file that holds the deleted data as soon as it is requested —
+ * all of the family's exports for a family deletion; for a child deletion, that child's exports and
+ * every family-wide export (child_id null: family data and progress files list every child). The
+ * rows become 'expired' (the download route refuses them; parents see "request a new copy") and the
+ * files are removed from private storage. A family-wide export that is still queued is left alone:
+ * the builder leaves out every child with an open deletion request.
+ *
+ * Service role (the caller has no update grant on exports); scoped to the family and child the
+ * handler verified. Runs after the deletion is recorded, so a storage failure never loses the
+ * request: the row keeps its storage_path (still refused for download) for a later cleanup, and the
+ * failure is logged without payload.
+ */
+async function withdrawExports(
+  c: Context<AppEnv>,
+  familyId: string,
+  childId: string | null,
+): Promise<void> {
+  const { deps } = c.var;
+  const now = deps.clock();
+  const withdrawn = await deps.db.asService(
+    (tx) => tx<{ id: string; storage_path: string | null }[]>`
+      update public.data_exports
+         set status = 'expired',
+             expires_at = case when status = 'ready' then least(coalesce(expires_at, ${now}), ${now})
+                           else expires_at end
+       where family_id = ${familyId}
+         and (status = 'ready' or (status = 'expired' and storage_path is not null))
+         and (${childId}::uuid is null or child_id = ${childId}::uuid or child_id is null)
+      returning id, storage_path`,
+  );
+  const files = withdrawn.filter(
+    (row): row is { id: string; storage_path: string } => row.storage_path !== null,
+  );
+  if (files.length === 0) return;
+  try {
+    await deps.providers.storage.remove(files.map((row) => row.storage_path));
+  } catch {
+    deps.log({
+      level: 'error',
+      event: 'export_withdraw_failed',
+      code: 'STORAGE_REMOVE_FAILED',
+      requestId: c.var.requestId,
+    });
+    return;
+  }
+  await deps.db.asService(
+    (tx) => tx`
+      update public.data_exports set storage_path = null
+       where family_id = ${familyId} and status = 'expired'
+         and id = any(${files.map((row) => row.id)}::uuid[])`,
+  );
+}
+
 const DELETION_COLUMNS =
   'id, scope, target_child_id, status, requested_at, complete_by, completed_at';
 
@@ -262,6 +333,14 @@ export function privacyRoutes(): Hono<AppEnv> {
       }
       if (code === 'P0002') throw new ApiError('NOT_FOUND', 'Not found');
       if (code === '42501') {
+        // The database also refuses a whole-family deletion by a non-owner (proposed forward
+        // migration for RV-privacy-1, same SQLSTATE); if ownership changed since the check above,
+        // say so instead of asking for the PIN again.
+        if (body.scope === 'family' && (await callerMembership(c))?.role !== 'owner') {
+          throw new ApiError('FORBIDDEN', 'Only the family owner can delete the whole family', {
+            rule: PRIVACY_RULES.ownerOnlyFamilyDeletion,
+          });
+        }
         throw new ApiError('STEP_UP_REQUIRED', 'Enter your parent PIN to continue');
       }
       throw error;
@@ -282,18 +361,28 @@ export function privacyRoutes(): Hono<AppEnv> {
            and family_id = ${membership.familyId}`;
       if (jobs.length !== 1) throw new Error('deletion purge job missing');
     });
+    await withdrawExports(c, membership.familyId, childId);
     deps.log({ level: 'info', event: 'deletion_requested', requestId: c.var.requestId });
     return c.json({ deletion: toDeletion(row) }, 202);
   });
 
   r.get('/deletion', requireParent, async (c) => {
     const { deps, parent } = c.var;
-    // The requester's own requests, read with the service role because a deleted family is
-    // tombstoned and invisible to RLS. Explicitly scoped to requested_by = the verified caller.
+    // Read with the service role because a deleted family is tombstoned and invisible to RLS.
+    // Explicitly scoped to the verified caller: requests they made, plus the requests of a
+    // tombstoned family they are still an active member of — so the other guardian sees the
+    // deleted-account state instead of "set up your family" until the purge revokes their
+    // membership (spec P14 deleted-account state, RV-privacy-5).
     const own = await deps.db.asService((tx) =>
       tx.unsafe<DeletionRow[]>(
-        `select ${DELETION_COLUMNS} from public.deletion_requests
-          where requested_by = $1::uuid order by requested_at desc limit 50`,
+        `select ${DELETION_COLUMNS} from public.deletion_requests d
+          where d.requested_by = $1::uuid
+             or exists (
+                  select 1 from public.family_memberships m
+                    join public.families f on f.id = m.family_id
+                   where m.family_id = d.family_id and m.user_id = $1::uuid
+                     and m.status = 'active' and f.deleted_at is not null)
+          order by d.requested_at desc limit 50`,
         [parent.userId],
       ),
     );
@@ -328,6 +417,8 @@ export function privacyRoutes(): Hono<AppEnv> {
       RULES.exportPerFamily,
       deps.clock(),
     );
+    // A family-wide export (no childId) is accepted while a child's deletion is pending: the builder
+    // leaves out every child with an open deletion request (RV-privacy-2).
     if (childId) {
       await assertFamilyChild(c, familyId, childId);
       // Decision: a deletion request stops processing immediately (spec P4), so no new export of
@@ -390,7 +481,7 @@ export function privacyRoutes(): Hono<AppEnv> {
          where id = ${exportId} and family_id = ${familyId}`,
     );
     deps.log({ level: 'info', event: 'export_requested', requestId: c.var.requestId });
-    return c.json({ export: toExport(row!) }, 202);
+    return c.json({ export: toExport(row!, deps.clock()) }, 202);
   }
 
   r.post('/exports', requireParent, async (c) => {
@@ -414,7 +505,8 @@ export function privacyRoutes(): Hono<AppEnv> {
         select id, kind, child_id, status, created_at, expires_at from public.data_exports
          where family_id = ${familyId} order by created_at desc limit 100`,
     );
-    return c.json({ exports: rows.map(toExport) });
+    const now = deps.clock();
+    return c.json({ exports: rows.map((row) => toExport(row, now)) });
   });
 
   // ----- Safety reports (family) -----------------------------------------------------------------

@@ -5,6 +5,7 @@ import {
   confirmationPhrase,
   deletableChildren,
   deletionStatusText,
+  exportLine,
   familyDeletion,
   loadPrivacyOverview,
   MOBILE_EXPORT_OPTIONS,
@@ -198,6 +199,20 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     expect(overview.family).toBeNull();
     expect(familyDeletion(overview.deletions)).toEqual(familyRequest);
     expect(deletionStatusText(familyRequest)).toMatch(/processing has stopped/i);
+  });
+
+  it('labels a lapsed or withdrawn export as expired, never as ready', () => {
+    // The API reports an export past its expiry (or withdrawn by a deletion) as expired
+    // (RV-privacy-8); the screen must say so instead of implying a copy is available.
+    const line = exportLine({
+      id: EXPORT,
+      kind: 'family_data',
+      childId: null,
+      status: 'expired',
+      createdAt: '2026-09-16T15:00:00.000Z',
+      expiresAt: '2026-09-23T15:00:00.000Z',
+    });
+    expect(line).toBe('All family data · Expired — request a new copy');
   });
 
   it('propagates other load failures so the screen can offer a retry', async () => {

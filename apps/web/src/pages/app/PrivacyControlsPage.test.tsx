@@ -407,6 +407,54 @@ describe('PrivacyControlsPage', () => {
     expect(text(items[1])).toMatch(/did not match the worksheet/i);
   });
 
+  it('says which child choices save a report and that “Tell a grown-up” sends nothing', async () => {
+    // Spec P4: "Never promise that the parent is alerted unless delivery is implemented and
+    // logged" (RV-privacy-7). Only the child's "Tell PencilLift" choices create a report.
+    const { api } = fakeApi();
+    renderPage(<PrivacyControlsPage />, { api });
+    const section = await screen.findByRole('region', { name: /safety reports/i });
+    const intro = text(section.querySelector('p'));
+    expect(intro).toMatch(/“tell pencillift” choices[^.]*saved to pencillift’s review queue/i);
+    expect(intro).toMatch(/“tell a grown-up”[^.]*doesn’t send anything or alert anyone/i);
+  });
+
+  it('shows an expired export as expired, with no download control', async () => {
+    const { api } = fakeApi({
+      exports: {
+        exports: [
+          {
+            ...queuedExport('family_data').export,
+            status: 'expired',
+            expiresAt: '2026-09-24T15:00:00.000Z',
+          },
+        ],
+      },
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /your exports/i });
+    expect(text(list)).toMatch(/expired — request a new copy/i);
+    expect(screen.queryByRole('button', { name: /download/i })).toBeNull();
+  });
+
+  it('shows another guardian the deleted-account state without saying they asked for it', async () => {
+    // RV-privacy-5: GET /v1/deletion now includes the owner's family deletion for a guardian.
+    const notFound = () => new ApiRequestError('NOT_FOUND', 'Create your family first', 404);
+    const { api } = fakeApi({
+      family: notFound,
+      exports: notFound,
+      reports: notFound,
+      deletion: { requests: [deletion('family')] },
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const heading = await screen.findByRole('heading', {
+      name: /your family account is being deleted/i,
+    });
+    const card = heading.closest('section');
+    expect(text(card)).toMatch(/processing stopped when the deletion was requested/i);
+    expect(text(card)).not.toMatch(/when you asked/i);
+    expect(screen.queryByRole('link', { name: /set up your family/i })).toBeNull();
+  });
+
   it('lets a parent report a concern', async () => {
     const { api, sends } = fakeApi({
       send: () => ({

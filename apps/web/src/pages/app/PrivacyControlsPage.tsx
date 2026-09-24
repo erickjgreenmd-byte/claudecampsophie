@@ -383,8 +383,8 @@ function DeletedAccount({ request }: { request: DeletionRequest }) {
           : 'Your family account is being deleted'}
       </h2>
       <p>
-        Processing stopped when you asked: your child’s devices were signed out and queued work was
-        cancelled. Family data can no longer be opened from any device.
+        Processing stopped when the deletion was requested: your children’s devices were signed out
+        and queued work was cancelled. Family data can no longer be opened from any device.
       </p>
       <p>
         {request.status === 'completed' && request.completedAt
@@ -936,9 +936,11 @@ function SafetyReportsSection({
   return (
     <Section id="reports-title" title="Safety reports">
       <p>
-        When your child uses “Tell a grown-up” in the app, or you send a report here, it is saved to
-        PencilLift’s review queue and its status is shown below. Reviewers see the type of report,
-        its status and item references — not homework text, your child’s name or your note.
+        When your child picks one of the “Tell PencilLift” choices in the app, or you send a report
+        here, it is saved to PencilLift’s review queue and its status is shown below. The app’s
+        “Tell a grown-up” card only encourages your child to talk to someone they trust; it doesn’t
+        send anything or alert anyone. Reviewers see the type of report, its status and item
+        references — not homework text, your child’s name or your note.
       </p>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <label htmlFor={categoryId}>What happened?</label>
