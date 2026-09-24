@@ -19,6 +19,10 @@ function publicEnv(name: string): string | null {
 const supabaseUrl = publicEnv('EXPO_PUBLIC_SUPABASE_URL');
 const supabasePublishableKey = publicEnv('EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY');
 const portalUrl = publicEnv('EXPO_PUBLIC_PORTAL_URL');
+// RevenueCat PUBLIC SDK keys (appl_… / goog_…), never the secret key. Absent → native purchases stay
+// switched off and the plan screen says so (src/billing/revenuecat.ts).
+const revenueCatIosKey = publicEnv('EXPO_PUBLIC_REVENUECAT_IOS_KEY');
+const revenueCatAndroidKey = publicEnv('EXPO_PUBLIC_REVENUECAT_ANDROID_KEY');
 
 const config: ExpoConfig = {
   name: 'PencilLift',
@@ -82,7 +86,14 @@ const config: ExpoConfig = {
     'expo-notifications',
   ],
   experiments: { typedRoutes: true },
-  extra: { apiBaseUrl, supabaseUrl, supabasePublishableKey, portalUrl },
+  extra: {
+    apiBaseUrl,
+    supabaseUrl,
+    supabasePublishableKey,
+    portalUrl,
+    revenueCatIosKey,
+    revenueCatAndroidKey,
+  },
 };
 
 export default config;
