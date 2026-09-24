@@ -955,8 +955,8 @@ function SafetyReportsSection({
         PencilLift also adds a report here when its safety check flags one of your child’s answers
         for a grown-up to look at. For that question, your child’s results show a calm message about
         talking with a grown-up they trust instead of a hint. PencilLift sends no automatic alert
-        (no email, text or notification). A PencilLift reviewer looks at every flag, and some flags
-        appear here only after that review.
+        (no email, text or notification). Some flags are kept off this list until a PencilLift
+        reviewer releases them.
       </p>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <label htmlFor={categoryId}>What happened?</label>
@@ -1016,7 +1016,12 @@ function SafetyReportsSection({
               {r.note ? <div style={{ color: 'var(--muted)' }}>{`“${r.note}”`}</div> : null}
               {r.reporterKind === 'system' ? (
                 <div>
-                  <p style={{ margin: '4px 0 0' }}>{PARENT_SAFETY_FLAG_COPY.summary}</p>
+                  {/* A flag a reviewer cleared as a false match: the summary is no longer true. */}
+                  <p style={{ margin: '4px 0 0' }}>
+                    {r.clearedAsFalseMatch
+                      ? PARENT_SAFETY_FLAG_COPY.cleared
+                      : PARENT_SAFETY_FLAG_COPY.summary}
+                  </p>
                   <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
                     {PARENT_SAFETY_FLAG_COPY.resources}
                   </p>

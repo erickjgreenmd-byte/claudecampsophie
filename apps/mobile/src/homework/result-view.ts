@@ -11,6 +11,8 @@
  * that anyone was alerted). When any answer was flagged, the page's status header and body (which
  * the results screen already renders) become the notice, every distinct template once, and the
  * score line is hidden: the child sees the help lines even where no per-question card is shown.
+ * The notice does not wait for results: the scan job files it before grading, so a scan still being
+ * checked, or one whose grading failed for good, shows it too (RV-child-safety-5).
  *
  * Pure logic with no react-native imports so it is unit-testable.
  */
@@ -187,9 +189,7 @@ export function buildResultView(detail: ChildAssignmentDetailResponse): ResultVi
   const status = statusView(detail.assignment.status);
   const questions = detail.questions.map((q): QuestionView => {
     const verdict = status.showResults ? q.verdict : null;
-    const flagged = status.showResults
-      ? [...q.feedback].reverse().find((f) => f.kind === 'safety')
-      : undefined;
+    const flagged = [...q.feedback].reverse().find((f) => f.kind === 'safety');
     // A flagged answer shows only the calm notice: no coaching (even from an earlier
     // transcription) and no "Try again" next to it. The stored grade is unchanged.
     const hints =

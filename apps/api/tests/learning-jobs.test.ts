@@ -695,6 +695,126 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     }
   });
 
+  it('a re-theme whose context words evaluate to the key keeps the bank item (LJA-F9)', async () => {
+    const fam = await family();
+    await consent(fam);
+    const ones = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+    const tens = ['', 'ten', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty'];
+    /** A valid place of letters and spaces whose words add up to `n` ("forty plus five"). */
+    const spelled = (n: number) => `${tens[Math.floor(n / 10)]} plus ${ones[n % 10]}`;
+    const key = Number((wordProblems[0]!.answerSpec as { value: string }).value);
+    expect(key).toBeGreaterThanOrEqual(10);
+    expect(key).toBeLessThan(90);
+    const client = createMockResponsesClient((request) => {
+      const refs = envelope(request).data.wordProblems.map((w) => w.ref);
+      return ok({
+        intro: 'Let’s practice story problems!',
+        items: [
+          { ref: refs[0], context: { name: 'Ava', things: 'apples', place: spelled(key) } },
+          { ref: refs[1], context: { name: 'Ava', things: 'apples', place: 'orchard' } },
+        ],
+      });
+    });
+    const out = await personalizeItems(
+      deps,
+      { ai: client },
+      await context(fam),
+      wordProblems,
+      'daily_set',
+      ['math.word_problems'],
+    );
+    expect(out.items[0]).toEqual(wordProblems[0]); // the key as words never reaches the child
+    expect(out.items[1]!.prompt.text).toContain('orchard');
+    expect(out.rethemed).toBe(1);
+  });
+
+  it('a personalization whose usage cannot be recorded keeps its cost counted (LJA-F5)', async () => {
+    const fam = await family();
+    await consent(fam);
+    const adminId = await seedOwnerAdmin(api.db);
+    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const recorded = async () => {
+      const [row] = await api.db.sql<{ micros: string }[]>`
+        select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+      return BigInt(row!.micros);
+    };
+    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros);
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
+    // Every insert into ai_usage_events fails (injected fault, e.g. a dropped connection).
+    const unmetered: JobDeps = {
+      ...deps,
+      db: {
+        ...deps.db,
+        asService: (fn) =>
+          deps.db.asService((tx) =>
+            fn(
+              new Proxy(tx, {
+                apply(target, self, args: unknown[]) {
+                  const strings = args[0];
+                  if (
+                    Array.isArray(strings) &&
+                    strings.join('?').includes('insert into public.ai_usage_events')
+                  ) {
+                    return Promise.reject(new Error('connection reset (injected by the test)'));
+                  }
+                  return Reflect.apply(target, self, args) as unknown;
+                },
+              }),
+            ),
+          ),
+      },
+    };
+    const client = createMockResponsesClient(() => ok({ intro: 'Let’s practice!', items: [] }));
+    try {
+      const ctx = await context(fam);
+      await personalizeItems(unmetered, { ai: client }, ctx, wordProblems, 'daily_set', []);
+      expect(client.requests).toHaveLength(1);
+      const [held] = await api.db.sql<{ micros: string }[]>`
+        select coalesce(sum(micros), 0)::text as micros from private.ai_spend_holds
+         where expires_at > ${api.now.value}`;
+      expect(BigInt(held!.micros)).toBeGreaterThan(0n);
+      // The provider already charged for the first call: a second one no longer fits the cap.
+      const out = await personalizeItems(deps, { ai: client }, ctx, wordProblems, 'daily_set', []);
+      expect(client.requests).toHaveLength(1);
+      expect(out.items).toEqual(wordProblems);
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+      await api.db.sql`delete from private.ai_spend_holds`;
+    }
+  });
+
+  it('a personalization request larger than its stage budget is not sent (LJA-F4)', async () => {
+    const fam = await family();
+    await consent(fam);
+    // About 21 KB of template text: over what the daily_set cost cap allows at one token per byte.
+    const oversized = wordProblems.map((item) => ({
+      ...item,
+      wordProblem: {
+        ...item.wordProblem!,
+        template: `${item.wordProblem!.template}${' '.repeat(7_000)}`,
+      },
+    }));
+    const client = createMockResponsesClient(() => ok({ intro: 'Let’s practice!', items: [] }));
+    const out = await personalizeItems(
+      deps,
+      { ai: client },
+      await context(fam),
+      oversized,
+      'daily_set',
+      [],
+    );
+    // Before the fix the estimate was 700 + 80 per word problem, whatever the request's size.
+    expect(client.requests).toHaveLength(0);
+    expect(out.items).toEqual(oversized);
+    expect(api.logs).toContainEqual({
+      level: 'warn',
+      event: 'practice_ai_failed',
+      code: 'STAGE_LIMIT',
+    });
+  });
+
   it('without consent nothing is sent to AI and the bank set is generated', async () => {
     const fam = await family();
     const child = fam.children[0]!.id;

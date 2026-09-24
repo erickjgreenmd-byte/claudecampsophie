@@ -380,6 +380,7 @@ describe('PrivacyControlsPage', () => {
           createdAt: '2026-09-23T15:00:00.000Z',
           triagedAt: null,
           resolvedAt: null,
+          clearedAsFalseMatch: false,
         },
         {
           id: REPORT_B,
@@ -392,6 +393,7 @@ describe('PrivacyControlsPage', () => {
           createdAt: '2026-09-22T15:00:00.000Z',
           triagedAt: '2026-09-22T16:00:00.000Z',
           resolvedAt: '2026-09-22T17:00:00.000Z',
+          clearedAsFalseMatch: false,
         },
       ],
     };
@@ -423,6 +425,7 @@ describe('PrivacyControlsPage', () => {
           createdAt: '2026-09-23T15:00:00.000Z',
           triagedAt: null,
           resolvedAt: null,
+          clearedAsFalseMatch: false,
         },
       ],
     };
@@ -452,6 +455,38 @@ describe('PrivacyControlsPage', () => {
     );
   });
 
+  it('a flag a reviewer cleared as a false match says so, not that the child sees a message (round 3)', async () => {
+    const reports: SafetyReports = {
+      reports: [
+        {
+          id: REPORT_A,
+          reporterKind: 'system',
+          category: 'severe_risk',
+          childId: RILEY,
+          questionId: 'e29e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2b',
+          note: null,
+          status: 'resolved',
+          createdAt: '2026-09-23T15:00:00.000Z',
+          triagedAt: '2026-09-23T16:00:00.000Z',
+          resolvedAt: '2026-09-23T16:00:00.000Z',
+          clearedAsFalseMatch: true,
+        },
+      ],
+    };
+    const { api } = fakeApi({ reports });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    const [item] = within(list).getAllByRole('listitem');
+    const content = text(item);
+    expect(content).toContain(PARENT_SAFETY_FLAG_COPY.cleared);
+    expect(content).not.toContain(PARENT_SAFETY_FLAG_COPY.summary);
+    expect(content).toMatch(/not a concern/i);
+    expect(content).toMatch(/resolved/i);
+    expect(content.replace(PARENT_SAFETY_FLAG_COPY.resources, '')).not.toMatch(
+      /alerted|notified|we (?:emailed|texted|sent)|self-harm|suicid|abuse|sexual|violen/i,
+    );
+  });
+
   it('parents cannot choose the system-only category when sending a report', async () => {
     const { api } = fakeApi();
     renderPage(<PrivacyControlsPage />, { api });
@@ -465,8 +500,15 @@ describe('PrivacyControlsPage', () => {
     expect(text(section)).toMatch(
       /pencillift also adds a report here[^.]*flags one of your child’s answers/i,
     );
-    // Honest about held reports (runbook 5.1) without saying whether one exists.
-    expect(text(section)).toMatch(/some flags appear here only after that review/i);
+    // Honest about held reports (runbook 5.1) without saying whether one exists, and without
+    // promising a staffed review of every flag (triage targets and the reviewer are not approved
+    // yet, Owner action #24; RV-child-safety-15).
+    expect(text(section)).toMatch(
+      /some flags are kept off this list until a pencillift reviewer releases them/i,
+    );
+    expect(text(section)).not.toMatch(
+      /looks at every flag|reviews every flag|every flag is reviewed/i,
+    );
     expect(text(section)).toMatch(/pencillift sends no automatic alert/i);
   });
 
@@ -543,6 +585,7 @@ describe('PrivacyControlsPage', () => {
           createdAt: '2026-09-24T15:00:00.000Z',
           triagedAt: null,
           resolvedAt: null,
+          clearedAsFalseMatch: false,
         },
       }),
     });

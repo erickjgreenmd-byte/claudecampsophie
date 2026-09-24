@@ -68,6 +68,8 @@ interface ScriptedQuestion {
   /** For coaching 'expression': the hint discloses the key as this unevaluated expression. */
   leakExpression?: string;
   rubric?: { criterion: string; met: boolean; note: string }[];
+  /** The grader's parent-only worked solution (default: a placeholder naming the question). */
+  worked?: string;
 }
 
 const WORKSHEET: ScriptedQuestion[] = [
@@ -179,7 +181,7 @@ function scriptedModel(script: Script): ResponsesClient & { requests: ResponsesR
               questionNumber: q.questionNumber,
               verdict: s.primary.verdict,
               correctAnswer: s.key,
-              workedSolution: `Worked solution for ${q.questionNumber}`,
+              workedSolution: s.worked ?? `Worked solution for ${q.questionNumber}`,
               misconception: s.primary.verdict === 'incorrect' ? 'dropped a letter' : null,
               rubric: s.rubric ?? null,
               evidence: 'student work visible',
@@ -234,10 +236,17 @@ function scriptedModel(script: Script): ResponsesClient & { requests: ResponsesR
 // Fixtures
 // ---------------------------------------------------------------------------------------------
 
-async function consent(fam: SeededFamily) {
+/**
+ * A verified consent record. By default it is written by the test provider (the labeled development
+ * mock), which counts only in development and test (LRD-1); `testProvider: false` stands for a real
+ * provider's record, as staging and production need.
+ */
+async function consent(fam: SeededFamily, options: { testProvider?: boolean } = {}) {
+  const testProvider = options.testProvider ?? true;
+  const provider = testProvider ? 'mock' : 'synthetic-verified-provider';
   await api.db.sql`
     insert into public.consent_records (family_id, adult_user_id, provider, method, purpose, policy_version, status, is_test_provider, verified_at)
-    values (${fam.familyId}, ${fam.ownerId}, 'mock', 'mock', 'child_learning_data', 'v1', 'verified', true, now())`;
+    values (${fam.familyId}, ${fam.ownerId}, ${provider}, ${provider}, 'child_learning_data', 'v1', 'verified', ${testProvider}, now())`;
 }
 
 interface Scan {
@@ -1291,6 +1300,11 @@ describe('usage metered after a concurrent purge (RV-lead-jobs-ai-18 follow-up)'
         scan.fam.ownerId,
         (tx) => tx`select public.request_deletion(${scan.fam.familyId}, null)`,
       );
+      // The purge job's run_after defaults to the database's now(); the test clock is pinned, so
+      // the job is made due on that clock (after 2026-09-24T15:00Z real time it was never claimed).
+      await api.db.sql`
+        update public.jobs set run_after = ${new Date(api.now.value.getTime() - 1000)}
+         where family_id = ${scan.fam.familyId} and kind = 'deletion_purge'`;
       await runJobs(deps); // another tick's worker runs the purge while grading is in flight
     });
     await handlerFor(client).scan_process!(deps, await jobRow(scan.jobId)).catch(() => undefined);
@@ -1303,5 +1317,738 @@ describe('usage metered after a concurrent purge (RV-lead-jobs-ai-18 follow-up)'
         from public.ai_usage_events where family_id = ${scan.fam.familyId}`;
     expect(usage!.keyed).toBe(0); // nothing points at the purged child ...
     expect(usage!.kept).toBeGreaterThanOrEqual(2); // ... but the owner's cost records stay
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Final lead review (LJA-F1, -F2, -F3, -F4, -F5, -F11, -F12)
+// ---------------------------------------------------------------------------------------------
+
+/** Recorded AI spend (all families), as the ceiling counts it this month. */
+async function recordedSpend(): Promise<bigint> {
+  const [row] = await api.db.sql<{ micros: string }[]>`
+    select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
+  return BigInt(row!.micros);
+}
+
+async function liveHolds(): Promise<{ n: number; micros: bigint }> {
+  const [row] = await api.db.sql<{ n: number; micros: string }[]>`
+    select count(*)::int as n, coalesce(sum(micros), 0)::text as micros from private.ai_spend_holds
+     where expires_at > ${api.now.value}`;
+  return { n: row!.n, micros: BigInt(row!.micros) };
+}
+
+/** Service transactions in which every statement whose text contains `sql` fails (`times` times). */
+function failing(sql: string, times = Number.POSITIVE_INFINITY): JobDeps {
+  let left = times;
+  return {
+    ...deps,
+    db: {
+      ...deps.db,
+      asService: (fn) =>
+        deps.db.asService((tx) =>
+          fn(
+            new Proxy(tx, {
+              apply(target, self, args: unknown[]) {
+                const strings = args[0];
+                if (left > 0 && Array.isArray(strings) && strings.join('?').includes(sql)) {
+                  left -= 1;
+                  return Promise.reject(new Error('connection reset (injected by the test)'));
+                }
+                return Reflect.apply(target, self, args) as unknown;
+              },
+            }),
+          ),
+        ),
+    },
+  };
+}
+
+/** Test cleanup: a job left waiting is cancelled (a finished one is left alone, never masking a failure). */
+async function cancelJob(jobId: string): Promise<void> {
+  await api.db.sql`
+    update public.jobs set status = 'cancelled'
+     where id = ${jobId} and status not in ('succeeded', 'failed_final', 'cancelled', 'dead_letter')`;
+}
+
+describe('final lead review (LJA-F1..F5, F11, F12)', () => {
+  it('a rubric label that states the private key or a completed sentence never reaches the child (LJA-F1)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const writing = (q: Partial<ScriptedQuestion>): ScriptedQuestion => ({
+      page: 1,
+      number: '1',
+      prompt: '',
+      answer: 'x',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: '',
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      ...q,
+    });
+    const questions = [
+      writing({
+        number: '1',
+        prompt: 'Write the plural of mouse.',
+        answer: 'mouses',
+        key: 'mice',
+        rubric: [
+          { criterion: 'Uses mice as the plural of mouse', met: false, note: 'n/a' },
+          { criterion: 'Uses the plural form', met: false, note: 'n/a' },
+        ],
+      }),
+      writing({
+        number: '2',
+        prompt: 'Write a sentence using the word bright.',
+        answer: 'bright',
+        key: 'The sun is very bright today.',
+        rubric: [{ criterion: 'Write The sun is very bright today', met: false, note: 'n/a' }],
+      }),
+      writing({
+        number: '3',
+        prompt: 'Finish the sentence: I stayed inside because ...',
+        answer: 'I stayed inside',
+        // No key: the example lives only in the parent's note, and a first-person sentence is
+        // never a criterion label.
+        rubric: [
+          {
+            criterion: 'Gives the reason it was raining',
+            met: false,
+            note: 'Model: "I stayed inside because it was raining."',
+          },
+          // Round 2: the label above is now also dropped as a sentence ("it was raining"); this one
+          // is criterion-shaped, so only the quoted example in its note can stop it.
+          {
+            criterion: 'Gives the reason of the heavy rain',
+            met: false,
+            // Quoted with no "label:" before it, so only the quoted-span protection covers it.
+            note: 'Compare with "I stayed inside because of the heavy rain."',
+          },
+          { criterion: 'I stayed inside because it was raining', met: false, note: 'n/a' },
+          { criterion: 'Start with: The water cycle has four stages', met: false, note: 'n/a' },
+          { criterion: 'Uses a because clause', met: true, note: 'n/a' },
+        ],
+      }),
+    ];
+    await runJobs(deps, handlerFor(scriptedModel({ questions })));
+    const rows = await feedback(scan.assignmentId);
+    for (const r of rows) {
+      expect(r.body).not.toMatch(/\bmice\b/i);
+      expect(r.body).not.toContain('The sun is very bright today');
+      expect(r.body).not.toMatch(/it was raining|water cycle|heavy rain/i);
+    }
+    // Labels that state nothing to copy are still shown.
+    expect(rows.map((r) => r.body).sort()).toEqual([
+      'Next time, work on: Uses the plural form.',
+      'You did this well: Uses a because clause.',
+    ]);
+    expect(api.logs.some((l) => l.event === 'rubric_label_blocked_by_guard')).toBe(true);
+    expect(JSON.stringify(api.logs)).not.toMatch(/mice|bright|raining|heavy rain/);
+  });
+
+  it('a rubric label that is a completed sentence or copies the solution’s example never reaches the child (CHK-LJA-F1-residual)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const writing = (q: Partial<ScriptedQuestion>): ScriptedQuestion => ({
+      page: 1,
+      number: '1',
+      prompt: '',
+      answer: 'x',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: 'Answers will vary.',
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      ...q,
+    });
+    const questions = [
+      // The checker's P2: the label finishes the prompt's sentence starter; the key names no answer.
+      writing({
+        number: '1',
+        prompt: 'Finish the sentence: The dog ran fast because ...',
+        answer: 'The dog ran',
+        rubric: [
+          { criterion: 'The dog ran fast because it was scared', met: false, note: 'n/a' },
+          { criterion: 'Uses a capital letter', met: true, note: 'n/a' },
+        ],
+      }),
+      // The checker's P3: the label copies an unquoted example from the worked solution.
+      writing({
+        number: '2',
+        prompt: 'Write a sentence using the word bright.',
+        answer: 'bright',
+        worked: 'A good answer: The lamp is bright at night.',
+        rubric: [{ criterion: 'Write The lamp is bright at night', met: false, note: 'n/a' }],
+      }),
+      // The same with a verb the shape check cannot see: the example after "A good answer:" is
+      // protected like a quoted one, while a plain criterion about the same prompt stays.
+      writing({
+        number: '3',
+        prompt: 'Write a sentence using the word glow.',
+        answer: 'glow',
+        worked: 'A good answer: The lamp glows at night. Look for: a capital letter.',
+        rubric: [
+          { criterion: 'Writes the lamp glows at night', met: false, note: 'n/a' },
+          { criterion: 'Uses the word glow in a sentence', met: false, note: 'n/a' },
+          // What the parent is told to look for is not example wording: it stays shown.
+          { criterion: 'Starts with a capital letter', met: true, note: 'n/a' },
+        ],
+      }),
+    ];
+    await runJobs(deps, handlerFor(scriptedModel({ questions })));
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    const rows = await feedback(scan.assignmentId);
+    for (const r of rows) {
+      expect(r.body).not.toMatch(/scared|lamp/i);
+    }
+    expect(rows.map((r) => r.body).sort()).toEqual([
+      'Next time, work on: Uses the word glow in a sentence.',
+      'You did this well: Starts with a capital letter.',
+      'You did this well: Uses a capital letter.',
+    ]);
+    expect(JSON.stringify(api.logs)).not.toMatch(/scared|lamp/);
+  });
+
+  it('example wording after "Example sentence:", "For example," or a new line never reaches the child (R2-LJA-F1-example-span-gaps)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // The checker's forms of an unquoted example in the worked solution; the key names no answer.
+    const worked = [
+      'Example sentence: The lamp glows at night.',
+      'For example, the lamp glows at night.',
+      'Sample response:\nThe lamp glows at night.',
+      'A strong sentence - the lamp glows at night.',
+      'A good answer: Mr. Lee’s lamp glows at night.',
+    ];
+    const questions: ScriptedQuestion[] = worked.map((w, i) => ({
+      page: 1,
+      number: String(i + 1),
+      // One prompt per question: the scripted model finds each question by its prompt.
+      prompt: `Write sentence ${i + 1} using the word glow.`,
+      answer: 'glow',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: 'Answers will vary.',
+      worked: w,
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric: [
+        {
+          criterion:
+            i === 4 ? 'Writes lee’s lamp glows at night' : 'Writes the lamp glows at night',
+          met: false,
+          note: 'n/a',
+        },
+        { criterion: 'Uses the word glow in a sentence', met: true, note: 'n/a' },
+      ],
+    }));
+    await runJobs(deps, handlerFor(scriptedModel({ questions })));
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => r.body)).toEqual(
+      worked.map(() => 'You did this well: Uses the word glow in a sentence.'),
+    );
+    expect(JSON.stringify(api.logs)).not.toMatch(/lamp/);
+  });
+
+  it('example wording after "Example 1:" or "A good example is" never reaches the child, and a description of what to accept is no example (R3-RL-5)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const glow = (
+      number: number,
+      worked: string,
+      rubric: NonNullable<ScriptedQuestion['rubric']>,
+    ): ScriptedQuestion => ({
+      page: 1,
+      number: String(number),
+      // One prompt per question: the scripted model finds each question by its prompt.
+      prompt: `Write sentence ${number} using the word glow.`,
+      answer: 'glow',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: 'Answers will vary.',
+      worked,
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric,
+    });
+    // The round-4 checker's example formats: the label copying the example is dropped.
+    const examples = [
+      'Example 1: The lamp glows at night.',
+      'Sample answer #1: The lamp glows at night.',
+      'An example would be the lamp glows at night.',
+      'A good example is the lamp glows at night.',
+    ];
+    // The checker's descriptions of what to accept: the criterion sharing their wording stays.
+    const accepted = [
+      [
+        'Topic sentence: states an opinion. Closing sentence: restates the opinion.',
+        'States an opinion',
+      ],
+      [
+        'First sentence - starts with a capital letter and uses glow.',
+        'Starts with a capital letter',
+      ],
+      [
+        'Answers will vary - look for a capital letter, the word glow and a period.',
+        'Uses the word glow in a sentence',
+      ],
+      [
+        'Answers will vary — any complete sentence that uses glow correctly.',
+        'Uses glow correctly',
+      ],
+      ['Check for sentence parts, e.g. a subject and a verb.', 'Has a subject and a verb'],
+      ['The sentence - uses the word glow correctly.', 'Uses the word glow correctly'],
+    ] as const;
+    const questions: ScriptedQuestion[] = [
+      ...examples.map((w, i) =>
+        glow(i + 1, w, [
+          { criterion: 'Writes the lamp glows at night', met: false, note: 'n/a' },
+          { criterion: 'Uses a capital letter', met: true, note: 'n/a' },
+        ]),
+      ),
+      ...accepted.map(([w, criterion], i) =>
+        glow(examples.length + i + 1, w, [{ criterion, met: true, note: 'n/a' }]),
+      ),
+    ];
+    await runJobs(deps, handlerFor(scriptedModel({ questions })));
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => r.body).sort()).toEqual(
+      [
+        ...examples.map(() => 'You did this well: Uses a capital letter.'),
+        ...accepted.map(([, criterion]) => `You did this well: ${criterion}.`),
+      ].sort(),
+    );
+    expect(JSON.stringify(api.logs)).not.toMatch(/lamp/);
+  });
+
+  it('in staging, a month without an owner budget pauses a queued scan with no AI call (LJA-F2)', async () => {
+    // Staging accepts only a real provider's consent (LRD-1), so the scan gets as far as the budget.
+    const scan = await queuedScan({ pages: 1, withConsent: false });
+    await consent(scan.fam, { testProvider: false });
+    const staging: JobDeps = { ...deps, config: { ...api.config, environment: 'staging' } };
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    try {
+      const report = await runJobs(staging, handlerFor(client));
+      expect(report).toEqual({ succeeded: 0, retried: 1, deadLettered: 0 });
+      expect(client.requests).toHaveLength(0);
+      expect(await assignment(scan.assignmentId)).toEqual({
+        status: 'failed_retryable',
+        error_code: 'SPEND_CEILING',
+      });
+      expect(await reservation(scan.reservationId)).toMatchObject({ status: 'reserved' });
+      expect(api.logs).toContainEqual({
+        level: 'error',
+        event: 'spend_budget_missing',
+        code: 'SPEND_BUDGET_MISSING',
+      });
+    } finally {
+      await cancelJob(scan.jobId);
+    }
+  });
+
+  it('in staging, a consent record from the test provider is not consent: the scan sends nothing (LRD-1)', async () => {
+    const scan = await queuedScan({ pages: 1 }); // the development mock's verified record only
+    const adminId = await seedOwnerAdmin(api.db);
+    // A budget with room, so nothing but the consent gate can stop the scan.
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', 1000000000000, ${adminId})`;
+    const staging: JobDeps = { ...deps, config: { ...api.config, environment: 'staging' } };
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    try {
+      await runJobs(staging, handlerFor(client));
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+      await cancelJob(scan.jobId);
+    }
+    expect(client.requests).toHaveLength(0);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'CONSENT_REQUIRED',
+    });
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+    expect(
+      await api.db.sql`select 1 from public.extracted_questions
+      where assignment_id = ${scan.assignmentId}`,
+    ).toHaveLength(0);
+  });
+
+  it('a draft child’s scan at the spend ceiling fails as not active, with no hold and no ceiling pause (CHK-LJA-F3-untested)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const adminId = await seedOwnerAdmin(api.db);
+    // A ceiling that refuses every stage: without the paid-profile check in spending() the scan
+    // would wait at the ceiling (and retry hourly) instead of ending.
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', 1, ${adminId})`;
+    await api.db.sql`
+      update public.child_profiles set status = 'draft' where id = ${scan.fam.children[0]!.id}`;
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    let report: Awaited<ReturnType<typeof runJobs>> | undefined;
+    let alerted: number[] | undefined;
+    try {
+      report = await runJobs(deps, handlerFor(client));
+      const [budget] = await api.db.sql<{ alerted: number[] }[]>`
+        select alerted_thresholds_percent as alerted from public.spend_budgets
+         where scope = 'global' and period_key = '2026-09'`;
+      alerted = budget!.alerted;
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+      await cancelJob(scan.jobId);
+    }
+    expect(report).toMatchObject({ retried: 0 });
+    expect(client.requests).toHaveLength(0);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'CHILD_NOT_ACTIVE',
+    });
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+    expect(await liveHolds()).toEqual({ n: 0, micros: 0n });
+    // A profile that may not use paid AI never raises the owner's ceiling alert.
+    expect(alerted).toEqual([]);
+    expect(api.logs.some((l) => l.event === 'spend_threshold_crossed')).toBe(false);
+  });
+
+  it('a scan for a child whose paid slot was released makes no AI call (LJA-F3)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // billing-sync releaseSlotlessProfiles after the scan was finalized, before the job runs.
+    await api.db.sql`
+      update public.child_profiles set status = 'draft' where id = ${scan.fam.children[0]!.id}`;
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 2) });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests).toHaveLength(0);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'CHILD_NOT_ACTIVE',
+    });
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+  });
+
+  it('a recheck for a child whose paid slot was released makes no AI call and keeps results (LJA-F3)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    await runJobs(deps, handlerFor(scriptedModel({ questions: WORKSHEET.slice(0, 2) })));
+    const before = await results(scan.assignmentId);
+    const [q] = await api.db.sql<{ id: string }[]>`
+      select id from public.extracted_questions
+       where assignment_id = ${scan.assignmentId} and prompt_text = '12 × 7 ='`;
+    await api.db.sql`
+      update public.extracted_questions
+         set corrected_student_answer_text = '84', corrected_by = ${scan.fam.ownerId}, corrected_at = now()
+       where id = ${q!.id}`;
+    await api.db
+      .sql`update public.assignments set status = 'checking' where id = ${scan.assignmentId}`;
+    await api.db.sql`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+      values ('scan_process', ${`scan:${scan.assignmentId}:v2`}, ${scan.fam.familyId}, ${scan.fam.children[0]!.id},
+              ${JSON.stringify({ assignmentId: scan.assignmentId, mode: 'recheck', questionIds: [q!.id] })}::text::jsonb,
+              ${new Date(api.now.value.getTime() - 1000)})`;
+    await api.db.sql`
+      update public.child_profiles set status = 'draft' where id = ${scan.fam.children[0]!.id}`;
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 2) });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests).toHaveLength(0);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'needs_parent_review',
+      error_code: 'CHILD_NOT_ACTIVE',
+    });
+    expect(await results(scan.assignmentId)).toEqual(before);
+  });
+
+  it('a paid slot released mid-scan: results already paid for are kept, no further AI call (LJA-F3)', async () => {
+    const scan = await queuedScan({ pages: 2 });
+    const inner = scriptedModel({ questions: WORKSHEET.slice(0, 3) });
+    // billing-sync moves the profile to draft while verification is in flight.
+    const client = hooked(inner, async (request) => {
+      if (request.outputName !== 'independent_verification') return;
+      await api.db.sql`
+        update public.child_profiles set status = 'draft' where id = ${scan.fam.children[0]!.id}`;
+    });
+    await runJobs(deps, handlerFor(client));
+    // Before the fix the two wrong answers were each sent to the tutor as well.
+    expect(inner.requests.map((r) => r.outputName)).toEqual([
+      'homework_extraction',
+      'private_grading',
+      'independent_verification',
+    ]);
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
+    expect((await results(scan.assignmentId)).map((r) => r.verdict).sort()).toEqual([
+      'correct',
+      'incorrect',
+      'incorrect',
+    ]);
+    const rows = await feedback(scan.assignmentId);
+    expect(rows.map((r) => [r.kind, r.body])).toEqual([
+      ['template_fallback', TEMPLATE_FALLBACK],
+      ['template_fallback', TEMPLATE_FALLBACK],
+    ]);
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'committed',
+      release_reason: null,
+    });
+  });
+
+  it('a paid slot released while grading is in flight: verification is never sent and the scan ends not active (CHK-LJA-F3-claim)', async () => {
+    const scan = await queuedScan({ pages: 2 });
+    const inner = scriptedModel({ questions: WORKSHEET.slice(0, 3) });
+    const client = hooked(inner, async (request) => {
+      if (request.outputName !== 'private_grading') return;
+      await api.db.sql`
+        update public.child_profiles set status = 'draft' where id = ${scan.fam.children[0]!.id}`;
+    });
+    await runJobs(deps, handlerFor(client));
+    // The corrected claim: results are kept only when the downgrade lands after verification was
+    // sent. Here the unverified grading is not kept, and nothing more is sent.
+    expect(inner.requests.map((r) => r.outputName)).toEqual([
+      'homework_extraction',
+      'private_grading',
+    ]);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'CHILD_NOT_ACTIVE',
+    });
+    expect(await results(scan.assignmentId)).toEqual([]);
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+  });
+
+  it('a recheck for a draft child still answers a severe-risk correction, with no AI call (LJA-F3)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    await runJobs(deps, handlerFor(scriptedModel({ questions: WORKSHEET.slice(0, 2) })));
+    const [q] = await api.db.sql<{ id: string }[]>`
+      select id from public.extracted_questions
+       where assignment_id = ${scan.assignmentId} and prompt_text = '12 × 7 ='`;
+    // A grown-up's correction shows the answer was a disclosure (synthetic text).
+    await api.db.sql`
+      update public.extracted_questions
+         set corrected_student_answer_text = 'I want to die', corrected_by = ${scan.fam.ownerId},
+             corrected_at = now()
+       where id = ${q!.id}`;
+    await api.db
+      .sql`update public.assignments set status = 'checking' where id = ${scan.assignmentId}`;
+    await api.db.sql`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+      values ('scan_process', ${`scan:${scan.assignmentId}:v2`}, ${scan.fam.familyId}, ${scan.fam.children[0]!.id},
+              ${JSON.stringify({ assignmentId: scan.assignmentId, mode: 'recheck', questionIds: [q!.id] })}::text::jsonb,
+              ${new Date(api.now.value.getTime() - 1000)})`;
+    await api.db.sql`
+      update public.child_profiles set status = 'draft' where id = ${scan.fam.children[0]!.id}`;
+    const client = scriptedModel({ questions: WORKSHEET.slice(0, 2) });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests).toHaveLength(0);
+    // The model-free safety response is not paid AI: the notice and the escalated report are written.
+    const [shown] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.child_feedback where question_id = ${q!.id} and kind = 'safety'`;
+    expect(shown!.n).toBe(1);
+    const [filed] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.safety_reports
+       where question_id = ${q!.id} and reporter_kind = 'system'`;
+    expect(filed!.n).toBe(1);
+  });
+
+  it('a request larger than its stage budget is refused before it is sent; recorded spend never passes the cap (LJA-F4)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const adminId = await seedOwnerAdmin(api.db);
+    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    // 150 questions at the extraction schema's 4,000-character prompt and answer limits.
+    const long = (s: string) => `${s} `.repeat(Math.ceil(4000 / (s.length + 1))).slice(0, 3990);
+    const questions: ScriptedQuestion[] = Array.from({ length: 150 }, (_, i) => ({
+      page: 1,
+      number: String(i + 1),
+      prompt: `${i}: ${long('Read the passage about the river and explain what the author means')}`,
+      answer: long('The author means that the river changes over time'),
+      kind: 'open_response',
+      subject: 'reading',
+      key: 'k',
+      primary: { verdict: 'correct', confidence: 'high' },
+      verifier: { verdict: 'correct', confidence: 'high' },
+    }));
+    const base = scriptedModel({ questions });
+    // Labeled mock usage proportional to what is sent (about 4 characters per token, 1,500 per image).
+    const client: ResponsesClient & { requests: ResponsesRequest[] } = {
+      name: base.name,
+      isMock: true,
+      requests: base.requests,
+      async create(request) {
+        const result = await base.create(request);
+        if (result.kind !== 'ok') return result;
+        const chars =
+          request.instructions.length +
+          request.input.reduce((n, p) => n + (p.type === 'input_text' ? p.text.length : 6000), 0);
+        return {
+          ...result,
+          usage: { inputTokens: Math.ceil(chars / 4), cachedInputTokens: 0, outputTokens: 300 },
+        };
+      },
+    };
+    const before = await recordedSpend();
+    const cap =
+      before +
+      BigInt(
+        PROPOSED_STAGE_LIMITS.extraction.maxCostMicros +
+          PROPOSED_STAGE_LIMITS.grading.maxCostMicros +
+          PROPOSED_STAGE_LIMITS.verification.maxCostMicros,
+      );
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
+    try {
+      await runJobs(deps, handlerFor(client));
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
+    expect(await recordedSpend()).toBeLessThanOrEqual(cap);
+    expect(client.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'STAGE_LIMIT',
+    });
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'released' });
+  });
+
+  it('a verification request too large for its stage budget sends the items to a grown-up (LJA-F4)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // About 40 KB of question text: grading (150,000 micros) fits, verification (100,000) does not.
+    const long = (s: string) => `${s} `.repeat(Math.ceil(1990 / (s.length + 1))).slice(0, 1990);
+    const questions: ScriptedQuestion[] = Array.from({ length: 10 }, (_, i) => ({
+      page: 1,
+      number: String(i + 1),
+      prompt: `${i}: ${long('Read the passage about the river and explain what the author means')}`,
+      answer: long('The author means that the river changes over time'),
+      kind: 'open_response',
+      subject: 'reading',
+      key: 'The river changes over time.',
+      primary: { verdict: 'correct', confidence: 'high' },
+      verifier: { verdict: 'correct', confidence: 'high' },
+    }));
+    const client = scriptedModel({ questions });
+    await runJobs(deps, handlerFor(client));
+    expect(client.requests.map((r) => r.outputName)).toEqual([
+      'homework_extraction',
+      'private_grading',
+    ]);
+    // Without an independent check nothing is accepted; the paid grading is kept for a grown-up.
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'needs_parent_review',
+      error_code: null,
+    });
+    const graded = await results(scan.assignmentId);
+    expect(graded).toHaveLength(10);
+    for (const r of graded) expect(r.verdict).not.toBe('correct');
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+  });
+
+  it('a stage whose usage cannot be recorded keeps its cost counted against the cap (LJA-F5)', async () => {
+    const adminId = await seedOwnerAdmin(api.db);
+    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    // Room for exactly one extraction stage.
+    const cap = (await recordedSpend()) + BigInt(PROPOSED_STAGE_LIMITS.extraction.maxCostMicros);
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
+    const unmetered = failing('insert into public.ai_usage_events');
+    const first = await queuedScan({ pages: 1 });
+    const second = await queuedScan({ pages: 1 });
+    const firstClient = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    const secondClient = scriptedModel({ questions: WORKSHEET.slice(0, 1) });
+    try {
+      await handlerFor(firstClient).scan_process!(unmetered, await jobRow(first.jobId));
+      expect(firstClient.requests.map((r) => r.outputName)).toEqual(['homework_extraction']);
+      expect(api.logs.some((l) => l.event === 'ai_usage_record_failed')).toBe(true);
+      // The billed cost could not be recorded, so its hold keeps counting it.
+      expect((await liveHolds()).micros).toBeGreaterThan(0n);
+      // The next extraction is refused: the provider already charged for the first one.
+      await handlerFor(secondClient).scan_process!(deps, await jobRow(second.jobId));
+      expect(secondClient.requests).toHaveLength(0);
+      expect(await assignment(second.assignmentId)).toEqual({
+        status: 'failed_retryable',
+        error_code: 'SPEND_CEILING',
+      });
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+      await api.db.sql`delete from private.ai_spend_holds`;
+      await cancelJob(first.jobId);
+      await cancelJob(second.jobId);
+    }
+  });
+
+  it('a mismatch whose allowance release fails once is released on the retry (LJA-F11)', async () => {
+    const scan = await queuedScan({
+      pages: 1,
+      registeredBytes: new Uint8Array([...syntheticJpeg(), 0]),
+    });
+    const client = scriptedModel({ questions: WORKSHEET });
+    const once = failing('update public.usage_reservations', 1);
+    const first = await runJobs(once, handlerFor(client));
+    expect(first.retried).toBe(1);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'needs_rescan',
+      error_code: 'PAGE_MISMATCH',
+    });
+    api.now.value = new Date(api.now.value.getTime() + 2 * 60_000);
+    try {
+      await runJobs(once, handlerFor(client));
+    } finally {
+      api.now.value = new Date('2026-09-24T15:00:00Z');
+    }
+    expect(client.requests).toHaveLength(0);
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'unreadable',
+    });
+    expect((await jobRow(scan.jobId)).attempts).toBe(2);
+  });
+
+  it('a stored page over the byte cap asks for a new scan on the first attempt (LJA-F12)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = scriptedModel({ questions: WORKSHEET });
+    const report = await runJobs(deps, {
+      scan_process: createScanProcessHandler({
+        ai: client,
+        readObject: () => Promise.reject(new StoredPageTooLarge()),
+        sleep: () => Promise.resolve(),
+      }),
+    });
+    expect(report).toEqual({ succeeded: 1, retried: 0, deadLettered: 0 });
+    expect(client.requests).toHaveLength(0);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'needs_rescan',
+      error_code: 'PAGE_MISMATCH',
+    });
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'unreadable',
+    });
+  });
+
+  it('the storage reader refuses an oversized object from its declared length without reading it (LJA-F12)', async () => {
+    const cap = 1024;
+    let pulled = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          pulled += 1;
+          controller.enqueue(new Uint8Array(512));
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const read = storageReader(
+      api.providers.storage,
+      () => Promise.resolve(new Response(body, { headers: { 'content-length': String(cap + 1) } })),
+      1000,
+      cap,
+    );
+    await expect(read('f/c/a/p.jpg')).rejects.toBeInstanceOf(StoredPageTooLarge);
+    expect(pulled).toBe(0);
   });
 });

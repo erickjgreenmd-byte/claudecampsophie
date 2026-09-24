@@ -24,6 +24,12 @@ export const PRIVACY_RULES = {
   childDeletionPending: 'CHILD_DELETION_PENDING',
   invalidTransition: 'INVALID_TRANSITION',
   resolutionNoteRequired: 'RESOLUTION_NOTE_REQUIRED',
+  /** Only a system report (the safety screen's flag) can be cleared as a false match. */
+  falseMatchSystemOnly: 'FALSE_MATCH_SYSTEM_ONLY',
+  /** A held flag cleared as a false match is never released to the family (runbook 5.1). */
+  falseMatchNotReleasable: 'FALSE_MATCH_NOT_RELEASABLE',
+  /** The flagged question's scan is still being checked; clear the flag once it is ready. */
+  scanStillChecking: 'SCAN_STILL_CHECKING',
 } as const;
 
 // ---------------------------------------------------------------------------------------------
@@ -208,10 +214,26 @@ export const PARENT_SAFETY_FLAG_COPY = {
     'PencilLift flagged an answer for a grown-up to look at. For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint. PencilLift sent no automatic alert (no email, text or notification); this list is where the flag appears. Please check in with your child.',
   resources:
     'If your child may be in danger, call 911. Support is available any time from the 988 Suicide & Crisis Lifeline (call or text 988) and the Childhelp National Child Abuse Hotline (1-800-422-4453).',
+  /**
+   * A visible flag a reviewer cleared as a false match (round 3, CHK2-CS-5). It replaces `summary`,
+   * which would no longer be true: the child's results stop showing the message for that question
+   * and the question is checked like the rest of the scan. A held flag is never listed.
+   */
+  cleared:
+    'A PencilLift reviewer checked this flag and found it was not a concern. Your child’s results no longer show the message about talking with a grown-up for that question, and the question is checked like the rest of the scan.',
 } as const;
 
 export const safetyReportStatusSchema = z.enum(['open', 'triaged', 'escalated', 'resolved']);
 export type SafetyReportStatus = z.infer<typeof safetyReportStatusSchema>;
+
+/**
+ * How a reviewer resolved a system report, beyond its note (migration 0760 `resolution`).
+ * `false_match`: the safety screen's word match was wrong for that question and transcription; the
+ * child's notice is hidden and the question is graded normally (runbook 5.1).
+ */
+export const SAFETY_REPORT_RESOLUTIONS = ['false_match'] as const;
+export const safetyReportResolutionSchema = z.enum(SAFETY_REPORT_RESOLUTIONS);
+export type SafetyReportResolution = z.infer<typeof safetyReportResolutionSchema>;
 
 export const SAFETY_NOTE_MAX_LENGTH = 500;
 export const RESOLUTION_NOTE_MAX_LENGTH = 1000;
@@ -240,6 +262,11 @@ export const safetyReportSchema = z.strictObject({
   createdAt: isoDateTimeSchema,
   triagedAt: isoDateTimeSchema.nullable(),
   resolvedAt: isoDateTimeSchema.nullable(),
+  /**
+   * A system report a reviewer cleared as a false match (show PARENT_SAFETY_FLAG_COPY.cleared, not
+   * the summary). Always false for parent and child reports. A held report is never listed at all.
+   */
+  clearedAsFalseMatch: z.boolean(),
 });
 export type SafetyReport = z.infer<typeof safetyReportSchema>;
 
@@ -279,10 +306,16 @@ export const adminSafetyReportSchema = z.strictObject({
   /** System reports only: the screen's category codes (never the matched text); else null. */
   screenCategories: z.array(safetyScreenReportCategorySchema).nullable(),
   /**
-   * False while a system report is held from the family's list (screen codes abuse, sexual or
-   * secrecy; runbook 5.1). Always true for child and parent reports.
+   * False while a report is held from the family's list: a system report with screen codes abuse,
+   * sexual or secrecy, and a child's report about a question such a report flagged (runbook 5.1).
+   * Always true for parent reports.
    */
   familyVisible: z.boolean(),
+  /**
+   * System reports only: a grown-up corrected the flagged answer's transcription after the screen
+   * read it (the child keeps the safety notice; the corrected text is not in this report). Else false.
+   */
+  transcriptionCorrected: z.boolean(),
   questionId: uuidSchema.nullable(),
   feedbackId: uuidSchema.nullable(),
   hasNote: z.boolean(),
@@ -291,26 +324,61 @@ export const adminSafetyReportSchema = z.strictObject({
   triagedAt: isoDateTimeSchema.nullable(),
   resolvedAt: isoDateTimeSchema.nullable(),
   resolutionNote: z.string().nullable(),
+  /** System reports only: `false_match` once a reviewer cleared the flag; else null. */
+  resolution: safetyReportResolutionSchema.nullable(),
 });
 export type AdminSafetyReport = z.infer<typeof adminSafetyReportSchema>;
 
+/** Reports per page of the owner admin queue (oldest first; RV-child-safety-9). */
+export const ADMIN_SAFETY_REPORTS_PAGE_SIZE = 200;
+
+/**
+ * GET /v1/admin/safety-reports[?status=…][&after=<nextCursor>]. Oldest first; `nextCursor` is set
+ * when more reports follow, so every report in the queue can be reached however many are open.
+ */
 export const adminSafetyReportsResponseSchema = z.strictObject({
-  reports: z.array(adminSafetyReportSchema),
+  reports: z.array(adminSafetyReportSchema).max(ADMIN_SAFETY_REPORTS_PAGE_SIZE),
+  nextCursor: z.string().max(80).nullable(),
 });
-export const adminSafetyReportResponseSchema = z.strictObject({ report: adminSafetyReportSchema });
+/**
+ * What a false-match clearance did to the flagged question's scan: `queued`, a recheck grades it
+ * now; `on_retry`, the scan's pending retry grades it; `none`, the scan cannot be graded (it
+ * failed for good, was cancelled, sent back for a retake, or the family is being deleted).
+ */
+export const SAFETY_CLEARANCE_RECHECKS = ['queued', 'on_retry', 'none'] as const;
+export const safetyClearanceRecheckSchema = z.enum(SAFETY_CLEARANCE_RECHECKS);
+export type SafetyClearanceRecheck = z.infer<typeof safetyClearanceRecheckSchema>;
+
+export const adminSafetyReportResponseSchema = z.strictObject({
+  report: adminSafetyReportSchema,
+  /** Present only on the request that cleared a false match. */
+  recheck: safetyClearanceRecheckSchema.optional(),
+});
 
 /**
  * PATCH /v1/admin/safety-reports/:id. A status move, a release of a held system report to the
  * family's list (`familyVisible: true`; forward only, a report is never hidden again), or both.
+ * `resolution: 'false_match'` (round 3, CHK2-CS-5) clears a system report's flag in the request
+ * that resolves it: the child's notice is hidden, the question is graded normally for that
+ * transcription, and a held report stays held (it cannot be combined with `familyVisible`).
  */
 export const updateSafetyReportRequestSchema = z
   .strictObject({
     status: z.enum(['triaged', 'escalated', 'resolved']).optional(),
     resolutionNote: z.string().trim().min(1).max(RESOLUTION_NOTE_MAX_LENGTH).optional(),
     familyVisible: z.literal(true).optional(),
+    resolution: safetyReportResolutionSchema.optional(),
   })
   .refine((b) => b.status !== undefined || b.familyVisible !== undefined, {
     message: 'Provide a status or familyVisible',
+  })
+  .refine((b) => b.resolution === undefined || b.status === 'resolved', {
+    message: 'A false match is cleared in the request that resolves the report',
+    path: ['resolution'],
+  })
+  .refine((b) => b.resolution === undefined || b.familyVisible === undefined, {
+    message: 'A cleared flag is not released to the family',
+    path: ['familyVisible'],
   });
 export type UpdateSafetyReportRequest = z.infer<typeof updateSafetyReportRequestSchema>;
 

@@ -4,7 +4,10 @@
 -- coaching call, shows the child a reviewed 'safety' template and files an escalated SYSTEM report
 -- for the owner's review queue (docs/Deployment_Runbook.md 5.1). System reports carry ids and
 -- screen codes only, never homework text. A report whose concern may involve the household (screen
--- codes abuse, sexual, secrecy) is held from the family's list until a reviewer releases it.
+-- codes abuse, sexual, secrecy) is held from the family's list until a reviewer releases it, and so
+-- is a child's own report about that question (the results screen's "Get help" button). A reviewer
+-- may clear a system report as a false match (section 5): the child's notice is then hidden and the
+-- question is graded normally for that transcription.
 
 -- ---------------------------------------------------------------------------------------------
 -- 1. The reviewed safety template is its own child feedback kind (rendered distinctly and calmly).
@@ -35,12 +38,20 @@ alter table public.safety_reports
   add column screen_version text check (char_length(screen_version) <= 40),
   -- Decision (runbook 5.1; proposed default, owner and counsel to approve): a system report whose
   -- screen codes include abuse, sexual or secrecy starts HELD (false) because the concern may
-  -- involve someone in the household; the owner admin releases it (true) after review. Families
-  -- read only visible reports (policy below) and cannot read this flag.
-  add column family_visible boolean not null default true;
+  -- involve someone in the household; the owner admin releases it (true) after review. A child's
+  -- report about a question with a held system report starts held too (child_report_content
+  -- below): otherwise the "Get help" report would show the household the held question at once
+  -- (RV-child-safety-6). Families read only visible reports (policy below) and cannot read this flag.
+  add column family_visible boolean not null default true,
+  -- Round 3 (CHK2-CS-5; spec P4 "human review procedures"): a reviewer resolved this system report
+  -- as a false match. The clearance is per question and transcription (the report's question_id and
+  -- transcription_at): the scan grades that transcription normally and the child's results stop
+  -- showing its safety notice. Only a code, never the answer text.
+  add column resolution text check (resolution in ('false_match'));
 
-alter table public.safety_reports add constraint safety_reports_hold_system_only
-  check (family_visible or reporter_kind = 'system');
+-- Parent reports are never held: a guardian always sees the report they filed.
+alter table public.safety_reports add constraint safety_reports_hold_kind
+  check (family_visible or reporter_kind in ('system', 'child'));
 
 -- Decision: a system report is always 'severe_risk', names its child and question, carries no note
 -- (no homework text), starts 'escalated' (runbook 5.1: serious by default) and can only move on to
@@ -68,6 +79,11 @@ alter table public.safety_reports add constraint safety_reports_system_shape che
 create unique index safety_reports_system_once
   on public.safety_reports (question_id, transcription_at) where reporter_kind = 'system';
 
+-- A false-match clearance belongs to a resolved system report.
+alter table public.safety_reports add constraint safety_reports_resolution_shape check (
+  resolution is null or (reporter_kind = 'system' and status = 'resolved')
+);
+
 -- [BUG] The purge (app.purge_family_data, 0710) deletes child_feedback before safety_reports, so a
 -- report linked to a hint or template (a child's report from a hint, every system report) made the
 -- feedback delete fail and blocked the child's deletion. The link is cleared instead; the purge
@@ -77,16 +93,91 @@ alter table public.safety_reports add constraint safety_reports_feedback_id_fkey
   foreign key (feedback_id) references public.child_feedback (id) on delete set null;
 
 -- ---------------------------------------------------------------------------------------------
--- 3. Grants: families keep reading their reports (RLS unchanged: members of the family only), but
---    not the screen columns; no client role can create a system report (authenticated inserts are
---    limited to reporter_kind 'parent' by the 0600 policy; pl_child has no table privilege and its
---    report RPC hardcodes 'child').
+-- 3. A child's report about a held flagged question is held with it (RV-child-safety-6). Same
+--    signature, checks and grants as 0600; only the hold is new. A held system report (any
+--    transcription) on the question named, or on the question the named feedback row belongs to,
+--    holds the child's report; the reviewer releases each report on its own (runbook 5.1).
+-- ---------------------------------------------------------------------------------------------
+
+create or replace function public.child_report_content(p_category text, p_question uuid default null, p_feedback uuid default null)
+returns uuid
+language plpgsql security definer
+set search_path = ''
+as $$
+declare
+  me uuid := app.current_child_id();
+  fam uuid := app.current_child_family_id();
+  about uuid;
+  held boolean;
+  report_id uuid;
+begin
+  if me is null then
+    raise exception 'child session required' using errcode = '42501';
+  end if;
+  if p_question is not null and not exists (
+      select 1 from public.extracted_questions where id = p_question and child_id = me) then
+    raise exception 'question not found' using errcode = 'P0002';
+  end if;
+  if p_feedback is not null and not exists (
+      select 1 from public.child_feedback where id = p_feedback and child_id = me) then
+    raise exception 'feedback not found' using errcode = 'P0002';
+  end if;
+  -- The named feedback row's own question counts too: the two ids are each checked as the child's,
+  -- not as belonging together.
+  about := (select question_id from public.child_feedback where id = p_feedback);
+  held := exists (
+    select 1 from public.safety_reports s
+     where s.question_id in (p_question, about) and s.reporter_kind = 'system' and not s.family_visible);
+  insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id, feedback_id, family_visible)
+    values (fam, me, 'child', p_category, p_question, p_feedback, not held)
+    returning id into report_id;
+  return report_id;
+end
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- 4. False-match clearance guard (round 3, CHK2-CS-5). A clearance is set in the same update that
+--    resolves the report (resolved is final), never changes afterwards, and a cleared report that
+--    was held is never released: the family never learns of a held report that was cleared. The
+--    admin API enforces the same rules; this is the second layer for any service-role writer.
+-- ---------------------------------------------------------------------------------------------
+
+create or replace function app.guard_safety_report_resolution() returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.resolution is distinct from old.resolution
+     and (old.resolution is not null or old.status = 'resolved') then
+    raise exception 'safety report % resolution is final', old.id using errcode = 'P0001';
+  end if;
+  if new.resolution is not null and new.family_visible and not old.family_visible then
+    raise exception 'a held safety report cleared as a false match is never released'
+      using errcode = 'P0001';
+  end if;
+  return new;
+end
+$$;
+
+create trigger safety_reports_resolution_guard before update on public.safety_reports
+  for each row execute function app.guard_safety_report_resolution();
+
+-- ---------------------------------------------------------------------------------------------
+-- 5. Grants: families keep reading their reports (RLS unchanged: members of the family only), but
+--    not the screen columns or the reviewer's resolution note; no client role can create a system
+--    report (authenticated inserts are limited to reporter_kind 'parent' by the 0600 policy;
+--    pl_child has no table privilege and its report RPC hardcodes 'child').
 -- ---------------------------------------------------------------------------------------------
 
 revoke select on public.safety_reports from authenticated;
 -- family_visible is not granted: a held report is invisible and the flag itself is not exposed.
+-- resolution_note is not granted (RV-child-safety-8): runbook 5.1 has the reviewer record authority
+-- and family-contact decisions there; the family sees the status and timestamps only. `resolution`
+-- is granted (round 3): a visible system report that was cleared as a false match must not keep
+-- telling the family that the child sees a safety message (the family copy says it was cleared); a
+-- held report stays invisible (policy below), so its clearance is never shown.
 grant select (id, family_id, child_id, reporter_kind, category, question_id, feedback_id, note, status,
-              created_at, triaged_at, resolved_at, resolution_note, transcription_at)
+              created_at, triaged_at, resolved_at, transcription_at, resolution)
   on public.safety_reports to authenticated;
 
 -- Families read their visible reports only (0670's member policy plus the hold). Parent inserts keep

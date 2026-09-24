@@ -1,5 +1,6 @@
 import { Hono, type Context } from 'hono';
 import {
+  ADMIN_SAFETY_REPORTS_PAGE_SIZE,
   createAnswerKeyExportRequestSchema,
   createDeletionRequestSchema,
   createExportRequestSchema,
@@ -10,13 +11,17 @@ import {
   updateSafetyReportRequestSchema,
   uuidSchema,
   type AdminSafetyReport,
+  type AssignmentStatus,
   type DataExport,
   type DeletionRequest,
   type ExportKind,
+  type SafetyClearanceRecheck,
   type SafetyReport,
+  type SafetyReportResolution,
   type SafetyReportStatus,
 } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
+import { stateRequestInstant } from '../db.ts';
 import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
 import {
   assertOwnerAdmin,
@@ -67,7 +72,12 @@ export const CHILD_REPORT_THANKS =
  * (`reporter_kind = 'system'`, category `severe_risk`, filed by the scan job's safety screen) start
  * `escalated`; migration 0760 keeps them `escalated` or `resolved`. A system report whose screen
  * codes include abuse, sexual or secrecy starts held from the family's list (`family_visible =
- * false`); the owner admin releases it with `familyVisible: true` (forward only, runbook 5.1).
+ * false`); the owner admin releases it with `familyVisible: true` (forward only, runbook 5.1). A
+ * child's report about a question with a held system report starts held too (migration 0760
+ * child_report_content, RV-child-safety-6) and is released the same way. A system report may be
+ * cleared as a false match in the request that resolves it (`resolution: 'false_match'`; round 3,
+ * CHK2-CS-5): the flagged question is then re-checked like a corrected answer, and a held report
+ * stays held for good (migration 0760 refuses its release too).
  */
 const REPORT_TRANSITIONS: Readonly<Record<SafetyReportStatus, readonly SafetyReportStatus[]>> = {
   open: ['triaged', 'escalated', 'resolved'],
@@ -75,6 +85,25 @@ const REPORT_TRANSITIONS: Readonly<Record<SafetyReportStatus, readonly SafetyRep
   escalated: ['resolved'],
   resolved: [],
 };
+
+/**
+ * Scan statuses in which a false-match clearance is refused: the scan job may already have passed
+ * its pre-grading screen, so the cleared question could stay ungraded. The reviewer clears it once
+ * the scan settles (runbook 5.1).
+ */
+const SCAN_STILL_CHECKING: readonly AssignmentStatus[] = [
+  'draft',
+  'uploading',
+  'queued',
+  'extracting',
+  'checking',
+  'verifying',
+];
+/**
+ * Statuses from which a cleared question is re-checked at once: the same states a parent's
+ * transcription correction may re-check from (they alone may move back to `checking`, 0100).
+ */
+const RECHECK_NOW: readonly AssignmentStatus[] = ['ready', 'needs_parent_review'];
 
 // ---------------------------------------------------------------------------------------------
 // Row types and DTO mapping (explicit columns only; storage paths are never selected)
@@ -110,6 +139,7 @@ interface ReportRow {
   created_at: Date;
   triaged_at: Date | null;
   resolved_at: Date | null;
+  resolution: SafetyReportResolution | null;
 }
 
 interface AdminReportRow {
@@ -123,11 +153,13 @@ interface AdminReportRow {
   has_note: boolean;
   screen_categories: AdminSafetyReport['screenCategories'];
   family_visible: boolean;
+  transcription_corrected: boolean;
   status: SafetyReportStatus;
   created_at: Date;
   triaged_at: Date | null;
   resolved_at: Date | null;
   resolution_note: string | null;
+  resolution: SafetyReportResolution | null;
 }
 
 const iso = (d: Date | null): string | null => (d ? d.toISOString() : null);
@@ -180,6 +212,7 @@ function toReport(row: ReportRow): SafetyReport {
     createdAt: row.created_at.toISOString(),
     triagedAt: iso(row.triaged_at),
     resolvedAt: iso(row.resolved_at),
+    clearedAsFalseMatch: row.reporter_kind === 'system' && row.resolution === 'false_match',
   };
 }
 
@@ -195,11 +228,13 @@ function toAdminReport(row: AdminReportRow): AdminSafetyReport {
     hasNote: row.has_note,
     screenCategories: row.screen_categories,
     familyVisible: row.family_visible,
+    transcriptionCorrected: row.transcription_corrected,
     status: row.status,
     createdAt: row.created_at.toISOString(),
     triagedAt: iso(row.triaged_at),
     resolvedAt: iso(row.resolved_at),
     resolutionNote: row.resolution_note,
+    resolution: row.resolution,
   };
 }
 
@@ -327,12 +362,14 @@ export function privacyRoutes(): Hono<AppEnv> {
     try {
       // The RPC re-checks membership and the step-up, tombstones, revokes child sessions/devices,
       // cancels queued work and (migration 0620) enqueues the purge in the same transaction.
-      const rows = await deps.db.asParent(parent, (tx) =>
-        tx.unsafe<DeletionRow[]>(
+      const rows = await deps.db.asParent(parent, async (tx) => {
+        // The purge job the RPC enqueues is due at the application's clock (migration 0780).
+        await stateRequestInstant(tx, deps.clock());
+        return tx.unsafe<DeletionRow[]>(
           `select ${DELETION_COLUMNS} from public.request_deletion($1::uuid, $2::uuid)`,
           [membership.familyId, childId],
-        ),
-      );
+        );
+      });
       row = rows[0]!;
     } catch (error) {
       const code = pgErrorCode(error);
@@ -359,9 +396,9 @@ export function privacyRoutes(): Hono<AppEnv> {
     // request is never acknowledged without its purge job.
     await deps.db.asService(async (tx) => {
       await tx`
-        insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+        insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
         values ('deletion_purge', ${'deletion:' + row.id}, ${membership.familyId}, ${childId}::uuid,
-                ${JSON.stringify({ deletionRequestId: row.id })}::text::jsonb)
+                ${JSON.stringify({ deletionRequestId: row.id })}::text::jsonb, ${deps.clock()})
         on conflict (idempotency_key) do nothing`;
       const jobs = await tx<{ id: string }[]>`
         select id from public.jobs
@@ -467,9 +504,9 @@ export function privacyRoutes(): Hono<AppEnv> {
     try {
       await deps.db.asService(
         (tx) => tx`
-          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
           values ('export_build', ${'export:' + exportId}, ${familyId}, ${childId}::uuid,
-                  ${JSON.stringify({ exportId })}::text::jsonb)
+                  ${JSON.stringify({ exportId })}::text::jsonb, ${deps.clock()})
           on conflict (idempotency_key) do nothing`,
       );
     } catch (error) {
@@ -550,7 +587,7 @@ export function privacyRoutes(): Hono<AppEnv> {
         insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id, note)
         select ${familyId}, ${childId}::uuid, 'parent', ${body.category}, ${questionId}::uuid, ${body.note ?? null}
          where app.family_is_active(${familyId})
-        returning id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at, resolved_at`;
+        returning id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at, resolved_at, resolution`;
       const created = rows[0];
       if (created) {
         await tx`
@@ -570,14 +607,16 @@ export function privacyRoutes(): Hono<AppEnv> {
   // the family sees that an answer was flagged for a grown-up, never which kind of concern the word
   // match suggested. No alert is sent and the response claims none. A held report (abuse, sexual or
   // secrecy codes) is filtered by RLS until the owner releases it; `family_visible` itself is not
-  // granted to `authenticated`, so this query cannot and does not name it.
+  // granted to `authenticated`, so this query cannot and does not name it. A visible flag a
+  // reviewer cleared as a false match is marked so (round 3): its summary would no longer be true.
   r.get('/safety-reports', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     const rows = await deps.db.asParent(
       parent,
       (tx) => tx<ReportRow[]>`
-        select id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at, resolved_at
+        select id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at, resolved_at,
+               resolution
           from public.safety_reports
          where family_id = ${familyId} order by created_at desc limit 100`,
     );
@@ -617,10 +656,18 @@ export function privacyRoutes(): Hono<AppEnv> {
   // ----- Owner admin report queue ---------------------------------------------------------------
 
   // System reports add the screen's category codes (never text) so the reviewer can follow the
-  // right escalation step (runbook 5.1).
+  // right escalation step (runbook 5.1), and whether a grown-up later corrected the flagged
+  // answer's transcription (RV-child-safety-7; never the corrected text).
   const ADMIN_COLUMNS = `id, family_id, child_id, reporter_kind, category, question_id, feedback_id,
-    (note is not null) as has_note, screen_categories, family_visible, status, created_at, triaged_at,
-    resolved_at, resolution_note`;
+    (note is not null) as has_note, screen_categories, family_visible,
+    (reporter_kind = 'system' and exists (
+       select 1 from public.extracted_questions q
+        where q.id = safety_reports.question_id
+          and q.corrected_at > safety_reports.transcription_at)) as transcription_corrected,
+    status, created_at, triaged_at, resolved_at, resolution_note, resolution`;
+  /** `<created_at in epoch microseconds>_<id>` of the last report on the previous page. */
+  const ADMIN_CURSOR =
+    /^([0-9]{1,19})_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
   r.get('/admin/safety-reports', requireParent, async (c) => {
     const { deps } = c.var;
@@ -632,18 +679,38 @@ export function privacyRoutes(): Hono<AppEnv> {
       if (!parsed.success) throw new ApiError('VALIDATION_FAILED', 'Invalid request: status');
       status = parsed.data;
     }
+    // Keyset pages, oldest first (RV-child-safety-9): a fixed first page of 200 hid every newer
+    // report once 200 were escalated, however severe. `after` is the previous page's `nextCursor`.
+    const after = c.req.query('after');
+    let cursor: { micros: string; id: string } | null = null;
+    if (after !== undefined) {
+      const m = ADMIN_CURSOR.exec(after);
+      if (!m) throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+      cursor = { micros: m[1]!, id: m[2]! };
+    }
     // Service role after the aal2 owner check above (RLS no longer grants admins family reports,
     // migration 0670). Selects ids, category, status and timestamps only — never homework text,
     // child nicknames or the parent's free-text note.
     const rows = await deps.db.asService((tx) =>
-      tx.unsafe<AdminReportRow[]>(
-        `select ${ADMIN_COLUMNS} from public.safety_reports
+      tx.unsafe<(AdminReportRow & { cursor_micros: string })[]>(
+        `select ${ADMIN_COLUMNS},
+                ((extract(epoch from created_at) * 1000000)::bigint)::text as cursor_micros
+           from public.safety_reports
           where ($1::text is null or status = $1::text)
-          order by created_at asc limit 200`,
-        [status],
+            and ($2::bigint is null
+                 or (created_at, id) > (timestamptz 'epoch' + $2::bigint * interval '1 microsecond', $3::uuid))
+          order by created_at asc, id asc
+          limit ${ADMIN_SAFETY_REPORTS_PAGE_SIZE + 1}`,
+        [status, cursor?.micros ?? null, cursor?.id ?? null],
       ),
     );
-    return c.json({ reports: rows.map(toAdminReport) });
+    const page = rows.slice(0, ADMIN_SAFETY_REPORTS_PAGE_SIZE);
+    const last = page.at(-1);
+    const nextCursor =
+      rows.length > ADMIN_SAFETY_REPORTS_PAGE_SIZE && last !== undefined
+        ? `${last.cursor_micros}_${last.id}`
+        : null;
+    return c.json({ reports: page.map(toAdminReport), nextCursor });
   });
 
   r.patch('/admin/safety-reports/:id', requireParent, async (c) => {
@@ -652,17 +719,21 @@ export function privacyRoutes(): Hono<AppEnv> {
     const id = uuidSchema.safeParse(c.req.param('id'));
     if (!id.success) throw new ApiError('NOT_FOUND', 'Report not found');
     const body = await readJson(c, updateSafetyReportRequestSchema);
+    const clearing = body.resolution === 'false_match';
     // `authenticated` has no update grant on reports; the owner admin (verified above, aal2) acts
     // through the service role on exactly this report id.
-    const row = await deps.db.asService(async (tx) => {
+    const outcome = await deps.db.asService(async (tx) => {
       const [current] = await tx<
         {
           status: SafetyReportStatus;
           family_id: string;
           resolution_note: string | null;
           family_visible: boolean;
+          reporter_kind: SafetyReport['reporterKind'];
+          question_id: string | null;
+          resolution: SafetyReportResolution | null;
         }[]
-      >`select status, family_id, resolution_note, family_visible
+      >`select status, family_id, resolution_note, family_visible, reporter_kind, question_id, resolution
           from public.safety_reports where id = ${id.data} for update`;
       if (!current) throw new ApiError('NOT_FOUND', 'Report not found');
       if (body.status !== undefined && !REPORT_TRANSITIONS[current.status].includes(body.status)) {
@@ -678,6 +749,35 @@ export function privacyRoutes(): Hono<AppEnv> {
           'Add a resolution note before resolving',
         );
       }
+      if (clearing && (current.reporter_kind !== 'system' || current.question_id === null)) {
+        throw businessRule(
+          PRIVACY_RULES.falseMatchSystemOnly,
+          'Only a flag from PencilLift’s safety screen can be cleared as a false match',
+        );
+      }
+      // Round 3 (CHK2-CS-5): the family never learns of a held flag that was cleared.
+      if (body.familyVisible === true && current.resolution !== null && !current.family_visible) {
+        throw businessRule(
+          PRIVACY_RULES.falseMatchNotReleasable,
+          'A held flag cleared as a false match is never released to the family',
+        );
+      }
+      // A clearance re-checks the flagged question, so its scan must not be mid-run: the run may
+      // already have passed its pre-grading screen and would leave the question unchecked.
+      let scan: { id: string; status: AssignmentStatus; child_id: string } | undefined;
+      if (clearing) {
+        [scan] = await tx<{ id: string; status: AssignmentStatus; child_id: string }[]>`
+          select a.id, a.status, a.child_id from public.assignments a
+            join public.extracted_questions q on q.assignment_id = a.id and q.family_id = a.family_id
+           where q.id = ${current.question_id} and a.family_id = ${current.family_id}
+             for update of a`;
+        if (scan && SCAN_STILL_CHECKING.includes(scan.status)) {
+          throw businessRule(
+            PRIVACY_RULES.scanStillChecking,
+            'This scan is still being checked. Clear the flag once it is ready.',
+          );
+        }
+      }
       const nextStatus = body.status ?? current.status;
       // Forward only: a held report can be released to the family list, never hidden again.
       const released = body.familyVisible === true && !current.family_visible;
@@ -688,7 +788,7 @@ export function privacyRoutes(): Hono<AppEnv> {
           `select ${ADMIN_COLUMNS} from public.safety_reports where id = $1::uuid`,
           [id.data],
         );
-        return same!;
+        return { report: same!, recheck: undefined };
       }
       const [updated] = await tx.unsafe<AdminReportRow[]>(
         `update public.safety_reports
@@ -697,19 +797,50 @@ export function privacyRoutes(): Hono<AppEnv> {
                 resolved_at = case when $2::text = 'resolved' and status <> 'resolved' then now()
                                    else resolved_at end,
                 resolution_note = $3::text,
-                family_visible = $4::boolean
+                family_visible = $4::boolean,
+                resolution = coalesce($5::text, resolution)
           where id = $1::uuid
           returning ${ADMIN_COLUMNS}`,
-        [id.data, nextStatus, note, visible],
+        [id.data, nextStatus, note, visible, clearing ? 'false_match' : null],
       );
+      let recheck: SafetyClearanceRecheck | undefined;
+      if (clearing) {
+        recheck = 'none';
+        const [family] = await tx<{ active: boolean }[]>`
+          select app.family_is_active(${current.family_id}) as active`;
+        if (scan && family?.active && RECHECK_NOW.includes(scan.status)) {
+          // The same re-check a parent's transcription correction queues (homework.ts): the scan
+          // job grades this question normally, because its pre-grading screen honours the
+          // clearance for this transcription (scan-process.ts screenBeforeGrading).
+          await tx`
+            update public.assignments set status = 'checking'
+             where id = ${scan.id} and family_id = ${current.family_id}`;
+          const [jobs] = await tx<{ n: number }[]>`
+            select count(*)::int as n from public.jobs
+             where family_id = ${current.family_id} and idempotency_key like ${`scan:${scan.id}:v%`}`;
+          await tx`
+            insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+            values ('scan_process', ${`scan:${scan.id}:v${(jobs?.n ?? 0) + 1}`}, ${current.family_id},
+                    ${scan.child_id},
+                    ${tx.json({ assignmentId: scan.id, mode: 'recheck', questionIds: [current.question_id!] })},
+                    ${deps.clock()})`;
+          recheck = 'queued';
+        } else if (scan && family?.active && scan.status === 'failed_retryable') {
+          // The scan's own retry grades every stored question again and honours the clearance.
+          recheck = 'on_retry';
+        }
+      }
       // A held report's audit rows carry no family_id: family members can read their family's
       // audit log (0001 audit_member_read), and it must not point them at a held report.
       const auditFamily = visible ? current.family_id : null;
       if (body.status !== undefined) {
+        const metadata = clearing
+          ? { from: current.status, to: body.status, resolution: 'false_match', recheck }
+          : { from: current.status, to: body.status };
         await tx`
           insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
           values (${auditFamily}, ${parent.userId}, 'admin', 'safety_report.updated', 'safety_report', ${id.data},
-                  ${JSON.stringify({ from: current.status, to: body.status })}::text::jsonb)`;
+                  ${JSON.stringify(metadata)}::text::jsonb)`;
       }
       if (released) {
         await tx`
@@ -717,9 +848,20 @@ export function privacyRoutes(): Hono<AppEnv> {
           values (${current.family_id}, ${parent.userId}, 'admin', 'safety_report.released_to_family', 'safety_report',
                   ${id.data}, ${JSON.stringify({ familyVisible: true })}::text::jsonb)`;
       }
-      return updated!;
+      return { report: updated!, recheck };
     });
-    return c.json({ report: toAdminReport(row) });
+    if (outcome.recheck !== undefined) {
+      deps.log({
+        level: 'info',
+        event: 'safety_flag_cleared',
+        code: `RECHECK_${outcome.recheck.toUpperCase()}`,
+        requestId: c.var.requestId,
+      });
+    }
+    return c.json({
+      report: toAdminReport(outcome.report),
+      ...(outcome.recheck !== undefined ? { recheck: outcome.recheck } : {}),
+    });
   });
 
   return r;

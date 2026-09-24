@@ -50,13 +50,21 @@ import {
   screenQuestion,
   type SafetyScreen,
 } from '@pencillift/domain/safety';
+import { acceptsTestProviderConsent } from '../config.ts';
 import type { Tx } from '../db.ts';
 import type { StorageProvider } from '../providers/index.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 import { ImageFormatError, stripImageMetadata } from '../services/image-metadata.ts';
 import type { DeadLetterReason, JobDeferral, JobDeps, JobHandler, JobRow } from './dispatcher.ts';
-import { acquireSpendHold, releaseSpendHold, SpendCeilingReached } from './spend-ceiling.ts';
-import { childRubricFeedback } from './rubric-feedback.ts';
+import {
+  acquireSpendHold,
+  inputTokenUpperBound,
+  settleSpend,
+  SpendCeilingReached,
+  usageRows,
+  type UsageRow,
+} from './spend-ceiling.ts';
+import { childRubricFeedback, exampleWordingSpans } from './rubric-feedback.ts';
 
 /**
  * Homework scan processing (spec P5, P6, P12; AC_CAPTURE_*, AC_GRADING_*). One durable job per
@@ -75,20 +83,27 @@ import { childRubricFeedback } from './rubric-feedback.ts';
  * answers or child identifiers.
  *
  * Child safety (spec P4; AC_SECURITY_02), moderation before and after generation:
- * - Before coaching, every extracted question's answer and printed prompt pass the deterministic
+ * - Before grading, every extracted question's answer and printed prompt pass the deterministic
  *   screen (@pencillift/domain/safety). A severe-risk result gets NO further model call for that
- *   question: the child sees the reviewed safety template (feedback kind 'safety') and an escalated
- *   SYSTEM safety report is filed (ids and screen codes only; runbook 5.1). One of each per question
- *   per transcription, so a crash replay or recheck adds nothing.
+ *   question (no grading, verification or coaching; RV-child-safety-5): the child sees the reviewed
+ *   safety template (feedback kind 'safety') and an escalated SYSTEM safety report is filed (ids and
+ *   screen codes only; runbook 5.1), before any grading call, so a failed or paused grading stage
+ *   cannot delay or drop it. One of each per question per transcription, so a crash replay or
+ *   recheck adds nothing. A question flagged for an earlier transcription keeps its notice after a
+ *   grown-up's correction and is not tutored (RV-child-safety-7); the admin queue shows the edit.
  * - After generation, a coaching packet that screens severe (companion persona, diagnosis,
  *   secrecy, contact, an ungrounded sensitive topic, ...) falls back to the reviewed template, and a
  *   rubric label that screens severe is dropped. Only codes are logged.
  * - A report whose screen codes include abuse, sexual or secrecy starts held from the family's list
  *   (runbook 5.1: the concern may involve someone in the household); the owner releases it.
- * Decision: grading is unchanged and a severe screen does not move the scan to parent review. The
- * parent review loop (routes/homework.ts settleParentReview) only settles undecided verdicts, so a
- * status with no open question could never be cleared; the escalated system report in the family's
- * report list is the parent-facing signal, and no alert is claimed.
+ * - A reviewer may clear a report as a false match (round 3, CHK2-CS-5; PATCH
+ *   /v1/admin/safety-reports/:id). The clearance is that question's transcription: its re-check
+ *   grades it normally (no new report, no notice), and a corrected transcription is screened afresh.
+ * Decision: a flagged question gets no verdict (it is not graded: no worked solution is written for
+ * a disclosure) and does not move the scan to parent review, so a held flag is never announced to
+ * the household as "needs your review"; the scan's status follows its other questions. The parent
+ * sees the question as not checked; the escalated system report in the family's report list (once
+ * visible) is the parent-facing signal, and no alert is claimed.
  */
 
 export const GRADER_VERSION = 'scan.v1';
@@ -397,6 +412,64 @@ function uniqueAnswers(answers: readonly ProtectedAnswer[]): ProtectedAnswer[] {
   });
 }
 
+/** Quoted wording ("…", “…”, «…», '…') with at least three letters: an example a label must not copy. */
+const QUOTED_SPAN =
+  /["“„«]([^"“”„«»\n]{3,400})["”»]|(?<![\p{L}\p{N}])['‘]([^'‘’\n]{3,400})['’](?![\p{L}\p{N}])/gu;
+
+/** Where a sentence splits into clauses: punctuation and common joining words. */
+const CLAUSE_BREAK =
+  /[,;:()—–]|\s(?:because|so|and|but|or|when|if|since|after|before|while|although|until|that)\s/iu;
+
+/**
+ * Everything a child-facing rubric row must not state (LJA-F1; spec P6 "no complete spelling
+ * target, completed sentence, or essay response"): the private key and every quoted example, or
+ * unquoted example ("A good answer: ..."; exampleWordingSpans), in the key, the worked
+ * solution or a criterion's note, each whole, per sentence and per clause of three
+ * or more words, in the protected forms `protectedAnswers` derives (text, and any number written in
+ * digits). Returns null when a form cannot be protected, so the caller shows no rubric rows (fail
+ * closed).
+ */
+export function rubricProtectedAnswers(solution: {
+  readonly correctAnswer: string;
+  readonly workedSolution: string;
+  readonly rubric: readonly { readonly note: string }[] | null;
+}): ProtectedAnswer[] | null {
+  const texts = new Set<string>();
+  const add = (raw: string, minLetters: number) => {
+    const text = raw.normalize('NFKC').replace(/\s+/g, ' ').trim();
+    const letters = text.match(/\p{L}/gu)?.length ?? 0;
+    if (text.length > 0 && (letters >= minLetters || /\p{N}/u.test(text))) texts.add(text);
+  };
+  // A sentence, and each clause of it with at least three words: a label may copy the completion
+  // ("it was raining") without the rest of the example sentence.
+  const addExample = (raw: string, minLetters: number) => {
+    add(raw, minLetters);
+    for (const sentence of raw.split(/(?<=[.!?])\s+|\n+/u)) {
+      add(sentence, minLetters);
+      for (const clause of sentence.split(CLAUSE_BREAK)) {
+        if (clause.trim().split(/\s+/u).length >= 3) add(clause, minLetters);
+      }
+    }
+  };
+  const key = solution.correctAnswer;
+  addExample(key, 1);
+  for (const source of [
+    key,
+    solution.workedSolution,
+    ...(solution.rubric ?? []).map((r) => r.note),
+  ]) {
+    for (const match of source.matchAll(QUOTED_SPAN)) addExample(match[1] ?? match[2] ?? '', 3);
+    for (const span of exampleWordingSpans(source)) addExample(span, 3);
+  }
+  const answers: ProtectedAnswer[] = [];
+  for (const text of texts) {
+    const forms = protectedAnswers('writing', text);
+    if (forms.length === 0) return null;
+    answers.push(...forms);
+  }
+  return uniqueAnswers(answers);
+}
+
 function toBase64(bytes: Uint8Array): string {
   let binary = '';
   const chunk = 0x8000;
@@ -535,7 +608,7 @@ export function createScanProcessHandler(options: ScanProcessOptions): JobHandle
       if (error instanceof SpendCeilingReached) return await run.pause();
       await run.fail(error);
     } finally {
-      await run.recordUsage();
+      await run.recordUsage(true);
     }
   };
   return Object.assign(handler, {
@@ -630,6 +703,12 @@ async function loadAssignment(
 
 class ScanRun {
   private readonly usage: AttemptRecord[] = [];
+  /**
+   * Questions whose severe screen a reviewer cleared as a false match for their current
+   * transcription (round 3, CHK2-CS-5): screenBeforeGrading lets them through and the post-grading
+   * backstop must not flag them again.
+   */
+  private readonly clearedFlags = new Set<string>();
 
   constructor(
     private readonly deps: JobDeps,
@@ -681,6 +760,12 @@ class ScanRun {
       await this.transition('failed_retryable', 'RESTARTED');
     }
     if (this.ctx.status === 'failed_retryable') await this.transition('queued');
+    if (this.ctx.status === 'needs_rescan') {
+      // A retry after the scan was sent back for a retake: the allowance release may have failed
+      // after the transition committed; it is idempotent, so release it now (spec P11; LJA-F11).
+      await this.settleReservation('unreadable');
+      return false;
+    }
     if (this.ctx.status !== 'queued') return false; // ready, cancelled, deleted, ... : done
     await this.transition('extracting');
     return true;
@@ -736,29 +821,26 @@ class ScanRun {
     };
   }
 
-  async recordUsage(): Promise<void> {
+  /**
+   * Meters the attempts so far (append-only cost rows). Inside a spend hold, rows that cannot be
+   * written now stay queued: the hold's settlement retries them in the transaction that releases
+   * the hold, and keeps the hold counting their cost if they still cannot be written (LJA-F5).
+   * `final` is the handler's last flush (no hold left): a failure there is only logged.
+   */
+  async recordUsage(final = false): Promise<void> {
     if (this.usage.length === 0) return;
-    const rows = this.usage.map((a) => ({
-      family_id: this.ctx.familyId,
-      child_id: this.ctx.childId,
-      stage: a.stage,
-      model_id: a.modelId,
-      prompt_version: a.promptVersion,
-      attempt: a.attempt,
-      status: a.status,
-      input_tokens: a.inputTokens,
-      cached_input_tokens: a.cachedInputTokens,
-      output_tokens: a.outputTokens,
-      latency_ms: a.latencyMs,
-      cost_micros: a.costMicros,
-      rate_table_version: a.rateTableVersion,
-    }));
-    this.usage.length = 0;
+    const attempts = this.usage.splice(0);
+    const rows = usageRows(attempts, this.ctx.familyId, this.ctx.childId);
     try {
       await this.deps.db.asService((tx) => tx`insert into public.ai_usage_events ${tx(rows)}`);
     } catch {
       // Metering must never hide the processing outcome; the gap is visible in the logs.
-      this.deps.log({ level: 'error', event: 'ai_usage_record_failed', code: 'METERING' });
+      if (final) {
+        this.deps.log({ level: 'error', event: 'ai_usage_record_failed', code: 'METERING' });
+        return;
+      }
+      this.usage.unshift(...attempts);
+      this.deps.log({ level: 'warn', event: 'ai_usage_record_deferred', code: 'METERING' });
     }
   }
 
@@ -769,8 +851,18 @@ class ScanRun {
    * put it in, the family live, no deletion open for the family or child, the child not archived and
    * consent still verified. `lock` holds the assignment row for the rest of a write transaction, so a
    * concurrent deletion (which moves the assignment to 'deleted') serialises with the write.
+   *
+   * `paidAi` is set right before an AI stage (and before its spend hold): the profile must still be
+   * `active`, i.e. hold a paid slot (spec P11 "stop paid AI for inactive profiles"; LJA-F3). A
+   * profile moved to draft when billing released its slot gets no further model call, even for a
+   * scan finalized, paused at the spend ceiling or a recheck queued before the downgrade. Model-free
+   * work stays allowed: the safety screen still answers a severe-risk answer, and when the downgrade
+   * lands after verification was sent, the verified results are still written (coaching falls back
+   * to the template). A downgrade while grading is in flight stops the run before verification: an
+   * initial scan then ends failed_final with CHILD_NOT_ACTIVE and its unverified grading is not
+   * kept (round-2 check CHK-LJA-F3-claim).
    */
-  private async assertActive(tx: Tx, lock: boolean): Promise<void> {
+  private async assertActive(tx: Tx, lock: boolean, paidAi = false): Promise<void> {
     const [row] = await tx<
       { status: string; family_deleted: boolean; child_status: string | null; deleting: boolean }[]
     >`
@@ -794,8 +886,10 @@ class ScanRun {
       throw new Superseded();
     }
     if (row.child_status === 'archived') throw new PermanentFailure('CHILD_ARCHIVED');
+    if (paidAi && row.child_status !== 'active') throw new PermanentFailure('CHILD_NOT_ACTIVE');
     const consent = await hasVerifiedConsent(tx, this.ctx.familyId, {
-      allowTestProvider: this.deps.config.environment !== 'production',
+      // A test provider's record is consent only where the labeled mock may run (LRD-1).
+      allowTestProvider: acceptsTestProviderConsent(this.deps.config.environment),
     });
     if (!consent) throw new PermanentFailure('CONSENT_REQUIRED');
   }
@@ -824,30 +918,38 @@ class ScanRun {
 
   /**
    * Admits a group of AI stages against the owner's spend ceiling with their upper-bound cost, runs
-   * them, then records their actual cost before the hold is released (RV-lead-jobs-ai-10).
+   * them, then records their actual cost and releases the hold in one transaction; a cost that
+   * cannot be recorded stays counted by the hold (RV-lead-jobs-ai-10, LJA-F5).
    */
   private async spending<T>(
     stages: readonly (keyof typeof PROPOSED_STAGE_LIMITS)[],
     fn: () => Promise<T>,
   ): Promise<T> {
     const micros = stages.reduce((n, s) => n + PROPOSED_STAGE_LIMITS[s].maxCostMicros, 0);
+    // No hold (and no wait at the ceiling) for a profile that may no longer use paid AI.
+    await this.deps.db.asService((tx) => this.assertActive(tx, false, true));
     const hold = await acquireSpendHold(this.deps, micros);
     try {
       return await fn();
     } finally {
-      await this.recordUsage();
-      await releaseSpendHold(this.deps, hold);
+      const rows: UsageRow[] = usageRows(this.usage.splice(0), this.ctx.familyId, this.ctx.childId);
+      await settleSpend(this.deps, hold, rows);
     }
   }
 
+  /**
+   * One AI stage. The pre-flight cost check uses an upper bound of the request actually sent
+   * (instructions, schema and every text part at one token per byte, a bound per image), so an
+   * oversized request is refused as STAGE_LIMIT before it is sent and no stage overshoots the hold
+   * it was admitted with (LJA-F4).
+   */
   private async stage<S extends z.ZodType>(
     prompt: PromptDefinition<S>,
     input: readonly InputPart[],
-    estimatedInputTokens: number,
   ): Promise<z.infer<S>> {
-    // Deletion, archiving or a consent withdrawal since the last step stops the run before any
-    // more child data goes to the provider (spec P4; RV-lead-jobs-ai-3).
-    await this.deps.db.asService((tx) => this.assertActive(tx, false));
+    // Deletion, archiving, a released paid slot or a consent withdrawal since the last step stops
+    // the run before any more child data goes to the provider (spec P4, P11; RV-lead-jobs-ai-3).
+    await this.deps.db.asService((tx) => this.assertActive(tx, false, true));
     const out = await runStage<S>({
       prompt,
       input,
@@ -862,7 +964,7 @@ class ScanRun {
         now: this.deps.clock(),
       },
       metadata: { stage: prompt.stage },
-      estimatedInputTokens,
+      estimatedInputTokens: inputTokenUpperBound(prompt, input),
       ...(this.options.sleep ? { sleep: this.options.sleep } : {}),
     });
     this.usage.push(...out.attempts);
@@ -897,7 +999,7 @@ class ScanRun {
       return;
     }
     await this.transition('checking');
-    const graded = await this.grade(questions, missingPassage);
+    const graded = await this.grade(await this.screenBeforeGrading(questions), missingPassage);
     await this.finish(graded);
     await this.settleReservation('committed');
   }
@@ -972,17 +1074,13 @@ class ScanRun {
     }
 
     const extraction = await this.spending(['extraction'], () =>
-      this.stage<typeof PROMPTS.extraction.outputSchema>(
-        PROMPTS.extraction,
-        [
-          dataEnvelope({
-            pageNumbers: pages.map((p) => p.page_number),
-            gradeLevel: this.ctx.gradeLevel,
-          }),
-          ...images,
-        ],
-        1_500 * pages.length + 800,
-      ),
+      this.stage<typeof PROMPTS.extraction.outputSchema>(PROMPTS.extraction, [
+        dataEnvelope({
+          pageNumbers: pages.map((p) => p.page_number),
+          gradeLevel: this.ctx.gradeLevel,
+        }),
+        ...images,
+      ]),
     );
 
     if (this.needsRescan(extraction, pages.length)) {
@@ -1064,6 +1162,11 @@ class ScanRun {
     questions: readonly QuestionRow[],
     missingPassage: ReadonlySet<number>,
   ): Promise<Graded[]> {
+    if (questions.length === 0) {
+      // Every question was flagged by the safety screen: nothing goes to a model (RV-child-safety-5).
+      if (this.ctx.status === 'checking') await this.transition('verifying');
+      return [];
+    }
     // Synthetic refs: printed numbers repeat across pages, so the model never keys on them.
     const refs = questions.map((q, i) => ({ ref: `q${i + 1}`, q }));
     // Grading and its independent verification are admitted together: once grading is paid for,
@@ -1071,23 +1174,19 @@ class ScanRun {
     const { verification, pending, early } = await this.spending(
       ['grading', 'verification'],
       async () => {
-        const grading = await this.stage<typeof PROMPTS.grading.outputSchema>(
-          PROMPTS.grading,
-          [
-            dataEnvelope({
-              gradeLevel: this.ctx.gradeLevel,
-              pagesMissingSourcePassage: [...missingPassage],
-              questions: refs.map(({ ref, q }) => ({
-                questionNumber: ref,
-                prompt: q.prompt,
-                studentAnswer: q.answer,
-                answerKind: q.answer_kind,
-                subject: q.subject_key,
-              })),
-            }),
-          ],
-          300 * questions.length + 600,
-        );
+        const grading = await this.stage<typeof PROMPTS.grading.outputSchema>(PROMPTS.grading, [
+          dataEnvelope({
+            gradeLevel: this.ctx.gradeLevel,
+            pagesMissingSourcePassage: [...missingPassage],
+            questions: refs.map(({ ref, q }) => ({
+              questionNumber: ref,
+              prompt: q.prompt,
+              studentAnswer: q.answer,
+              answerKind: q.answer_kind,
+              subject: q.subject_key,
+            })),
+          }),
+        ]);
         const primaryByRef = new Map(grading.results.map((r) => [r.questionNumber, r]));
         if (this.ctx.status === 'checking') await this.transition('verifying');
 
@@ -1140,11 +1239,13 @@ class ScanRun {
                   })),
                 }),
               ],
-              250 * pending.length + 500,
             );
           } catch (error) {
-            // Without an independent check nothing is accepted: those items go to a grown-up.
-            if (!(error instanceof RetryableFailure)) throw error;
+            // Without an independent check nothing is accepted: those items go to a grown-up. That
+            // includes a verification request too large for its stage budget (LJA-F4): the paid
+            // grading is kept for review instead of failing the scan.
+            const tooLarge = error instanceof PermanentFailure && error.code === 'STAGE_LIMIT';
+            if (!(error instanceof RetryableFailure) && !tooLarge) throw error;
             verification = null;
           }
         }
@@ -1300,6 +1401,7 @@ class ScanRun {
 
     for (const g of graded) {
       // Moderation before generation: a severe-risk answer or prompt is never sent to the tutor.
+      // screenBeforeGrading already kept flagged questions out of grading; this is the backstop.
       const screen = screenQuestion({
         prompt: g.question.prompt,
         answer: g.question.answer,
@@ -1307,12 +1409,12 @@ class ScanRun {
         ageBand: this.ctx.ageBand,
       });
       const step = feedbackStep({
-        severe: screen.level === 'severe',
+        severe: screen.level === 'severe' && !this.clearedFlags.has(g.question.id),
         final: g.final,
         hasPrivate: g.private !== null,
         parentOverride: g.question.parent_override,
       });
-      if (step === 'safety') await this.safetyResponse(g, screen);
+      if (step === 'safety') await this.safetyResponse(g.question, screen);
       else if (step === 'coach') await this.coach(g);
       else if (step === 'rubric') await this.rubricFeedback(g);
     }
@@ -1397,6 +1499,8 @@ class ScanRun {
         select count(*)::int as n from public.child_feedback f
           join public.extracted_questions q on q.id = f.question_id
          where f.question_id = ${g.question.id} and f.created_at >= coalesce(q.corrected_at, '-infinity'::timestamptz)
+           -- A safety notice a reviewer cleared as a false match is not coaching (round 3).
+           and f.kind <> 'safety'
       `,
     );
     if ((existing?.n ?? 0) > 0) return; // already coached for this transcription (crash replay)
@@ -1406,22 +1510,18 @@ class ScanRun {
     if (key !== null) {
       try {
         rows = await this.spending(['coaching'], async () => {
-          const packet = await this.stage<typeof PROMPTS.coaching.outputSchema>(
-            PROMPTS.coaching,
-            [
-              dataEnvelope({
-                gradeLevel: this.ctx.gradeLevel,
-                ageBand: this.ctx.ageBand,
-                skill: g.question.skill,
-                question: g.question.prompt,
-                studentAnswer: g.question.answer,
-                likelyMisconception: g.private?.misconception ?? null,
-                // Given so hints are accurate; the guard below blocks any leak of it.
-                answerForTutorOnly: key.tutorKey,
-              }),
-            ],
-            900,
-          );
+          const packet = await this.stage<typeof PROMPTS.coaching.outputSchema>(PROMPTS.coaching, [
+            dataEnvelope({
+              gradeLevel: this.ctx.gradeLevel,
+              ageBand: this.ctx.ageBand,
+              skill: g.question.skill,
+              question: g.question.prompt,
+              studentAnswer: g.question.answer,
+              likelyMisconception: g.private?.misconception ?? null,
+              // Given so hints are accurate; the guard below blocks any leak of it.
+              answerForTutorOnly: key.tutorKey,
+            }),
+          ]);
           // Expressions are read as their value ("6 × 7" discloses 42), explicitly (L-012).
           const decision = guardChildContent({
             packet,
@@ -1484,11 +1584,25 @@ class ScanRun {
    * asks the child to go over the writing with a grown-up.
    */
   private async rubricFeedback(g: Graded): Promise<void> {
+    // Labels are model output: each row is checked against the private key and the example wording
+    // in the parent-only solution before a child can read it (LJA-F1).
+    const answers = g.private ? rubricProtectedAnswers(g.private) : null;
+    if (answers === null) {
+      this.deps.log({
+        level: 'warn',
+        event: 'rubric_label_blocked_by_guard',
+        code: 'UNPROTECTABLE',
+      });
+      return;
+    }
     const rows = childRubricFeedback(g.private?.rubric ?? null, {
       ageBand: this.ctx.ageBand,
       context: { prompt: g.question.prompt, subject: g.question.subject_key },
       onSafetyReject: (code) =>
         this.deps.log({ level: 'warn', event: 'rubric_label_blocked_by_safety', code }),
+      protectedAnswers: answers,
+      onLeak: (code) =>
+        this.deps.log({ level: 'warn', event: 'rubric_label_blocked_by_guard', code }),
     });
     if (rows.length === 0) return;
     await this.guardedWrite(async (tx) => {
@@ -1496,6 +1610,8 @@ class ScanRun {
         select count(*)::int as n from public.child_feedback f
           join public.extracted_questions q on q.id = f.question_id
          where f.question_id = ${g.question.id} and f.created_at >= coalesce(q.corrected_at, '-infinity'::timestamptz)
+           -- A safety notice a reviewer cleared as a false match is not a rubric row (round 3).
+           and f.kind <> 'safety'
       `;
       if ((existing?.n ?? 0) > 0) return; // already written for this transcription (crash replay)
       for (const row of rows) {
@@ -1508,12 +1624,121 @@ class ScanRun {
   }
 
   /**
+   * Moderation before generation (spec P4; RV-child-safety-5): screens every question before any
+   * grading call and answers the flagged ones here, so a grading failure, a spend-ceiling pause or
+   * a dead-lettered job can neither send the text to a model nor delay the template and report.
+   * Returns the questions that may be graded. A question flagged for an earlier transcription keeps
+   * its notice (RV-child-safety-7). A reviewer's false-match clearance (round 3, CHK2-CS-5) is
+   * honoured per question and transcription: a severe screen of the transcription the reviewer
+   * cleared is graded normally, and a notice kept from an earlier transcription is dropped once
+   * every flag on the question was cleared. A corrected transcription is screened afresh. Round 4
+   * (CHK3-CS-8): a question is graded only once EVERY system report on it is cleared, so clearing
+   * one of two reports (the original and a corrected transcription's) keeps the notice and grades
+   * nothing: the child never gets hints next to a notice, and the child route shows the notice
+   * until the last report is cleared (homework.ts).
+   */
+  private async screenBeforeGrading(questions: readonly QuestionRow[]): Promise<QuestionRow[]> {
+    const ids = questions.map((q) => q.id);
+    const state = new Map(
+      (
+        await this.deps.db.asService(
+          (tx) => tx<
+            {
+              id: string;
+              flagged: boolean;
+              cleared_now: boolean;
+              all_cleared: boolean;
+            }[]
+          >`
+            select q.id,
+                   exists (select 1 from public.child_feedback f
+                            where f.question_id = q.id and f.family_id = q.family_id
+                              and f.kind = 'safety') as flagged,
+                   exists (select 1 from public.safety_reports s
+                            where s.question_id = q.id and s.family_id = q.family_id
+                              and s.reporter_kind = 'system' and s.resolution = 'false_match'
+                              and s.transcription_at = coalesce(q.corrected_at, q.created_at)) as cleared_now,
+                   exists (select 1 from public.safety_reports s
+                            where s.question_id = q.id and s.family_id = q.family_id
+                              and s.reporter_kind = 'system')
+                   and not exists (select 1 from public.safety_reports s
+                                    where s.question_id = q.id and s.family_id = q.family_id
+                                      and s.reporter_kind = 'system'
+                                      and s.resolution is distinct from 'false_match') as all_cleared
+              from public.extracted_questions q
+             where q.family_id = ${this.ctx.familyId} and q.id = any(${ids}::uuid[])`,
+        )
+      ).map((r) => [r.id, r] as const),
+    );
+    const toGrade: QuestionRow[] = [];
+    for (const question of questions) {
+      const known = state.get(question.id);
+      const screen = screenQuestion({
+        prompt: question.prompt,
+        answer: question.answer,
+        subject: question.subject_key,
+        ageBand: this.ctx.ageBand,
+      });
+      if (screen.level === 'severe' && known?.cleared_now && known.all_cleared) {
+        this.clearedFlags.add(question.id);
+        this.deps.log({
+          level: 'info',
+          event: 'safety_flag_cleared_graded',
+          code: 'SAFETY_CLEARED',
+        });
+        toGrade.push(question);
+      } else if (screen.level === 'severe') {
+        await this.safetyResponse(question, screen);
+      } else if (known?.flagged && !known.all_cleared) {
+        await this.keepSafetyNotice(question);
+      } else {
+        toGrade.push(question);
+      }
+    }
+    return toGrade;
+  }
+
+  /**
+   * A grown-up corrected the transcription of a flagged answer (RV-child-safety-7). The child keeps
+   * the reviewed template (a copy for the current transcription: the child route shows only feedback
+   * written for it), the tutor is not called, and no new report is filed for the corrected text; the
+   * earlier report stays in the owner's queue, which shows that the flagged answer was corrected.
+   */
+  private async keepSafetyNotice(question: QuestionRow): Promise<void> {
+    const copied = await this.guardedWrite(async (tx) => {
+      const [current] = await tx<{ corrected_at: Date | null }[]>`
+        select corrected_at from public.extracted_questions
+         where id = ${question.id} and family_id = ${this.ctx.familyId}`;
+      if (!current) return false;
+      const [shown] = await tx<{ id: string }[]>`
+        select id from public.child_feedback
+         where question_id = ${question.id} and kind = 'safety'
+           and created_at >= coalesce(${current.corrected_at}::timestamptz, '-infinity'::timestamptz)
+         limit 1`;
+      if (shown) return false;
+      const [latest] = await tx<{ body: string; guard_version: string }[]>`
+        select body, guard_version from public.child_feedback
+         where question_id = ${question.id} and kind = 'safety'
+         order by created_at desc limit 1`;
+      if (!latest) return false;
+      await tx`
+        insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
+        values (${question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, 'safety', ${latest.body},
+                ${latest.guard_version})`;
+      return true;
+    });
+    if (copied) {
+      this.deps.log({ level: 'warn', event: 'safety_notice_kept', code: 'SAFETY_CORRECTED' });
+    }
+  }
+
+  /**
    * A severe-risk answer (spec P4; AC_SECURITY_02): the reviewed safety template for the child and
    * an escalated system report for the owner's queue, in one transaction, once per question per
    * transcription (a replay finds both and adds nothing). No model call is made for the question.
    * The report holds ids, the screen's category codes and versions: never homework text.
    */
-  private async safetyResponse(g: Graded, screen: SafetyScreen): Promise<void> {
+  private async safetyResponse(question: QuestionRow, screen: SafetyScreen): Promise<void> {
     const categories = screen.categories.filter(isReportCategory);
     // Runbook 5.1: abuse-type codes may involve someone in the household, so the report starts
     // held from the family's list and its audit row carries no family_id (family members can read
@@ -1521,21 +1746,20 @@ class ScanRun {
     const held = heldFromFamily(screen.categories);
     const body = childSafetyMessage(screen.categories, this.ctx.ageBand);
     const filed = await this.guardedWrite(async (tx) => {
-      const [question] = await tx<{ transcription_at: Date; corrected_at: Date | null }[]>`
-        select coalesce(corrected_at, created_at) as transcription_at, corrected_at
-          from public.extracted_questions
-         where id = ${g.question.id} and family_id = ${this.ctx.familyId}`;
-      if (!question) return false;
+      const [current] = await tx<{ corrected_at: Date | null }[]>`
+        select corrected_at from public.extracted_questions
+         where id = ${question.id} and family_id = ${this.ctx.familyId}`;
+      if (!current) return false;
       const [existing] = await tx<{ id: string }[]>`
         select id from public.child_feedback
-         where question_id = ${g.question.id} and kind = 'safety'
-           and created_at >= coalesce(${question.corrected_at}::timestamptz, '-infinity'::timestamptz)
+         where question_id = ${question.id} and kind = 'safety'
+           and created_at >= coalesce(${current.corrected_at}::timestamptz, '-infinity'::timestamptz)
          order by created_at desc limit 1`;
       let feedbackId = existing?.id;
       if (feedbackId === undefined) {
         const [created] = await tx<{ id: string }[]>`
           insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
-          values (${g.question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, 'safety', ${body},
+          values (${question.id}, ${this.ctx.familyId}, ${this.ctx.childId}, 'safety', ${body},
                   ${SAFETY_TEMPLATES_VERSION})
           returning id`;
         feedbackId = created!.id;
@@ -1545,9 +1769,13 @@ class ScanRun {
         insert into public.safety_reports
           (family_id, child_id, reporter_kind, category, question_id, feedback_id, status,
            transcription_at, screen_categories, screen_version, family_visible)
-        values (${this.ctx.familyId}, ${this.ctx.childId}, 'system', 'severe_risk', ${g.question.id},
-                ${feedbackId}, 'escalated', ${question.transcription_at}, ${categories}::text[],
-                ${SAFETY_SCREEN_VERSION}, ${!held})
+        values (${this.ctx.familyId}, ${this.ctx.childId}, 'system', 'severe_risk', ${question.id},
+                ${feedbackId}, 'escalated',
+                -- Read in SQL, not through a JS Date: microseconds are kept, so the admin queue can
+                -- tell a later correction from this transcription.
+                (select coalesce(q.corrected_at, q.created_at) from public.extracted_questions q
+                  where q.id = ${question.id}),
+                ${categories}::text[], ${SAFETY_SCREEN_VERSION}, ${!held})
         on conflict (question_id, transcription_at) where reporter_kind = 'system' do nothing
         returning id`;
       if (!report) return false;
@@ -1579,7 +1807,7 @@ class ScanRun {
       await this.transition('needs_parent_review', 'NO_QUESTIONS_FOUND');
       return;
     }
-    const graded = await this.grade(questions, new Set());
+    const graded = await this.grade(await this.screenBeforeGrading(questions), new Set());
     // Other questions keep their results; the assignment state reflects all of them.
     const ids = new Set(graded.map((g) => g.question.id));
     const others = await this.deps.db.asService(

@@ -289,12 +289,26 @@ describe('safety template (spec P4; AC_SECURITY_02)', () => {
     expect(view.questions[0]!.safety?.body).toBe(BODY);
   });
 
-  it('shows nothing while the scan is still being checked', () => {
-    const view = buildResultView(
-      flagged('checking', [{ id: SAFETY_ID, kind: 'safety', body: BODY }]),
-    );
-    expect(view.questions[0]!.safety).toBeNull();
-    expect(view.questions[0]!.verdict.title).toBe('Still checking');
+  it('shows the notice whatever the scan status: it does not wait for grading (RV-child-safety-5)', () => {
+    // The scan job files the template before any grading call, so a scan still being checked, or
+    // one whose grading failed for good, can carry it. The help lines are shown; results are not.
+    for (const status of ['checking', 'verifying', 'failed_final', 'failed_retryable'] as const) {
+      const view = buildResultView(
+        flagged(status, [{ id: SAFETY_ID, kind: 'safety', body: BODY }]),
+      );
+      expect(view.questions[0]!.safety?.body, status).toBe(BODY);
+      expect(view.status.title, status).toBe(SAFETY_NOTICE_TITLE);
+      expect(view.status.body, status).toBe(BODY);
+      expect(view.status.showResults, status).toBe(false);
+      expect(view.status.inProgress, status).toBe(statusView(status).inProgress);
+      expect(view.questions[1]!.verdict.title, status).toBe('Still checking');
+      expect(view.summary, status).toBeNull();
+    }
+    // A hint is never shown before results are, even next to no notice.
+    const hinted = buildResultView(flagged('checking', [{ id: HINT_ID, kind: 'hint', body: 'x' }]));
+    expect(hinted.questions[0]!.hints).toEqual([]);
+    expect(hinted.questions[0]!.safety).toBeNull();
+    expect(hinted.questions[0]!.verdict.title).toBe('Still checking');
   });
 
   it('the notice copy never claims an alert and never asks for secrecy', () => {

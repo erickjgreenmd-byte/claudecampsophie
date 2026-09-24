@@ -15,6 +15,7 @@ import {
 } from '@pencillift/contracts';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import type { AppEnv } from '../src/middleware/context.ts';
+import { withholdStatedAnswers } from '../src/routes/homework.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
 
 // Synthetic families only: Riley (child 0) and Sam (child 1), plus other families for isolation.
@@ -1419,5 +1420,116 @@ describe('configurable limits (spec P5)', () => {
       pages: pages(1, { mimeType: 'image/png', byteSize: 1024 }),
     });
     expect(ok.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Final lead review (LJA-F7, -F10): what the child detail view shows
+// ---------------------------------------------------------------------------------------------
+
+describe('child detail view after the final lead review (LJA-F7, -F10)', () => {
+  async function childView(assignmentId: string) {
+    return childAssignmentDetailResponseSchema.parse(
+      await json(await api.request(`/v1/child/assignments/${assignmentId}`, { token: riley })),
+    );
+  }
+
+  it('after a parent override the child sees no coaching written for the machine verdict (LJA-F10)', async () => {
+    const seeded = await readyScan(fam, token, 0);
+    // A safety notice for the answer stays whatever the verdict (a severe screen always wins).
+    await api.db.sql`
+      insert into public.child_feedback (question_id, family_id, child_id, kind, body, guard_version)
+      values (${seeded.questionId}, ${fam.familyId}, ${fam.children[0]!.id}, 'safety',
+              'Let’s talk about this with a grown-up you trust.', 'safety-templates.test')`;
+    const res = await api.request(`/v1/questions/${seeded.questionId}/override`, {
+      method: 'POST',
+      token,
+      body: { verdict: 'correct', reason: 'The teacher accepted this answer' },
+    });
+    expect(res.status).toBe(200);
+    const q1 = (await childView(seeded.assignmentId)).questions.find(
+      (q) => q.id === seeded.questionId,
+    )!;
+    expect(q1.verdict).toBe('correct');
+    // Before the fix the machine verdict's "Try finding a common denominator first." hint stayed.
+    expect(q1.feedback.map((f) => [f.kind, f.body])).toEqual([
+      ['safety', 'Let’s talk about this with a grown-up you trust.'],
+    ]);
+  });
+
+  it('a transcription that states an answer is shown with the answer blanked (LJA-F7)', async () => {
+    const seeded = await readyScan(fam, token, 0);
+    // Model output: the worksheet photo told the extraction model to write the answers in.
+    await api.db.sql`
+      update public.extracted_questions
+         set prompt_text = 'What is 12 × 7? (answer: 84)', student_answer_text = '72 (correct answer: 84)'
+       where id = ${seeded.questionId}`;
+    await api.db.sql`
+      update public.extracted_questions set corrected_prompt_text = 'Add 2 and 5. The answer is 7.'
+       where id = ${seeded.secondQuestionId}`;
+    const view = await childView(seeded.assignmentId);
+    const byId = new Map(view.questions.map((q) => [q.id, q]));
+    expect(byId.get(seeded.questionId)).toMatchObject({
+      promptText: 'What is 12 × 7? (answer: ___)',
+      studentAnswerText: '72 (correct answer: ___)',
+    });
+    expect(byId.get(seeded.secondQuestionId)!.promptText).toBe('Add 2 and 5. The answer is ___.');
+    expect(JSON.stringify(view)).not.toMatch(/\b84\b/);
+
+    // Also while the scan is still being checked, before any key is known.
+    await advance(seeded.assignmentId, ['checking']);
+    const checking = await childView(seeded.assignmentId);
+    expect(JSON.stringify(checking)).not.toMatch(/\b84\b/);
+  });
+
+  it('blanks every labelled answer form it is given (LJA-F7)', () => {
+    for (const [text, shown] of [
+      ['Solve 5 + 2. Ans = 7', 'Solve 5 + 2. Ans = ___'],
+      [
+        'Pick one: A, B or C. The correct answer is B.',
+        'Pick one: A, B or C. The correct answer is ___.',
+      ],
+      ['Solve 3x = 9. Solution: x = 3', 'Solve 3x = 9. Solution: ___'],
+      ['What is 12 × 7? (answer: 12 × 7 = 84)', 'What is 12 × 7? (answer: ___)'],
+      ['Spell the word. [Answer key - kitten]', 'Spell the word. [Answer key - ___]'],
+      ['Round 3.46. Final answer: 3.5', 'Round 3.46. Final answer: ___'],
+    ] as const) {
+      expect(withholdStatedAnswers(text), text).toBe(shown);
+    }
+    // "solution" in a science prompt is not a label: only "Solution:" / "Solution =" states one.
+    for (const text of [
+      'Solutions are mixtures in which one substance dissolves in another. Give an example.',
+      'A solution is a mixture. Name one.',
+    ]) {
+      expect(withholdStatedAnswers(text), text).toBe(text);
+    }
+    expect(withholdStatedAnswers('My answer is 72', { bracketedOnly: true })).toBe(
+      'My answer is 72',
+    );
+    expect(withholdStatedAnswers('72 [answer = 84]', { bracketedOnly: true })).toBe(
+      '72 [answer = ___]',
+    );
+  });
+
+  it('printed instructions, blank answer lines and the child’s own words are shown unchanged (LJA-F7)', async () => {
+    const seeded = await readyScan(fam, token, 0);
+    const prompts = [
+      'Answer the questions below. Which is bigger, 7 or 3?',
+      'Answer: ________',
+      'Answer: Who is the main character?',
+      'Explain your answer: use words and numbers.',
+    ];
+    for (const [i, prompt] of prompts.entries()) {
+      await api.db.sql`
+        update public.extracted_questions
+           set prompt_text = ${prompt},
+               student_answer_text = ${i === 0 ? 'The answer is 7 because 7 is more than 3.' : 'ok'}
+         where id = ${seeded.questionId}`;
+      const q1 = (await childView(seeded.assignmentId)).questions.find(
+        (q) => q.id === seeded.questionId,
+      )!;
+      expect(q1.promptText).toBe(prompt);
+      if (i === 0) expect(q1.studentAnswerText).toBe('The answer is 7 because 7 is more than 3.');
+    }
   });
 });

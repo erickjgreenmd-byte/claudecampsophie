@@ -6,7 +6,6 @@ import {
   PROPOSED_STAGE_LIMITS,
   runStage,
   type AgeBand,
-  type AttemptRecord,
   type PracticePersonalization,
   type ResponsesClient,
 } from '@pencillift/ai';
@@ -61,14 +60,17 @@ import {
   type ReviewRelease,
   type ReviewSchedule,
 } from '@pencillift/domain/scheduling';
+import { acceptsTestProviderConsent } from '../config.ts';
 import type { Tx } from '../db.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
 import {
   acquireSpendHold,
-  releaseSpendHold,
+  inputTokenUpperBound,
+  settleSpend,
   SpendCeilingReached,
   SpendCeilingUnevaluable,
+  usageRows,
 } from './spend-ceiling.ts';
 
 /**
@@ -528,34 +530,6 @@ interface Personalized {
   readonly rethemed: number;
 }
 
-async function recordUsage(
-  deps: JobDeps,
-  ctx: ChildContext,
-  usage: readonly AttemptRecord[],
-): Promise<void> {
-  if (usage.length === 0) return;
-  const rows = usage.map((a) => ({
-    family_id: ctx.familyId,
-    child_id: ctx.childId,
-    stage: a.stage,
-    model_id: a.modelId,
-    prompt_version: a.promptVersion,
-    attempt: a.attempt,
-    status: a.status,
-    input_tokens: a.inputTokens,
-    cached_input_tokens: a.cachedInputTokens,
-    output_tokens: a.outputTokens,
-    latency_ms: a.latencyMs,
-    cost_micros: a.costMicros,
-    rate_table_version: a.rateTableVersion,
-  }));
-  try {
-    await deps.db.asService((tx) => tx`insert into public.ai_usage_events ${tx(rows)}`);
-  } catch {
-    deps.log({ level: 'error', event: 'ai_usage_record_failed', code: 'METERING' });
-  }
-}
-
 /** Payload-free log line for model output the safety screen refused (never the text). */
 function logSafetyBlock(deps: JobDeps, screen: SafetyScreen): void {
   deps.log({
@@ -583,7 +557,7 @@ export async function personalizeItems(
   if (ai === undefined || items.length === 0) return unchanged;
   const consent = await deps.db.asService((tx) =>
     hasVerifiedConsent(tx, ctx.familyId, {
-      allowTestProvider: deps.config.environment !== 'production',
+      allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
     }),
   );
   if (!consent) {
@@ -631,30 +605,33 @@ export async function personalizeItems(
     });
   });
   const prompt = stage === 'daily_set' ? PROMPTS.daily_set : PROMPTS.thursday_bundle;
-  let out: Awaited<ReturnType<typeof runStage<typeof prompt.outputSchema>>>;
+  const input = [
+    dataEnvelope({
+      gradeLevel: ctx.grade,
+      ageBand: ctx.ageBand,
+      // Skill labels only: no names, homework text, answers or scores.
+      focusSkills: focusSkills.slice(0, 6).map(skillLabel),
+      wordProblems,
+    }),
+  ];
+  let out: Awaited<ReturnType<typeof runStage<typeof prompt.outputSchema>>> | undefined;
   try {
     out = await runStage<typeof prompt.outputSchema>({
       prompt,
-      input: [
-        dataEnvelope({
-          gradeLevel: ctx.grade,
-          ageBand: ctx.ageBand,
-          // Skill labels only: no names, homework text, answers or scores.
-          focusSkills: focusSkills.slice(0, 6).map(skillLabel),
-          wordProblems,
-        }),
-      ],
+      input,
       client: ai,
       limits: PROPOSED_STAGE_LIMITS[stage],
       rates: options.rates ?? DEFAULT_RATE_TABLE_2026_09_18,
       gate,
       metadata: { stage },
-      estimatedInputTokens: 700 + 80 * wordProblems.length,
+      // An upper bound of the request actually sent, so the stage never overshoots its hold (LJA-F4).
+      estimatedInputTokens: inputTokenUpperBound(prompt, input),
       ...(options.sleep ? { sleep: options.sleep } : {}),
     });
-    await recordUsage(deps, ctx, out.attempts);
   } finally {
-    await releaseSpendHold(deps, hold); // after the stage's actual cost is recorded
+    // The actual cost is recorded and the hold released in one transaction; a cost that cannot be
+    // recorded stays counted by the hold until the month ends (LJA-F5).
+    await settleSpend(deps, hold, usageRows(out?.attempts ?? [], ctx.familyId, ctx.childId));
   }
   if (!out.result.ok) {
     deps.log({ level: 'warn', event: 'practice_ai_failed', code: out.result.error.code });
@@ -673,6 +650,19 @@ export async function personalizeItems(
     if (original === undefined) continue;
     const themed = rethemeWordProblem(original, proposal.context);
     if (themed === null) {
+      rejected += 1;
+      continue;
+    }
+    // The bank's self-check reads a problem statement with expressions off (the problem contains
+    // its own computation); the AI-proposed words must not state the key as one ("forty plus
+    // five" for 45), so the re-themed prompt is checked again with expressions read (LJA-F9).
+    if (
+      guardChildContent({
+        packet: themed.prompt,
+        answers: protectedAnswersFor(themed.answerSpec),
+        options: { evaluateExpressions: true },
+      }).decision !== 'release'
+    ) {
       rejected += 1;
       continue;
     }

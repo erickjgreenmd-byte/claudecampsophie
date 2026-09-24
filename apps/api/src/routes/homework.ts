@@ -38,6 +38,7 @@ import {
 import { calendarMonthOf, isValidIanaZone } from '@pencillift/domain';
 import { readJson } from '../app.ts';
 import { verifyChildAccessToken } from '../auth/child.ts';
+import { acceptsTestProviderConsent } from '../config.ts';
 import type { ChildPrincipal, ParentPrincipal, Tx } from '../db.ts';
 import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
 import {
@@ -400,7 +401,8 @@ async function assertCanCollect(
   caller: Caller,
   childId: string,
 ): Promise<void> {
-  const allowTestProvider = c.var.deps.config.environment !== 'production';
+  // A record the development consent mock wrote counts only where that mock may run (LRD-1).
+  const allowTestProvider = acceptsTestProviderConsent(c.var.deps.config.environment);
   if (!(await hasVerifiedConsent(tx, caller.familyId, { allowTestProvider }))) {
     throw businessRule(
       'CONSENT_REQUIRED',
@@ -978,10 +980,10 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
            where family_id = ${caller.familyId} and idempotency_key like ${`scan:${id}:v%`}`;
         // Payload holds references only, never homework content (migration 0600).
         await tx`
-          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
           values ('scan_process', ${`scan:${id}:v${(jobs?.n ?? 0) + 1}`}, ${caller.familyId},
                   ${assignment.child_id},
-                  ${tx.json({ assignmentId: id, mode: 'initial', reservationId })})
+                  ${tx.json({ assignmentId: id, mode: 'initial', reservationId })}, ${deps.clock()})
           on conflict (idempotency_key) do nothing`;
         const [updated] = await tx<AssignmentRow[]>`
           update public.assignments set status = 'queued'
@@ -1325,10 +1327,11 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
           select count(*)::int as n from public.jobs
            where family_id = ${familyId} and idempotency_key like ${`scan:${assignment.id}:v%`}`;
         await tx`
-          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload)
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
           values ('scan_process', ${`scan:${assignment.id}:v${(jobs?.n ?? 0) + 1}`}, ${familyId},
                   ${assignment.child_id},
-                  ${tx.json({ assignmentId: assignment.id, mode: 'recheck', questionIds: [questionId] })})`;
+                  ${tx.json({ assignmentId: assignment.id, mode: 'recheck', questionIds: [questionId] })},
+                  ${deps.clock()})`;
         await audit(tx, caller, 'homework.transcription_corrected', 'question', questionId);
         const [row] = await readParentQuestions(tx, familyId, assignment.id, questionId);
         return { assignment: updated!, question: row! };
@@ -1404,8 +1407,16 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     // this one narrowly scoped service read applies them (the child must not be told "Try again"
     // after a grown-up confirmed the answer). Only these columns are read, scoped to the child's
     // own questions; see schemaRequests for the grant that would move it under pl_child. The
-    // correction time keeps feedback to the current transcription: a hint or safety notice written
-    // for the answer as first read is not shown after a grown-up corrected it.
+    // correction time keeps coaching to the current transcription: a hint written for the answer
+    // as first read is not shown after a grown-up corrected it. The override time does the same
+    // for the verdict: coaching written for the machine verdict is not shown next to a grown-up's
+    // verdict. A safety notice is different (spec P4; RV-child-safety-5 and 7): the scan job files
+    // it before grading, so the child sees it as soon as it exists, whatever the scan's status
+    // (still being checked, waiting for a retry, failed for good), and a later correction or
+    // override never hides it (a severe screen always wins; LJA-F10). Only the latest notice is
+    // shown: the recheck of a corrected answer files a copy of it. Once a reviewer cleared every
+    // flag on the question as a false match (runbook 5.1; round 3, CHK2-CS-5), no notice is shown:
+    // the question is re-checked and graded like the others.
     const corrections =
       data.questions.length === 0
         ? []
@@ -1417,10 +1428,19 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
                 corrected_student_answer_text: string | null;
                 corrected_at: Date | null;
                 parent_override_verdict: GradedVerdict | null;
+                overridden_at: Date | null;
+                safety_cleared: boolean;
               }[]
             >`
               select q.id, q.corrected_prompt_text, q.corrected_student_answer_text, q.corrected_at,
-                     r.parent_override_verdict
+                     r.parent_override_verdict, r.overridden_at,
+                     exists (select 1 from public.safety_reports s
+                              where s.question_id = q.id and s.family_id = q.family_id
+                                and s.reporter_kind = 'system')
+                     and not exists (select 1 from public.safety_reports s
+                                      where s.question_id = q.id and s.family_id = q.family_id
+                                        and s.reporter_kind = 'system'
+                                        and s.resolution is distinct from 'false_match') as safety_cleared
                 from public.extracted_questions q
                 left join public.question_results r on r.question_id = q.id
                where q.assignment_id = ${id} and q.child_id = ${child.childId}
@@ -1432,25 +1452,33 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
       assignment: toChildSummary(data.assignment),
       questions: data.questions.map((q) => {
         const fix = byId.get(q.id);
+        const answerText =
+          fix?.corrected_student_answer_text !== undefined &&
+          fix.corrected_student_answer_text !== null
+            ? fix.corrected_student_answer_text
+            : q.student_answer_text;
+        const overriddenAt = fix?.parent_override_verdict ? fix.overridden_at : null;
+        const own = data.feedback.filter((f) => f.question_id === q.id);
+        const notice = fix?.safety_cleared
+          ? undefined
+          : own.filter((f) => f.kind === 'safety').at(-1);
         return {
           id: q.id,
           questionNumber: q.question_number,
-          promptText: fix?.corrected_prompt_text ?? q.prompt_text,
+          promptText: withholdStatedAnswers(fix?.corrected_prompt_text ?? q.prompt_text),
           studentAnswerText:
-            fix?.corrected_student_answer_text !== undefined &&
-            fix.corrected_student_answer_text !== null
-              ? fix.corrected_student_answer_text
-              : q.student_answer_text,
+            answerText === null ? null : withholdStatedAnswers(answerText, { bracketedOnly: true }),
           verdict: showResults ? (fix?.parent_override_verdict ?? q.verdict) : null,
-          feedback: showResults
-            ? data.feedback
-                .filter(
-                  (f) =>
-                    f.question_id === q.id &&
-                    (!fix?.corrected_at || f.created_at >= fix.corrected_at),
-                )
-                .map((f) => ({ id: f.id, kind: f.kind, body: f.body }))
-            : [],
+          feedback: own
+            .filter(
+              (f) =>
+                f === notice ||
+                (showResults &&
+                  f.kind !== 'safety' &&
+                  (!fix?.corrected_at || f.created_at >= fix.corrected_at) &&
+                  (!overriddenAt || f.created_at >= overriddenAt)),
+            )
+            .map((f) => ({ id: f.id, kind: f.kind, body: f.body })),
         };
       }),
     };
@@ -1458,6 +1486,66 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
   });
 
   return r;
+}
+
+// Whitespace runs are bounded ([ \t]{0,3}) so the patterns stay linear on long transcriptions.
+const QUALIFIER = String.raw`(?:(?:correct|right|final)[ \t]{1,3})?`;
+/** ":", "=", "→", or a dash between spaces. */
+const SYMBOL_SEPARATOR = String.raw`[ \t]{0,3}(?:[:=→]|[-–—](?=[ \t]))[ \t]{0,3}`;
+/**
+ * "answer", "answers", "answer key" or "ans" (optionally "correct"/"right"/"final") followed by a
+ * symbol, "is" or "are"; "solution(s)" only with a symbol, because "A solution is a mixture ..." is
+ * a science prompt, while "Solution: x = 3" states one.
+ */
+const ANSWER_LABEL = String.raw`(?:${QUALIFIER}(?:answers?(?:[ \t]{1,3}key)?|ans)(?:${SYMBOL_SEPARATOR}|[ \t]{1,3}(?:is|are)\b[ \t]{0,3})|${QUALIFIER}solutions?${SYMBOL_SEPARATOR})`;
+const VALUE_END = String.raw`[ \t]{0,3}(?:[)\]};\n]|[.!?](?:\s|$)|$)`;
+/** A labelled value, up to a closing bracket, a line or sentence end, or the end of the text. */
+const STATED_ANSWER = new RegExp(
+  String.raw`(?<![\p{L}\p{N}])(?<!\b(?:your|my)\s)(${ANSWER_LABEL})([^\n()\[\]{};]{1,80}?)(?=${VALUE_END})`,
+  'giu',
+);
+/** The same, only inside brackets: "(answer: 84)", "[correct answer = 84]". */
+const BRACKETED_ANSWER = new RegExp(
+  String.raw`([(\[][ \t]{0,3}${ANSWER_LABEL})([^\n()\[\]]{1,80}?)(?=[ \t]{0,3}[)\]])`,
+  'giu',
+);
+
+/**
+ * Transcriptions are model output, and a worksheet photo can carry prompt-injection text that makes
+ * the extraction model write the answer in ("What is 12 × 7? (answer: 84)"). Before a child sees a
+ * transcription, a value labelled as the answer is replaced by a blank (spec P6 "never the withheld
+ * solution or answer key"; LJA-F7). It needs no key, so it also covers a scan still being checked.
+ * A blank answer line ("Answer: ____"), a question after the label and "your answer:" stay as
+ * printed. In the child's own answer only a bracketed label counts, so their own words ("The answer
+ * is 7 because ...") are shown as written.
+ *
+ * A partial mitigation, not a fix (LJA-F7 residual, round-2 decision): an answer the model adds
+ * without an answer label ("What is 12 × 7? (84)", "= 84", "Key: 84") is shown, and a printed
+ * prompt that labels a value it asks about ("Tom says the answer is 12. Is he right?") loses that
+ * value. No check against the private key is used: the extraction model is the only reading of the
+ * page (grading and verification see its text, not the photo), so text it added cannot be told from
+ * printed text; printed prompts legitimately carry the key (comparisons, option lists, "circle the
+ * correct spelling"); and blanking only the span that matches the key would mark the right option.
+ */
+export function withholdStatedAnswers(
+  text: string,
+  options: { readonly bracketedOnly?: boolean } = {},
+): string {
+  const pattern = options.bracketedOnly ? BRACKETED_ANSWER : STATED_ANSWER;
+  return text.replace(
+    pattern,
+    (match: string, label: string, value: string, offset: number, whole: string) => {
+      if (!/[\p{L}\p{N}]/u.test(value)) return match; // a blank answer line
+      if (
+        whole
+          .slice(offset + match.length)
+          .trimStart()
+          .startsWith('?')
+      )
+        return match; // a question
+      return `${label}___`;
+    },
+  );
 }
 
 interface ChildAssignmentRow {
