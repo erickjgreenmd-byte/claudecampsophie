@@ -151,6 +151,48 @@ describe('child session', () => {
     expect(storage.data.get(STORAGE_KEYS.childRefreshToken)).toBe(tokenResponse(2).refreshToken);
   });
 
+  it('[BUG-012 reproduction] two independent refreshers on one device revoke the child session', async () => {
+    // The server rotates refresh tokens and treats a presented token that was already rotated as
+    // reuse: it revokes the whole session (spec P3; the API's child refresh behaviour).
+    const valid = new Set<string>();
+    let revoked = false;
+    let n = 1;
+    const server = (call: Call) => {
+      if (call.path === '/v1/child/pair') {
+        const t = tokenResponse(n++);
+        valid.add(t.refreshToken);
+        return t;
+      }
+      const presented = (call.body as { refreshToken: string }).refreshToken;
+      if (revoked || !valid.delete(presented)) {
+        revoked = true;
+        return new ApiRequestError('UNAUTHENTICATED', 'Session ended', 401);
+      }
+      const t = tokenResponse(n++);
+      valid.add(t.refreshToken);
+      return t;
+    };
+    let now = NOW;
+    const storage = memoryStorage();
+    const make = () =>
+      createChildSession({
+        storage,
+        publicApi: fakeApi(server).api,
+        authedApi: () => fakeApi(() => ({ ok: true })).api,
+        now: () => now,
+      });
+    // Before the fix, the homework screens ran a second session beside the app's: same stored
+    // refresh token, separate in-memory state.
+    const appSession = make();
+    const homeworkSession = make();
+    await appSession.pair({ code: 'ABCDEFGH', deviceLabel: 'Tablet', platform: 'android' });
+    now = new Date(NOW.getTime() + 20 * 60_000); // both access tokens expired
+    await Promise.allSettled([appSession.accessToken(), homeworkSession.accessToken()]);
+    expect(revoked).toBe(true); // the second presentation of the same token ended the session
+    expect(storage.data.get(STORAGE_KEYS.childRefreshToken)).toBeUndefined();
+    // Hence exactly one session per device: see 'the app has exactly one child token refresher'.
+  });
+
   it('forgets the child when the server revoked the session', async () => {
     let revoked = false;
     let now = NOW;
