@@ -267,7 +267,12 @@ export async function applySnapshots(
 ): Promise<FamilyCapacity> {
   const mappings = await loadProductMappings(tx);
   let records = await loadRecords(tx, familyId);
-  for (const snapshot of snapshots) {
+  // A provider timestamp later than our own observation time (clock skew or bad data) would make
+  // every later genuine observation, including a refund, look stale (RV-entitlements-1). Clamp it.
+  const bounded = snapshots.map((s) =>
+    s.providerUpdatedAt.getTime() > now.getTime() ? { ...s, providerUpdatedAt: now } : s,
+  );
+  for (const snapshot of bounded) {
     records = [
       ...reconcileEntitlements(records, snapshot, mappings, runtimeEnvironment, now).records,
     ];

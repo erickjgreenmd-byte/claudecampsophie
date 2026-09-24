@@ -162,6 +162,27 @@ describe('RevenueCat webhook authentication and dedupe (AC_CONN_05, AC_BILLING_0
     expect((await capacity(fam))!.paid_slots).toBe(2);
   });
 
+  it('[RV-entitlements-1] a future-dated provider timestamp cannot freeze the entitlement', async () => {
+    const fam = await seedFamily(api.db, { childCount: 2 });
+    const ref = await billingRef(fam);
+    api.providers.subscriptions.state.set(ref, [
+      snapshot(ref, { providerUpdatedAt: new Date('2027-01-01T00:00:00Z') }),
+    ]);
+    await postRc(rcEvent(ref));
+    expect((await capacity(fam))?.paid_slots).toBe(2);
+    // The genuine later observation (a revocation an hour later) must still apply.
+    api.now.value = new Date(api.now.value.getTime() + 3600_000);
+    try {
+      api.providers.subscriptions.state.set(ref, [
+        snapshot(ref, { status: 'revoked', providerUpdatedAt: new Date('2026-09-24T15:30:00Z') }),
+      ]);
+      await postRc(rcEvent(ref, { type: 'CANCELLATION', cancel_reason: 'CUSTOMER_SUPPORT' }));
+    } finally {
+      api.now.value = new Date(api.now.value.getTime() - 3600_000);
+    }
+    expect((await capacity(fam))?.paid_slots).toBe(0);
+  });
+
   it('Apple + Google subscriptions never add up; the conflict is flagged (AC_CAPACITY_05)', async () => {
     const fam = await seedFamily(api.db);
     const ref = await billingRef(fam);
