@@ -6,3 +6,5 @@ export * from './family.ts';
 export * from './rewards.ts';
 export * from './homework.ts';
 export * from './learning.ts';
+export * from './privacy.ts';
+export * from './client.ts';

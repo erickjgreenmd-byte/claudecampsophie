@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { ApiRequestError, createApiClient } from './api.ts';
+import { ApiRequestError, createApiClient } from './client.ts';
 
 const schema = z.strictObject({ ok: z.boolean() });
 

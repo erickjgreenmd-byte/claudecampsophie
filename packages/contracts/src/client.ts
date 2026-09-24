@@ -1,4 +1,4 @@
-import { apiErrorBodySchema, type ApiErrorCode } from '@pencillift/contracts';
+import { apiErrorBodySchema, type ApiErrorCode } from './errors.ts';
 import type { z } from 'zod';
 
 /** A typed API failure the UI can branch on (never shows raw server text for unknown errors). */

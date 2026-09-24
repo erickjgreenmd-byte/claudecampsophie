@@ -1,6 +1,7 @@
 import { createBrowserRouter, Link, Outlet, RouterProvider } from 'react-router';
 import { Logo } from './components/Logo.tsx';
 import { routes } from './routes.tsx';
+import { createDefaultSession, SessionProvider } from './lib/session.tsx';
 
 function Shell() {
   return (
@@ -28,7 +29,13 @@ function Shell() {
   );
 }
 
+const session = createDefaultSession();
+
 export function App() {
   const router = createBrowserRouter([{ element: <Shell />, children: routes }]);
-  return <RouterProvider router={router} />;
+  return (
+    <SessionProvider value={session}>
+      <RouterProvider router={router} />
+    </SessionProvider>
+  );
 }

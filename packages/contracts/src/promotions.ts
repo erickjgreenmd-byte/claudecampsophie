@@ -133,3 +133,158 @@ export const offerMappingInputSchema = z.strictObject({
 });
 
 export const generationRequestSchema = z.strictObject({ month: calendarMonthSchema });
+
+export const promoTemplateSchema = promoTemplateInputSchema.extend({
+  id: uuidSchema,
+  enabled: z.boolean(),
+  paused: z.boolean(),
+  createdAt: isoDateTimeSchema,
+});
+
+export const listPromoTemplatesResponseSchema = z.strictObject({
+  templates: z.array(promoTemplateSchema),
+});
+
+export const activationResultSchema = z.strictObject({
+  ok: z.boolean(),
+  /** Domain rule codes that block activation (e.g. TIMEZONE_NOT_CONFIRMED). */
+  problems: z.array(z.string()),
+});
+
+export const generationPreviewItemSchema = z.strictObject({
+  templateId: uuidSchema,
+  templateName: z.string(),
+  generationKey: z.string(),
+  percentOff: z.number().int(),
+  opensAt: isoDateTimeSchema,
+  closesAt: isoDateTimeSchema,
+  codeCount: z.number().int().nonnegative(),
+  alreadyGenerated: z.boolean(),
+});
+
+export const generationPreviewResponseSchema = z.strictObject({
+  month: calendarMonthSchema,
+  items: z.array(generationPreviewItemSchema),
+});
+
+export const generationRunResponseSchema = z.strictObject({
+  month: calendarMonthSchema,
+  created: z.array(
+    z.strictObject({
+      campaignId: uuidSchema,
+      generationKey: z.string(),
+      codeCount: z.number().int(),
+    }),
+  ),
+  skippedExisting: z.array(z.string()),
+});
+
+export const campaignStatusSchema = z.enum([
+  'provisioning',
+  'active',
+  'paused',
+  'revoked',
+  'ended',
+  'failed',
+]);
+
+export const campaignSummarySchema = z.strictObject({
+  id: uuidSchema,
+  templateId: uuidSchema,
+  campaignMonth: calendarMonthSchema,
+  status: campaignStatusSchema,
+  percentOff: z.number().int(),
+  schoolId: uuidSchema.nullable(),
+  opensAt: isoDateTimeSchema,
+  closesAt: isoDateTimeSchema,
+  redemptionCap: z.number().int(),
+  liveRedemptions: z.number().int(),
+  confirmedRedemptions: z.number().int(),
+  budgetCapCents: centsSchema,
+  committedDiscountCents: centsSchema,
+  offerMappings: z.array(
+    z.strictObject({
+      channel: channelSchema,
+      paidSlots: z.number().int(),
+      status: z.enum(['pending', 'ready', 'failed', 'unsupported']),
+      providerOfferId: z.string().nullable(),
+      reason: z.string().nullable(),
+    }),
+  ),
+});
+
+export const listCampaignsResponseSchema = z.strictObject({
+  campaigns: z.array(campaignSummarySchema),
+});
+
+export const campaignCodesResponseSchema = z.strictObject({
+  campaignId: uuidSchema,
+  /** Shared codes are shown formatted (e.g. ABCDE-FGHJK-X); individual codes are exported, not listed. */
+  codes: z.array(
+    z.strictObject({
+      id: uuidSchema,
+      code: z.string(),
+      usageCap: z.number().int().nullable(),
+      status: z.enum(['active', 'revoked']),
+    }),
+  ),
+});
+
+export const campaignActionSchema = z.strictObject({
+  action: z.enum(['pause', 'resume', 'revoke']),
+});
+
+export const schoolAdminSchema = z.strictObject({
+  id: uuidSchema,
+  name: z.string(),
+  city: z.string().nullable(),
+  region: z.string().nullable(),
+  status: z.enum(['pending_verification', 'active', 'inactive']),
+  recipientVerified: z.boolean(),
+});
+
+export const listAdminSchoolsResponseSchema = z.strictObject({
+  schools: z.array(schoolAdminSchema),
+});
+
+export const createSchoolRequestSchema = z.strictObject({
+  name: z.string().trim().min(2).max(160),
+  city: z.string().trim().max(80).nullable(),
+  region: z.string().trim().max(40).nullable(),
+});
+
+export const schoolMonthReportSchema = z.strictObject({
+  schoolId: uuidSchema,
+  month: calendarMonthSchema,
+  /** Counts are strings because school-facing views may show "<5" (privacy suppression). */
+  attributedSignups: z.string(),
+  donationEligibleFamilies: z.string(),
+  accruedCents: z.number().int().nullable(),
+  paidCents: z.number().int().nullable(),
+});
+
+export const payoutBatchSchema = z.strictObject({
+  id: uuidSchema,
+  schoolId: uuidSchema,
+  batchKey: z.string(),
+  totalCents: centsSchema,
+  status: z.enum(['accrued', 'approved', 'paid', 'failed', 'adjusted']),
+  externalTransferRef: z.string().nullable(),
+  createdAt: isoDateTimeSchema,
+});
+
+export const listPayoutsResponseSchema = z.strictObject({ payouts: z.array(payoutBatchSchema) });
+
+export const preparePayoutRequestSchema = z.strictObject({
+  schoolId: uuidSchema,
+  throughMonth: calendarMonthSchema,
+});
+
+export const preparePayoutResponseSchema = z.discriminatedUnion('status', [
+  z.strictObject({ status: z.literal('created'), payout: payoutBatchSchema }),
+  z.strictObject({ status: z.literal('carried_forward'), netCents: z.number().int() }),
+]);
+
+export const markPayoutPaidRequestSchema = z.strictObject({
+  externalTransferRef: z.string().min(3).max(200),
+});
