@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import { colors, minTouchTarget, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandHero } from '../src/brand/BrandMark.tsx';
 import { childSession } from '../src/family/runtime.ts';
 import { entryRoute } from '../src/lib/entry.ts';
 import { currentMode } from '../src/lib/mode.ts';
@@ -39,6 +40,9 @@ export default function Welcome() {
 
   return (
     <View style={styles.screen} accessibilityRole="summary">
+      {/* Full-colour symbol above the text wordmark (the traced lockup PNG would blur at this
+          size); the wordmark text names the brand, so the symbol is decorative. */}
+      <BrandHero />
       <Text style={styles.wordmark} accessibilityRole="header">
         <Text style={{ color: colors.navy }}>Pencil</Text>
         <Text style={{ color: colors.tealText }}>Lift</Text>

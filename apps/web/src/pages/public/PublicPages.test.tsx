@@ -130,6 +130,20 @@ describe('LandingPage truthful product copy (spec P1)', () => {
     expect(text).toMatch(/not yet available/i);
   });
 
+  it('shows the traced lockup with the tagline as the hero visual and keeps the h1 as text', async () => {
+    const { container } = await renderPublic(LandingPage, '/');
+    const hero = screen.getByRole('img', { name: 'PencilLift' });
+    expect(hero.getAttribute('src')).toBe('/brand/lockup.svg');
+    expect(hero.getAttribute('width')).toMatch(/^\d+$/);
+    expect(hero.getAttribute('height')).toMatch(/^\d+$/);
+    // The h1 keeps the tagline as real text (visually hidden) and comes right after the lockup.
+    const h1 = screen.getByRole('heading', { level: 1 });
+    expect(h1.className).toContain('sr-only');
+    expect(hero.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The old text lockup ("Pencil" + "Lift" spans) is gone from the page markup.
+    expect(container.querySelectorAll('span[aria-label="PencilLift"]')).toHaveLength(0);
+  });
+
   it.each([LandingPage, HowItWorksPage])('lists all six supported subjects', async (Page) => {
     await renderPublic(Page, '/');
     const subjects = screen.getByRole('list', { name: /subjects/i });

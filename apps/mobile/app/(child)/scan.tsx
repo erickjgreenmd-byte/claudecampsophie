@@ -12,6 +12,7 @@ import {
   type HomeworkUploadLimits,
 } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { childApi } from '../../src/homework/child-api.ts';
 import { nativeUploadIo, normalizePhoto } from '../../src/homework/native-io.ts';
 import {
@@ -311,6 +312,9 @@ export default function ScanScreen() {
   if (upload.kind === 'done') {
     return (
       <SafeAreaView style={styles.screen}>
+        <View style={styles.content}>
+          <BrandRow />
+        </View>
         <View style={styles.center}>
           <Text style={styles.title} accessibilityRole="header">
             Sent!
@@ -333,6 +337,7 @@ export default function ScanScreen() {
   return (
     <SafeAreaView style={styles.screen}>
       <ScrollView contentContainerStyle={styles.content}>
+        <BrandRow />
         <Text style={styles.title} accessibilityRole="header">
           Scan your homework
         </Text>
@@ -555,7 +560,13 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.offWhite },
   cameraScreen: { flex: 1, backgroundColor: colors.navy },
   camera: { flex: 1 },
-  content: { padding: spacing.md, gap: spacing.md },
+  content: {
+    padding: spacing.md,
+    gap: spacing.md,
+    width: '100%',
+    maxWidth: 640 + 2 * spacing.md,
+    alignSelf: 'center',
+  },
   center: { flex: 1, padding: spacing.lg, justifyContent: 'center', gap: spacing.md },
   title: { fontSize: typography.scale.xl, fontWeight: '800', color: colors.navy },
   body: { fontSize: typography.scale.md, color: colors.navy },

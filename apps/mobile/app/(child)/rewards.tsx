@@ -12,6 +12,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ChildRewards } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
   askForRewardAction,
@@ -102,6 +103,7 @@ export default function ChildRewardsScreen() {
           ) : undefined
         }
       >
+        <BrandRow />
         <Text accessibilityRole="header" style={styles.title}>
           My rewards
         </Text>
@@ -251,7 +253,13 @@ export default function ChildRewardsScreen() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.offWhite },
-  content: { padding: spacing.lg, paddingBottom: spacing.xxl },
+  content: {
+    padding: spacing.lg,
+    paddingBottom: spacing.xxl,
+    width: '100%',
+    maxWidth: 640 + 2 * spacing.md,
+    alignSelf: 'center',
+  },
   title: {
     fontSize: typography.scale.xxl,
     fontWeight: '800',

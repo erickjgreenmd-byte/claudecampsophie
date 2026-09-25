@@ -18,6 +18,7 @@ import type {
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { devicePlatform } from '../../src/family/runtime.ts';
 import { registerAdultCacheClearer } from '../../src/family/parent-session.ts';
 import {
@@ -122,6 +123,7 @@ export default function ParentResourcesScreen() {
             columnTop.current = e.nativeEvent.layout.y;
           }}
         >
+          <BrandRow />
           <Title>Learning resources</Title>
           <Body muted>
             Free practice ideas and optional study materials for the subject and grade you choose.

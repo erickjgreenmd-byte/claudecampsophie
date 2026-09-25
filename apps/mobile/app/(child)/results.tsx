@@ -8,6 +8,7 @@ import {
   type ChildAssignmentSummary,
 } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { childApi } from '../../src/homework/child-api.ts';
 import {
   buildResultView,
@@ -71,6 +72,7 @@ function ScanList() {
   );
   return (
     <ScrollView contentContainerStyle={styles.content}>
+      <BrandRow />
       <Text style={styles.title} accessibilityRole="header">
         My scans
       </Text>
@@ -118,6 +120,7 @@ function ResultDetail({ id }: { id: string }) {
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
+      <BrandRow />
       {state.kind === 'loading' ? <Loading /> : null}
       {state.kind === 'error' ? <LoadError message={state.message} onRetry={state.reload} /> : null}
       {state.kind === 'ready' ? (
@@ -245,7 +248,13 @@ function Button({
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.offWhite },
-  content: { padding: spacing.md, gap: spacing.md },
+  content: {
+    padding: spacing.md,
+    gap: spacing.md,
+    width: '100%',
+    maxWidth: 640 + 2 * spacing.md,
+    alignSelf: 'center',
+  },
   center: { alignItems: 'center', gap: spacing.sm, padding: spacing.lg },
   title: { fontSize: typography.scale.xl, fontWeight: '800', color: colors.navy },
   body: { fontSize: typography.scale.md, color: colors.navy },

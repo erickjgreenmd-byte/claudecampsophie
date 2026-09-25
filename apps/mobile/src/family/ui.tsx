@@ -10,10 +10,11 @@ import {
   Text,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, type Edge } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../brand/BrandMark.tsx';
 import { currentMode } from '../lib/mode.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { parentApi } from './runtime.ts';
@@ -24,15 +25,32 @@ import { lockParentArea } from './unlock.ts';
  * large text, 44pt touch targets, and text labels on every state (never colour alone).
  */
 
-export function Screen({ children }: { children: ReactNode }) {
+/** Screens under a native header or an inset layout leave the top edge to it. */
+const DEFAULT_EDGES: readonly Edge[] = ['left', 'right', 'bottom'];
+
+/**
+ * Screen chrome: the brand row (mark only; the screen's Title stays the H1) above the content, in
+ * a centred column that stays readable on tablets (max 640 px, 16 px gutters). A root route shown
+ * without a header (/pair) passes `edges` including 'top'.
+ */
+export function Screen({
+  children,
+  edges = DEFAULT_EDGES,
+}: {
+  children: ReactNode;
+  edges?: readonly Edge[] | undefined;
+}) {
   return (
-    <SafeAreaView style={styles.screen} edges={['left', 'right', 'bottom']}>
+    <SafeAreaView style={styles.screen} edges={edges}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-          <View style={styles.column}>{children}</View>
+          <View style={styles.column}>
+            <BrandRow />
+            {children}
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -276,8 +294,8 @@ export const styles = StyleSheet.create({
   flex: { flex: 1 },
   screen: { flex: 1, backgroundColor: colors.offWhite },
   content: { padding: spacing.md, paddingBottom: spacing.xxl, alignItems: 'center' },
-  // Tablet layouts: a readable column that does not stretch edge to edge.
-  column: { width: '100%', maxWidth: 720 },
+  // Tablet layouts (iPad, Fire HD): a readable column that does not stretch edge to edge.
+  column: { width: '100%', maxWidth: 640 },
   title: {
     fontSize: typography.scale.xl,
     fontWeight: '800',

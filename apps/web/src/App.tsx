@@ -46,24 +46,43 @@ function ParentNav() {
   );
 }
 
+const MAIN_LINKS: readonly (readonly [string, string])[] = [
+  ['/how-it-works', 'How it works'],
+  ['/pricing', 'Pricing'],
+  ['/support', 'Support'],
+  ['/app', 'Parent portal'],
+];
+
+/**
+ * Brand bar on every page (styles.css `.brand-bar`): off-white ground, the traced lockup at 36 px
+ * (symbol only under 420 px), navy links with a teal focus ring, 16 px gutters from `.container`.
+ */
+function BrandBar() {
+  return (
+    <header className="brand-bar">
+      <div className="container brand-bar-inner">
+        <Link to="/" className="brand-home" aria-label="PencilLift home">
+          <Logo />
+        </Link>
+        <nav aria-label="Main" className="brand-nav">
+          {MAIN_LINKS.map(([to, label]) => (
+            <NavLink key={to} to={to}>
+              {label}
+            </NavLink>
+          ))}
+        </nav>
+      </div>
+    </header>
+  );
+}
+
 function Shell() {
   return (
     <>
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <header
-        className="container"
-        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-      >
-        <Link to="/" style={{ textDecoration: 'none' }}>
-          <Logo />
-        </Link>
-        <nav aria-label="Main">
-          <Link to="/how-it-works">How it works</Link> · <Link to="/pricing">Pricing</Link> ·{' '}
-          <Link to="/support">Support</Link> · <Link to="/app">Parent portal</Link>
-        </nav>
-      </header>
+      <BrandBar />
       <ParentNav />
       <main id="main" className="container">
         <Outlet />

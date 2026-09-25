@@ -114,3 +114,91 @@ select {
   background: var(--surface, #fff);
   padding: 0.5rem 0.75rem;
 }
+
+/* Visually hidden, still read by assistive technology and crawlers (the landing h1). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Brand bar: off-white ground, navy links, teal focus ring, 16px gutters (from .container). */
+.brand-bar {
+  background: var(--off-white);
+  border-bottom: 1px solid rgba(23, 50, 77, 0.14);
+}
+.brand-bar-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 24px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.brand-bar a {
+  color: var(--navy);
+  text-decoration: none;
+  font-weight: 700;
+  border-radius: 6px;
+}
+.brand-bar a:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.brand-bar a:focus-visible {
+  /* Teal (#008D87) keeps at least 3:1 against off-white and white (WCAG 1.4.11; brand.test.ts). */
+  outline: 3px solid var(--teal);
+  outline-offset: 3px;
+}
+.brand-nav {
+  /* Takes the space beside the logo and wraps its links inside, so on a phone the symbol and the
+     first links share a row instead of the whole nav dropping under the logo. */
+  flex: 1 1 200px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 20px;
+  font-size: 0.95rem;
+}
+.brand-nav a[aria-current='page'] {
+  color: var(--teal-text);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 6px;
+}
+.brand-home {
+  display: inline-flex;
+}
+.logo {
+  display: block;
+  line-height: 0;
+}
+.logo img {
+  /* Same value as HEADER_LOGO_HEIGHT in Logo.tsx; width follows the asset's aspect ratio. */
+  display: block;
+  height: 36px;
+  width: auto;
+}
+
+/* Landing hero: the full lockup (with tagline) is the visual; the h1 stays for AT and search. */
+.hero {
+  padding: 24px 0 8px;
+}
+.logo-hero {
+  display: block;
+  width: min(100%, 560px);
+  height: auto;
+  margin: 8px 0 20px;
+}
+.feature-card {
+  border-top: 4px solid var(--teal);
+}

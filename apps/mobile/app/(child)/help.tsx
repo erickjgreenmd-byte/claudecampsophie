@@ -4,6 +4,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ChildReportCategory } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
   CHILD_HELP_COPY,
@@ -41,6 +42,7 @@ export default function ChildHelpScreen() {
   return (
     <SafeAreaView style={styles.screen} edges={['top', 'left', 'right', 'bottom']}>
       <ScrollView contentContainerStyle={styles.content}>
+        <BrandRow />
         <Text accessibilityRole="header" style={styles.title}>
           {CHILD_HELP_COPY.title}
         </Text>
@@ -115,7 +117,13 @@ export default function ChildHelpScreen() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.offWhite },
-  content: { padding: spacing.lg, paddingBottom: spacing.xxl },
+  content: {
+    padding: spacing.lg,
+    paddingBottom: spacing.xxl,
+    width: '100%',
+    maxWidth: 640 + 2 * spacing.md,
+    alignSelf: 'center',
+  },
   title: {
     fontSize: typography.scale.xxl,
     fontWeight: '800',

@@ -44,7 +44,14 @@ const config: ExpoConfig = {
   scheme: 'pencillift',
   version: '0.1.0',
   orientation: 'default',
+  // The product UI has no dark theme, so the app stays light. Keep the splash config below without
+  // a `dark` block while this is 'light': expo-splash-screen's iOS plugin writes
+  // UIUserInterfaceStyle=Automatic whenever a dark splash exists, overriding this key (it warns).
+  // brand/assets splash-dark-1200.png is exported for the day this becomes 'automatic'.
   userInterfaceStyle: 'light',
+  // Brand assets (brand/ASSETS.md): opaque teal tile for iOS and the store masks; traced from the
+  // approved reference, never the whole presentation board, never the tagline in an icon.
+  icon: './assets/brand/icon-ios-1024.png',
   platforms: ['ios', 'android', 'web'],
   ios: {
     bundleIdentifier: 'com.pencillift.app',
@@ -67,6 +74,13 @@ const config: ExpoConfig = {
   android: {
     package: 'com.pencillift.app',
     versionCode: 1,
+    // Adaptive icon for Google Play and Fire tablets: symbol inside the 66 dp safe circle over a
+    // teal ground, plus the Android 13+ monochrome (themed-icon) layer.
+    adaptiveIcon: {
+      foregroundImage: './assets/brand/adaptive-foreground-1024.png',
+      monochromeImage: './assets/brand/adaptive-monochrome-1024.png',
+      backgroundColor: '#008D87',
+    },
     permissions: ['CAMERA', 'USE_BIOMETRIC'],
     blockedPermissions: [
       'android.permission.ACCESS_FINE_LOCATION',
@@ -98,7 +112,19 @@ const config: ExpoConfig = {
       { faceIDPermission: 'Face ID lets a parent unlock the parent area quickly.' },
     ],
     'expo-notifications',
+    [
+      // Keys per node_modules/expo-splash-screen/plugin/build/types.d.ts (Props): image, imageWidth,
+      // resizeMode, backgroundColor; `dark { image, backgroundColor }` only with 'automatic' above.
+      'expo-splash-screen',
+      {
+        image: './assets/brand/splash-1200.png',
+        imageWidth: 220,
+        resizeMode: 'contain',
+        backgroundColor: '#F7F9FB',
+      },
+    ],
   ],
+  web: { favicon: './assets/brand/symbol-256.png' },
   experiments: { typedRoutes: true },
   extra: {
     apiBaseUrl,

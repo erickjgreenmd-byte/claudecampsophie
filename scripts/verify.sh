@@ -31,6 +31,8 @@ dir_for() {
 }
 
 echo "▶ secrets"; node scripts/scan-secrets.mjs
+# Committed brand assets keep their dimensions, opacity, icon safe zones and size budget (no browser needed).
+echo "▶ brand assets"; node scripts/brand/export-assets.mjs --check
 if [ -z "$ONLY" ]; then
   echo "▶ format"; pnpm -s format:check
   echo "▶ lint"; pnpm -s lint

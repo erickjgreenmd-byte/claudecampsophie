@@ -1,4 +1,5 @@
 import { Link } from 'react-router';
+import { Logo } from '../../components/Logo.tsx';
 import { cardGrid, CtaLink, ctaRow, lead, PageTitle, Section, SubjectList } from './common.tsx';
 
 /** What PencilLift does (spec P1). Each claim describes implemented or specified behaviour only. */
@@ -33,8 +34,14 @@ export default function LandingPage() {
   return (
     <>
       <PageTitle title="Turn homework into progress" />
-      <div style={{ padding: '24px 0 8px' }}>
-        <h1>Turn homework into progress.</h1>
+      <div className="hero">
+        {/*
+          The traced lockup (symbol, wordmark and the tagline as artwork) is the hero visual. The
+          h1 keeps the same words as real text for screen readers and search, visually hidden so
+          sighted visitors do not read the tagline twice in a row.
+        */}
+        <Logo variant="hero" />
+        <h1 className="sr-only">Turn homework into progress.</h1>
         <p style={lead}>
           PencilLift helps your child understand their own homework, and helps you see what needs
           attention. Your child gets step-by-step guidance on mistakes instead of the answer key,
@@ -52,7 +59,7 @@ export default function LandingPage() {
       <Section title="What PencilLift does">
         <ul role="list" style={cardGrid}>
           {features.map((feature) => (
-            <li key={feature.title} className="card">
+            <li key={feature.title} className="card feature-card">
               <h3 style={{ marginTop: 0 }}>{feature.title}</h3>
               <p style={{ marginBottom: 0 }}>{feature.body}</p>
             </li>

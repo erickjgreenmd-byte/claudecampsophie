@@ -12,6 +12,9 @@ import {
 import { childSession, devicePlatform, modeEffects } from '../src/family/runtime.ts';
 import { Body, Button, Card, ErrorBox, Screen, styles, Title } from '../src/family/ui.tsx';
 
+/** This root route has no native header, so the screen applies the top inset itself. */
+const ROOT_EDGES = ['top', 'left', 'right', 'bottom'] as const;
+
 /**
  * Connect a child's device (spec P3; AC_ACCESS_04/07). A grown-up gives the child a one-time code
  * from the parent area. Redeeming it creates a child-only session; it can never open the parent
@@ -57,7 +60,7 @@ export default function PairScreen() {
 
   if (pairedName) {
     return (
-      <Screen>
+      <Screen edges={ROOT_EDGES}>
         <Title>This device is connected</Title>
         <Body>This device is connected to {pairedName}’s space.</Body>
         <Button
@@ -69,7 +72,7 @@ export default function PairScreen() {
   }
 
   return (
-    <Screen>
+    <Screen edges={ROOT_EDGES}>
       <Title>Connect a child’s device</Title>
       <Body>Ask a grown-up for your connect code. It has 8 letters and numbers.</Body>
       <Card>

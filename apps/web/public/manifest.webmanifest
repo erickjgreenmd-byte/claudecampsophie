@@ -1,0 +1,35 @@
+{
+  "name": "PencilLift",
+  "short_name": "PencilLift",
+  "description": "Turn homework into progress.",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#008D87",
+  "background_color": "#F7F9FB",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
