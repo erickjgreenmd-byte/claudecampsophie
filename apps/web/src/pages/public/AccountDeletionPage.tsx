@@ -100,16 +100,16 @@ export default function AccountDeletionPage() {
         </p>
       </Section>
 
-      <Section title="Your App Store or Google Play subscription">
+      <Section title="Your App Store, Google Play or Amazon Appstore subscription">
         <div className="notice">
           <p style={{ margin: 0 }}>
             <strong>
               Deleting your PencilLift account does not cancel an App Store or Google Play
-              subscription.
+              subscription, or an Amazon Appstore subscription on a Fire tablet.
             </strong>{' '}
-            To stop being charged, cancel it in the App Store or Google Play, in your Apple account
-            or Google Play subscription settings. We recommend cancelling before you delete your
-            account.
+            To stop being charged, cancel it in the App Store or Google Play (or in the Amazon
+            Appstore on a Fire tablet), in your Apple, Google Play or Amazon subscription settings.
+            We recommend cancelling before you delete your account.
           </p>
         </div>
       </Section>

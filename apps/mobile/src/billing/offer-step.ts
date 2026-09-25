@@ -14,7 +14,7 @@ import type { OfferRedemptionStore } from './store.ts';
  * webhook (GET /v1/family/promotions shows `confirmed`). Pure: no react-native imports.
  */
 
-export type OfferChannel = 'app_store' | 'play_store' | 'stripe';
+export type OfferChannel = 'app_store' | 'play_store' | 'stripe' | 'amazon_appstore';
 
 export interface OfferStepInput {
   readonly redemptionId: string;
@@ -64,6 +64,15 @@ function submitProblem(error: unknown): string {
 
 export async function runStoreOfferStep(input: OfferStepInput): Promise<OfferStepResult> {
   const { channel, store } = input;
+  if (channel === 'amazon_appstore') {
+    // The Amazon Appstore has no offer-code sheet or redeem page (spec P17 native offer redemption
+    // covers Apple and Google); nothing is submitted to the server and nothing is pretended.
+    return {
+      kind: 'unsupported_channel',
+      message:
+        'Promo codes can’t be redeemed through the Amazon Appstore on Fire tablets yet, so this promotion can’t be applied there.',
+    };
+  }
   if (channel !== 'app_store' && channel !== 'play_store') {
     return {
       kind: 'unsupported_channel',

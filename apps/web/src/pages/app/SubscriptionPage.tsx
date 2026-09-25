@@ -31,6 +31,7 @@ const STORE_NAME: Record<BillingChannel, string> = {
   app_store: 'App Store',
   play_store: 'Google Play',
   stripe: 'Web billing',
+  amazon_appstore: 'Amazon Appstore',
 };
 
 const STATUS_LABEL: Record<BillingEntitlementStatus, string> = {

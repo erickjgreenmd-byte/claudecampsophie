@@ -28,6 +28,7 @@ import {
   runGeneration,
   toDomainTemplate,
 } from '../services/p17-jobs.ts';
+import type { BillingChannel } from '@pencillift/domain';
 
 type Ctx = Context<AppEnv>;
 
@@ -299,7 +300,7 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
       const mappings = await tx<
         {
           campaign_id: string;
-          channel: 'app_store' | 'play_store' | 'stripe';
+          channel: BillingChannel;
           paid_slots: number;
           status: 'pending' | 'ready' | 'failed' | 'unsupported';
           provider_offer_id: string | null;

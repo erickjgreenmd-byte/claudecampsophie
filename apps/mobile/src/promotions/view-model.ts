@@ -167,6 +167,7 @@ export const STORE_NAME: Record<Channel, string> = {
   app_store: 'App Store',
   play_store: 'Google Play',
   stripe: 'Web billing',
+  amazon_appstore: 'Amazon Appstore',
 };
 
 export type RedeemAvailability =

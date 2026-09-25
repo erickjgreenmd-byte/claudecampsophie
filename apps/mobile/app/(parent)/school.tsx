@@ -10,7 +10,6 @@ import {
   createNativeBillingStore,
   createNativeOfferRedemptionStore,
 } from '../../src/billing/revenuecat.ts';
-import { devicePlatform } from '../../src/family/runtime.ts';
 import {
   Body,
   Button,
@@ -47,7 +46,6 @@ import type {
 import {
   buildQuoteView,
   buildSchoolView,
-  channelForPlatform,
   chooseSchoolPrompt,
   CONTRIBUTION_LINES,
   historyRows,
@@ -62,6 +60,7 @@ import {
   storeStepView,
   type StoreStepView,
 } from '../../src/promotions/store-step.ts';
+import { storeChannelForBuild } from '../../src/billing/revenuecat.ts';
 
 /**
  * Parent School and promotions (spec P17 parent interfaces; AC_PROMO_14, AC_UX_01/02). One school
@@ -284,7 +283,8 @@ const PLAN_OPTIONS: readonly { value: string; label: string }[] = [
 ];
 
 function PromoCard({ api, onRedeemed }: { api: ApiClient; onRedeemed: () => void }) {
-  const channel = useMemo(() => channelForPlatform(devicePlatform()), []);
+  // The store this build was made for (Google Play or the Amazon Appstore), never assumed from the OS.
+  const channel = useMemo(() => storeChannelForBuild(), []);
   const [code, setCode] = useState('');
   const [plan, setPlan] = useState('');
   const [checking, setChecking] = useState(false);

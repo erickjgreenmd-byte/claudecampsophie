@@ -26,9 +26,10 @@ import {
   SubscriptionBoundElsewhere,
   type FamilyBillingResult,
 } from '../services/billing-sync.ts';
+import type { BillingChannel } from '@pencillift/domain';
 
 type Ctx = Context<AppEnv>;
-type Channel = 'app_store' | 'play_store' | 'stripe';
+type Channel = BillingChannel;
 type BillingEnvironment = 'sandbox' | 'production';
 
 /**
@@ -61,6 +62,7 @@ const STORE_NAME: Record<Channel, string> = {
   app_store: 'The App Store',
   play_store: 'Google Play',
   stripe: 'Web billing',
+  amazon_appstore: 'The Amazon Appstore',
 };
 
 function childrenLabel(count: number): string {
@@ -110,8 +112,8 @@ export function storesToCheck(
   if (known.size > 0) return known;
   return new Set<Channel>(
     config.flags.stripeWebBillingEnabled
-      ? ['app_store', 'play_store', 'stripe']
-      : ['app_store', 'play_store'],
+      ? ['app_store', 'play_store', 'amazon_appstore', 'stripe']
+      : ['app_store', 'play_store', 'amazon_appstore'],
   );
 }
 

@@ -27,7 +27,7 @@ const portalUrl = publicEnv('EXPO_PUBLIC_PORTAL_URL');
  * is never printed. Absent → native purchases stay switched off and the plan screen says so
  * (src/billing/revenuecat.ts).
  */
-function revenueCatPublicKey(name: string, prefix: 'appl_' | 'goog_'): string | null {
+function revenueCatPublicKey(name: string, prefix: 'appl_' | 'goog_' | 'amzn_'): string | null {
   const key = publicEnv(name)?.trim() ?? '';
   if (key === '') return null;
   if (key.startsWith(prefix) && /^[A-Za-z0-9]{10,100}$/.test(key.slice(prefix.length))) return key;
@@ -37,6 +37,15 @@ function revenueCatPublicKey(name: string, prefix: 'appl_' | 'goog_'): string | 
 }
 const revenueCatIosKey = revenueCatPublicKey('EXPO_PUBLIC_REVENUECAT_IOS_KEY', 'appl_');
 const revenueCatAndroidKey = revenueCatPublicKey('EXPO_PUBLIC_REVENUECAT_ANDROID_KEY', 'goog_');
+// Amazon Appstore builds (Fire tablets have no Google Play services): RevenueCat's Amazon public key
+// (`amzn_…`) and which Android store this build is for. A build is for exactly one store; the
+// default is Google Play so an unset variable never produces an Amazon build by accident.
+const revenueCatAmazonKey = revenueCatPublicKey('EXPO_PUBLIC_REVENUECAT_AMAZON_KEY', 'amzn_');
+const rawAndroidStore = publicEnv('EXPO_PUBLIC_ANDROID_STORE') ?? 'play';
+if (rawAndroidStore !== 'play' && rawAndroidStore !== 'amazon') {
+  throw new Error('EXPO_PUBLIC_ANDROID_STORE must be "play" or "amazon"');
+}
+const androidStore: 'play' | 'amazon' = rawAndroidStore;
 
 const config: ExpoConfig = {
   name: 'PencilLift',
@@ -133,6 +142,8 @@ const config: ExpoConfig = {
     portalUrl,
     revenueCatIosKey,
     revenueCatAndroidKey,
+    revenueCatAmazonKey,
+    androidStore,
   },
 };
 

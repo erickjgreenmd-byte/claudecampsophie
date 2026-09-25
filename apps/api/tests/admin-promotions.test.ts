@@ -4,6 +4,7 @@ import { applyRefund } from '../src/services/billing-sync.ts';
 import { runDonationAccrual, runGeneration } from '../src/services/p17-jobs.ts';
 import { cryptoRandom } from '@pencillift/domain';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
+import { AMAZON_NO_OFFER_CODES } from '../src/services/p17-jobs.ts';
 
 let api: TestApi;
 let adminToken: string;
@@ -431,5 +432,36 @@ describe('school verification (P17 onboarding)', () => {
     const [audit] = await api.db.sql<{ n: number }[]>`
       select count(*)::int as n from public.audit_events where action = 'school.updated' and target_id = ${created.id}`;
     expect(audit!.n).toBe(1);
+  });
+});
+
+describe('Amazon Appstore campaigns (Fire tablets; the store has no offer codes)', () => {
+  it('generates Amazon mappings as unsupported with the reason, while the other stores start pending', async () => {
+    const t = await json<{ id: string }>(
+      await adminReq('/promo-templates', 'POST', {
+        ...templateInput,
+        name: 'Amazon test',
+        timezoneConfirmed: true,
+        channels: ['app_store', 'amazon_appstore'],
+      }),
+    );
+    expect(
+      (await json<{ ok: boolean }>(await adminReq(`/promo-templates/${t.id}/activate`, 'POST'))).ok,
+    ).toBe(true);
+    await runGeneration(api.apiDb, '2026-12', cryptoRandom);
+    const list = await json<{
+      campaigns: {
+        templateId: string;
+        offerMappings: { channel: string; status: string; reason: string | null }[];
+      }[];
+    }>(await adminReq('/campaigns?month=2026-12'));
+    const campaign = list.campaigns.find((x) => x.templateId === t.id)!;
+    const amazon = campaign.offerMappings.filter((m) => m.channel === 'amazon_appstore');
+    const appStore = campaign.offerMappings.filter((m) => m.channel === 'app_store');
+    expect(amazon.length).toBeGreaterThan(0);
+    expect(
+      amazon.every((m) => m.status === 'unsupported' && m.reason === AMAZON_NO_OFFER_CODES),
+    ).toBe(true);
+    expect(appStore.every((m) => m.status === 'pending' && m.reason === null)).toBe(true);
   });
 });

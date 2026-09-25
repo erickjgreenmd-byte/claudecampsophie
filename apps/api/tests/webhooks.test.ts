@@ -6,7 +6,11 @@ import { cryptoRandom } from '@pencillift/domain';
 import { seedFamily, seedOwnerAdmin, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { mapRevenueCatSubscription } from '../src/providers/billing.ts';
 import { hmacSha256, toHex } from '../src/security/crypto.ts';
-import { verifyStripeSignature } from '../src/services/billing-sync.ts';
+import {
+  mapRevenueCatEventToPeriod,
+  verifyStripeSignature,
+  type RevenueCatEvent,
+} from '../src/services/billing-sync.ts';
 import { createTestApi, json, type TestApi } from './helpers.ts';
 
 const RC_AUTH = 'Bearer rc-webhook-secret-for-tests-0123456789';
@@ -86,6 +90,7 @@ beforeAll(async () => {
     ['app_store', 'pl_family_2', 2],
     ['play_store', 'pl_family_3', 3],
     ['stripe', 'price_family_2', 2],
+    ['amazon_appstore', 'pl_family_2', 2],
   ] as const) {
     await api.db.sql`
       insert into public.store_product_mappings (channel, product_id, environment, paid_slots)
@@ -507,5 +512,113 @@ describe('RevenueCat subscription mapping (pure)', () => {
     expect(
       mapRevenueCatSubscription('fam_x', 'p', { ...base, is_sandbox: false }, now)?.environment,
     ).toBe('production');
+  });
+});
+
+describe('RevenueCat webhook store names (BUG-113)', () => {
+  it('records the billing period for an event whose store is spelled APP_STORE (webhook casing)', async () => {
+    // RevenueCat's REST subscriber payload spells stores in lowercase, its webhook events in
+    // uppercase (APP_STORE, PLAY_STORE, AMAZON, STRIPE, …). A lowercase-only map turned every real
+    // event's store into "unknown", so no billing period, donation month or revenue row was
+    // written while capacity still arrived through the subscriber fetch.
+    const fam = await seedFamily(api.db, { childCount: 2 });
+    const ref = await billingRef(fam);
+    api.providers.subscriptions.state.set(ref, [snapshot(ref)]);
+    const tx = `tx_upper_${randomUUID()}`;
+    const res = await postRc(rcEvent(ref, { store: 'APP_STORE', transaction_id: tx }));
+    expect((await json<{ status: string }>(res)).status).toBe('processed');
+    expect((await capacity(fam))?.paid_slots).toBe(2);
+    const periods = await api.db.sql`
+      select channel, charged_amount_cents from public.billing_periods where provider_period_id = ${tx}`;
+    expect(periods).toEqual([{ channel: 'app_store', charged_amount_cents: 4998 }]);
+  });
+
+  function pureEvent(store: string | undefined): RevenueCatEvent {
+    return {
+      id: 'evt_pure',
+      type: 'RENEWAL',
+      app_user_id: 'fam_x',
+      product_id: 'pl_family_2',
+      store,
+      purchased_at_ms: Date.parse('2026-09-10T00:00:00Z'),
+      expiration_at_ms: Date.parse('2026-10-10T00:00:00Z'),
+      price_in_purchased_currency: 49.98,
+      currency: 'USD',
+      period_type: 'NORMAL',
+      transaction_id: 'tx_pure',
+      event_timestamp_ms: Date.parse('2026-09-10T00:05:00Z'),
+    };
+  }
+
+  it.each([
+    ['APP_STORE', 'app_store'],
+    ['PLAY_STORE', 'play_store'],
+    ['AMAZON', 'amazon_appstore'],
+    ['STRIPE', 'stripe'],
+    ['app_store', 'app_store'],
+    ['amazon', 'amazon_appstore'],
+  ])('maps the webhook store %s to the %s channel', (store, channel) => {
+    expect(mapRevenueCatEventToPeriod(pureEvent(store))?.channel).toBe(channel);
+  });
+
+  it('stores PencilLift does not sell on never become billing periods', () => {
+    for (const store of [
+      'PROMOTIONAL',
+      'MAC_APP_STORE',
+      'RC_BILLING',
+      'amazon_appstore',
+      undefined,
+    ]) {
+      expect(mapRevenueCatEventToPeriod(pureEvent(store))).toBeNull();
+    }
+  });
+
+  it('maps the subscriber payload’s lowercase amazon store to amazon_appstore', () => {
+    const now = new Date('2026-09-24T00:00:00Z');
+    const snap = mapRevenueCatSubscription(
+      'fam_x',
+      'pl_family_2',
+      {
+        purchase_date: '2026-09-10T00:00:00Z',
+        expires_date: '2026-10-10T00:00:00Z',
+        store: 'amazon',
+        is_sandbox: true,
+      },
+      now,
+    );
+    expect(snap?.channel).toBe('amazon_appstore');
+    expect(snap?.providerSubscriptionId).toBe('rc:fam_x:amazon_appstore:pl_family_2');
+    expect(mapRevenueCatSubscription('fam_x', 'p', { store: 'AMAZON' }, now)).toBeNull(); // no dates
+  });
+
+  it('an Amazon Appstore purchase grants capacity, records its period and can be refunded', async () => {
+    const fam = await seedFamily(api.db, { childCount: 2 });
+    const ref = await billingRef(fam);
+    api.providers.subscriptions.state.set(ref, [
+      snapshot(ref, {
+        channel: 'amazon_appstore',
+        providerSubscriptionId: `rc:${ref}:amazon_appstore:pl_family_2`,
+      }),
+    ]);
+    const tx = `tx_amzn_${randomUUID()}`;
+    const purchase = await postRc(
+      rcEvent(ref, { type: 'INITIAL_PURCHASE', store: 'AMAZON', transaction_id: tx }),
+    );
+    expect((await json<{ status: string }>(purchase)).status).toBe('processed');
+    expect(await capacity(fam)).toEqual({ paid_slots: 2, conflict: null });
+    const [period] = await api.db.sql<{ channel: string; settlement: string }[]>`
+      select channel, settlement from public.billing_periods where provider_period_id = ${tx}`;
+    expect(period).toEqual({ channel: 'amazon_appstore', settlement: 'settled' });
+    await postRc(
+      rcEvent(ref, {
+        type: 'CANCELLATION',
+        cancel_reason: 'CUSTOMER_SUPPORT',
+        store: 'AMAZON',
+        transaction_id: tx,
+      }),
+    );
+    const [after] = await api.db.sql<{ settlement: string }[]>`
+      select settlement from public.billing_periods where provider_period_id = ${tx}`;
+    expect(after!.settlement).toBe('refunded');
   });
 });

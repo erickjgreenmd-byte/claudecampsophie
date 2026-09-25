@@ -18,6 +18,7 @@ import {
 import { transitionRedemption, type RedemptionState } from '@pencillift/domain/promotions';
 import type { Tx } from '../db.ts';
 import type { AppDeps } from '../middleware/context.ts';
+import { revenueCatStoreChannel } from '../providers/billing.ts';
 import { hmacSha256, timingSafeEqual, toHex } from '../security/crypto.ts';
 
 /**
@@ -78,16 +79,14 @@ export interface RevenueCatEvent {
   readonly event_timestamp_ms?: number | undefined;
 }
 
-const RC_STORE: Record<string, BillingChannel | undefined> = {
-  app_store: 'app_store',
-  play_store: 'play_store',
-  stripe: 'stripe',
-};
-
-/** Charge-bearing RevenueCat events become billing periods; others only trigger a state refresh. */
+/**
+ * Charge-bearing RevenueCat events become billing periods; others only trigger a state refresh.
+ * Store names arrive in the webhook's uppercase spelling (`APP_STORE`, `AMAZON`); the mapping
+ * accepts either case (BUG-113).
+ */
 export function mapRevenueCatEventToPeriod(event: RevenueCatEvent): NormalizedPeriod | null {
   if (event.type !== 'INITIAL_PURCHASE' && event.type !== 'RENEWAL') return null;
-  const channel = event.store ? RC_STORE[event.store] : undefined;
+  const channel = revenueCatStoreChannel(event.store);
   if (!channel || !event.transaction_id || !event.product_id) return null;
   if (event.purchased_at_ms === undefined || event.expiration_at_ms === undefined) return null;
   if (event.price_in_purchased_currency === undefined) return null;
@@ -115,6 +114,19 @@ export function mapRevenueCatEventToPeriod(event: RevenueCatEvent): NormalizedPe
 
 export function isRevenueCatRefund(event: RevenueCatEvent): boolean {
   return event.type === 'CANCELLATION' && event.cancel_reason === 'CUSTOMER_SUPPORT';
+}
+
+/**
+ * The store channel whose period a RevenueCat refund reverses: the App Store, Google Play or the
+ * Amazon Appstore. Stripe refunds arrive through Stripe's own webhook, never through RevenueCat.
+ */
+export function revenueCatRefundChannel(
+  event: RevenueCatEvent,
+): 'app_store' | 'play_store' | 'amazon_appstore' | null {
+  const channel = revenueCatStoreChannel(event.store);
+  return channel === 'app_store' || channel === 'play_store' || channel === 'amazon_appstore'
+    ? channel
+    : null;
 }
 
 // ---------------------------------------------------------------------------------------------

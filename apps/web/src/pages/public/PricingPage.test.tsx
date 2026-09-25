@@ -47,6 +47,18 @@ describe('PricingPage (spec P11, P17, AC_CAPACITY_11)', () => {
     expect(text).toMatch(/no separate family account fee/i);
   });
 
+  it('names the Amazon Appstore for Fire tablets without claiming any store is set up', async () => {
+    const { container } = await renderPricing();
+    const text = container.textContent;
+    expect(text).toMatch(/on Fire tablets, the Amazon Appstore once store setup is complete/);
+    expect(text).toMatch(/shown by the App Store, Google Play or the Amazon Appstore/);
+    expect(text).toMatch(
+      /cancel your subscription in the App Store, Google Play or, on a Fire tablet, the Amazon Appstore/,
+    );
+    expect(text).toMatch(/not yet available for purchase/i);
+    expect(text).not.toMatch(/available (now )?(on|in) the Amazon Appstore/i);
+  });
+
   it('states USD, store-provided checkout amounts, and that plans are not yet purchasable', async () => {
     const { container } = await renderPricing();
     const text = container.textContent;

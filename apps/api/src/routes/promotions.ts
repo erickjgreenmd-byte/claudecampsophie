@@ -28,6 +28,7 @@ import {
   monthToDate,
   type RedemptionContext,
 } from '../services/promotions-data.ts';
+import type { BillingChannel } from '@pencillift/domain';
 
 type Ctx = Context<AppEnv>;
 
@@ -104,7 +105,7 @@ async function evaluate(
   familyId: string,
   body: {
     code: string;
-    channel: 'app_store' | 'play_store' | 'stripe';
+    channel: BillingChannel;
     paidSlots?: number | undefined;
   },
   unlocked: boolean,
@@ -172,7 +173,7 @@ async function evaluate(
 interface RedemptionRow {
   id: string;
   campaign_month: string;
-  channel: 'app_store' | 'play_store' | 'stripe';
+  channel: BillingChannel;
   state: RedemptionState;
   percent_off: number;
   regular_cents: number;

@@ -1,15 +1,17 @@
 /**
- * The app's view of a native store (App Store / Google Play through RevenueCat), spec P11/P17.
+ * The app's view of a native store (App Store, Google Play or, on Fire tablets, the Amazon Appstore,
+ * all through RevenueCat), spec P11/P17.
  * Pure: no react-native imports. `revenuecat.ts` implements these interfaces on a device; tests use
  * labeled fakes. Nothing a store reports on the device grants a paid slot by itself: every purchase
  * or restore is followed by a server-side sync, and only the server's verified state is shown.
  */
 
-export type StoreChannel = 'app_store' | 'play_store';
+export type StoreChannel = 'app_store' | 'play_store' | 'amazon_appstore';
 
 export const STORE_LABEL: Record<StoreChannel | 'stripe', string> = {
   app_store: 'the App Store',
   play_store: 'Google Play',
+  amazon_appstore: 'the Amazon Appstore',
   stripe: 'web billing',
 };
 
@@ -68,12 +70,14 @@ export interface OfferRedemptionStore {
 export const PUBLIC_SDK_KEY_PREFIX: Record<StoreChannel, string> = {
   app_store: 'appl_',
   play_store: 'goog_',
+  amazon_appstore: 'amzn_',
 };
 
 /**
  * A RevenueCat public SDK key is safe to ship in the app; a secret key (`sk_…`) or any other key
- * never is. Allowlist, not denylist (RV-billing-6): only `appl_…` (App Store) and `goog_…` (Google
- * Play) public keys qualify, and for a given store only that store's prefix. Anything else leaves
+ * never is. Allowlist, not denylist (RV-billing-6): only `appl_…` (App Store), `goog_…` (Google
+ * Play) and `amzn_…` (Amazon Appstore) public keys qualify, and for a given store only that store's
+ * prefix: a `goog_…` key on an Amazon build is refused, and the reverse. Anything else leaves
  * native purchases switched off in this build. app.config.ts applies the same rule at build time
  * so a wrong key never reaches the manifest.
  */
@@ -133,6 +137,16 @@ const DEFAULT_MANAGEMENT_URL: Record<StoreChannel, (packageName: string) => stri
   app_store: () => 'https://apps.apple.com/account/subscriptions',
   play_store: (pkg) =>
     `https://play.google.com/store/account/subscriptions?package=${encodeURIComponent(pkg)}`,
+  // Amazon's "Your Memberships & Subscriptions" page lists Appstore subscriptions (to confirm on a
+  // Fire device once an Amazon developer account exists; docs/Connections.md).
+  amazon_appstore: () => 'https://www.amazon.com/yourmembershipsandsubscriptions',
+};
+
+/** The store's own web domain, the only place a provider-reported management link may point. */
+const STORE_HOST: Record<StoreChannel, (hostname: string) => boolean> = {
+  app_store: (host) => host === 'apps.apple.com',
+  play_store: (host) => host === 'play.google.com',
+  amazon_appstore: (host) => host === 'www.amazon.com' || host.endsWith('.amazon.com'),
 };
 
 /**
@@ -147,11 +161,7 @@ export function managementUrl(
   if (providerUrl) {
     try {
       const url = new URL(providerUrl);
-      const allowed =
-        channel === 'app_store'
-          ? url.hostname === 'apps.apple.com'
-          : url.hostname === 'play.google.com';
-      if (url.protocol === 'https:' && allowed) return url.toString();
+      if (url.protocol === 'https:' && STORE_HOST[channel](url.hostname)) return url.toString();
     } catch {
       // Fall through to the platform default.
     }

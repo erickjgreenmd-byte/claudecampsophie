@@ -14,6 +14,10 @@ import {
 import type { Db, Tx } from '../db.ts';
 import { isUniqueViolation } from '../errors.ts';
 import { loadDesignations } from './promotions-data.ts';
+import type { BillingChannel } from '@pencillift/domain';
+
+/** The Amazon Appstore offers no promotional offer codes; recorded as the mapping's reason. */
+export const AMAZON_NO_OFFER_CODES = 'The Amazon Appstore has no offer codes';
 
 /**
  * P17 scheduled work, shared by the owner console and the cron dispatcher. Both are idempotent:
@@ -37,7 +41,7 @@ interface TemplateRow {
   code_mode: 'shared' | 'individual';
   individual_code_count: number | null;
   shared_code_usage_cap: number | null;
-  channels: ('app_store' | 'play_store' | 'stripe')[];
+  channels: BillingChannel[];
   enabled: boolean;
   paused: boolean;
   created_at: Date;
@@ -138,8 +142,17 @@ export async function runGeneration(
         `;
         }
         // Every channel x tier starts pending: a code is never usable until its provider offer is ready.
+        // The Amazon Appstore has no offer codes at all, so its rows start unsupported with the reason
+        // the table requires; a Fire-tablet family is told the code cannot be redeemed through that store.
         for (const channel of template.channels) {
           for (const slots of template.eligible_tiers) {
+            if (channel === 'amazon_appstore') {
+              await tx`
+              insert into public.provider_offer_mappings (campaign_id, channel, paid_slots, status, reason)
+              values (${campaign.id}, ${channel}, ${slots}, 'unsupported', ${AMAZON_NO_OFFER_CODES})
+            `;
+              continue;
+            }
             await tx`
             insert into public.provider_offer_mappings (campaign_id, channel, paid_slots, status)
             values (${campaign.id}, ${channel}, ${slots}, 'pending')

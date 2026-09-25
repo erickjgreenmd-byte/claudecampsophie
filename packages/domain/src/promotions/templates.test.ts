@@ -2,6 +2,7 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { addMonths, calendarMonthOf } from '../shared/time.ts';
 import {
+  PROMO_CHANNELS,
   draftCampaignTemplate,
   explainMonthlyGeneration,
   planMonthlyGeneration,
@@ -133,6 +134,14 @@ describe('P17 campaign templates: activation rules', () => {
     expect(errorCode(makeTemplate({ channels: [] }))).toBe('INVALID_CHANNELS');
     expect(errorCode(makeTemplate({ channels: ['amazon' as 'stripe'] }))).toBe('INVALID_CHANNELS');
     expect(errorCode(makeTemplate({ channels: ['stripe', 'stripe'] }))).toBe('INVALID_CHANNELS');
+  });
+
+  it('the Amazon Appstore (Fire tablets) is a channel a campaign may target', () => {
+    expect(PROMO_CHANNELS).toEqual(['app_store', 'play_store', 'stripe', 'amazon_appstore']);
+    expect(errorCode(makeTemplate({ channels: ['amazon_appstore'] }))).toBeNull();
+    expect(errorCode(makeTemplate({ channels: ['play_store', 'amazon_appstore'] }))).toBeNull();
+    // RevenueCat's own store name is not a PencilLift channel.
+    expect(errorCode(makeTemplate({ channels: ['AMAZON' as 'stripe'] }))).toBe('INVALID_CHANNELS');
   });
 
   it('reports every problem at once for the administrator, first code by documented order', () => {

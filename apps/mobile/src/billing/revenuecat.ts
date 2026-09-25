@@ -20,37 +20,58 @@ import {
  * typechecking only: purchases need a real device, a store sandbox account and the owner's
  * RevenueCat project (docs/Owner_Actions.md #4), none of which exist in this environment.
  *
- * Feature gate: the SDK is configured ONLY when this build carries a real public SDK key for the
- * platform (EXPO_PUBLIC_REVENUECAT_IOS_KEY / EXPO_PUBLIC_REVENUECAT_ANDROID_KEY via app.config.ts
- * `extra`). Without one, `available` is false and the plan screen says purchases are not available
- * in this build; nothing is simulated. Every purchase or restore is followed by POST
- * /v1/billing/sync by the caller (purchase-flow.ts); the device result never grants a slot.
+ * Feature gate: the SDK is configured ONLY when this build carries a real public SDK key for its
+ * store (EXPO_PUBLIC_REVENUECAT_IOS_KEY / EXPO_PUBLIC_REVENUECAT_ANDROID_KEY, or
+ * EXPO_PUBLIC_REVENUECAT_AMAZON_KEY for a Fire tablet build made with
+ * EXPO_PUBLIC_ANDROID_STORE=amazon, via app.config.ts `extra`). Without one, `available` is false
+ * and the plan screen says purchases are not available in this build; nothing is simulated. Every
+ * purchase or restore is followed by POST /v1/billing/sync by the caller (purchase-flow.ts); the
+ * device result never grants a slot.
+ *
+ * Fire OS is Android without Google services: an Amazon build configures RevenueCat with
+ * `useAmazon: true` so purchases go through the Amazon Appstore, never Google Play Billing.
  */
 
 interface Extra {
   revenueCatIosKey?: unknown;
   revenueCatAndroidKey?: unknown;
+  revenueCatAmazonKey?: unknown;
+  /** 'play' (default) or 'amazon': which Android store this build is for (app.config.ts). */
+  androidStore?: unknown;
 }
 
 const PACKAGE_NAME = 'com.pencillift.app';
 
-function channel(): StoreChannel | null {
+function extra(): Extra {
+  return Constants.expoConfig?.extra ?? {};
+}
+
+/**
+ * This build's store: the App Store on iOS; on Android, Google Play, or the Amazon Appstore when
+ * the build was made for Fire tablets. A build is for exactly one store; the default is Google
+ * Play, so a build that never set the store cannot sell through Amazon by accident.
+ */
+export function storeChannelForBuild(): StoreChannel | null {
   if (Platform.OS === 'ios') return 'app_store';
-  if (Platform.OS === 'android') return 'play_store';
+  if (Platform.OS === 'android') {
+    return extra().androidStore === 'amazon' ? 'amazon_appstore' : 'play_store';
+  }
   return null;
 }
 
-/** The platform's public SDK key from the build, or null (only that platform's public key shape). */
+/** Which `extra` value carries each store's public SDK key. */
+const KEY_FOR_STORE: Record<StoreChannel, (e: Extra) => unknown> = {
+  app_store: (e) => e.revenueCatIosKey,
+  play_store: (e) => e.revenueCatAndroidKey,
+  amazon_appstore: (e) => e.revenueCatAmazonKey,
+};
+
+/** This build's store's public SDK key, or null (only that store's own public key shape counts). */
 export function revenueCatPublicKey(): string | null {
-  const extra = (Constants.expoConfig?.extra ?? {}) as Extra;
-  const store = channel();
-  const raw =
-    store === 'app_store'
-      ? extra.revenueCatIosKey
-      : store === 'play_store'
-        ? extra.revenueCatAndroidKey
-        : null;
-  return store !== null && isUsablePublicSdkKey(raw, store) ? raw.trim() : null;
+  const store = storeChannelForBuild();
+  if (store === null) return null;
+  const raw = KEY_FOR_STORE[store](extra());
+  return isUsablePublicSdkKey(raw, store) ? raw.trim() : null;
 }
 
 /** Purchases.configure may run once per app process; identity changes use logIn/logOut after that. */
@@ -77,7 +98,12 @@ export function identifyStoreAccount(billingRef: string): Promise<void> {
     if (!apiKey) throw new Error('Store purchases are not configured in this build');
     if (!sdkConfigured) {
       // Configure directly as the family's opaque billing ref: no anonymous store identity is created.
-      Purchases.configure({ apiKey, appUserID: billingRef });
+      // A Fire tablet build talks to the Amazon Appstore instead of Google Play Billing.
+      Purchases.configure({
+        apiKey,
+        appUserID: billingRef,
+        ...(storeChannelForBuild() === 'amazon_appstore' ? { useAmazon: true } : {}),
+      });
       sdkConfigured = true;
       identifiedAs = billingRef;
       return;
@@ -137,7 +163,7 @@ function errorCodes() {
 }
 
 export function createNativeBillingStore(): BillingStore {
-  const storeChannel = channel();
+  const storeChannel = storeChannelForBuild();
   const available = storeChannel !== null && revenueCatPublicKey() !== null;
   return {
     channel: storeChannel,
@@ -177,6 +203,19 @@ export function createNativeBillingStore(): BillingStore {
             : null;
           if (basePlan) await Purchases.purchaseSubscriptionOption(basePlan, change);
           else await Purchases.purchasePackage(pkg, null, change);
+        } else if (storeChannel === 'amazon_appstore') {
+          // The Amazon Appstore has no replacement or proration flow: buying another tier while a
+          // plan is live would start a second, parallel subscription, which never happens
+          // (AC_CAPACITY_05). The parent ends the current plan in the Amazon Appstore first; a
+          // first purchase is a plain package purchase.
+          if (request.replacing) {
+            return {
+              kind: 'failed',
+              message:
+                'On a Fire tablet the Amazon Appstore can’t switch a subscription to another plan. Cancel your current plan in the Amazon Appstore first, then choose the new plan once it has ended. You haven’t been charged.',
+            };
+          }
+          await Purchases.purchasePackage(pkg);
         } else {
           // Apple: all tiers are one subscription group, so the App Store applies an upgrade now
           // and a downgrade at renewal within the same subscription (no duplicate purchase).

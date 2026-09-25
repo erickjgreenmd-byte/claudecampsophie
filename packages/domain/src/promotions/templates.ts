@@ -16,10 +16,12 @@ export const SUBSCRIBER_CLASSES = ['new', 'existing', 'lapsed'] as const;
 /** new = never subscribed; existing = has a current subscription; lapsed = subscription expired. */
 export type SubscriberClass = (typeof SUBSCRIBER_CLASSES)[number];
 
+/** Channels a campaign may target; includes the Amazon Appstore (Fire tablets). */
 export const PROMO_CHANNELS = [
   'app_store',
   'play_store',
   'stripe',
+  'amazon_appstore',
 ] as const satisfies readonly BillingChannel[];
 
 export const CODE_MODES = ['shared', 'individual'] as const;

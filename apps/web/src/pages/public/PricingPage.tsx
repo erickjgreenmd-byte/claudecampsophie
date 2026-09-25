@@ -67,23 +67,24 @@ export default function PricingPage() {
         <div className="notice">
           <p style={{ margin: 0 }}>
             <strong>Plans are not yet available for purchase.</strong> They will be offered as
-            in-app subscriptions through the App Store and Google Play once store setup is complete.
+            in-app subscriptions through the App Store, Google Play and, on Fire tablets, the Amazon
+            Appstore once store setup is complete.
           </p>
         </div>
         <ul>
           <li>Prices are listed in US dollars.</li>
           <li>
             The amount you pay at checkout, including any tax, proration and your renewal date, is
-            shown by the App Store or Google Play and may differ by storefront.
+            shown by the App Store, Google Play or the Amazon Appstore and may differ by storefront.
           </li>
           <li>
             Only a parent can buy or change a plan, from the PIN-protected parent area. Children
             can’t make purchases.
           </li>
           <li>
-            You manage or cancel your subscription in the App Store or Google Play. Deleting your
-            PencilLift account doesn’t cancel a store subscription; see{' '}
-            <Link to="/account-deletion">how to delete your account</Link>.
+            You manage or cancel your subscription in the App Store, Google Play or, on a Fire
+            tablet, the Amazon Appstore. Deleting your PencilLift account doesn’t cancel a store
+            subscription; see <Link to="/account-deletion">how to delete your account</Link>.
           </li>
         </ul>
       </Section>

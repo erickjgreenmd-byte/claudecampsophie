@@ -2,12 +2,18 @@
 import type { BillingChannel } from '../shared/billing.ts';
 import type { ProviderSubscriptionSnapshot, StoreProductMapping } from './products.ts';
 
-export const CHANNELS: readonly BillingChannel[] = ['app_store', 'play_store', 'stripe'];
+export const CHANNELS: readonly BillingChannel[] = [
+  'app_store',
+  'play_store',
+  'stripe',
+  'amazon_appstore',
+];
 
 const PRODUCT_PREFIX: Readonly<Record<BillingChannel, string>> = {
   app_store: 'com.pencillift.capacity.',
   play_store: 'pencillift_capacity_',
   stripe: 'price_pl_capacity_',
+  amazon_appstore: 'com.pencillift.amazon.capacity.',
 };
 
 /** Synthetic store product id for a capacity tier on a channel. */

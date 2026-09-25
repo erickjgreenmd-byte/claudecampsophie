@@ -59,11 +59,26 @@ const revenueCatSubscriberSchema = z.object({
 
 type RevenueCatSubscription = z.infer<typeof revenueCatSubscriptionSchema>;
 
+/**
+ * RevenueCat store names → PencilLift billing channels. The REST subscriber payload spells stores
+ * in lowercase (`app_store`); webhook events spell them in uppercase (`APP_STORE`, `PLAY_STORE`,
+ * `AMAZON`, `STRIPE`, `PROMOTIONAL`, `MAC_APP_STORE`), which a lowercase-only map turned into
+ * "unknown store" for every real event (BUG-113). Both spellings are accepted. `AMAZON` is the
+ * Amazon Appstore (Fire tablets). Promotional grants, the Mac App Store and any store PencilLift
+ * does not sell on are not paid capacity and map to null.
+ */
 const STORE_CHANNEL: Record<string, BillingChannel | undefined> = {
   app_store: 'app_store',
   play_store: 'play_store',
   stripe: 'stripe',
+  amazon: 'amazon_appstore',
 };
+
+/** The billing channel a RevenueCat `store` value names, in either spelling, or null. */
+export function revenueCatStoreChannel(store: string | null | undefined): BillingChannel | null {
+  if (typeof store !== 'string') return null;
+  return STORE_CHANNEL[store.trim().toLowerCase()] ?? null;
+}
 
 function date(value: string | null | undefined): Date | null {
   if (!value) return null;
@@ -78,7 +93,7 @@ export function mapRevenueCatSubscription(
   sub: RevenueCatSubscription,
   now: Date,
 ): ProviderSubscriptionSnapshot | null {
-  const channel = sub.store ? STORE_CHANNEL[sub.store] : undefined;
+  const channel = revenueCatStoreChannel(sub.store);
   // Promotional/manual grants and other stores are not paid capacity.
   if (!channel) return null;
   const periodStart = date(sub.purchase_date);

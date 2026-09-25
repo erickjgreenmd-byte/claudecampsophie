@@ -206,7 +206,7 @@ function availabilityFor(input: PlanViewInput): PlanAvailability {
     return {
       kind: 'no_store_on_device',
       message:
-        'Plans are bought and changed in the PencilLift app on an iPhone, iPad or Android device.',
+        'Plans are bought and changed in the PencilLift app on an iPhone, iPad, Android device or Fire tablet.',
     };
   }
   if (!input.storeAvailable) {

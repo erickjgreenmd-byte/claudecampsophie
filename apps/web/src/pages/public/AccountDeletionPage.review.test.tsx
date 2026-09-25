@@ -42,6 +42,17 @@ describe('AccountDeletionPage review', () => {
     }
   });
 
+  it('names the Amazon Appstore subscription on Fire tablets next to the App Store and Google Play', async () => {
+    // Fire tablets buy through the Amazon Appstore (no Google Play); deleting the account cancels
+    // nothing there either, and the page must say where to cancel without claiming the store exists.
+    await renderPublic(AccountDeletionPage, '/account-deletion');
+    const store = screen.getByRole('region', { name: /subscription/i });
+    expect(store.textContent).toMatch(
+      /does not cancel an App Store or Google Play subscription, or an Amazon Appstore subscription on a Fire tablet/i,
+    );
+    expect(store.textContent).toMatch(/or in the Amazon Appstore on a Fire tablet/i);
+  });
+
   it('[RV-public-site-3] says that only the family owner can delete the whole family account', async () => {
     // Implemented design: POST /v1/deletion with scope "family" returns FORBIDDEN
     // (ownerOnlyFamilyDeletion) for an invited guardian (apps/api/src/routes/privacy.ts). The

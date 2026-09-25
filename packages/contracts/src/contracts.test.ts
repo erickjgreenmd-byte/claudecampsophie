@@ -3,12 +3,20 @@ import {
   API_ERROR_CODES,
   API_ERROR_STATUS,
   apiErrorBodySchema,
+  channelSchema,
   childPairRequestSchema,
   promoQuoteResponseSchema,
   promoRedeemRequestSchema,
 } from './index.ts';
 
 describe('contracts', () => {
+  it('billing channels are the two phone stores, web billing and the Amazon Appstore', () => {
+    expect(channelSchema.options).toEqual(['app_store', 'play_store', 'stripe', 'amazon_appstore']);
+    // RevenueCat's store names are mapped by the API, never accepted as channels.
+    expect(channelSchema.safeParse('amazon').success).toBe(false);
+    expect(channelSchema.safeParse('AMAZON').success).toBe(false);
+  });
+
   it('maps every error code to an HTTP status', () => {
     for (const code of API_ERROR_CODES) {
       expect(API_ERROR_STATUS[code]).toBeGreaterThanOrEqual(400);

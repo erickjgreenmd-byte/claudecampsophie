@@ -1,7 +1,11 @@
 import type { Cents } from './money.ts';
 
-/** Billing channel. `stripe` is the optional, disabled-by-default adult web route. */
-export type BillingChannel = 'app_store' | 'play_store' | 'stripe';
+/**
+ * Billing channel. `amazon_appstore` is the Amazon Appstore on Fire tablets (Android without Google
+ * services; RevenueCat names that store `AMAZON`). `stripe` is the optional, disabled-by-default
+ * adult web route.
+ */
+export type BillingChannel = 'app_store' | 'play_store' | 'stripe' | 'amazon_appstore';
 
 /** What a provider invoice/transaction line represents. Only full monthly periods count for P17. */
 export type BillingPeriodKind = 'subscription_period' | 'proration' | 'addon' | 'tax_only';

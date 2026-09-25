@@ -12,6 +12,7 @@ import {
   reconcilePromotionsForPeriod,
   reconcileFamilyBilling,
   recordBillingPeriod,
+  revenueCatRefundChannel,
   reverifyFormerHolders,
   stripeBillingRef,
   syncFamilyFromProvider,
@@ -405,9 +406,8 @@ export function webhooksRoutes(): Hono<AppEnv> {
                 );
               }
             }
-            if (isRevenueCatRefund(event) && event.transaction_id && event.store) {
-              const channel =
-                event.store === 'app_store' || event.store === 'play_store' ? event.store : null;
+            if (isRevenueCatRefund(event) && event.transaction_id) {
+              const channel = revenueCatRefundChannel(event);
               if (channel)
                 await applyRefund(tx, family.id, channel, event.transaction_id, 'refund', null);
             }

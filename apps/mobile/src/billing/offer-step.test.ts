@@ -151,4 +151,21 @@ describe('runStoreOfferStep (spec P17 native offer redemption)', () => {
     expect(calls).toEqual([]);
     expect(log).toEqual([]);
   });
+
+  it('the Amazon Appstore (Fire tablets) has no redemption step: nothing is submitted or opened', async () => {
+    const log: string[] = [];
+    const { api, calls } = fakeApi(() => redemption(), log);
+    const store = fakeOfferStore(log);
+    const result = await runStoreOfferStep({
+      redemptionId: REDEMPTION,
+      code: CODE,
+      channel: 'amazon_appstore',
+      api,
+      store,
+    });
+    expect(result.kind).toBe('unsupported_channel');
+    expect(result).toMatchObject({ message: expect.stringMatching(/Amazon Appstore/) });
+    expect(calls).toEqual([]);
+    expect(log).toEqual([]);
+  });
 });

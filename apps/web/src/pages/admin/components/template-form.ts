@@ -33,6 +33,7 @@ export const CHANNEL_LABEL: Record<Channel, string> = {
   app_store: 'App Store',
   play_store: 'Google Play',
   stripe: 'Web billing (Stripe)',
+  amazon_appstore: 'Amazon Appstore (no store codes)',
 };
 
 export const SUBSCRIBER_LABEL: Record<SubscriberClass, string> = {

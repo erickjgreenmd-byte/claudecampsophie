@@ -10,6 +10,10 @@ export const idempotencyKeySchema = z
   .min(16)
   .max(128)
   .regex(/^[A-Za-z0-9_-]+$/);
-export const channelSchema = z.enum(['app_store', 'play_store', 'stripe']);
+/**
+ * Billing channel: the two phone stores, optional Stripe web billing and the Amazon Appstore
+ * (Fire tablets; RevenueCat names that store `AMAZON`).
+ */
+export const channelSchema = z.enum(['app_store', 'play_store', 'stripe', 'amazon_appstore']);
 export const centsSchema = z.number().int().min(0).max(10_000_000);
 export const ianaZoneSchema = z.string().min(1).max(64);
