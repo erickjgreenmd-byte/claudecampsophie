@@ -4,7 +4,7 @@ Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on 
 Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
 (1–4 paid slots) — unchanged.
 
-## Current state (2026-09-25; code at `a2aed0c`)
+## Current state (2026-09-25; code at `6d0d5d0`)
 
 Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
 approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
@@ -17,16 +17,21 @@ support queue and case console, parent support intake on web and mobile; no refu
 Later the same day: transactional email through Resend, fail closed, with draft copy for every template the code
 sends (`04c17ac`; Owner action #14 names the GoDaddy DNS steps), and the support policy settings — refund window,
 response targets, partial refunds — as admin settings with the refund window shown to parents (`a2aed0c`; Owner
-actions #31 closed by decision, #32). MCP connectors for Supabase, Stripe and Expo are attached to the build
-session but no project, account or EAS project of PencilLift's exists yet (Connections).
+actions #31 closed by decision, #32). Then the store-readiness pass (`6d0d5d0`): four store audits and their code
+gaps closed — in-app account closure (soft delete through the Supabase Auth Admin API, migration 0830), a parental
+gate before every pre-PIN outbound link, in-app legal links, subscription disclosures, native config (privacy
+manifest, permissions, export compliance, no push stack, EAS linkage with loud variables), web legal pages final
+under `VITE_LEGAL_REVIEWED`, security headers; the store submission checklist is in `docs/Release_Readiness.md`
+and the owner-side rows are Owner actions #33–#37. MCP connectors for Supabase, Stripe and Expo are attached to
+the build session but no project, account or EAS project of PencilLift's exists yet (Connections).
 Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with its gap): integration_tested 33,
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `a2aed0c`:
-api 913, domain 3,656, db 335, web 461, mobile 509, ai 49, contracts 15, ui-tokens 4 (5,942 tests, 0 failed,
-0 skipped), gate audit, finance, release-artifact scan with negative control. The gate on `99166da` had first
-failed on four purge tests and caught BUG-114 before that commit (L-026). CI runs and their results are listed in `docs/Test_Evidence.md` (the table
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `6d0d5d0`:
+api 931, domain 3,656, db 341, web 526, mobile 554, ai 49, contracts 15, ui-tokens 4 (6,076 tests, 0 failed,
+0 skipped), gate audit, finance, release-artifact scan with negative control. Earlier gates caught BUG-114 (a
+stale function re-creation, L-026) and BUG-115 (a pinned-clock time bomb, L-027) before their commits. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
 there is the source of truth; a records-only commit may still have its run in progress).
 
 Open risks (not hidden by 'closed'): BUG-096 (answers the extraction model inserts into the child's transcription;
@@ -53,10 +58,10 @@ moderation built but never run live (no key).
 
 ## In flight
 
-- Store-readiness audit (Apple Kids Category, Google Play Families, Amazon Appstore, native build config) and an
-  adversarial bug hunt across every area, read-only, workflow `wf_2a9a8aa6-7c4`; its confirmed findings and
-  code gaps go to a fix workflow (failing test first, checkers, isolated gate) and to the store checklist in
-  `docs/Release_Readiness.md`.
+- Adversarial bug hunt across every area (read-only, workflow `wf_2a9a8aa6-7c4`, finder rounds with three-lens
+  verification); its confirmed findings go to a fix workflow (failing test first, checkers, isolated gate).
+  The four store audits of the same workflow are done and their code gaps are closed (`wf_b0de02d8-ca2`; store
+  checklist in `docs/Release_Readiness.md`); the owner-side rows are Owner actions #33–#37.
 
 ## Next exact steps
 
