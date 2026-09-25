@@ -44,5 +44,8 @@ export const routes: RouteObject[] = [
     path: '/admin/monetization',
     lazy: page(() => import('./pages/admin/MonetizationAdminPage.tsx')),
   },
+  { path: '/app/support', lazy: page(() => import('./pages/app/SupportPage.tsx')) },
+  { path: '/admin/support', lazy: page(() => import('./pages/admin/SupportAdminPage.tsx')) },
+  { path: '/admin/revenue', lazy: page(() => import('./pages/admin/RevenueAdminPage.tsx')) },
   { path: '*', lazy: page(() => import('./pages/public/NotFoundPage.tsx')) },
 ];

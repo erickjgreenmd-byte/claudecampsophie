@@ -98,7 +98,12 @@ describe('FamilyDashboardPage', () => {
     expect(screen.getByText(/Paid child slots:/).textContent).toContain('1 (1 in use)');
     expect(screen.getByText(/Draft: not active yet, no charge/)).toBeTruthy();
     expect(screen.getByText(/Active: uses a paid slot/)).toBeTruthy();
-    for (const name of ['Children and pairing codes', 'Connected devices', 'Guardians']) {
+    for (const name of [
+      'Children and pairing codes',
+      'Connected devices',
+      'Guardians',
+      'Support',
+    ]) {
       expect(screen.getByRole('link', { name })).toBeTruthy();
     }
   });

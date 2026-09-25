@@ -111,3 +111,29 @@ Rules:
 ## Safety flags go to the parent (owner decision, 2026-09-25)
 
 The parent is the only person PencilLift sends a safety message to, and the parent addresses the concern. Every flag the screen or provider moderation files is visible to the family at once and emailed to every active guardian (no homework text, child name or category in the email); the parent can mark a flag addressed or a false alarm from the portal and the app after a PIN unlock; the owner-admin queue remains a support tool. The family-hold mechanism (0760 `family_visible`, admin release) stays in the schema but `FAMILY_HOLD_CATEGORIES` is empty. The rule that abuse, sexual and secrecy codes never come from a printed prompt keys on `HOUSEHOLD_SENSITIVE_CATEGORIES`, not on the hold list. The lead's dissent: this can deliver a disclosure to the person it names; recorded in Owner action #24 and Threat_Model T34.
+
+## Support cases and the owner-operations dashboard (2026-09-25)
+
+- **Support cases** (migration 0810): a parent opens a case from the portal or the app (`POST /v1/support/cases`;
+  kinds complaint, refund_request, billing_issue, bug, safety_question, other; subject ≤ 120 and body ≤ 2000
+  characters, enforced by the schema and the API). Case text is the parent's account text: the intake notice
+  forbids child names and homework, and no child data is ever copied into a case. A refund request names one of
+  the family's own provider billing periods by the natural key `(channel, provider_period_id)`, so a case can only
+  point at a charge the provider actually reported. Replies are messages; staff notes are `internal` and never
+  reach the family (RLS is the second layer behind the API's parent-role reads). Rate limits: 10 cases and 30
+  replies per family per hour. A family purge removes the family's cases and messages (migration 0820); a
+  child-scoped purge keeps them.
+- **Refunds** are never issued by PencilLift code. Store refunds (App Store, Google Play, Amazon) are the store's
+  and are only reflected from `billing_periods.refunded_cents` and pending refunds. A Stripe refund, when web
+  billing is enabled, is issued by the owner in the Stripe dashboard and recorded on the case as
+  `stripe_refund_issued` with the reference (required by a check constraint); `stripeRefundFromCase` is `false`
+  in the contract until a refund call exists behind the web-billing flag.
+- **Owner dashboard** (`/v1/admin/overview`, `/revenue`, `/subscriptions`, `/support/*`, `/settings/store-fee-rates`;
+  web `/admin`, `/admin/support`, `/admin/revenue`): every metric carries its source table and definition, months
+  are UTC keys and `now` is an input, money is integer cents, store fees are an owner-set rate per channel in basis
+  points (estimated, never presented as the provider's statement), churn is floored basis points with `null` when
+  there is no base. The attention list names every rule, zero counts included, and says honestly when no owner
+  console exists for a row (failed jobs, deletion requests, safety reports — the last are the parent's under the
+  2026-09-25 decision). All owner routes require `requireParent` + `requireOwnerAdmin` (aal2); a `support` staff
+  role cannot reach the queue until the owner decides on `app.is_support_staff()` (Owner action #31).
+

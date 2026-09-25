@@ -9,3 +9,5 @@ export * from './learning.ts';
 export * from './privacy.ts';
 export * from './monetization.ts';
 export * from './billing.ts';
+export * from './support.ts';
+export * from './admin-ops.ts';

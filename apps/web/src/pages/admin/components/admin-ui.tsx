@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { z } from 'zod';
+import { channelSchema } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState } from '../../../components/states.tsx';
 import { RequireParent, type QueryState } from '../../../lib/session.tsx';
@@ -53,6 +54,8 @@ export function AdminAccessDenied() {
 
 const NAV: readonly { to: string; label: string }[] = [
   { to: '/admin', label: 'Owner admin' },
+  { to: '/admin/support', label: 'Support' },
+  { to: '/admin/revenue', label: 'Subscriptions and revenue' },
   { to: '/admin/promotions', label: 'Promotions' },
   { to: '/admin/schools', label: 'Schools and payouts' },
   { to: '/admin/monetization', label: 'Monetization' },
@@ -260,11 +263,40 @@ export function ConfirmButton({
 export const buttonRow = { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 } as const;
 export const sectionStyle = { marginTop: 16 } as const;
 export const tableStyle = { width: '100%', borderCollapse: 'collapse' } as const;
+/**
+ * Hairline rule derived from the navy token (brand: every colour comes from the token set; no
+ * other hex literal). The same 14% navy that styles.css uses under the brand bar.
+ */
+export const RULE_COLOR = 'color-mix(in srgb, var(--navy) 14%, var(--white))';
+
 export const cellStyle = {
   textAlign: 'left',
-  borderTop: '1px solid #e3e8ee',
+  borderTop: `1px solid ${RULE_COLOR}`,
   padding: '8px 8px 8px 0',
   verticalAlign: 'top',
+} as const;
+
+/** Right-aligned numeric cell: tabular figures so columns of money line up. */
+export const numberCellStyle = {
+  ...cellStyle,
+  textAlign: 'right',
+  fontVariantNumeric: 'tabular-nums',
+  whiteSpace: 'nowrap',
+} as const;
+
+/** styles.css sizes inputs and selects; a textarea gets the same treatment inline. */
+export const textareaStyle = {
+  display: 'block',
+  width: '100%',
+  maxWidth: 640,
+  minHeight: 120,
+  fontSize: '1rem',
+  fontFamily: 'inherit',
+  padding: '8px 12px',
+  borderRadius: 8,
+  border: '1px solid var(--muted)',
+  color: 'var(--navy)',
+  background: 'var(--white)',
 } as const;
 
 /**
@@ -324,4 +356,174 @@ export function formatUtc(iso: string): string {
     hourCycle: 'h23',
   });
   return `${text} UTC`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Company dashboard building blocks (owner overview, support queue, revenue)
+// ---------------------------------------------------------------------------------------------
+
+export type Channel = z.infer<typeof channelSchema>;
+
+/** Every billing channel the contract knows, read at run time (never a hardcoded list). */
+export const CHANNELS: readonly Channel[] = channelSchema.options;
+
+const CHANNEL_LABEL: Readonly<Record<Channel, string>> = {
+  app_store: 'App Store',
+  play_store: 'Google Play',
+  stripe: 'Web billing (Stripe)',
+  amazon_appstore: 'Amazon Appstore',
+};
+
+export function channelLabel(channel: Channel): string {
+  return CHANNEL_LABEL[channel];
+}
+
+export const smallMutedStyle = { color: 'var(--muted)', fontSize: '0.85rem' } as const;
+
+/**
+ * Names the table a number was read from and how it was counted (product decision: every number
+ * on the owner dashboard says its source and definition; nothing is rounded up). A disclosure
+ * rather than a hover-only tooltip so keyboard and touch users can open it.
+ */
+export function Provenance({
+  source,
+  definition,
+  label = 'Source',
+}: {
+  source: string;
+  definition: string;
+  label?: string;
+}) {
+  return (
+    <details style={{ ...smallMutedStyle, marginTop: 4, overflowWrap: 'anywhere' }}>
+      <summary style={{ cursor: 'pointer' }}>
+        {label}: <code style={{ overflowWrap: 'anywhere' }}>{source}</code>
+      </summary>
+      <p style={{ margin: '4px 0 0' }}>{definition}</p>
+    </details>
+  );
+}
+
+export type Tone = 'neutral' | 'attention' | 'success' | 'danger';
+
+const PILL_TONES: Readonly<Record<Tone, { background: string; color: string }>> = {
+  neutral: { background: 'var(--off-white)', color: 'var(--navy)' },
+  attention: { background: 'var(--gold)', color: 'var(--navy)' },
+  success: { background: 'var(--success)', color: 'var(--white)' },
+  danger: { background: 'var(--danger)', color: 'var(--white)' },
+};
+
+/** A short status label. Gold means "needs a person", danger only for failures. */
+export function Pill({ tone = 'neutral', children }: { tone?: Tone; children: ReactNode }) {
+  return (
+    <span
+      style={{
+        ...PILL_TONES[tone],
+        display: 'inline-block',
+        borderRadius: 999,
+        padding: '2px 10px',
+        fontSize: '0.85rem',
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+        border: `1px solid ${RULE_COLOR}`,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+export function StatGrid({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div
+      role="list"
+      aria-label={label}
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: 12,
+        marginTop: 12,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Stat tile: label, one value, an optional detail line and the number's provenance. The value
+ * is text-coloured (never the data colour); a gold top rule marks a tile that needs attention.
+ */
+export function StatTile({
+  label,
+  value,
+  detail,
+  source,
+  definition,
+  tone = 'neutral',
+  to,
+}: {
+  label: string;
+  value: string;
+  detail?: ReactNode;
+  source: string;
+  definition: string;
+  tone?: 'neutral' | 'attention';
+  to?: string | undefined;
+}) {
+  return (
+    <div
+      role="listitem"
+      className="card"
+      style={{
+        padding: 16,
+        borderTop: `4px solid ${tone === 'attention' ? 'var(--gold)' : 'var(--teal)'}`,
+      }}
+    >
+      <p style={{ ...smallMutedStyle, margin: 0, fontWeight: 700, color: 'var(--navy)' }}>
+        {label}
+      </p>
+      <p style={{ margin: '4px 0 0', fontSize: '1.75rem', fontWeight: 800, color: 'var(--navy)' }}>
+        {value}
+      </p>
+      {detail !== undefined ? (
+        <p style={{ ...smallMutedStyle, margin: '4px 0 0' }}>{detail}</p>
+      ) : null}
+      {to !== undefined ? (
+        <p style={{ margin: '6px 0 0', fontSize: '0.9rem' }}>
+          <Link to={to}>Open {label.toLowerCase()}</Link>
+        </p>
+      ) : null}
+      <Provenance source={source} definition={definition} />
+    </div>
+  );
+}
+
+/** "2026-10-01T05:00:00Z" -> "Oct 1, 2026" (UTC calendar date). */
+export function formatUtcDate(iso: string): string {
+  return new Date(iso).toLocaleDateString('en-US', {
+    timeZone: 'UTC',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
+/** Whole hours as "3h", "2d 5h" or "14d"; null reads as "—". */
+export function ageText(hours: number | null): string {
+  if (hours === null) return '—';
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const rest = hours % 24;
+  return rest === 0 ? `${days}d` : `${days}d ${rest}h`;
+}
+
+/** Whole percent rounded down, as the API rounds; never rounds up. */
+export function percentText(basisPoints: number | null): string {
+  return basisPoints === null ? '—' : `${(basisPoints / 100).toFixed(2)}%`;
+}
+
+/** First eight characters of an id, for tables where the full uuid is available on the detail. */
+export function shortId(id: string): string {
+  return id.slice(0, 8);
 }

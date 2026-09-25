@@ -26,6 +26,7 @@ const PARENT_LINKS: readonly (readonly [string, string])[] = [
   ['/app/guardians', 'Guardians'],
   ['/app/security', 'Security'],
   ['/app/privacy', 'Privacy & data'],
+  ['/app/support', 'Support'],
 ];
 
 /** Parent-portal navigation, shown only inside /app (never on public pages). */

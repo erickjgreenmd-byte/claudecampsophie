@@ -72,6 +72,9 @@ function Dashboard() {
               <li>
                 <Link to="/app/privacy">Privacy, export and deletion</Link>
               </li>
+              <li>
+                <Link to="/app/support">Support</Link> — questions, billing and refund requests
+              </li>
             </ul>
           </nav>
         </div>

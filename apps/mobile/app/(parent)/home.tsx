@@ -118,6 +118,7 @@ function FamilyHome({ api }: { api: ApiClient }) {
         onPress={() => router.push('/(parent)/resources')}
       />
       <Button label="Privacy and data" secondary onPress={() => router.push('/(parent)/privacy')} />
+      <Button label="Support" secondary onPress={() => router.push('/(parent)/support')} />
 
       {guardianView ? (
         <>

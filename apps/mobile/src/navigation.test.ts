@@ -79,7 +79,15 @@ describe('mobile navigation integrity', () => {
 
   it('the parent home links to every parent tool screen', () => {
     const home = readFileSync(join(appDir, '(parent)', 'home.tsx'), 'utf8');
-    for (const screen of ['rewards', 'planner', 'plan', 'school', 'resources', 'privacy']) {
+    for (const screen of [
+      'rewards',
+      'planner',
+      'plan',
+      'school',
+      'resources',
+      'privacy',
+      'support',
+    ]) {
       expect(home, screen).toContain(`'/(parent)/${screen}'`);
     }
   });
