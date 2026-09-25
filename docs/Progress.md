@@ -80,6 +80,13 @@ moderation built but never run live (no key).
 - The bug hunt's second finder round (`wf_2a9a8aa6-7c4` resumed on `110ff0f`): seven area finders told the
   first-round titles, three-lens verification of anything new; its confirmed findings go to a fix round.
 
+**Paused 2026-09-25 22:35 UTC at the owner's request (usage limit).** Fix round 3 (`wf_b932ae15-34e`)
+was stopped mid-run; its seven fixers' partial edits are in the container's working tree, unverified and
+uncommitted, and are re-runnable rather than recoverable. The round-2 findings and the fix plan are saved
+in `docs/hardening/` because the container is ephemeral. To resume: re-run the workflow from
+`docs/hardening/round3-fix-plan.json` (regenerate the script from the template in the same directory),
+then gate, push and record as the earlier rounds did.
+
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.

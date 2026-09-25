@@ -1,0 +1,31 @@
+export const meta = {
+  name: 'hardening-fix',
+  description: 'Fix confirmed findings and store code gaps per area with failing tests first; adversarial checkers; one bounded re-fix',
+  phases: [
+    { title: 'Fix', detail: 'one fixer per area, disjoint files, failing test first' },
+    { title: 'Check', detail: 'acceptance checker per area: regression / listed / residual' },
+    { title: 'Refix', detail: 'one bounded re-fix and recheck for areas not ok' },
+  ],
+}
+// args: { head, areas: [{ key, title, files: [...], findings: [...], gaps: [...], notes }] }
+const SCRATCH = '/tmp/claude-0/-home-user-claudecampsophie/b1b9c04d-3d1c-58be-b925-a948687d722a/scratchpad/hardening'
+const COMMON = `Repository /home/user/claudecampsophie (branch claude/new-session-vil6cz, HEAD ${args.head}). Rules that bind you: edit ONLY the files listed as yours (another agent owns every other file; the lead owns apps/api/src/app.ts, apps/web/src/routes.tsx, packages/contracts/src/index.ts, packages/domain package.json exports and migration numbering — if you need one of those, describe the exact change in leadActions instead). Never run git. Never run repo-wide formatters; run prettier --write only on your own files. For each finding: reproduce with a failing test first (say which test failed before the change), fix, retest; never weaken a test, an RLS policy, a consent/ZDR gate or a verification step; if a test's assertion is wrong, say why in a comment naming the finding. Partial vitest runs must pass --reporter=default. Local Postgres 16 is up; if a connection is refused run 'pnpm db:local' once. Synthetic names only; no secrets. Keep notes under ${SCRATCH}/<label>/. Your final text is data for the lead.`
+
+const FIX_SCHEMA = { type: 'object', properties: { area: { type: 'string' }, done: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, change: { type: 'string' }, regressionTest: { type: 'string' }, failedBeforeChange: { type: 'boolean' } }, required: ['id', 'change', 'regressionTest', 'failedBeforeChange'] } }, notDone: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, reason: { type: 'string' } }, required: ['id', 'reason'] } }, leadActions: { type: 'array', items: { type: 'string' } }, filesChanged: { type: 'array', items: { type: 'string' } }, commands: { type: 'array', items: { type: 'object', properties: { cmd: { type: 'string' }, result: { type: 'string' } }, required: ['cmd', 'result'] } } }, required: ['area', 'done', 'notDone', 'leadActions', 'filesChanged', 'commands'] }
+const CHECK_SCHEMA = { type: 'object', properties: { ok: { type: 'boolean' }, problems: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, kind: { type: 'string', enum: ['regression', 'listed', 'residual'] }, severity: { type: 'string', enum: ['high', 'medium', 'low'] }, problem: { type: 'string' }, evidence: { type: 'string' } }, required: ['id', 'kind', 'severity', 'problem', 'evidence'] } }, verified: { type: 'array', items: { type: 'string' } } }, required: ['ok', 'problems', 'verified'] }
+
+const fixPrompt = (a, extra) => `${COMMON}\n\nArea: ${a.title}. Your files: ${a.files.join(', ')}.\n\nConfirmed findings to fix (each verified by three independent reviewers; the repro is in each):\n${JSON.stringify(a.findings, null, 1)}\n\nStore code gaps to close:\n${JSON.stringify(a.gaps, null, 1)}\n\nNotes: ${a.notes ?? ''}\n${extra ?? ''}\nWork every item; if one is impossible within your files say so in notDone with the exact lead change.`
+const checkPrompt = (a, fix) => `${COMMON}\n\nYou are the acceptance checker for area "${a.title}" (read-only except notes). The fixer reported: ${JSON.stringify(fix)}. Findings it was to fix: ${JSON.stringify(a.findings.map((f) => ({ id: f.id, title: f.title, repro: f.repro })))}; gaps: ${JSON.stringify(a.gaps)}.\n\nVerify each claim yourself: diff the owned files against HEAD (git diff is read-only and allowed), run the named tests, try one mutation per fix (revert the fix, watch the test fail, restore byte-for-byte and confirm with a hash), and run the area's wider suites. Classify every problem: 'regression' (something that worked at HEAD is broken or a test/gate was weakened), 'listed' (an item was not actually fixed), 'residual' (a limitation, documented). ok=true only with no regression and no listed problem.`
+
+phase('Fix')
+const results = await pipeline(args.areas,
+  (a) => agent(fixPrompt(a), { label: `fix:${a.key}`, phase: 'Fix', schema: FIX_SCHEMA, effort: 'high' }).then((fix) => ({ a, fix })),
+  ({ a, fix }) => agent(checkPrompt(a, fix), { label: `check:${a.key}`, phase: 'Check', schema: CHECK_SCHEMA, effort: 'high' }).then((check) => ({ a, fix, check })),
+  async ({ a, fix, check }) => {
+    if (!check || check.ok) return { a, fix, check, refix: null, recheck: null }
+    const blocking = check.problems.filter((p) => p.kind !== 'residual')
+    const refix = await agent(fixPrompt(a, `\nRE-FIX ROUND. The checker found these problems with the first attempt; fix exactly these (do not redo the rest): ${JSON.stringify(blocking)}. The first attempt's report: ${JSON.stringify(fix)}.`), { label: `refix:${a.key}`, phase: 'Refix', schema: FIX_SCHEMA, effort: 'high' })
+    const recheck = await agent(checkPrompt(a, refix), { label: `recheck:${a.key}`, phase: 'Refix', schema: CHECK_SCHEMA, effort: 'high' })
+    return { a, fix, check, refix, recheck }
+  })
+return results.filter(Boolean).map((r) => ({ area: r.a.key, fix: r.fix, check: r.check, refix: r.refix, recheck: r.recheck }))
