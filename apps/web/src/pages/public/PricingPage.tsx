@@ -5,6 +5,7 @@ import {
 } from '@pencillift/domain/pricing';
 import { formatUsd } from '@pencillift/domain/shared/money';
 import { Link } from 'react-router';
+import { isStoreLive } from '../../lib/config.ts';
 import { lead, muted, PageTitle, Section } from './common.tsx';
 
 /**
@@ -64,13 +65,21 @@ export default function PricingPage() {
       </p>
 
       <Section title="Availability and checkout">
-        <div className="notice">
-          <p style={{ margin: 0 }}>
-            <strong>Plans are not yet available for purchase.</strong> They will be offered as
-            in-app subscriptions through the App Store, Google Play and, on Fire tablets, the Amazon
-            Appstore once store setup is complete.
+        {/* WEB-R1-11: pre-launch wording until the store review build sets VITE_STORE_LIVE=true. */}
+        {isStoreLive() ? (
+          <p>
+            Plans are in-app subscriptions, bought by a parent in the PencilLift app through the App
+            Store, Google Play or, on Fire tablets, the Amazon Appstore.
           </p>
-        </div>
+        ) : (
+          <div className="notice">
+            <p style={{ margin: 0 }}>
+              <strong>Plans are not yet available for purchase.</strong> They will be offered as
+              in-app subscriptions through the App Store, Google Play and, on Fire tablets, the
+              Amazon Appstore once store setup is complete.
+            </p>
+          </div>
+        )}
         <ul>
           <li>Prices are listed in US dollars.</li>
           <li>

@@ -149,8 +149,12 @@ async function removeGuardian(tx: Tx, familyId: string, userId: string, now: Dat
  */
 async function enqueueClose(tx: Tx, userId: string, now: Date): Promise<void> {
   const key = `account_close:${userId}`;
+  // A dead-lettered closure re-queues itself as `<key>:retry<n>` (JOBS-R1-01), so a live or
+  // finished successor counts like a live or finished version.
   const existing = await tx<{ status: string }[]>`
-    select status from public.jobs where idempotency_key = ${key} or idempotency_key like ${key + ':v%'}
+    select status from public.jobs
+     where idempotency_key = ${key} or idempotency_key like ${key + ':v%'}
+        or idempotency_key like ${key + ':retry%'}
      order by created_at desc limit 1`;
   const last = existing[0]?.status;
   if (

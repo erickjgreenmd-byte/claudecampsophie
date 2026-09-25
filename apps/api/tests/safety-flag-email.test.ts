@@ -587,7 +587,8 @@ describe('a refusing provider (staging/production without an email adapter)', ()
     expect(final).toMatchObject({
       status: 'dead_letter',
       attempts: job!.max_attempts,
-      last_error_code: 'Error',
+      // The pipeline code, not the class name (JOBS-R1-04): the refusing provider fails the send.
+      last_error_code: 'EMAIL_SEND_FAILED',
     });
     // Bounded: nothing more is claimed.
     await dueNow(fam, 7 * 3600_000);

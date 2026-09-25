@@ -3,6 +3,7 @@ import {
   assertWebEnv,
   formatEffectiveDate,
   isLegalReviewed,
+  isStoreLive,
   readLegalConfig,
   readWebConfig,
   REQUIRED_PRODUCTION_VARS,
@@ -155,5 +156,22 @@ describe('assertWebEnv (runs once at startup from config.ts)', () => {
   it('fails loudly for a production build without public values or a reviewed build without legal values', () => {
     expect(() => assertWebEnv({ PROD: true })).toThrow(/VITE_API_BASE_URL/);
     expect(() => assertWebEnv({ VITE_LEGAL_REVIEWED: 'true' })).toThrow(/VITE_SUPPORT_EMAIL/);
+  });
+});
+
+describe('isStoreLive (WEB-R1-11: the pre-launch notices switch)', () => {
+  it('is true only for the exact string "true"; anything else keeps the pre-launch notices', () => {
+    expect(isStoreLive({ VITE_STORE_LIVE: 'true' })).toBe(true);
+    for (const value of [undefined, '', 'false', '1', 'TRUE', ' true', true]) {
+      expect(isStoreLive({ VITE_STORE_LIVE: value }), String(value)).toBe(false);
+    }
+    expect(isStoreLive({})).toBe(false);
+  });
+
+  it('adds no startup gate: every existing check still decides alone', () => {
+    expect(() => assertWebEnv({ VITE_STORE_LIVE: 'true' })).not.toThrow();
+    expect(() => assertWebEnv({ VITE_STORE_LIVE: 'true', PROD: true })).toThrow(
+      /VITE_API_BASE_URL/,
+    );
   });
 });

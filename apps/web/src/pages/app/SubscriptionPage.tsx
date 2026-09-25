@@ -10,14 +10,15 @@ import {
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { formatUsd } from '@pencillift/domain/shared/money';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
+import { billingChannels, STORE_NAME, STORE_THAT_BILLS_YOU } from '../../components/stores.ts';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 
 /**
  * Parent subscription overview (spec P11, P14 "subscription"; AC_CAPACITY_02/06/11, AC_BILLING_06).
  * Shows the verified paid slot count, assigned profiles, managing store, store subscriptions and
- * the approved price table. Purchases and plan changes happen in the App Store or Google Play from
- * the PencilLift app; optional web billing is disabled until the owner decides, so this page never
- * offers a purchase. Amounts are integer cents from the API and @pencillift/domain.
+ * the approved price table. Purchases and plan changes happen in the App Store, Google Play or the
+ * Amazon Appstore from the PencilLift app; optional web billing is disabled until the owner decides,
+ * so this page never offers a purchase. Amounts are integer cents from the API and @pencillift/domain.
  */
 export default function SubscriptionPage() {
   return (
@@ -26,13 +27,6 @@ export default function SubscriptionPage() {
     </RequireParent>
   );
 }
-
-const STORE_NAME: Record<BillingChannel, string> = {
-  app_store: 'App Store',
-  play_store: 'Google Play',
-  stripe: 'Web billing',
-  amazon_appstore: 'Amazon Appstore',
-};
 
 const STATUS_LABEL: Record<BillingEntitlementStatus, string> = {
   pending: 'Waiting for the store (for example Ask to Buy) — no access yet',
@@ -315,7 +309,7 @@ function CheckWithStore({ onSynced }: { onSynced: (status: BillingStatus) => voi
   );
 }
 
-function storePriceCell(data: BillingStatus, channel: 'app_store' | 'play_store', slots: number) {
+function storePriceCell(data: BillingStatus, channel: BillingChannel, slots: number) {
   const tier = data.tiers.find((t) => t.paidSlots === slots);
   const product = data.products.find(
     (p) => p.channel === channel && p.paidSlots === slots && p.storePriceCents !== null,
@@ -329,6 +323,7 @@ function storePriceCell(data: BillingStatus, channel: 'app_store' | 'play_store'
 
 function PriceTable({ data }: { data: BillingStatus }) {
   const headingId = useId();
+  const stores = billingChannels();
   return (
     <section className="card" style={sectionStyle} aria-labelledby={headingId}>
       <h2 id={headingId}>Prices</h2>
@@ -349,12 +344,12 @@ function PriceTable({ data }: { data: BillingStatus }) {
               <th scope="col" style={cell}>
                 Approved price
               </th>
-              <th scope="col" style={cell}>
-                App Store price
-              </th>
-              <th scope="col" style={cell}>
-                Google Play price
-              </th>
+              {/* WEB-R1-04: one column per store that can bill a family, Amazon Appstore included. */}
+              {stores.map((channel) => (
+                <th key={channel} scope="col" style={cell}>
+                  {STORE_NAME[channel]} price
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
@@ -364,8 +359,11 @@ function PriceTable({ data }: { data: BillingStatus }) {
                   {childrenLabel(tier.paidSlots)}
                 </th>
                 <td style={{ ...cell, fontWeight: 800 }}>{formatUsd(tier.approvedMonthlyCents)}</td>
-                <td style={cell}>{storePriceCell(data, 'app_store', tier.paidSlots)}</td>
-                <td style={cell}>{storePriceCell(data, 'play_store', tier.paidSlots)}</td>
+                {stores.map((channel) => (
+                  <td key={channel} style={cell}>
+                    {storePriceCell(data, channel, tier.paidSlots)}
+                  </td>
+                ))}
               </tr>
             ))}
           </tbody>
@@ -388,25 +386,24 @@ function ChangingYourPlan() {
       <ul>
         <li>
           Buy, add a child slot or move to a smaller plan in the PencilLift app on your phone or
-          tablet. The App Store or Google Play shows what you’ll pay today, including any proration,
-          before you confirm.
+          tablet. Your store (the App Store, Google Play or the Amazon Appstore) shows what you’ll
+          pay today, including any proration, before you confirm.
         </li>
         <li>
-          Plans can’t be bought on the web: PencilLift subscriptions are sold through the App Store
-          and Google Play.
+          Plans can’t be bought on the web: PencilLift subscriptions are sold through the App Store,
+          Google Play and, on Fire tablets, the Amazon Appstore.
         </li>
         <li>
           A new child slot is added only after the store confirms payment. Purchases waiting for
           approval (Ask to Buy), cancelled or failed purchases don’t add a slot.
         </li>
         <li>
-          To cancel, use the store that bills you. Deleting a child profile or your PencilLift
-          account doesn’t cancel a store subscription or lower its price.
+          To cancel, use {STORE_THAT_BILLS_YOU}. Deleting a child profile or your PencilLift account
+          doesn’t cancel a store subscription or lower its price.
         </li>
       </ul>
-      <p>
-        Have a monthly promo code? Enter it on <Link to="/app/school">School and promotions</Link>.
-      </p>
+      {/* WEB-R1-06: no promo-code invitation here; no code can be redeemed from the portal until the
+          in-app offer step ships (School and promotions says so up front). */}
     </section>
   );
 }

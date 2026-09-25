@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Link } from 'react-router';
-import { MIN_PASSWORD_LENGTH } from '../../lib/auth.ts';
+import { Link, useSearchParams } from 'react-router';
+import { MIN_PASSWORD_LENGTH, safeNextPath } from '../../lib/auth.ts';
 import { useSession } from '../../lib/session.tsx';
 import { Notice } from '../../components/states.tsx';
 import { AccountForm, EMAIL_RE, Field } from './forms.tsx';
@@ -9,6 +9,10 @@ import { SignInNotConfigured } from './NotConfigured.tsx';
 /** Adult account creation. The email must be verified before a family can be created (spec P3). */
 export default function SignUpPage() {
   const { auth } = useSession();
+  const [params] = useSearchParams();
+  // WEB-R1-01: the verification link returns to where the adult was going (for example a guardian
+  // invitation, `/app/guardians#accept=<token>`); same-origin paths only, `/app` otherwise.
+  const next = safeNextPath(params.get('next'));
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -30,7 +34,7 @@ export default function SignUpPage() {
             });
           if (password !== confirm)
             return Promise.resolve({ ok: false, message: 'The two passwords do not match.' });
-          return account.signUp(email.trim(), password, `${window.location.origin}/app`);
+          return account.signUp(email.trim(), password, `${window.location.origin}${next}`);
         }}
         done={() => (
           <Notice>
@@ -66,7 +70,8 @@ export default function SignUpPage() {
         />
       </AccountForm>
       <p>
-        Already have an account? <Link to="/sign-in">Sign in</Link>
+        Already have an account?{' '}
+        <Link to={`/sign-in?next=${encodeURIComponent(next)}`}>Sign in</Link>
       </p>
     </>
   );

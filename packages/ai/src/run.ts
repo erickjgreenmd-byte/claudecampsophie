@@ -31,10 +31,35 @@ export interface AttemptRecord {
   readonly latencyMs: number;
   readonly costMicros: number;
   readonly rateTableVersion: string;
+  /**
+   * True when the provider never reported this attempt's usage (a client-side timeout, a network
+   * failure, a 5xx) and the tokens and cost are the upper bound the attempt was admitted with: the
+   * provider may still have run and billed the whole generation, so it counts in full, like the
+   * domain's `failed_billed` settlement (JOBS-R1-03). Absent or false: the usage is the provider's.
+   */
+  readonly usageEstimated?: boolean;
 }
 
 export type RunStageErrorCode =
-  'CHILD_DATA_GATE' | 'STAGE_LIMIT' | 'PROVIDER_FAILED' | 'OUTPUT_INVALID' | 'UNKNOWN_MODEL';
+  | 'CHILD_DATA_GATE'
+  | 'STAGE_LIMIT'
+  | 'PROVIDER_FAILED'
+  /** The provider refused the request itself (400/413/415/422): sending it again cannot succeed. */
+  | 'PROVIDER_REJECTED'
+  | 'OUTPUT_INVALID'
+  | 'UNKNOWN_MODEL';
+
+/** Statuses by which the provider refuses the request body itself (size, image, schema). */
+const REJECTED_REQUEST_STATUSES: ReadonlySet<number> = new Set([400, 413, 415, 422]);
+
+/**
+ * Whether an error answer may have been billed without its usage being reported (JOBS-R1-03): no
+ * HTTP answer at all (our timeout aborted it, or the connection failed after the request was sent)
+ * or a server error. A 4xx (including 429) is refused before the model runs and is never billed.
+ */
+function usageUnknown(status: number | null): boolean {
+  return status === null || status >= 500;
+}
 
 export interface RunStageInput<S extends z.ZodType> {
   readonly prompt: PromptDefinition<S>;
@@ -104,15 +129,30 @@ export async function runStage<S extends z.ZodType>(
       timeoutMs: limits.timeoutMs,
       metadata: { ...options.metadata, prompt_version: prompt.version },
     });
+    // JOBS-R1-03: an attempt whose usage is unknown is metered at the upper bound it was admitted
+    // with (every estimated input token and the whole output budget), so the stage's cap, the
+    // owner's ceiling and the ledger never count a possibly billed generation as free.
+    const estimated = response.kind === 'error' && usageUnknown(response.status);
     const usage =
-      response.kind === 'error'
-        ? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }
-        : response.usage;
-    const cost = computeOperationCostMicros(rates, {
-      modelId: response.kind === 'error' ? modelId : response.modelId,
-      ...usage,
-    });
-    const costMicros = cost.ok ? cost.value.costMicros : 0;
+      response.kind !== 'error'
+        ? response.usage
+        : estimated
+          ? {
+              inputTokens: options.estimatedInputTokens,
+              cachedInputTokens: 0,
+              outputTokens: limits.maxOutputTokens,
+            }
+          : { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+    let costMicros: number;
+    if (estimated) {
+      costMicros = estimate.value;
+    } else {
+      const cost = computeOperationCostMicros(rates, {
+        modelId: response.kind === 'error' ? modelId : response.modelId,
+        ...usage,
+      });
+      costMicros = cost.ok ? cost.value.costMicros : 0;
+    }
     spent += costMicros;
     const record = (status: AttemptRecord['status']): AttemptRecord => ({
       stage: prompt.stage,
@@ -124,13 +164,23 @@ export async function runStage<S extends z.ZodType>(
       latencyMs: response.latencyMs,
       costMicros,
       rateTableVersion: rates.version,
+      usageEstimated: estimated,
     });
 
     if (response.kind === 'error') {
       attempts.push(record(response.timedOut ? 'timeout' : 'failed'));
       lastError = 'PROVIDER_FAILED';
-      if (!response.retryable)
-        return { result: err('PROVIDER_FAILED', 'Provider rejected the request'), attempts };
+      if (!response.retryable) {
+        const rejected = response.status !== null && REJECTED_REQUEST_STATUSES.has(response.status);
+        return {
+          result: err(
+            rejected ? 'PROVIDER_REJECTED' : 'PROVIDER_FAILED',
+            'Provider rejected the request',
+            response.status === null ? undefined : { status: response.status },
+          ),
+          attempts,
+        };
+      }
     } else if (response.kind === 'incomplete') {
       attempts.push(record('failed'));
       lastError = 'PROVIDER_FAILED';

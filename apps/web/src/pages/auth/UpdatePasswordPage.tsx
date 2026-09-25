@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Link } from 'react-router';
+import { Link, useLocation } from 'react-router';
 import { MIN_PASSWORD_LENGTH } from '../../lib/auth.ts';
 import { useParentSession, useSession } from '../../lib/session.tsx';
+import { AuthLinkNotice, readAuthLinkProblem } from '../../components/AuthLinkNotice.tsx';
 import { Loading, Notice } from '../../components/states.tsx';
 import { AccountForm, Field } from './forms.tsx';
 import { SignInNotConfigured } from './NotConfigured.tsx';
@@ -10,11 +11,17 @@ import { SignInNotConfigured } from './NotConfigured.tsx';
 export default function UpdatePasswordPage() {
   const { auth } = useSession();
   const state = useParentSession();
+  const location = useLocation();
   const [password, setPassword] = useState('');
   const account = auth.account;
   if (!account) return <SignInNotConfigured />;
   if (state.status === 'loading') return <Loading />;
   if (state.status !== 'signed_in') {
+    // WEB-R1-07: a reset link opened in another browser, or an expired one, says why and offers a
+    // new link, instead of the bare "request a new link" loop.
+    if (readAuthLinkProblem(location.search, location.hash)) {
+      return <AuthLinkNotice requestHref="/reset-password" purpose="reset" />;
+    }
     return (
       <Notice>
         This page opens from the reset link in your email.{' '}

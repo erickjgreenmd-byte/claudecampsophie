@@ -5,8 +5,10 @@ import {
   Outlet,
   RouterProvider,
   useLocation,
+  type RouteObject,
 } from 'react-router';
 import { Logo } from './components/Logo.tsx';
+import { RouteError } from './components/RouteError.tsx';
 import { routes } from './routes.tsx';
 import { unconfiguredAuth } from './lib/auth.ts';
 import { readWebConfig } from './lib/config.ts';
@@ -106,8 +108,36 @@ const session = createDefaultSession(
     : unconfiguredAuth,
 );
 
+/** Last resort when the Shell itself fails: still branded, still offers a way back. */
+function ShellError() {
+  return (
+    <>
+      <BrandBar />
+      <main id="main" className="container">
+        <RouteError />
+      </main>
+    </>
+  );
+}
+
+/**
+ * WEB-R1-02: every page renders under a pathless route whose error boundary shows inside the Shell's
+ * <Outlet>, so a page that throws or a stale lazy chunk after a deploy keeps the brand bar and
+ * navigation and offers "Reload" / "Go to the family dashboard" (never React Router's default
+ * "Unexpected Application Error!" page).
+ */
+export function appRoutes(children: RouteObject[]): RouteObject[] {
+  return [
+    {
+      element: <Shell />,
+      errorElement: <ShellError />,
+      children: [{ errorElement: <RouteError />, children }],
+    },
+  ];
+}
+
 export function App() {
-  const router = createBrowserRouter([{ element: <Shell />, children: routes }]);
+  const router = createBrowserRouter(appRoutes(routes));
   return (
     <SessionProvider value={session}>
       <RouterProvider router={router} />

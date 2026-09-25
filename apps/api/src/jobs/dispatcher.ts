@@ -81,6 +81,97 @@ const GENERATION_LEAD_DAYS = 5;
 const EXPORT_EXTENSIONS = ['json', 'pdf', 'csv'] as const;
 
 // ---------------------------------------------------------------------------------------------
+// Failure codes and dead-letter successors
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A job failure with a payload-free pipeline code (JOBS-R1-04). The ledger records `code` in
+ * `last_error_code`, so an operator can tell a storage outage from a provider refusal there.
+ */
+export class JobFailure extends Error {
+  constructor(
+    readonly code: string,
+    message: string = code,
+  ) {
+    super(message);
+    this.name = 'JobFailure';
+  }
+}
+
+/** A pipeline code: upper-case letters, digits and underscores (never free text or an id). */
+const PIPELINE_CODE_RE = /^[A-Z][A-Z0-9_]{1,63}$/;
+
+/**
+ * What the ledger stores for a failure (JOBS-R1-04): the error's `code` when it is a pipeline code
+ * (JobFailure, the scan's RetryableFailure/PermanentFailure, provider errors carrying one), else the
+ * class name. Never the message, which may carry provider text.
+ */
+export function ledgerErrorCode(error: unknown): string {
+  if (!(error instanceof Error)) return 'Error';
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' && PIPELINE_CODE_RE.test(code) ? code : error.name;
+}
+
+/**
+ * How long a dead-lettered deletion purge or account closure waits before its successor runs
+ * (JOBS-R1-01): long enough for a storage or auth incident to be over, short enough that a deletion
+ * still completes the same day.
+ */
+export const DEAD_LETTER_SUCCESSOR_DELAY_MS = 6 * 3600_000;
+
+const RETRY_SUFFIX_RE = /:retry(\d+)$/;
+
+/**
+ * Compensation for the jobs that must eventually complete (deletion_purge, account_close;
+ * JOBS-R1-01): a dead letter queues a versioned successor for the same work (idempotency key
+ * `<original key>:retry<n>`, same kind, family, child, payload and attempt budget, due after
+ * DEAD_LETTER_SUCCESSOR_DELAY_MS), logs an error with the code and writes an audit row naming the
+ * job ids and codes only (no user id, request id or storage path). Terminal rows stay immutable
+ * (migration 0600); the successor is a new row. Idempotent: the key is derived from the dead job,
+ * so a repeated compensation inserts nothing.
+ */
+async function queueDeadLetterSuccessor(
+  deps: JobDeps,
+  job: JobRow,
+  reason: DeadLetterReason,
+  code: 'DELETION_PURGE_DEAD_LETTER' | 'ACCOUNT_CLOSE_DEAD_LETTER',
+  shouldRequeue: (tx: Tx, lastErrorCode: string | null) => Promise<boolean>,
+): Promise<void> {
+  const outcome = await deps.db.asService(async (tx) => {
+    const [dead] = await tx<{ idempotency_key: string; last_error_code: string | null }[]>`
+      select idempotency_key, last_error_code from public.jobs
+       where id = ${job.id} and status = 'dead_letter'`;
+    if (!dead) return null;
+    if (!(await shouldRequeue(tx, dead.last_error_code))) return null;
+    const match = RETRY_SUFFIX_RE.exec(dead.idempotency_key);
+    const retry = match ? Number(match[1]) + 1 : 1;
+    const base = match ? dead.idempotency_key.slice(0, match.index) : dead.idempotency_key;
+    const [successor] = await tx<{ id: string }[]>`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, max_attempts, run_after)
+      values (${job.kind}, ${`${base}:retry${retry}`}, ${job.family_id}, ${job.child_id},
+              ${JSON.stringify(job.payload)}::text::jsonb, ${job.max_attempts},
+              ${new Date(deps.clock().getTime() + DEAD_LETTER_SUCCESSOR_DELAY_MS)})
+      on conflict (idempotency_key) do nothing
+      returning id`;
+    if (!successor) return null;
+    await tx`
+      insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+      values (${job.family_id}, 'system', 'job.dead_letter_requeued', 'job', ${job.id},
+              ${JSON.stringify({
+                kind: job.kind,
+                code,
+                reason,
+                attempts: job.attempts,
+                lastErrorCode: dead.last_error_code,
+                successorJobId: successor.id,
+                retry,
+              })}::text::jsonb)`;
+    return successor.id;
+  });
+  if (outcome !== null) deps.log({ level: 'error', event: 'job_dead_letter_requeued', code });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Deletion purge
 // ---------------------------------------------------------------------------------------------
 
@@ -88,9 +179,40 @@ const EXPORT_EXTENSIONS = ['json', 'pdf', 'csv'] as const;
  * Deletion: remove private storage objects first (homework pages and export files), then purge rows
  * and schedule a second storage pass for anything a still-valid signed upload writes afterwards (a
  * retry can never orphan files, and a late upload cannot outlive the deletion).
+ *
+ * A purge never stops for good (JOBS-R1-01): after its bounded retries a dead letter queues a
+ * successor (onDeadLetter below) while the deletion request is still open, so a storage or database
+ * incident delays a deletion by hours, never strands it; the owner's account_close keeps deferring
+ * meanwhile.
  */
-export const deletionPurgeHandler: JobHandler = async (deps, job) => {
-  if (!job.family_id) throw new Error('deletion_purge job without family');
+export const deletionPurgeHandler: JobHandler = Object.assign(
+  (deps: JobDeps, job: JobRow): Promise<void> => runDeletionPurge(deps, job),
+  {
+    onDeadLetter: (deps: JobDeps, job: JobRow, reason: DeadLetterReason): Promise<void> => {
+      if (!job.family_id) return Promise.resolve(); // malformed: no successor could ever succeed
+      const requestId =
+        typeof job.payload.deletionRequestId === 'string' ? job.payload.deletionRequestId : null;
+      return queueDeadLetterSuccessor(
+        deps,
+        job,
+        reason,
+        'DELETION_PURGE_DEAD_LETTER',
+        async (tx) => {
+          // Nothing left to do once the request is no longer open (completed or cancelled).
+          if (requestId === null || !UUID_RE.test(requestId)) return true;
+          const open = await tx`
+            select 1 from public.deletion_requests
+             where id = ${requestId}::uuid and family_id = ${job.family_id}
+               and status in ('requested', 'processing')`;
+          return open.length > 0;
+        },
+      );
+    },
+  },
+);
+
+async function runDeletionPurge(deps: JobDeps, job: JobRow): Promise<void> {
+  if (!job.family_id) throw new JobFailure('INVALID_JOB', 'deletion_purge job without family');
   const familyId = job.family_id;
   const childId =
     job.child_id ?? (typeof job.payload.childId === 'string' ? job.payload.childId : null);
@@ -121,7 +243,13 @@ export const deletionPurgeHandler: JobHandler = async (deps, job) => {
     ...exports.flatMap((e) => (e.storage_path ? [e.storage_path] : [])),
     ...pendingExportPaths,
   ];
-  if (paths.length > 0) await deps.providers.storage.remove(paths);
+  if (paths.length > 0) {
+    try {
+      await deps.providers.storage.remove(paths);
+    } catch {
+      throw new JobFailure('STORAGE_REMOVE_FAILED');
+    }
+  }
   // Pages a still-valid signed URL can write, and pending exports, are removed again after the
   // upload window closes (RV-lead-jobs-ai-20).
   const late = [
@@ -140,7 +268,7 @@ export const deletionPurgeHandler: JobHandler = async (deps, job) => {
       `;
     }
   });
-};
+}
 
 // ---------------------------------------------------------------------------------------------
 // Safety flag email (owner decision, 2026-09-25: the parent is the only safety recipient)
@@ -200,7 +328,7 @@ export const safetyFlagEmailHandler: JobHandler = Object.assign(
       // production (only development and test may use the labeled outbox).
       deps.log({ level: 'error', event: 'safety_flag_email_blocked', code: 'EMAIL_PROVIDER_MOCK' });
       await recordFlagEmailFailed(deps, reportId);
-      throw new Error('EMAIL_PROVIDER_MOCK');
+      throw new JobFailure('EMAIL_PROVIDER_MOCK');
     }
     const recipients = await deps.db.asService(
       (tx) => tx<{ email: string | null; email_verified: boolean }[]>`
@@ -224,7 +352,7 @@ export const safetyFlagEmailHandler: JobHandler = Object.assign(
     if (!origin) {
       deps.log({ level: 'error', event: 'safety_flag_email_blocked', code: 'NO_PORTAL_ORIGIN' });
       await recordFlagEmailFailed(deps, reportId);
-      throw new Error('NO_PORTAL_ORIGIN');
+      throw new JobFailure('NO_PORTAL_ORIGIN');
     }
     const portalUrl = `${origin}/app/privacy`;
     let accepted = 0;
@@ -244,7 +372,7 @@ export const safetyFlagEmailHandler: JobHandler = Object.assign(
         code: 'EMAIL_SEND_FAILED',
       });
       await recordFlagEmailFailed(deps, reportId);
-      throw new Error('EMAIL_SEND_FAILED');
+      throw new JobFailure('EMAIL_SEND_FAILED');
     }
     await deps.db.asService(async (tx) => {
       const stamped = await tx`
@@ -322,14 +450,37 @@ export const ACCOUNT_CLOSE_RECHECK_MS = 5 * 60_000;
  * development and test (L-016): the refusing provider fails the job. Logs and the audit row carry
  * the user id and provider name only.
  */
-export const accountCloseHandler: JobHandler = async (deps, job) => {
+export const accountCloseHandler: JobHandler = Object.assign(
+  (deps: JobDeps, job: JobRow): Promise<void | JobDeferral> => runAccountClose(deps, job),
+  {
+    /**
+     * JOBS-R1-01: an outage of the auth service (or of anything the job reads) never ends a closure
+     * for good: a dead letter queues a successor. Not when the last refusal was FAMILY_ACTIVE (the
+     * user holds a live family again, a rule and not an outage: a fresh request queues a new
+     * closure once that family is deleted), nor for a malformed payload.
+     */
+    onDeadLetter: (deps: JobDeps, job: JobRow, reason: DeadLetterReason): Promise<void> => {
+      const userId = typeof job.payload.userId === 'string' ? job.payload.userId : '';
+      if (!UUID_RE.test(userId)) return Promise.resolve();
+      return queueDeadLetterSuccessor(
+        deps,
+        job,
+        reason,
+        'ACCOUNT_CLOSE_DEAD_LETTER',
+        (_tx, lastErrorCode) => Promise.resolve(lastErrorCode !== 'FAMILY_ACTIVE'),
+      );
+    },
+  },
+);
+
+async function runAccountClose(deps: JobDeps, job: JobRow): Promise<void | JobDeferral> {
   const userId = typeof job.payload.userId === 'string' ? job.payload.userId : '';
-  if (!UUID_RE.test(userId)) throw new Error('account_close job without user');
+  if (!UUID_RE.test(userId)) throw new JobFailure('INVALID_JOB', 'account_close job without user');
   const authAdmin = deps.providers.authAdmin;
-  if (!authAdmin) throw new Error('AUTH_ADMIN_NOT_CONFIGURED');
+  if (!authAdmin) throw new JobFailure('AUTH_ADMIN_NOT_CONFIGURED');
   if (authAdmin.isMock && !MOCK_ENVIRONMENTS.has(deps.config.environment)) {
     deps.log({ level: 'error', event: 'account_close_blocked', code: 'AUTH_ADMIN_MOCK' });
-    throw new Error('AUTH_ADMIN_MOCK');
+    throw new JobFailure('AUTH_ADMIN_MOCK');
   }
   const [state] = await deps.db.asService(
     (tx) => tx<{ closed: boolean; live_family: boolean; purge_pending: boolean }[]>`
@@ -356,7 +507,7 @@ export const accountCloseHandler: JobHandler = async (deps, job) => {
   if (state?.closed) return;
   if (state?.live_family) {
     deps.log({ level: 'error', event: 'account_close_blocked', code: 'FAMILY_ACTIVE' });
-    throw new Error('FAMILY_ACTIVE');
+    throw new JobFailure('FAMILY_ACTIVE');
   }
   if (state?.purge_pending) {
     return {
@@ -365,7 +516,12 @@ export const accountCloseHandler: JobHandler = async (deps, job) => {
       code: 'PURGE_PENDING',
     };
   }
-  const { outcome } = await authAdmin.closeUser(userId);
+  let outcome: string;
+  try {
+    ({ outcome } = await authAdmin.closeUser(userId));
+  } catch {
+    throw new JobFailure('AUTH_ADMIN_CLOSE_FAILED');
+  }
   await deps.db.asService(
     (tx) => tx`
       insert into public.audit_events (actor_kind, action, target_type, target_id, metadata)
@@ -373,7 +529,7 @@ export const accountCloseHandler: JobHandler = async (deps, job) => {
               ${JSON.stringify({ provider: authAdmin.name, outcome })}::text::jsonb)`,
   );
   deps.log({ level: 'info', event: 'account_closed', code: outcome });
-};
+}
 
 export const DEFAULT_HANDLERS: Readonly<Record<string, JobHandler>> = {
   deletion_purge: deletionPurgeHandler,
@@ -394,7 +550,11 @@ export interface TickReport {
   entitlementsReconciled: number;
   inactivity: { notified: number; deleted: number };
   /** Rate-limit buckets and sign-out records cleared in bulk (migration 0720). */
-  identityHousekeeping: { rateLimitBuckets: number; endedAuthSessions: number };
+  identityHousekeeping: {
+    rateLimitBuckets: number;
+    endedAuthSessions: number;
+    endedSessionRows: number;
+  };
   /** Daily, Thursday and top-up jobs queued this tick (0 when learning handlers are not registered). */
   learningJobsEnqueued: number;
   /** Terminal job rows older than JOB_RETENTION_DAYS deleted this tick (BUG-139, migration 0840). */
@@ -541,7 +701,7 @@ async function runOne(
       (tx) => tx`
         update public.jobs set status = ${dead ? 'dead_letter' : 'failed_retryable'}, locked_until = null,
                run_after = ${new Date(deps.clock().getTime() + backoffMs)},
-               last_error_code = ${error instanceof Error ? error.name : 'Error'}
+               last_error_code = ${ledgerErrorCode(error)}
          where id = ${job.id} and status = 'running' and attempts = ${job.attempts}
         returning id
       `,
@@ -1049,7 +1209,7 @@ export async function runScheduledTick(
   });
   const identityHousekeeping = await step(
     'identity_housekeeping',
-    { rateLimitBuckets: 0, endedAuthSessions: 0 },
+    { rateLimitBuckets: 0, endedAuthSessions: 0, endedSessionRows: 0 },
     () => runIdentityHousekeeping(deps.db, now),
   );
   // Learning jobs are queued only where a worker will run them, and before the job ledger so a due

@@ -353,7 +353,9 @@ describe('SchoolAndPromotionsPage — monthly promo codes (spec P17, AC_PROMO_14
           ? quote({ channel: 'stripe' })
           : redemption({ channel: 'stripe', state: 'provider_pending' }),
     });
-    renderPage(<SchoolAndPromotionsPage />, { api });
+    // WEB-R1-06: web billing is hidden while it is disabled; this redemption-safety check runs with
+    // it enabled, the only state in which a web redemption can happen.
+    renderPage(<SchoolAndPromotionsPage webBillingEnabled />, { api });
     await enterCode(CODE, /web billing/);
     const card = await screen.findByRole('region', { name: 'Your code preview' });
     await userEvent.click(within(card).getByRole('button', { name: /Redeem code/ }));
@@ -387,7 +389,9 @@ describe('SchoolAndPromotionsPage — monthly promo codes (spec P17, AC_PROMO_14
           : redemption({ channel: 'stripe' });
       },
     });
-    renderPage(<SchoolAndPromotionsPage />, { api });
+    // WEB-R1-06: web billing is hidden while it is disabled; this redemption-safety check runs with
+    // it enabled, the only state in which a web redemption can happen.
+    renderPage(<SchoolAndPromotionsPage webBillingEnabled />, { api });
     await enterCode(CODE, /web billing/);
     const card = await screen.findByRole('region', { name: 'Your code preview' });
     await userEvent.click(within(card).getByRole('checkbox'));

@@ -4,6 +4,7 @@ import { createApiClient, type ApiClient, ApiRequestError } from '@pencillift/co
 import { unconfiguredAuth, type AuthAdapter, type ParentSession } from './auth.ts';
 import { readWebConfig, type WebConfig } from './config.ts';
 import { Loading, Notice } from '../components/states.tsx';
+import { AuthLinkNotice } from '../components/AuthLinkNotice.tsx';
 
 export interface SessionValue {
   readonly config: WebConfig;
@@ -66,11 +67,18 @@ export function useParentSession(): ParentState {
 
 function SignInPrompt() {
   const location = useLocation();
-  const next = encodeURIComponent(`${location.pathname}${location.search}`);
+  // WEB-R1-01: the fragment is part of the return path. The guardian invitation arrives as
+  // `/app/guardians#accept=<token>`; dropping the hash would lose the invitation at sign-in.
+  // `safeNextPath` keeps the destination same-origin on the way back.
+  const next = encodeURIComponent(`${location.pathname}${location.search}${location.hash}`);
   return (
-    <Notice>
-      Please <Link to={`/sign-in?next=${next}`}>sign in</Link> to see your family.
-    </Notice>
+    <>
+      {/* WEB-R1-07: an email link that could not sign the adult in here says why. */}
+      <AuthLinkNotice requestHref="/sign-in" purpose="sign_in" />
+      <Notice>
+        Please <Link to={`/sign-in?next=${next}`}>sign in</Link> to see your family.
+      </Notice>
+    </>
   );
 }
 

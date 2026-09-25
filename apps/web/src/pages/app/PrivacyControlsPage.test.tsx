@@ -220,9 +220,15 @@ describe('PrivacyControlsPage', () => {
     expect(text).toMatch(/within 30 days/i);
     expect(text).toMatch(/backups expire on a documented schedule/i);
     expect(text).toMatch(/billing records/i);
-    expect(
-      screen.getAllByText(/does not cancel an app store or google play subscription/i),
-    ).not.toHaveLength(0);
+    // WEB-R1-04: the retention notice names every store that can bill a family, including the
+    // Amazon Appstore (the old page-wide pattern matched only "an App Store or Google Play
+    // subscription"), and says to cancel in the store that bills you.
+    expect(text).toMatch(
+      /does not cancel an App Store, Google Play or Amazon Appstore subscription/i,
+    );
+    expect(text).toMatch(
+      /Cancel it in the store that bills you \(App Store, Google Play or Amazon Appstore\)/,
+    );
   });
 
   it('shows loading first, then honest empty states', async () => {
@@ -457,8 +463,12 @@ describe('PrivacyControlsPage', () => {
     ).toBeNull();
     expect(screen.getByRole('button', { name: /delete my account/i })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /request export/i })).toBeNull();
+    // WEB-R1-04: the notice names every store that can bill a family, including the Amazon
+    // Appstore (the old pattern matched only "an App Store or Google Play subscription").
     expect(
-      screen.getAllByText(/does not cancel an app store or google play subscription/i),
+      screen.getAllByText(
+        /does not cancel an App Store, Google Play or Amazon Appstore subscription/i,
+      ),
     ).not.toHaveLength(0);
   });
 

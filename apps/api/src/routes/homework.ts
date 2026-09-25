@@ -11,6 +11,8 @@ import {
   finalizeAssignmentRequestSchema,
   FINALIZED_ASSIGNMENT_STATUSES,
   HOMEWORK_READABLE_MIME_TYPES,
+  HOMEWORK_SCAN_MAX_TOTAL_BYTES,
+  homeworkScanFits,
   overrideResultRequestSchema,
   uploadPagesRequestSchema,
   uuidSchema,
@@ -609,7 +611,7 @@ async function settleParentReview(tx: Tx, caller: Caller, questionId: string): P
 }
 
 /** Validates page numbering and the configured limits before touching the database. */
-function validatePages(pages: readonly UploadPage[], config: HomeworkConfig): void {
+function validatePages(pages: readonly UploadPage[], config: HomeworkConfig, caller: Caller): void {
   const numbers = pages.map((p) => p.pageNumber).sort((a, b) => a - b);
   if (numbers.some((n, i) => n !== i + 1)) {
     throw new ApiError('VALIDATION_FAILED', 'Invalid request: pages must be numbered 1, 2, 3, …');
@@ -639,6 +641,20 @@ function validatePages(pages: readonly UploadPage[], config: HomeworkConfig): vo
   if (pages.some((p) => p.byteSize > limits.maxPageBytes)) {
     const mb = Math.floor(limits.maxPageBytes / (1024 * 1024));
     throw businessRule('PAGE_TOO_LARGE', `Each page must be ${mb} MB or smaller`);
+  }
+  // One scan is one extraction request: its pages together are bounded so the request fits in a
+  // Worker's memory (HOMEWORK_SCAN_MAX_TOTAL_BYTES, JOBS-R1-02). Refused here, before any page is
+  // registered, signed or counted against the allowance.
+  if (!homeworkScanFits(pages.map((p) => p.byteSize))) {
+    const mb = Math.floor(HOMEWORK_SCAN_MAX_TOTAL_BYTES / (1024 * 1024));
+    throw businessRule(
+      'SCAN_TOO_LARGE',
+      say(
+        caller,
+        `These pages add up to more than ${mb} MB, which is more than one scan can hold. Take the photos again at a smaller size, or split the pages into two scans.`,
+        'These pictures are too big to send together. Ask a grown-up to help.',
+      ),
+    );
   }
 }
 
@@ -767,7 +783,7 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
     const { deps } = c.var;
     const id = paramUuid(c, 'id', 'Scan not found');
     const { pages } = await readJson(c, uploadPagesRequestSchema);
-    validatePages(pages, config);
+    validatePages(pages, config, caller);
 
     const registered = await deps.db
       .asService(async (tx) => {

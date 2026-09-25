@@ -180,7 +180,8 @@ describe('SubscriptionPage (spec P11, P14 subscription)', () => {
       '$69.96',
     ]);
     const two = within(prices).getByRole('row', { name: /^2 children/ });
-    // Approved | App Store (differs, stated) | Google Play (exact).
+    // Approved | App Store (differs, stated) | Google Play (exact) | Amazon Appstore (none yet).
+    // WEB-R1-04: the table gained the Amazon Appstore column, so each row has one more cell.
     expect(
       within(two)
         .getAllByRole('cell')
@@ -189,9 +190,10 @@ describe('SubscriptionPage (spec P11, P14 subscription)', () => {
       '$49.98',
       '$49.99 (differs from the approved $49.98, so this plan isn’t sold there)',
       '$49.98',
+      'Not verified yet',
     ]);
     const three = within(prices).getByRole('row', { name: /^3 children/ });
-    expect(within(three).getAllByText('Not verified yet')).toHaveLength(2);
+    expect(within(three).getAllByText('Not verified yet')).toHaveLength(3);
     expect(within(prices).getByText(/no separate family account fee/)).toBeTruthy();
   });
 
@@ -249,16 +251,16 @@ describe('SubscriptionPage (spec P11, P14 subscription)', () => {
     },
   );
 
-  it('offers no purchase on the web, explains the stores, and links to promo codes', async () => {
+  // WEB-R1-06: the page no longer links to promo codes ("Have a monthly promo code? Enter it…"),
+  // because no code can be redeemed from the portal until the in-app offer step ships; that is now
+  // asserted in StoreChannels.test.tsx.
+  it('offers no purchase on the web and explains the stores', async () => {
     const { api } = fakeApi();
     renderPage(<SubscriptionPage />, { api });
     const changing = await screen.findByRole('region', { name: 'Changing your plan' });
     expect(within(changing).getByText(/can’t be bought on the web/)).toBeTruthy();
     expect(within(changing).getByText(/Ask to Buy/)).toBeTruthy();
     expect(within(changing).getByText(/doesn’t cancel a store subscription/)).toBeTruthy();
-    expect(
-      within(changing).getByRole('link', { name: 'School and promotions' }).getAttribute('href'),
-    ).toBe('/app/school');
     expect(
       screen.queryByRole('button', { name: /buy|subscribe|purchase|upgrade|checkout/i }),
     ).toBeNull();

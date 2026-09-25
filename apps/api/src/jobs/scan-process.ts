@@ -1,9 +1,13 @@
 import { z } from 'zod';
-import { DEFAULT_HOMEWORK_UPLOAD_LIMITS } from '@pencillift/contracts';
+import {
+  DEFAULT_HOMEWORK_UPLOAD_LIMITS,
+  HOMEWORK_SCAN_MAX_TOTAL_BYTES,
+} from '@pencillift/contracts';
 import {
   checkChildDataGate,
   dataEnvelope,
-  imagePart,
+  dataUrlBytes,
+  imagePartFromDataUrl,
   MODERATION_TIMEOUT_MS,
   moderationFlagged,
   PROMPTS,
@@ -500,15 +504,6 @@ export function rubricProtectedAnswers(solution: {
   return uniqueAnswers(answers);
 }
 
-function toBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
 /** Screen categories a system report may carry (child text; mirrors migration 0760). */
 const REPORT_CATEGORIES: ReadonlySet<string> = new Set([
   'self_harm',
@@ -610,6 +605,13 @@ export function storageReader(
       return whole;
     }
     const reader = response.body.getReader();
+    // A declared length (of an unencoded body) is read straight into one buffer (JOBS-R1-02: no
+    // second page-sized copy); a body that turns out longer continues in chunks, as without one.
+    let buffer =
+      Number.isFinite(declared) && declared > 0 && !response.headers.get('content-encoding')
+        ? new Uint8Array(declared)
+        : null;
+    let filled = 0;
     const chunks: Uint8Array[] = [];
     let total = 0;
     for (;;) {
@@ -620,8 +622,18 @@ export function storageReader(
         await reader.cancel();
         throw new StoredPageTooLarge();
       }
+      if (buffer !== null && filled + value.length <= buffer.length) {
+        buffer.set(value, filled);
+        filled += value.length;
+        continue;
+      }
+      if (buffer !== null) {
+        chunks.push(buffer.subarray(0, filled));
+        buffer = null;
+      }
       chunks.push(value);
     }
+    if (buffer !== null) return filled === buffer.length ? buffer : buffer.slice(0, filled);
     const bytes = new Uint8Array(total);
     let offset = 0;
     for (const chunk of chunks) {
@@ -632,9 +644,33 @@ export function storageReader(
   };
 }
 
+/**
+ * Strips a page's metadata and makes its image part, letting go of each copy as soon as the next
+ * exists (JOBS-R1-02): the stored bytes once they are stripped, the stripped bytes once their data
+ * URL is encoded. At most two page-sized buffers are alive at any point. Throws ImageFormatError
+ * for content that is not the declared image type.
+ */
+function strippedImagePart(
+  held: { bytes: Uint8Array | null },
+  mimeType: 'image/jpeg' | 'image/png',
+): InputPart {
+  const clean: { bytes: Uint8Array | null } = {
+    bytes: stripImageMetadata(held.bytes ?? new Uint8Array(), mimeType),
+  };
+  held.bytes = null;
+  const url = dataUrlBytes(mimeType, clean.bytes ?? new Uint8Array());
+  clean.bytes = null;
+  return imagePartFromDataUrl(url);
+}
+
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  // A copy backed by a plain ArrayBuffer (digest does not accept shared memory).
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes)));
+  // Digested in place when the bytes sit on a plain ArrayBuffer (JOBS-R1-02: no page-sized copy);
+  // a view of shared memory, which digest does not accept, is copied first.
+  const data: Uint8Array<ArrayBuffer> =
+    bytes.buffer instanceof ArrayBuffer
+      ? (bytes as Uint8Array<ArrayBuffer>)
+      : new Uint8Array(bytes);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
   return Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -1112,6 +1148,12 @@ class ScanRun {
     const code = out.result.error.code;
     if (code === 'CHILD_DATA_GATE') throw new PermanentFailure('AI_NOT_AVAILABLE');
     if (code === 'STAGE_LIMIT' || code === 'UNKNOWN_MODEL') throw new PermanentFailure(code);
+    // The provider refused the request itself (too large, an image it cannot read, a schema it
+    // rejects): the same body would be refused again, so the scan ends now instead of five retries
+    // re-sending it (JOBS-R1-02).
+    if (code === 'PROVIDER_REJECTED') {
+      throw new PermanentFailure(`${prompt.stage.toUpperCase()}_REQUEST_REJECTED`);
+    }
     throw new RetryableFailure(`${prompt.stage.toUpperCase()}_${code}`);
   }
 
@@ -1175,40 +1217,51 @@ class ScanRun {
     if (pages.some((p) => p.mime_type !== 'image/jpeg' && p.mime_type !== 'image/png')) {
       throw new PermanentFailure('FORMAT_NEEDS_CONVERSION');
     }
+    // One request carries every page, so its size is bounded where pages are registered
+    // (HOMEWORK_SCAN_MAX_TOTAL_BYTES, JOBS-R1-02). A scan registered before that bound, or with a
+    // configuration above it, is refused here before any page is read into memory.
+    const totalBytes = pages.reduce((n, p) => n + p.byte_size, 0);
+    if (totalBytes > HOMEWORK_SCAN_MAX_TOTAL_BYTES) {
+      this.deps.log({ level: 'warn', event: 'scan_too_large', code: 'SCAN_TOO_LARGE' });
+      throw new PermanentFailure('SCAN_TOO_LARGE');
+    }
+    // Pages are handled one at a time and each is held once: its stored bytes until they are
+    // checked and stripped, then only its data URL (JOBS-R1-02: no digest copy, no whole-page
+    // binary string, the raw bytes dropped before the next page is read).
     const images: InputPart[] = [];
     for (const page of pages) {
-      let bytes: Uint8Array | null;
+      // The page's bytes live only in this holder, so they can be let go of mid-page.
+      const held: { bytes: Uint8Array | null } = { bytes: null };
       try {
-        bytes = await this.options.readObject(page.storage_path);
+        held.bytes = await this.options.readObject(page.storage_path);
       } catch (error) {
         if (!(error instanceof StoredPageTooLarge))
           throw new RetryableFailure('STORAGE_READ_FAILED');
-        bytes = null;
       }
       // What reaches the AI is exactly what was registered and finalized: the stored size and
       // sha256 must match the registration (a replaced or corrupted object is never sent).
       if (
-        bytes === null ||
-        bytes.length !== page.byte_size ||
-        (await sha256Hex(bytes)) !== page.sha256
+        held.bytes === null ||
+        held.bytes.length !== page.byte_size ||
+        (await sha256Hex(held.bytes)) !== page.sha256
       ) {
         this.deps.log({ level: 'warn', event: 'scan_page_mismatch', code: 'PAGE_MISMATCH' });
         await this.transition('needs_rescan', 'PAGE_MISMATCH');
         await this.settleReservation('unreadable');
         return null;
       }
-      let clean: Uint8Array;
+      let part: InputPart;
       try {
         // Location/camera metadata never leaves our systems (spec P4); content that is not the
         // declared image type is never forwarded "as is".
-        clean = stripImageMetadata(bytes, page.mime_type);
+        part = strippedImagePart(held, page.mime_type as 'image/jpeg' | 'image/png');
       } catch (error) {
         if (!(error instanceof ImageFormatError)) throw error;
         await this.transition('needs_rescan', 'IMAGE_UNREADABLE');
         await this.settleReservation('unreadable');
         return null;
       }
-      images.push(imagePart(page.mime_type as 'image/jpeg' | 'image/png', toBase64(clean)));
+      images.push(part);
     }
 
     const extraction = await this.spending(['extraction'], () =>

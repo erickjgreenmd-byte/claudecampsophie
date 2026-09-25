@@ -64,6 +64,12 @@ Findings, in order of consequence:
    are unknown. The package's partial break-even (34 / 137 / 685 two-child families for $500 / $2,000 /
    $10,000 fixed monthly) stays partial.
 
+Metering of failed attempts (JOBS-R1-03, round 2b): a provider attempt whose usage is unknown (our timeout, a
+network failure or a 5xx answer) is metered at its upper-bound estimate and counts against the stage cap and the
+monthly ceiling, because the provider may still bill it. Recorded spend can therefore run above the provider's bill
+during an outage; it never runs below it. After one timed-out extraction attempt at most one more fits the stage
+cap, so a slow provider fails a scan sooner rather than spending past the cap.
+
 ## 4. What measurement would change the conclusion
 
 | Measurement | Why it matters | How it will be captured |

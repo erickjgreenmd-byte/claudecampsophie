@@ -603,6 +603,41 @@ describe('page uploads (AC_CAPTURE_02)', () => {
     expect(row).toEqual({ status: 'draft', n: 0 });
   });
 
+  it('JOBS-R1-02: pages that add up to more than one scan can carry are refused before anything is registered', async () => {
+    const MiB = 1024 * 1024;
+    // Four 4 MB phone photos: each is under the page limit, together they are not one scan.
+    const id = await created(token, {
+      childId: fam.children[0]!.id,
+      pageCount: 4,
+      idempotencyKey: key(),
+    });
+    const res = await upload(token, id, { pages: pages(4, { byteSize: 4 * MiB }) });
+    expect(res.status).toBe(422);
+    const error = await errorOf(res);
+    expect(error.rule).toBe('SCAN_TOO_LARGE');
+    expect(error.message).toBe(
+      'These pages add up to more than 15 MB, which is more than one scan can hold. Take the photos again at a smaller size, or split the pages into two scans.',
+    );
+    const [row] = await api.db.sql<{ status: string; n: number }[]>`
+      select a.status, (select count(*)::int from public.source_pages p where p.assignment_id = a.id) as n
+        from public.assignments a where a.id = ${id}`;
+    expect(row).toEqual({ status: 'draft', n: 0 });
+    // Exactly at the bound is fine.
+    const ok = await upload(token, id, { pages: pages(4, { byteSize: 3.75 * MiB }) });
+    expect(ok.status).toBe(200);
+  });
+
+  it('JOBS-R1-02: a child hears the same rule in child words', async () => {
+    const id = await created(riley, { pageCount: 2, idempotencyKey: key() });
+    const res = await upload(riley, id, { pages: pages(2, { byteSize: 8 * 1024 * 1024 }) });
+    expect(res.status).toBe(422);
+    const error = await errorOf(res);
+    expect(error.rule).toBe('SCAN_TOO_LARGE');
+    expect(error.message).toBe(
+      'These pictures are too big to send together. Ask a grown-up to help.',
+    );
+  });
+
   it('an interrupted upload resumes with the same pages; different pages are refused', async () => {
     const id = await created(riley, { pageCount: 2, idempotencyKey: key() });
     const p = pages(2);

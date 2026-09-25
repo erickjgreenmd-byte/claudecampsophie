@@ -33,6 +33,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState, Loading, Notice } from '../../components/states.tsx';
+import { STORE_THAT_BILLS_YOU } from '../../components/stores.ts';
 import { RequireParent, useApiQuery, useSession, type QueryState } from '../../lib/session.tsx';
 
 /**
@@ -98,8 +99,9 @@ const EMAIL_STATE_COPY: Record<SafetyFlagEmailStatus, string> = {
   failed: PARENT_SAFETY_FLAG_COPY.emailFailed,
 };
 
+// WEB-R1-04: every store that can bill a family, the Amazon Appstore included.
 const STORE_SUBSCRIPTION_NOTICE =
-  'Deleting your PencilLift account does not cancel an App Store or Google Play subscription.';
+  'Deleting your PencilLift account does not cancel an App Store, Google Play or Amazon Appstore subscription.';
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -421,8 +423,8 @@ function DeletedAccount({ request }: { request: DeletionRequest }) {
       </p>
       <div className="notice">
         <p style={{ margin: 0 }}>
-          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> To stop being charged, cancel it in the App
-          Store or Google Play.
+          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> To stop being charged, cancel it in{' '}
+          {STORE_THAT_BILLS_YOU}.
         </p>
       </div>
     </section>
@@ -452,7 +454,7 @@ function RetentionSection() {
           security log that uses pseudonymous ids only — never homework or answers.
         </li>
         <li>
-          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> Cancel it in the App Store or Google Play.
+          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> Cancel it in {STORE_THAT_BILLS_YOU}.
         </li>
       </ul>
     </Section>
@@ -834,8 +836,8 @@ function DeletionSection({
       </p>
       <div className="notice">
         <p style={{ margin: 0 }}>
-          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> Cancel it in the App Store or Google Play
-          first if you no longer want to be charged.
+          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> Cancel it in {STORE_THAT_BILLS_YOU} first if
+          you no longer want to be charged.
         </p>
       </div>
       <DeleteChildForm family={family} requests={requests} onChanged={onChanged} />

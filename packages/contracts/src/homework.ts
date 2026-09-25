@@ -34,6 +34,34 @@ export const DEFAULT_HOMEWORK_UPLOAD_LIMITS: HomeworkUploadLimits = {
 };
 
 /**
+ * Fixed ceiling on the bytes of all pages of one scan together (JOBS-R1-02): 15 MiB, the size of
+ * the largest single page (so every page that passes its own limit still fits a scan of one). Every
+ * page of a scan goes to the AI provider in ONE extraction request, built in the memory of a
+ * Cloudflare Worker isolate (128 MB; candidate platform figure, the docs could not be fetched).
+ * Measured with the real extraction path (stripImageMetadata, dataUrlBytes, imagePartFromDataUrl,
+ * encodeRequestBody), live memory sampled after every step, 2026-09-25: the request body is 4/3 of
+ * the page bytes and the peak is 2.68 x the scan, 40 MiB for 15 MiB whether it is 1, 4 or 10 pages,
+ * about a third of an isolate and under half of it with the Worker's own heap. The earlier path
+ * peaked at 5.34 x (80 MiB for one 15 MiB page, 200 MB for ten 5 MB pages). Pages the mobile app
+ * sends (longest side 2,000 px, JPEG 0.85) are well under 1 MB each, so ten of them fit easily.
+ * Like HOMEWORK_IMAGE_LIMITS this bounds work on our side rather than expressing product policy, so
+ * it is fixed, not configurable, and not part of the limits response; the apps import it. Page
+ * registration refuses a scan over it with the business rule `SCAN_TOO_LARGE`; the scan job refuses
+ * one registered before the bound as SCAN_TOO_LARGE (failed_final, allowance released).
+ */
+export const HOMEWORK_SCAN_MAX_TOTAL_BYTES = 15 * 1024 * 1024;
+
+/** Whether pages of these sizes fit one scan (HOMEWORK_SCAN_MAX_TOTAL_BYTES). */
+export function homeworkScanFits(byteSizes: readonly number[]): boolean {
+  let total = 0;
+  for (const size of byteSizes) {
+    if (!Number.isSafeInteger(size) || size < 0) return false;
+    total += size;
+  }
+  return total <= HOMEWORK_SCAN_MAX_TOTAL_BYTES;
+}
+
+/**
  * Types the scan job can read today. HEIC and PDF stay in the configured list above (spec P5 names
  * them; the limits endpoint reports them and clients show them as "not available yet") but need the
  * isolated converter, which is not deployed yet. Page registration therefore refuses them with the
@@ -200,6 +228,8 @@ export const HOMEWORK_BUSINESS_RULES = [
   'QUOTA_EXCEEDED',
   'TOO_MANY_PAGES',
   'PAGE_TOO_LARGE',
+  /** All pages together exceed HOMEWORK_SCAN_MAX_TOTAL_BYTES (one extraction request, JOBS-R1-02). */
+  'SCAN_TOO_LARGE',
   'UNSUPPORTED_FILE_TYPE',
   /** HEIC/PDF: configured as allowed, but unreadable until the converter ships (see above). */
   'FORMAT_NOT_SUPPORTED_YET',

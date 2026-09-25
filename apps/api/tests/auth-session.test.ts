@@ -274,6 +274,31 @@ describe('identity housekeeping for the scheduled tick', () => {
     expect(ended.map((e) => e.session_id)).toEqual(['5e551011-0000-4000-8000-0000000000b2']);
   });
 
+  it('prunes child sessions that ended over 30 days ago with their tokens, never a live one (DB-R1-07)', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const childId = fam.children[0]!.id;
+    const deviceId = fam.children[0]!.deviceId;
+    const session = async (endedDaysAgo: number | null): Promise<string> => {
+      const [row] = await api.db.sql<{ id: string }[]>`
+        insert into public.child_sessions (family_id, child_id, device_id, expires_at, revoked_at, revoke_reason)
+        values (${fam.familyId}, ${childId}, ${deviceId},
+                now() + interval '30 days',
+                ${endedDaysAgo === null ? null : api.db.sql`now() - make_interval(days => ${endedDaysAgo})`},
+                ${endedDaysAgo === null ? null : 'test'})
+        returning id`;
+      return row!.id;
+    };
+    const live = await session(null);
+    const recent = await session(5);
+    const old = await session(45);
+    const result = await runIdentityHousekeeping(api.apiDb, new Date('2027-06-01T00:00:00Z'));
+    expect(result.endedSessionRows).toBeGreaterThanOrEqual(1);
+    const left = await api.db.sql<{ id: string }[]>`
+      select id from public.child_sessions where id = any(${[live, recent, old]}::uuid[])`;
+    // The tick clock (far ahead) does not matter: rows are aged by the database clock.
+    expect(new Set(left.map((r) => r.id))).toEqual(new Set([live, recent]));
+  });
+
   it('a tick clock far ahead of the database never purges a fresh sign-out record', async () => {
     const fam = await seedFamily(api.db);
     const KEPT = '5e551011-0000-4000-8000-0000000000c1';

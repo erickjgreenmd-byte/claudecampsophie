@@ -1,5 +1,6 @@
 import { Link } from 'react-router';
 import { Logo } from '../../components/Logo.tsx';
+import { isStoreLive } from '../../lib/config.ts';
 import { cardGrid, CtaLink, ctaRow, lead, PageTitle, Section, SubjectList } from './common.tsx';
 
 /** What PencilLift does (spec P1). Each claim describes implemented or specified behaviour only. */
@@ -86,15 +87,18 @@ export default function LandingPage() {
         </p>
       </Section>
 
-      <Section title="Where PencilLift is today">
-        <div className="notice">
-          <p style={{ margin: 0 }}>
-            PencilLift is still being built. The app is not yet available to download, and plans are
-            not yet available for purchase. Questions? Visit our{' '}
-            <Link to="/support">support page</Link>.
-          </p>
-        </div>
-      </Section>
+      {/* WEB-R1-11: pre-launch only; the store review build sets VITE_STORE_LIVE=true. */}
+      {isStoreLive() ? null : (
+        <Section title="Where PencilLift is today">
+          <div className="notice">
+            <p style={{ margin: 0 }}>
+              PencilLift is still being built. The app is not yet available to download, and plans
+              are not yet available for purchase. Questions? Visit our{' '}
+              <Link to="/support">support page</Link>.
+            </p>
+          </div>
+        </Section>
+      )}
     </>
   );
 }

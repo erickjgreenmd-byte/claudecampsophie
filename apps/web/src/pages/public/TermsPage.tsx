@@ -1,5 +1,6 @@
 import { Link } from 'react-router';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
+import { isStoreLive } from '../../lib/config.ts';
 import {
   DraftOnly,
   lead,
@@ -54,7 +55,10 @@ export default function TermsPage() {
         <ul>
           <li>
             Current regular prices are on the <Link to="/pricing">pricing page</Link>.
-            <DraftOnly> Plans are not yet available for purchase.</DraftOnly>
+            {/* WEB-R1-11: never shown once the stores are live (VITE_STORE_LIVE=true). */}
+            {isStoreLive() ? null : (
+              <DraftOnly> Plans are not yet available for purchase.</DraftOnly>
+            )}
           </li>
           <li>
             Subscriptions are sold and billed by {PAYMENT_STORES}. The store shows the exact amount,

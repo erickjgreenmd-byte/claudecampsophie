@@ -154,6 +154,11 @@ database check is wider so widening later needs no data rewrite, but the portal'
 select count(*) from public.child_profiles where grade_level > 8 or age_band = '14-18';  -- must be 0
 ```
 
+Migration 0850 binds every subject link to its child (DB-R1-05) and refuses to apply if a row already links a
+subject of another child; only a hand-crafted Data-API request could have made one. If it stops, the error names
+the counts per table: review each row with its family (clear the subject or move it to the subject's child) and
+re-run the migration.
+
 ### 3.2 Secret scanning (AC_SECURITY_04)
 
 - **Tracked files**: `node scripts/scan-secrets.mjs` (CI) and `--staged` (pre-commit gate, `scripts/verify.sh`).
@@ -316,6 +321,7 @@ Build variables (all public; Vite inlines them into the bundle, so scan the buil
 | `VITE_LEGAL_REVIEWED` | Optional | Exactly `true` once the owner and legal counsel have signed off the public legal pages (Owner action #15). Any other value keeps the "Draft for review" banner and the "to be confirmed" notes |
 | `VITE_LEGAL_EFFECTIVE_DATE` | With `VITE_LEGAL_REVIEWED=true` | Effective date of the privacy policy and terms, `YYYY-MM-DD`; shown as "Effective date: October 1, 2026" |
 | `VITE_SUPPORT_EMAIL` | With `VITE_LEGAL_REVIEWED=true` | The monitored support mailbox; rendered as a `mailto:` link on the privacy, terms, support, contact and deletion pages. Until then the pages show the placeholder `support@pencillift.com (to be confirmed)` as plain text |
+| `VITE_STORE_LIVE` | Optional | Exactly `true` for the store review build and every later production build: hides the public pre-launch notices on `/`, `/pricing` and `/terms` (WEB-R1-11). Any other value keeps them |
 
 Gates (`apps/web/src/lib/config.ts`, tested by `config.test.ts` and `pages/public/legal.test.tsx`): the module
 checks the environment once at startup, before any page renders. A production build (`import.meta.env.PROD`)
@@ -353,6 +359,14 @@ Job ledger retention (BUG-139, migration 0840): the tick's `job_retention` step 
 touched. A longer horizon needs only the interval changed in `runScheduledTick`.
 
 Dead letters: `select id, kind, attempts, last_error_code, updated_at from public.jobs where status = 'dead_letter'`.
+`last_error_code` holds the pipeline code (for example `STORAGE_REMOVE_FAILED`, `AUTH_ADMIN_CLOSE_FAILED`,
+`FAMILY_ACTIVE`, `EXTRACTION_PROVIDER_FAILED`, `EMAIL_SEND_FAILED`, `SCAN_TOO_LARGE`, `<STAGE>_REQUEST_REJECTED`),
+never free text (JOBS-R1-04). A dead-lettered `deletion_purge` or `account_close` re-queues itself as
+`<key>:retry<n>` six hours later (JOBS-R1-01), writes the audit action `job.dead_letter_requeued` and logs
+`DELETION_PURGE_DEAD_LETTER` / `ACCOUNT_CLOSE_DEAD_LETTER` at error level: alert on those two codes, because a
+configuration fault (for example the Auth Admin adapter missing in production) re-queues every six hours until it
+is fixed. Child sessions, their refresh tokens and adult step-ups that ended more than 30 days ago are deleted by
+the tick's identity housekeeping (`app.prune_session_rows`, migration 0850).
 Error codes are payload-free (exception class names or pipeline codes such as `EXTRACTION_PROVIDER_FAILED`).
 To retry after fixing the cause, insert a **new** job with a new idempotency key version (e.g. `scan:<id>:v3`);
 terminal job rows are immutable by trigger. Scans that exhausted retries are already `failed_final` with their

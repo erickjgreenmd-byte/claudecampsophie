@@ -173,7 +173,8 @@ describe('p17-ui review probes (passing): redemption safety', () => {
               release = () => resolve(pendingRedemption);
             }),
     });
-    renderPage(<SchoolAndPromotionsPage />, { api });
+    // WEB-R1-06: web billing is hidden while disabled; this probe runs with it enabled.
+    renderPage(<SchoolAndPromotionsPage webBillingEnabled />, { api });
     const input = await screen.findByLabelText(/^Promo code$/i);
     await userEvent.type(input, CODE);
     await userEvent.click(screen.getByRole('radio', { name: /web billing/ }));
@@ -194,7 +195,8 @@ describe('p17-ui review probes (passing): redemption safety', () => {
           ? stripeQuote
           : new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN to continue', 403),
     });
-    renderPage(<SchoolAndPromotionsPage />, { api });
+    // WEB-R1-06: web billing is hidden while disabled; this probe runs with it enabled.
+    renderPage(<SchoolAndPromotionsPage webBillingEnabled />, { api });
     await userEvent.type(await screen.findByLabelText(/^Promo code$/i), CODE);
     await userEvent.click(screen.getByRole('radio', { name: /web billing/ }));
     await userEvent.click(screen.getByRole('button', { name: /Check code/i }));

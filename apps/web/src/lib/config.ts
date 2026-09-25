@@ -78,6 +78,19 @@ export function isLegalReviewed(env: WebEnv = import.meta.env): boolean {
   return env.VITE_LEGAL_REVIEWED === 'true';
 }
 
+/**
+ * WEB-R1-11: true only when the build is made for store review or later, when the apps can be
+ * downloaded and plans bought (`VITE_STORE_LIVE=true`). It switches off the public site's
+ * pre-launch notices ("still being built", "not yet available"); it adds no startup gate.
+ *
+ * Decision: only the exact string "true" counts, as for VITE_LEGAL_REVIEWED. Anything else keeps the
+ * pre-launch notices, because claiming availability too early is the worse error. The store review
+ * build must set it (docs/Release_Readiness.md).
+ */
+export function isStoreLive(env: WebEnv = import.meta.env): boolean {
+  return env.VITE_STORE_LIVE === 'true';
+}
+
 export interface LegalConfig {
   readonly reviewed: boolean;
   /** ISO calendar date (YYYY-MM-DD) the policy and terms take effect; null while a draft. */

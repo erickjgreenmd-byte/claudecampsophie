@@ -27,7 +27,8 @@ import {
  * management"; AC_ACCESS_04, AC_CAPACITY_03). Adding a child creates an uncharged draft. A draft
  * becomes active when one of the family's unused paid slots is assigned to it (no new purchase);
  * only active children can be paired with a device. Pairing codes are shown once. This page never
- * sells capacity: new paid slots are bought in the PencilLift app from the App Store/Google Play.
+ * sells capacity: new paid slots are bought in the PencilLift app from the App Store, Google Play or
+ * the Amazon Appstore (WEB-R1-04).
  */
 export default function ChildrenPage() {
   return (
@@ -102,8 +103,8 @@ function ChildrenContent({ data, onChanged }: { data: FamilyOverview; onChanged:
         <p>
           New children start as <strong>draft</strong> profiles. A draft costs nothing and can’t be
           used on a device. Activating a draft assigns one of your unused paid slots to it, with no
-          new purchase. New paid slots are bought in the PencilLift app through the App Store or
-          Google Play; this portal never charges you. See your{' '}
+          new purchase. New paid slots are bought in the PencilLift app through the App Store,
+          Google Play or the Amazon Appstore; this portal never charges you. See your{' '}
           <Link to="/app/subscription">subscription</Link> for the plan and managing store.
         </p>
       </section>

@@ -310,7 +310,7 @@ function PolicyForm() {
             </label>
           </div>
           <div style={buttonRow}>
-            <button type="submit" className="primary" disabled={busy !== null}>
+            <button type="submit" className="btn" disabled={busy !== null}>
               {busy === 'save-policy' ? 'Saving…' : 'Save policy'}
             </button>
           </div>

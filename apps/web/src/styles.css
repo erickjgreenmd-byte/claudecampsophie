@@ -40,12 +40,14 @@ a {
   margin: 0 auto;
   padding: 16px;
 }
+/* WEB-R1-03: 16px bold white text is not WCAG large text, so the fill is the darker --teal-text
+   (5.95:1, as the public CtaLink); --teal (4.07:1) stays for focus rings and non-text accents. */
 .btn {
   min-height: 44px;
   padding: 10px 18px;
   border-radius: 999px;
-  border: 2px solid var(--teal);
-  background: var(--teal);
+  border: 2px solid var(--teal-text);
+  background: var(--teal-text);
   color: var(--white);
   font-weight: 800;
   cursor: pointer;
@@ -94,6 +96,12 @@ select {
   border: 1px solid var(--muted);
   width: 100%;
   max-width: 420px;
+}
+/* WEB-R1-10: checkboxes and radios keep their natural size (the rule above is for text inputs). */
+input[type='checkbox'],
+input[type='radio'] {
+  width: auto;
+  min-height: 24px;
 }
 @media (prefers-reduced-motion: reduce) {
   * {

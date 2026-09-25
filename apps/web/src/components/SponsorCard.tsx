@@ -345,7 +345,6 @@ export function SponsorCard({
                 type="radio"
                 name={`${ids}-category`}
                 value={option.value}
-                style={{ width: 'auto', minHeight: 24 }}
                 checked={category === option.value}
                 onChange={() => setCategory(option.value)}
               />

@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { safeNextPath } from '../../lib/auth.ts';
-import { useSession } from '../../lib/session.tsx';
+import { useParentSession, useSession } from '../../lib/session.tsx';
+import { AuthLinkNotice } from '../../components/AuthLinkNotice.tsx';
 import { Notice } from '../../components/states.tsx';
 import { AccountForm, EMAIL_RE, Field } from './forms.tsx';
 import { SignInNotConfigured } from './NotConfigured.tsx';
@@ -9,6 +10,7 @@ import { SignInNotConfigured } from './NotConfigured.tsx';
 /** Parent sign-in (spec P3). Children never sign in here; they use a paired device. */
 export default function SignInPage() {
   const { auth } = useSession();
+  const parent = useParentSession();
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const next = safeNextPath(params.get('next'));
@@ -20,6 +22,10 @@ export default function SignInPage() {
 
   return (
     <>
+      {/* WEB-R1-07: a failed email link (other browser, expired) is explained, not ignored. */}
+      {parent.status === 'signed_out' ? (
+        <AuthLinkNotice requestHref="/sign-in" purpose="sign_in" />
+      ) : null}
       <AccountForm
         title="Parent sign in"
         submitLabel={mode === 'password' ? 'Sign in' : 'Email me a sign-in link'}
@@ -72,7 +78,7 @@ export default function SignInPage() {
       </p>
       <p>
         <Link to="/reset-password">Forgot your password?</Link> ·{' '}
-        <Link to="/sign-up">Create a parent account</Link>
+        <Link to={`/sign-up?next=${encodeURIComponent(next)}`}>Create a parent account</Link>
       </p>
     </>
   );

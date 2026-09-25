@@ -13,6 +13,12 @@ import {
 import type { ApiRequestError } from '@pencillift/contracts/client';
 import { DEFAULT_MAX_PAID_SLOTS, formatUsd, priceTable } from '@pencillift/domain';
 import { ErrorState, Loading } from '../../components/states.tsx';
+import {
+  billingChannels,
+  STORE_NAME,
+  STORE_OPTION_LABEL,
+  WEB_BILLING_ENABLED,
+} from '../../components/stores.ts';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 import { buttonRow, sectionStyle, StepUpNotice, toApiError, useLastGood } from './SecurityPage.tsx';
 
@@ -21,18 +27,27 @@ import { buttonRow, sectionStyle, StepUpNotice, toApiError, useLastGood } from '
  * AC_UX_01/02). One school per family; a change starts next program month. Every monthly code is
  * entered fresh, covers exactly one billing period, and is shown as a preview until the store
  * confirms it. The page shows what the API returns and never computes prices itself.
+ *
+ * WEB-R1-06: until the in-app offer step ships, codes can only be previewed here, and the page says
+ * so up front. `webBillingEnabled` defaults to the portal's web-billing switch (off), so "PencilLift
+ * web billing" is not offered while the API would refuse it; tests pass `true` to exercise the web
+ * redemption path that exists for when the owner enables it.
  */
-export default function SchoolAndPromotionsPage() {
+export default function SchoolAndPromotionsPage({
+  webBillingEnabled = WEB_BILLING_ENABLED,
+}: {
+  webBillingEnabled?: boolean;
+}) {
   return (
     <RequireParent>
       <h1>School and promotions</h1>
       <p>
-        Choose the school your family supports and use this month’s PencilLift promo code, if you
-        have one. Codes and school settings are for grown-ups only.
+        Choose the school your family supports and preview this month’s PencilLift promo code, if
+        you have one. Codes and school settings are for grown-ups only.
       </p>
       <SchoolSection />
       <ContributionExplainer />
-      <PromoSection />
+      <PromoSection webBillingEnabled={webBillingEnabled} />
     </RequireParent>
   );
 }
@@ -474,30 +489,26 @@ function ContributionExplainer() {
 // Promo codes
 // ---------------------------------------------------------------------------------------------
 
-const CHANNEL_NAME: Record<Channel, string> = {
-  app_store: 'App Store',
-  play_store: 'Google Play',
-  stripe: 'Web billing',
-  amazon_appstore: 'Amazon Appstore',
-};
-
-const CHANNEL_OPTIONS: readonly { value: Channel; label: string }[] = [
-  { value: 'app_store', label: 'App Store (iPhone or iPad)' },
-  { value: 'play_store', label: 'Google Play (Android)' },
-  { value: 'stripe', label: 'PencilLift web billing' },
-];
+/** WEB-R1-04: every store a family can be billed by (from channelSchema), Amazon included. */
+function channelOptions(webBillingEnabled: boolean): readonly { value: Channel; label: string }[] {
+  return billingChannels(webBillingEnabled).map((value) => ({
+    value,
+    label: STORE_OPTION_LABEL[value],
+  }));
+}
 
 function newIdempotencyKey(): string {
   return crypto.randomUUID();
 }
 
 /**
- * Decision: App Store and Google Play offers can only be applied through the store's own offer
- * sheet inside the PencilLift app (RevenueCat/StoreKit/Play Billing), and that in-app step does not
- * exist yet. Reserving a native-channel code here would create a reservation nothing can complete
- * (it would hold a cap slot and block the family's next code), so native codes are previewed but
- * not reserved until the in-app step ships. Web billing (Stripe) redemption stays available; the
- * API reports CHANNEL_UNAVAILABLE while web billing is disabled.
+ * Decision: App Store, Google Play and Amazon Appstore offers can only be applied through the
+ * store's own offer sheet inside the PencilLift app (RevenueCat/StoreKit/Play Billing/Amazon IAP),
+ * and that in-app step does not exist yet. Reserving a native-channel code here would create a
+ * reservation nothing can complete (it would hold a cap slot and block the family's next code), so
+ * native codes are previewed but not reserved until the in-app step ships. Web billing (Stripe)
+ * redemption is offered only while web billing is enabled (WEB_BILLING_ENABLED; the API reports
+ * CHANNEL_UNAVAILABLE while it is disabled), so the page never offers a path that ends there.
  */
 const NATIVE_STORE_STEP_AVAILABLE = false;
 
@@ -511,7 +522,7 @@ interface QuoteRequest {
   paidSlots?: number;
 }
 
-function PromoSection() {
+function PromoSection({ webBillingEnabled }: { webBillingEnabled: boolean }) {
   const headingId = useId();
   const [historyVersion, setHistoryVersion] = useState(0);
   const refreshHistory = useCallback(() => setHistoryVersion((v) => v + 1), []);
@@ -524,14 +535,29 @@ function PromoSection() {
           only. Enter a new code each month for another discounted month — codes never carry
           forward, and without a new code your next renewal is your regular price.
         </p>
-        <CodeEntry onRedeemed={refreshHistory} />
+        {!NATIVE_STORE_STEP_AVAILABLE && !webBillingEnabled ? (
+          <div className="notice" role="note">
+            <p style={{ margin: 0 }}>
+              <strong>Codes are previewed here.</strong> A code is used in the PencilLift app, where
+              your store confirms the offer. That in-app step isn’t available yet, so no code can be
+              used right now and your next renewal stays at your regular price.
+            </p>
+          </div>
+        ) : null}
+        <CodeEntry onRedeemed={refreshHistory} webBillingEnabled={webBillingEnabled} />
       </section>
       <HistorySection version={historyVersion} />
     </>
   );
 }
 
-function CodeEntry({ onRedeemed }: { onRedeemed: () => void }) {
+function CodeEntry({
+  onRedeemed,
+  webBillingEnabled,
+}: {
+  onRedeemed: () => void;
+  webBillingEnabled: boolean;
+}) {
   const { api } = useSession();
   const codeId = useId();
   const slotsId = useId();
@@ -606,14 +632,13 @@ function CodeEntry({ onRedeemed }: { onRedeemed: () => void }) {
         />
         <fieldset style={{ border: 0, padding: 0, margin: '12px 0 0' }}>
           <legend style={{ fontWeight: 700 }}>Where is your subscription billed?</legend>
-          {CHANNEL_OPTIONS.map((option) => (
+          {channelOptions(webBillingEnabled).map((option) => (
             <label key={option.value} style={{ fontWeight: 400, display: 'flex', gap: 8 }}>
               <input
                 type="radio"
                 name="promo-channel"
                 value={option.value}
                 checked={channel === option.value}
-                style={{ width: 'auto', minHeight: 24 }}
                 onChange={() => {
                   setChannel(option.value);
                   setFieldError(null);
@@ -777,7 +802,6 @@ function QuotePreview({
               id={ackId}
               type="checkbox"
               checked={acknowledged}
-              style={{ width: 'auto', minHeight: 24 }}
               aria-describedby={ackError ? ackErrorId : undefined}
               onChange={(e) => {
                 setAcknowledged(e.target.checked);
@@ -805,7 +829,7 @@ function QuotePreview({
       ) : (
         <div className="notice" role="status">
           <p style={{ margin: 0 }}>
-            <strong>Not available yet.</strong> {CHANNEL_NAME[request.channel]} codes are redeemed
+            <strong>Not available yet.</strong> {STORE_NAME[request.channel]} codes are redeemed
             inside the PencilLift app, where your store confirms the offer. That in-app store step
             isn’t available yet. No code has been used, and your next renewal stays at the regular
             price.

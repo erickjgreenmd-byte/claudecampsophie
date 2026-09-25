@@ -26,7 +26,8 @@ const questions: { question: string; answer: string }[] = [
   {
     question: 'I forgot my parent PIN.',
     answer:
-      'For your child’s safety, a parent PIN is reset only after we verify you are the parent on the account. Contact support from the email address on your parent account.',
+      // WEB-R1-08: the portal has a verified self-serve reset (/app/security/reset-pin).
+      'Sign in to the parent portal, open Security, choose Reset your parent PIN and confirm your account password. That check keeps the reset with the parent on the account. Contact support only if you can’t sign in.',
   },
   {
     question: 'How do I change or cancel my subscription?',

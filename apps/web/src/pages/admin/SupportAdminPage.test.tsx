@@ -516,3 +516,14 @@ describe('Case detail', () => {
     expect(screen.getByText(/refunds the charge in the Stripe dashboard/)).toBeTruthy();
   });
 });
+
+describe('Support policy form styling (WEB-R1-09)', () => {
+  it('the “Save policy” button uses the portal button class like every other submit', async () => {
+    const { api } = fakeApi();
+    render(api);
+    const save = await screen.findByRole('button', { name: 'Save policy' });
+    // `className="primary"` had no CSS rule, so the button rendered unstyled (no 44px target).
+    expect(save.className.split(/\s+/)).toContain('btn');
+    expect(save.className.split(/\s+/)).not.toContain('primary');
+  });
+});
