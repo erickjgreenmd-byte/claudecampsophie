@@ -4,6 +4,7 @@ import { SAFETY_TEMPLATES_APPROVED, SAFETY_TEMPLATES_STATUS } from '@pencillift/
 import type { Db } from './db.ts';
 import { MIN_STORAGE_SERVICE_KEY_LENGTH, storageUrlProblem } from './providers/supabase-storage.ts';
 import { EMAIL_TEMPLATES_STATUS } from './providers/index.ts';
+import { emailFromProblem, resendKeyProblem } from './providers/email-resend.ts';
 
 /**
  * Runtime configuration. Only names appear in source; values come from Worker secrets/vars.
@@ -73,8 +74,12 @@ export interface ApiConfig {
      */
     readonly moderation: 'development_mock' | 'unavailable' | 'openai';
     readonly storage: 'development_mock' | 'supabase';
-    /** No transactional email adapter exists yet; invitations go to a development outbox. */
-    readonly email: 'development_mock';
+    /**
+     * Transactional email, selected like billing: the labeled outbox mock only in development/test,
+     * `unavailable` (every send refused, never a silent mock) in staging/production without
+     * RESEND_API_KEY, `resend` with the key and EMAIL_FROM (docs/Owner_Actions.md #14).
+     */
+    readonly email: 'development_mock' | 'unavailable' | 'resend';
   };
   readonly flags: {
     /** Optional adult web billing (spec P11) — disabled until the owner decides launch policy. */
@@ -180,6 +185,15 @@ export function loadConfig(
     });
   }
 
+  // An email value the adapter would refuse is a configuration error here too (LRD-4): a Resend key
+  // needs a sender on a verified domain; without the key, EMAIL_FROM is ignored.
+  if (env.RESEND_API_KEY) {
+    const keyProblem = resendKeyProblem(env.RESEND_API_KEY);
+    if (keyProblem) errors.push({ name: 'RESEND_API_KEY', problem: keyProblem });
+    const fromProblem = emailFromProblem(env.EMAIL_FROM ?? '');
+    if (fromProblem) errors.push({ name: 'EMAIL_FROM', problem: fromProblem });
+  }
+
   const zdrEvidence =
     env.ZDR_APPROVAL_EVIDENCE_REFERENCE && env.ZDR_APPROVAL_VERIFIED_AT
       ? { reference: env.ZDR_APPROVAL_EVIDENCE_REFERENCE, verifiedAt: env.ZDR_APPROVAL_VERIFIED_AT }
@@ -204,7 +218,7 @@ export function loadConfig(
       ai: env.OPENAI_API_KEY ? 'openai' : 'development_mock',
       moderation: env.OPENAI_API_KEY ? 'openai' : mockOrUnavailable(environment),
       storage: env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY ? 'supabase' : 'development_mock',
-      email: 'development_mock',
+      email: env.RESEND_API_KEY ? 'resend' : mockOrUnavailable(environment),
     },
     flags: {
       stripeWebBillingEnabled: env.OPTIONAL_STRIPE_WEB_BILLING_ENABLED === 'true',
@@ -399,8 +413,8 @@ export function productionReadiness(
     ),
     item(
       'email_provider',
-      false,
-      'Transactional email adapter not implemented; outside development/test invitations and notices cannot be sent',
+      config.providers.email === 'resend',
+      `Transactional email (${config.providers.email}): guardian invitations, safety flags and notices need RESEND_API_KEY and EMAIL_FROM on a domain verified in Resend; without them every send is refused outside development/test`,
     ),
     item(
       'safety_templates',

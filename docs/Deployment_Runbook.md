@@ -41,6 +41,7 @@ Worker **secrets** (`wrangler secret put <NAME> --env <env>`):
 | `REVENUECAT_WEBHOOK_AUTH` | Exact `Authorization` header value configured on the RevenueCat webhook |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Optional web billing (only with `OPTIONAL_STRIPE_WEB_BILLING_ENABLED=true`) |
 | `OPENAI_API_KEY`, `OPENAI_PROJECT` | Server-only AI; without a key scans stay queued and readiness reports AI blocked |
+| `RESEND_API_KEY` (secret), `EMAIL_FROM` (var) | Transactional email through Resend (Owner action #14): the sender must be on a domain verified in Resend (DNS records at GoDaddy); a malformed key or sender is a configuration error (503 NOT_CONFIGURED); without the key staging/production refuse every send and readiness reports `email_provider` blocked |
 | `ZDR_APPROVAL_EVIDENCE_REFERENCE`, `ZDR_APPROVAL_VERIFIED_AT` | Documented zero-data-retention approval (a boolean is rejected) |
 | `CONSENT_PROVIDER` | Reserved for the consent adapter the owner selects (owner action #7). No adapter exists yet: leave unset — an unknown value fails configuration on purpose |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Private homework storage adapter (`providers/supabase-storage.ts`) |
@@ -108,6 +109,7 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 | Check | Ready when | Enforced beyond the report |
 |---|---|---|
 | `billing_provider` | `REVENUECAT_SECRET_API_KEY` is set | Staging/production without it get an unavailable client (`selectBillingProviders`, `apps/api/src/index.ts`): RevenueCat webhooks answer 503 and are retried later, `POST /v1/billing/sync` reports the store as unreachable, the stale-entitlement sweep skips the family. Nothing is granted or revoked from an empty mock state. |
+| `email_provider` | `RESEND_API_KEY` and `EMAIL_FROM` are set | Staging/production without them get a provider that refuses every send (`selectStorageAndEmail`): guardian invitations answer PROVIDER_UNAVAILABLE, the safety flag email job records `failed` and dead-letters after its retries (the parent list says the email could not be sent), inactivity notices are not sent and the family is not marked notified. |
 | `web_billing_provider` | Optional web billing is off, or `STRIPE_SECRET_KEY` is set | Same rule for the Stripe client |
 | `catalog_data` | No live fixture or fake catalog rows (`app.fake_catalog_rows()`, migration 0770); the detail gives counts per catalog | A database marked production refuses them (below) |
 | `database_environment` | This database is marked `production` | The mark activates the fixture guard (fake rows are refused on write and the mark is refused while any exist). A production Worker also leaves fake resources and campaigns out of what it serves (`withoutFakes`), but launch only once this check is `ready` |

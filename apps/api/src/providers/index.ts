@@ -86,8 +86,9 @@ export type EmailTemplateKey = (typeof EMAIL_TEMPLATE_KEYS)[number];
 export const EMAIL_TEMPLATES_STATUS = 'draft_pending_owner_and_educator_approval' as const;
 
 /**
- * The outbox mock's template table: subject and body for the templates whose copy is written in
- * this repository. DRAFTS: the owner and an educator must approve this wording before launch, like
+ * The template table every adapter renders from (the outbox mock and Resend): subject and body for
+ * the templates whose copy is written in this repository; a key without copy (`deletion_received`,
+ * `export_ready`, unused today) is refused by the real adapter. DRAFTS: the owner and an educator must approve this wording before launch, like
  * the child safety templates (packages/domain safety/templates.ts). A real adapter (docs/Owner_Actions.md
  * #14) renders the same copy from the same key.
  *
@@ -104,6 +105,36 @@ export const EMAIL_TEMPLATES: Readonly<
     >
   >
 > = {
+  guardian_invitation: {
+    subject: 'You’re invited to a PencilLift family account',
+    body: (params) =>
+      [
+        'Hello,',
+        '',
+        `A parent has invited you to help manage the PencilLift family account “${params.familyName ?? 'their family'}”.`,
+        'Guardians can see homework results and settings for the children in the family; the child area itself never needs an email address.',
+        '',
+        `Accept the invitation here: ${params.acceptUrl ?? ''}`,
+        `This link expires at ${params.expiresAt ?? 'the time shown in the portal'} and works once.`,
+        '',
+        'If you were not expecting this, ignore this email; nothing is shared until the invitation is accepted.',
+        '— PencilLift',
+      ].join('\n'),
+  },
+  inactivity_notice: {
+    subject: 'Your PencilLift family account has been inactive',
+    body: (params) =>
+      [
+        'Hello,',
+        '',
+        `Nobody has used your PencilLift family account for a while. Unless someone signs in within the next ${params.days ?? '30'} days, the account and its children’s data will be deleted, as our privacy policy describes.`,
+        '',
+        'To keep the account, sign in to the PencilLift parent portal or open the app. To delete it now, use Privacy, export and deletion in the portal.',
+        '',
+        'This email names no child and quotes no homework.',
+        '— PencilLift',
+      ].join('\n'),
+  },
   safety_flag: {
     subject: 'PencilLift flagged an answer for you to look at',
     body: (params) =>

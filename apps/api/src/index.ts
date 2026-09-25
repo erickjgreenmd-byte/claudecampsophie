@@ -18,6 +18,7 @@ import { createScanProcessHandler, storageReader } from './jobs/scan-process.ts'
 import type { AppDeps } from './middleware/context.ts';
 import { createDbRateLimiter } from './middleware/rate-limit.ts';
 import { createSupabaseStorage } from './providers/supabase-storage.ts';
+import { createResendEmail } from './providers/email-resend.ts';
 import {
   createDevelopmentConsentMock,
   createMemoryStorageMock,
@@ -280,8 +281,22 @@ export function selectStorageAndEmail(
   } else {
     storage = mocksAllowed ? createMemoryStorageMock() : createUnavailableStorage();
   }
-  // No transactional email adapter exists yet (docs/Connections.md, Owner action #14).
-  const email = mocksAllowed ? createOutboxEmailMock() : createUnavailableEmail();
+  // Email: Resend with RESEND_API_KEY + EMAIL_FROM (docs/Owner_Actions.md #14); a value the adapter
+  // refuses is NOT_CONFIGURED like storage; otherwise the outbox mock only where mocks are allowed.
+  let email: EmailProvider;
+  if (
+    config.providers.email === 'resend' &&
+    typeof env.RESEND_API_KEY === 'string' &&
+    typeof env.EMAIL_FROM === 'string'
+  ) {
+    try {
+      email = createResendEmail({ apiKey: env.RESEND_API_KEY, from: env.EMAIL_FROM });
+    } catch {
+      return NOT_CONFIGURED;
+    }
+  } else {
+    email = mocksAllowed ? createOutboxEmailMock() : createUnavailableEmail();
+  }
   return { ok: true, storage, email };
 }
 

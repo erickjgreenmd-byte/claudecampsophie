@@ -290,13 +290,34 @@ describe('buildRuntime wires storage and email explicitly (AC_DEPLOY_07, L-016)'
     ).rejects.toThrow(/not configured/);
   });
 
-  it('staging with Supabase keys gets real storage; email stays unavailable (no adapter exists)', () => {
+  it('staging with Supabase keys gets real storage; email stays unavailable without a Resend key', () => {
     const built = build({ APP_ENV: 'staging', ...REAL_STORAGE });
     if (!built.ok) throw new Error(`staging should build: ${built.code}`);
     const { storage, email } = built.runtime.deps.providers;
     expect(storage.isMock).toBe(false);
     expect(storage.name).not.toBe('not_configured');
     expect([email.name, email.isMock]).toEqual(['not_configured', false]);
+  });
+
+  it('staging with RESEND_API_KEY and EMAIL_FROM gets the Resend adapter; a refused value is NOT_CONFIGURED', () => {
+    const built = build({
+      APP_ENV: 'staging',
+      ...REAL_STORAGE,
+      RESEND_API_KEY: 're_test_key_value_not_real_1234567890',
+      EMAIL_FROM: 'PencilLift <hello@pencillift.test>',
+    });
+    if (!built.ok) throw new Error(`staging should build: ${built.code}`);
+    const { email } = built.runtime.deps.providers;
+    expect([email.name, email.isMock]).toEqual(['resend', false]);
+    // The sender is validated by loadConfig first (LRD-4): a bad one never reaches the adapter.
+    const bad = build({
+      APP_ENV: 'staging',
+      ...REAL_STORAGE,
+      RESEND_API_KEY: 're_test_key_value_not_real_1234567890',
+      EMAIL_FROM: 'not an address',
+    });
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.code).toBe('NOT_CONFIGURED');
   });
 });
 

@@ -58,6 +58,38 @@ describe('provider configuration is honest (AC_DEPLOY_07)', () => {
     });
   });
 
+  it('email is Resend only with a well-formed key and a sender; the mock never outside development/test', () => {
+    const withKey = loadConfig({
+      ...TEST_ENV,
+      APP_ENV: 'staging',
+      RESEND_API_KEY: 're_test_key_value_not_real_1234567890',
+      EMAIL_FROM: 'PencilLift <hello@pencillift.test>',
+    });
+    if (!withKey.ok) throw new Error(`config should load: ${JSON.stringify(withKey.errors)}`);
+    expect(withKey.config.providers.email).toBe('resend');
+    const status = Object.fromEntries(
+      productionReadiness(withKey.config).map((i) => [i.check, i.status]),
+    );
+    expect(status['email_provider']).toBe('ready');
+
+    const staging = loadConfig({ ...TEST_ENV, APP_ENV: 'staging' });
+    expect(staging.ok && staging.config.providers.email).toBe('unavailable');
+
+    const badKey = loadConfig({
+      ...TEST_ENV,
+      RESEND_API_KEY: 'sk_live_wrong_kind_of_key_123456',
+      EMAIL_FROM: 'hello@pencillift.test',
+    });
+    expect(badKey.ok).toBe(false);
+    if (!badKey.ok) expect(badKey.errors.map((e) => e.name)).toEqual(['RESEND_API_KEY']);
+    const noFrom = loadConfig({
+      ...TEST_ENV,
+      RESEND_API_KEY: 're_test_key_value_not_real_1234567890',
+    });
+    expect(noFrom.ok).toBe(false);
+    if (!noFrom.ok) expect(noFrom.errors.map((e) => e.name)).toEqual(['EMAIL_FROM']);
+  });
+
   it('unapproved child safety messages and missing provider moderation block production (AC_SECURITY_02)', () => {
     const loaded = loadConfig({ ...TEST_ENV, APP_ENV: 'production' });
     if (!loaded.ok) throw new Error('config should load');
