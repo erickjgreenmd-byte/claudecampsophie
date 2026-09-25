@@ -35,6 +35,21 @@ price and the release-readiness check blocks any tier whose store price ≠ appr
 | Code volume | 1M codes/app/quarter; custom code redemption limit ≤ 25,000 at a time — `doc-verified` | Promo code quotas — `candidate` | Unlimited promotion codes — `candidate` |
 | Redemption surface | App Store code-redemption sheet or signed promotional offer via StoreKit/RevenueCat | In-app purchase flow with selected offer token | Our web checkout / billing portal |
 
+## 2a. Amazon Appstore (Fire tablets) — channel `amazon_appstore`
+
+Added 2026-09-25 with the Amazon channel (Owner action #29). Amazon's developer documentation was not reachable
+from this environment; every row below is `candidate` except where the installed RevenueCat SDK typings are the
+source, and none is sandbox-verified (Amazon App Tester needs the owner's developer account).
+
+| Capability | Amazon Appstore | Evidence |
+|---|---|---|
+| Subscriptions through RevenueCat | Supported by the SDK: `Purchases.configure({ useAmazon: true })` with an `amzn_…` public key; the build's store is fixed at build time (`EXPO_PUBLIC_ANDROID_STORE=amazon`), never guessed from the OS | `doc-verified` against `react-native-purchases` typings in `node_modules` |
+| Approved totals $39.99 / $49.98 / $59.97 / $69.96 | Believed representable (Amazon takes a base list price per item); the release-readiness price check applies exactly as for the other stores, so a mismatch blocks the tier rather than rounding | `candidate` |
+| Offer codes / redeemable promotion codes | **None.** Amazon has no subscriber-redeemable code surface, so every P17 mapping for this channel is recorded `unsupported` with the reason "The Amazon Appstore has no offer codes" (`apps/api/src/services/p17-jobs.ts`, tested); the parent UI says the code cannot be redeemed through that store. Introductory pricing for new subscribers may exist but is not a per-family code and is not used | `candidate` (the absence is asserted in code and must be confirmed in the owner's Amazon console) |
+| Webhook store name | RevenueCat sends `AMAZON` in webhooks and `amazon` in the REST subscriber payload; one normalizing function maps both to `amazon_appstore` (BUG-113) | `doc-verified` against the SDK typings; first sandbox webhook to confirm (Owner action #4) |
+| Distribution | APK from the `preview-amazon` / `production-amazon` EAS profiles, uploaded by hand (EAS Submit has no Amazon target) | `candidate` |
+| Push notifications on Fire OS | No Google services, so no FCM; Amazon Device Messaging would be needed later — none today | `candidate` |
+
 ## 3. Design consequences implemented in code
 
 1. **Internal code first, provider offer second.** A family enters a PencilLift code; the server validates it
@@ -62,3 +77,4 @@ price and the release-readiness check blocks any tier whose store price ≠ appr
 - [ ] Google internal testing: new-subscriber offer; defer for existing subscriber; tier replacement during an offer.
 - [ ] Stripe test mode: discount on renewal invoice only; proration invoice between redemption and renewal untouched.
 - [ ] RevenueCat: webhook + `GET /subscribers` reflect offer/period dates for each of the above.
+- [ ] Amazon App Tester: a subscription purchase on a Fire tablet build reaches RevenueCat as store `AMAZON` and records a billing period; confirm the four list prices and that no code-redemption surface exists.
