@@ -4,7 +4,7 @@ Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on 
 Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
 (1–4 paid slots) — unchanged.
 
-## Current state (2026-09-25; code at `77c13b1`)
+## Current state (2026-09-25; code at `6728bea`)
 
 Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
 approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
@@ -33,14 +33,19 @@ client-side unlock in memory only (privacy screen included) and store names per 
 observed, the stale-entitlement sweep rotates, the RevenueCat TRANSFER shape is accepted, non-USD charges stay out of
 USD revenue and the donation rule, consent withdrawal ends the child's access and keeps a pending safety-flag email,
 the privacy page names the real photo-removal paths, and migration 0840 adds job and safety-report indexes, 90-day
-job retention, membership release at deletion request time and pseudo-zone refusal. MCP connectors for Supabase, Stripe and Expo are attached to
+job retention, membership release at deletion request time and pseudo-zone refusal. Then round 2b (`6728bea`,
+BUG-143..159): invitation links survive sign-in, a branded route error boundary, AA button contrast on the web,
+the Amazon Appstore across the portal, honest promo-code copy, auth-link failure notices, a `VITE_STORE_LIVE` launch
+switch, child-bound subject links and session housekeeping (migration 0850), a deletion purge and account closure
+that re-queue after a dead letter, a 15 MiB per-scan bound with mobile downscaling, timeouts metered at their upper
+bound and pipeline codes in the job ledger. MCP connectors for Supabase, Stripe and Expo are attached to
 the build session but no project, account or EAS project of PencilLift's exists yet (Connections).
 Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with its gap): integration_tested 33,
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `77c13b1`:
-api 982, domain 3,656, db 355, web 530, mobile 592, ai 49, contracts 20, ui-tokens 4 (6,188 tests, 0 failed,
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `6728bea`:
+api 997, domain 3,656, db 366, web 574, mobile 596, ai 59, contracts 20, ui-tokens 4 (6,272 tests, 0 failed,
 0 skipped), gate audit, finance, release-artifact scan with negative control. Earlier gates caught BUG-114 (a
 stale function re-creation, L-026) and BUG-115 (a pinned-clock time bomb, L-027) before their commits. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
 there is the source of truth; a records-only commit may still have its run in progress).
@@ -69,21 +74,18 @@ moderation built but never run live (no key).
 
 ## In flight
 
-- Hardening round 2b (workflow `wf_90c8faf6-975`): the remaining seventeen confirmed findings of the bug hunt, in
-  three areas with disjoint files — web portal (WEB-R1-01..04, 06..11: invitation token through sign-in, route
-  error boundary, button contrast, Amazon channel, promo-code honesty, PKCE link errors, FAQ and layout fixes, a
-  launch switch for pre-launch copy), database (DB-R1-05..07, migration 0850: child-bound subject links, dead
-  ON DELETE actions, session-table indexes and housekeeping) and jobs (JOBS-R1-01..04: a purge that never stops for
-  good, bounded scan request size, metered timeouts, pipeline codes in the job ledger). Failing test first,
-  checkers with mutation checks, isolated gate.
+- Round 2c (workflow `wf_1eaa94df-496`): follow-ups the round-2b fixers reported — web homework uploads downscaled
+  in the browser and pre-checked against the per-scan bound, Amazon in owner promo campaigns, a password reset
+  started in the mobile app that finishes on the web, AA contrast for mobile buttons, and child copy for an
+  oversize scan.
 - The bug hunt (`wf_2a9a8aa6-7c4`) verified 48 first-round findings (44 confirmed, 4 refuted); its second finder
   round did not run (session limit) and is owed on a stable tree after round 2b.
 
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Integrate round 2b (lead actions, gate, commit, records), then run the bug hunt's second finder round on the
-   stable tree and fix what it confirms.
+2. Integrate round 2c (gate, commit, records), then run the bug hunt's second finder round on the stable tree and
+   fix what it confirms.
 3. Owner actions in `docs/Owner_Actions.md` (#1–#37) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
