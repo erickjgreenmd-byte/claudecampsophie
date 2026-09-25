@@ -9,7 +9,11 @@ import type {
   SafetyReports,
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
-import { PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
+import {
+  PARENT_SAFETY_FLAG_ACTIONS,
+  PARENT_SAFETY_FLAG_COPY,
+  type SafetyReport,
+} from '@pencillift/contracts';
 import { renderPage } from '../../test/render.tsx';
 import PrivacyControlsPage from './PrivacyControlsPage.tsx';
 
@@ -114,6 +118,39 @@ function deletion(scope: 'family' | 'child', childId: string | null = null) {
     completeBy: '2026-10-24T15:00:00.000Z',
     completedAt: null,
   };
+}
+
+/** A family report with the contract's full shape (strict schema); nothing acted on or sent. */
+function report(overrides: Partial<SafetyReport> & Pick<SafetyReport, 'id'>): SafetyReport {
+  return {
+    reporterKind: 'child',
+    category: 'other',
+    childId: RILEY,
+    questionId: null,
+    note: null,
+    status: 'open',
+    createdAt: '2026-09-23T15:00:00.000Z',
+    triagedAt: null,
+    resolvedAt: null,
+    clearedAsFalseMatch: false,
+    parentActionAt: null,
+    parentOutcome: null,
+    emailedAt: null,
+    emailStatus: 'not_sent',
+    ...overrides,
+  };
+}
+
+/** A safety-screen flag about Riley, escalated and unresolved unless overridden. */
+function flag(overrides: Partial<SafetyReport> = {}): SafetyReport {
+  return report({
+    id: REPORT_A,
+    reporterKind: 'system',
+    category: 'severe_risk',
+    questionId: 'e29e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2a',
+    status: 'escalated',
+    ...overrides,
+  });
 }
 
 afterEach(cleanup);
@@ -369,32 +406,25 @@ describe('PrivacyControlsPage', () => {
   it('lists family safety reports with who reported them and their status', async () => {
     const reports: SafetyReports = {
       reports: [
-        {
+        report({
           id: REPORT_A,
           reporterKind: 'child',
           category: 'answer_revealed',
           childId: RILEY,
-          questionId: null,
-          note: null,
           status: 'open',
           createdAt: '2026-09-23T15:00:00.000Z',
-          triagedAt: null,
-          resolvedAt: null,
-          clearedAsFalseMatch: false,
-        },
-        {
+        }),
+        report({
           id: REPORT_B,
           reporterKind: 'parent',
           category: 'wrong_or_confusing',
           childId: SAM,
-          questionId: null,
           note: 'The hint did not match the worksheet.',
           status: 'resolved',
           createdAt: '2026-09-22T15:00:00.000Z',
           triagedAt: '2026-09-22T16:00:00.000Z',
           resolvedAt: '2026-09-22T17:00:00.000Z',
-          clearedAsFalseMatch: false,
-        },
+        }),
       ],
     };
     const { api } = fakeApi({ reports });
@@ -405,30 +435,21 @@ describe('PrivacyControlsPage', () => {
     expect(text(items[0])).toMatch(/showed an answer/i);
     expect(text(items[0])).toMatch(/reported by riley/i);
     expect(text(items[0])).toMatch(/waiting for review/i);
+    // A child's report: no email is sent for it, and it says so; only "looked into" is offered.
+    expect(text(items[0])).toContain(PARENT_SAFETY_FLAG_COPY.emailNotSent);
+    expect(
+      within(items[0]!).getByRole('button', { name: PARENT_SAFETY_FLAG_ACTIONS.addressed.label }),
+    ).toBeTruthy();
+    expect(within(items[0]!).queryByRole('button', { name: /false alarm/i })).toBeNull();
+    // A parent's own report is reviewed by PencilLift: nothing to act on.
     expect(text(items[1])).toMatch(/reported by a parent/i);
     expect(text(items[1])).toMatch(/resolved/i);
     expect(text(items[1])).toMatch(/did not match the worksheet/i);
+    expect(within(items[1]!).queryAllByRole('button')).toEqual([]);
   });
 
-  it('shows a safety-screen flag honestly, with resources and no alert claim (AC_SECURITY_02)', async () => {
-    const QUESTION = 'e29e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2a';
-    const reports: SafetyReports = {
-      reports: [
-        {
-          id: REPORT_A,
-          reporterKind: 'system',
-          category: 'severe_risk',
-          childId: RILEY,
-          questionId: QUESTION,
-          note: null,
-          status: 'escalated',
-          createdAt: '2026-09-23T15:00:00.000Z',
-          triagedAt: null,
-          resolvedAt: null,
-          clearedAsFalseMatch: false,
-        },
-      ],
-    };
+  it('shows a safety-screen flag honestly, with resources and the recorded email state (AC_SECURITY_02)', async () => {
+    const reports: SafetyReports = { reports: [flag({ emailStatus: 'not_sent' })] };
     const { api } = fakeApi({ reports });
     renderPage(<PrivacyControlsPage />, { api });
     const list = await screen.findByRole('list', { name: /family safety reports/i });
@@ -439,15 +460,18 @@ describe('PrivacyControlsPage', () => {
     expect(content).toMatch(/riley/i);
     expect(content).toMatch(/escalated for urgent review/i);
     expect(content).toMatch(/pencillift flagged an answer for a grown-up to look at/i);
-    expect(content).toMatch(/pencillift sent no automatic alert/i);
+    // The recorded delivery: no email was sent, and the row never claims one.
+    expect(content).toContain(PARENT_SAFETY_FLAG_COPY.emailNotSent);
+    expect(content).not.toContain(PARENT_SAFETY_FLAG_COPY.emailSent);
     // It says what the product shows, not what the child saw (opening results is not recorded).
     expect(content).not.toMatch(/your child saw/i);
     expect(content).toMatch(/988/);
     expect(content).toMatch(/1-800-422-4453/);
     expect(content).toMatch(/911/);
-    // Never claims a delivery, and never names the kind of concern the word match suggested.
-    expect(content.replace(/sent no automatic alert/i, '')).not.toMatch(
-      /alerted|notified|we (?:emailed|texted|sent)/i,
+    // Never claims a delivery that did not happen, and never names the kind of concern the word
+    // match suggested.
+    expect(content.replace(/no email has been sent/i, '')).not.toMatch(
+      /alerted|notified|we (?:emailed|texted|sent)|pencillift emailed/i,
     );
     // (The resources line names the hotlines; that is not about this report.)
     expect(content.replace(PARENT_SAFETY_FLAG_COPY.resources, '')).not.toMatch(
@@ -455,22 +479,169 @@ describe('PrivacyControlsPage', () => {
     );
   });
 
-  it('a flag a reviewer cleared as a false match says so, not that the child sees a message (round 3)', async () => {
+  it('says an email was sent only when the delivery is recorded, and says when it failed', async () => {
+    const { api } = fakeApi({
+      reports: {
+        reports: [
+          flag({ id: REPORT_A, emailStatus: 'sent', emailedAt: '2026-09-23T15:00:05.000Z' }),
+          flag({
+            id: REPORT_B,
+            emailStatus: 'failed',
+            createdAt: '2026-09-22T15:00:00.000Z',
+          }),
+        ],
+      },
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    const [sent, failed] = within(list).getAllByRole('listitem');
+    expect(text(sent)).toContain(PARENT_SAFETY_FLAG_COPY.emailSent);
+    expect(text(sent)).toMatch(/names no child, no question and no kind of concern/i);
+    expect(text(failed)).toContain(PARENT_SAFETY_FLAG_COPY.emailFailed);
+    expect(text(failed)).toMatch(/could not be sent/i);
+    expect(text(failed)).not.toContain(PARENT_SAFETY_FLAG_COPY.emailSent);
+  });
+
+  it('offers the two actions on an unresolved flag and explains what each does', async () => {
+    const { api } = fakeApi({ reports: { reports: [flag()] } });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    const [item] = within(list).getAllByRole('listitem');
+    const buttons = within(item!)
+      .getAllByRole('button')
+      .map((b) => b.textContent);
+    expect(buttons).toEqual([
+      PARENT_SAFETY_FLAG_ACTIONS.addressed.label,
+      PARENT_SAFETY_FLAG_ACTIONS.falseMatch.label,
+    ]);
+    const content = text(item);
+    expect(content).toContain(PARENT_SAFETY_FLAG_ACTIONS.addressed.effect);
+    expect(content).toContain(PARENT_SAFETY_FLAG_ACTIONS.falseMatch.effect);
+    // The false-alarm action says what happens to the child's results and the question.
+    expect(content).toMatch(/removes the message from your child’s results/i);
+    expect(content).toMatch(/check the question like the rest of the scan/i);
+    expect(content).toMatch(/both need a recent parent pin unlock/i);
+  });
+
+  it('"I’ve looked into this" sends the outcome, then reloads the list', async () => {
+    let acted = false;
+    const { api, sends, gets } = fakeApi({
+      reports: () => ({
+        reports: [
+          acted
+            ? flag({
+                status: 'resolved',
+                resolvedAt: '2026-09-24T15:00:00.000Z',
+                parentActionAt: '2026-09-24T15:00:00.000Z',
+                parentOutcome: 'addressed',
+              })
+            : flag(),
+        ],
+      }),
+      send: (call) => {
+        if (call.path === `/v1/safety-reports/${REPORT_A}`) {
+          acted = true;
+          return {
+            report: flag({
+              status: 'resolved',
+              resolvedAt: '2026-09-24T15:00:00.000Z',
+              parentActionAt: '2026-09-24T15:00:00.000Z',
+              parentOutcome: 'addressed',
+            }),
+          };
+        }
+        return new Error(`unexpected ${call.path}`);
+      },
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    await userEvent.click(
+      within(list).getByRole('button', { name: PARENT_SAFETY_FLAG_ACTIONS.addressed.label }),
+    );
+    expect(sends).toEqual([
+      { method: 'PATCH', path: `/v1/safety-reports/${REPORT_A}`, body: { outcome: 'addressed' } },
+    ]);
+    await waitFor(() => {
+      expect(gets.filter((g) => g === '/v1/safety-reports').length).toBeGreaterThan(1);
+    });
+    // The resolved row shows the outcome and offers nothing more.
+    const item = await within(
+      await screen.findByRole('list', { name: /family safety reports/i }),
+    ).findByText(PARENT_SAFETY_FLAG_COPY.addressed);
+    const row = item.closest('li')!;
+    expect(text(row)).toMatch(/resolved/i);
+    expect(text(row)).not.toContain(PARENT_SAFETY_FLAG_COPY.summary);
+    expect(within(row).queryAllByRole('button')).toEqual([]);
+  });
+
+  it('"This was a false alarm" sends false_match and says the question is checked normally', async () => {
+    const { api, sends } = fakeApi({
+      reports: { reports: [flag()] },
+      send: () => ({
+        report: flag({
+          status: 'resolved',
+          resolvedAt: '2026-09-24T15:00:00.000Z',
+          clearedAsFalseMatch: true,
+          parentActionAt: '2026-09-24T15:00:00.000Z',
+          parentOutcome: 'false_match',
+        }),
+      }),
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    await userEvent.click(
+      within(list).getByRole('button', { name: PARENT_SAFETY_FLAG_ACTIONS.falseMatch.label }),
+    );
+    expect(sends).toEqual([
+      { method: 'PATCH', path: `/v1/safety-reports/${REPORT_A}`, body: { outcome: 'false_match' } },
+    ]);
+    expect(await screen.findByText(/cleared as a false alarm/i)).toBeTruthy();
+  });
+
+  it('asks for the parent PIN when acting on a flag needs a step-up; nothing is retried by itself', async () => {
+    const { api, sends } = fakeApi({
+      reports: { reports: [flag()] },
+      send: (call) =>
+        call.path === '/v1/adult/unlock' ? { unlockedUntil: '2026-09-24T15:05:00.000Z' } : stepUp(),
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    await userEvent.click(
+      within(list).getByRole('button', { name: PARENT_SAFETY_FLAG_ACTIONS.falseMatch.label }),
+    );
+    const prompt = await within(list).findByRole('group', { name: /enter your parent pin/i });
+    await userEvent.type(within(prompt).getByLabelText(/parent pin/i), '482913');
+    await userEvent.click(within(prompt).getByRole('button', { name: /unlock/i }));
+    expect(await within(list).findByText(/unlocked/i)).toBeTruthy();
+    expect(text(list)).toContain(`Press “${PARENT_SAFETY_FLAG_ACTIONS.falseMatch.label}” again`);
+    expect(sends).toHaveLength(2);
+    expect(sends[0]).toMatchObject({ method: 'PATCH', body: { outcome: 'false_match' } });
+    expect(sends[1]).toMatchObject({ path: '/v1/adult/unlock' });
+  });
+
+  it('a report resolved meanwhile explains the refusal (409) instead of failing silently', async () => {
+    const { api } = fakeApi({
+      reports: { reports: [flag()] },
+      send: () => new ApiRequestError('CONFLICT', 'This report is already resolved', 409),
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    const list = await screen.findByRole('list', { name: /family safety reports/i });
+    await userEvent.click(
+      within(list).getByRole('button', { name: PARENT_SAFETY_FLAG_ACTIONS.addressed.label }),
+    );
+    expect(await within(list).findByText(/already resolved/i)).toBeTruthy();
+  });
+
+  it('a flag cleared as a false match says so, not that the child sees a message (round 3)', async () => {
     const reports: SafetyReports = {
       reports: [
-        {
-          id: REPORT_A,
-          reporterKind: 'system',
-          category: 'severe_risk',
-          childId: RILEY,
+        flag({
           questionId: 'e29e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2b',
-          note: null,
           status: 'resolved',
-          createdAt: '2026-09-23T15:00:00.000Z',
           triagedAt: '2026-09-23T16:00:00.000Z',
           resolvedAt: '2026-09-23T16:00:00.000Z',
           clearedAsFalseMatch: true,
-        },
+        }),
       ],
     };
     const { api } = fakeApi({ reports });
@@ -482,6 +653,7 @@ describe('PrivacyControlsPage', () => {
     expect(content).not.toContain(PARENT_SAFETY_FLAG_COPY.summary);
     expect(content).toMatch(/not a concern/i);
     expect(content).toMatch(/resolved/i);
+    expect(within(item!).queryAllByRole('button')).toEqual([]);
     expect(content.replace(PARENT_SAFETY_FLAG_COPY.resources, '')).not.toMatch(
       /alerted|notified|we (?:emailed|texted|sent)|self-harm|suicid|abuse|sexual|violen/i,
     );
@@ -500,16 +672,17 @@ describe('PrivacyControlsPage', () => {
     expect(text(section)).toMatch(
       /pencillift also adds a report here[^.]*flags one of your child’s answers/i,
     );
-    // Honest about held reports (runbook 5.1) without saying whether one exists, and without
-    // promising a staffed review of every flag (triage targets and the reviewer are not approved
-    // yet, Owner action #24; RV-child-safety-15).
-    expect(text(section)).toMatch(
-      /some flags are kept off this list until a pencillift reviewer releases them/i,
-    );
+    // Owner decision (2026-09-25): no flag is held from this list, every flag is emailed to the
+    // guardians (each row says whether that email was sent), and the parent addresses it. The
+    // page no longer speaks of held flags, and still does not promise a staffed review of every
+    // flag (triage targets and the reviewer are not approved yet, Owner action #24).
+    expect(text(section)).toMatch(/emails the guardians on this account/i);
+    expect(text(section)).toMatch(/says whether that email was sent/i);
+    expect(text(section)).not.toMatch(/kept off this list|reviewer releases/i);
+    expect(text(section)).not.toMatch(/sends no automatic alert/i);
     expect(text(section)).not.toMatch(
       /looks at every flag|reviews every flag|every flag is reviewed/i,
     );
-    expect(text(section)).toMatch(/pencillift sends no automatic alert/i);
   });
 
   it('never loads the safety screen’s rules into the parent bundle (copy comes from contracts)', () => {
@@ -574,19 +747,14 @@ describe('PrivacyControlsPage', () => {
   it('lets a parent report a concern', async () => {
     const { api, sends } = fakeApi({
       send: () => ({
-        report: {
+        report: report({
           id: REPORT_A,
           reporterKind: 'parent',
           category: 'unsafe_content',
           childId: null,
-          questionId: null,
           note: 'Tone felt wrong.',
-          status: 'open',
           createdAt: '2026-09-24T15:00:00.000Z',
-          triagedAt: null,
-          resolvedAt: null,
-          clearedAsFalseMatch: false,
-        },
+        }),
       }),
     });
     renderPage(<PrivacyControlsPage />, { api });

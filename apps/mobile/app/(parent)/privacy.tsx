@@ -12,8 +12,10 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import type { StandardExportKind } from '@pencillift/contracts';
+import { PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
+import type { ParentReportOutcome, StandardExportKind } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
   confirmationPhrase,
@@ -25,8 +27,11 @@ import {
   MOBILE_EXPORT_OPTIONS,
   parentErrorMessage,
   PRIVACY_RETENTION_LINES,
+  reportOutcomeAction,
   requestDeletionAction,
   requestExportAction,
+  SAFETY_REPORTS_INTRO,
+  safetyReportView,
   unlockAction,
   type ActionResult,
   type DeletionTarget,
@@ -40,12 +45,18 @@ type ScreenState =
   | { status: 'error'; message: string }
   | { status: 'ready'; data: PrivacyOverview };
 
-type Feedback = { area: 'export' | 'delete'; result: ActionResult; id: number } | null;
+type Feedback =
+  | { area: 'export' | 'delete'; result: ActionResult; id: number }
+  | { area: 'report'; reportId: string; result: ActionResult; id: number }
+  | null;
 
 /**
  * Parent privacy screen (spec P4, P10, P14 "export/delete"; AC_ACCESS_10, AC_SECURITY_05). Request
  * a private export, delete a child's data or the whole family (typed confirmation + server-enforced
- * PIN step-up), and read how long information is kept. Logic lives in src/privacy (unit-tested).
+ * PIN step-up), read how long information is kept, and follow the family's safety reports: every
+ * flag is listed with the recorded state of the guardian email, and a guardian can mark it looked
+ * into or a false alarm (owner decision, 2026-09-25; same wording as the web portal). Logic lives
+ * in src/privacy (unit-tested).
  */
 export default function ParentPrivacyScreen() {
   const tokenSource = parentPrivacyTokenSource();
@@ -108,6 +119,17 @@ export default function ParentPrivacyScreen() {
     }
   };
 
+  const actOnReport = async (reportId: string, outcome: ParentReportOutcome) => {
+    if (!api || busy !== null) return;
+    setBusy(`report:${reportId}:${outcome}`);
+    setFeedback(null);
+    const result = await reportOutcomeAction(api, reportId, outcome);
+    setFeedbackCount((n) => n + 1);
+    setFeedback({ area: 'report', reportId, result, id: feedbackCount + 1 });
+    setBusy(null);
+    if (result.status === 'done') await load();
+  };
+
   const data = state.status === 'ready' ? state.data : null;
   const deleted = data && !data.family ? familyDeletion(data.deletions) : null;
 
@@ -126,6 +148,7 @@ export default function ParentPrivacyScreen() {
             ) : undefined
           }
         >
+          <BrandRow />
           <Text accessibilityRole="header" style={styles.title}>
             Privacy, export and deletion
           </Text>
@@ -220,6 +243,56 @@ export default function ParentPrivacyScreen() {
                       {`• ${exportLine(item)}`}
                     </Text>
                   ))
+                )}
+              </Section>
+
+              <Section title="Safety reports">
+                <Text style={styles.body}>{SAFETY_REPORTS_INTRO}</Text>
+                {data.reports.length === 0 ? (
+                  <Text style={[styles.body, styles.spaced]}>No safety reports yet.</Text>
+                ) : (
+                  data.reports.map((r) => {
+                    const view = safetyReportView(data.family, r);
+                    return (
+                      <View
+                        key={view.id}
+                        style={styles.report}
+                        accessibilityLabel={`${view.title}. ${view.meta}`}
+                      >
+                        <Text style={[styles.body, styles.bold]}>{view.title}</Text>
+                        <Text style={styles.muted}>{view.meta}</Text>
+                        {view.note ? <Text style={styles.muted}>{`“${view.note}”`}</Text> : null}
+                        {view.lines.map((line) => (
+                          <Text key={line} style={[styles.body, styles.spaced]}>
+                            {line}
+                          </Text>
+                        ))}
+                        {view.actions.map((action) => (
+                          <View key={action.outcome}>
+                            <Button
+                              label={
+                                busy === `report:${view.id}:${action.outcome}`
+                                  ? 'Saving…'
+                                  : action.label
+                              }
+                              disabled={busy !== null}
+                              secondary
+                              onPress={() => void actOnReport(view.id, action.outcome)}
+                            />
+                            <Text style={styles.muted}>{action.effect}</Text>
+                          </View>
+                        ))}
+                        {view.actions.length > 0 ? (
+                          <Text style={styles.muted}>
+                            {PARENT_SAFETY_FLAG_COPY.actionsNeedUnlock}
+                          </Text>
+                        ) : null}
+                        {feedback?.area === 'report' && feedback.reportId === view.id ? (
+                          <ResultView key={feedback.id} result={feedback.result} api={api} />
+                        ) : null}
+                      </View>
+                    );
+                  })
                 )}
               </Section>
 
@@ -464,7 +537,14 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
   },
   body: { fontSize: typography.scale.md, color: colors.navy },
+  muted: { fontSize: typography.scale.sm, color: colors.muted, marginTop: spacing.xs },
   bold: { fontWeight: '800' },
+  report: {
+    borderTopWidth: 1,
+    borderTopColor: colors.muted,
+    paddingTop: spacing.sm,
+    marginTop: spacing.md,
+  },
   bullet: { marginTop: spacing.xs },
   spaced: { marginTop: spacing.sm },
   loading: { marginVertical: spacing.lg },

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CHILD_SAFETY_MESSAGE_MAX_LENGTH,
   FAMILY_HOLD_CATEGORIES,
+  HOUSEHOLD_SENSITIVE_CATEGORIES,
   SAFETY_AGE_BANDS,
   SAFETY_RESOURCES_US,
   SAFETY_TEMPLATES_APPROVED,
@@ -11,6 +12,7 @@ import {
   SEVERE_SAFETY_CATEGORIES,
   childSafetyMessage,
   heldFromFamily,
+  householdSensitive,
   screenModelOutput,
 } from './index.ts';
 
@@ -90,15 +92,35 @@ describe('child safety message', () => {
 });
 
 describe('family hold (runbook 5.1)', () => {
-  it('holds reports whose concern may involve the household, and only those', () => {
-    expect(FAMILY_HOLD_CATEGORIES).toEqual(['abuse', 'sexual', 'secrecy']);
-    expect(heldFromFamily(['abuse'])).toBe(true);
-    expect(heldFromFamily(['self_harm', 'sexual'])).toBe(true);
-    expect(heldFromFamily(['violence', 'secrecy'])).toBe(true);
-    expect(heldFromFamily(['self_harm'])).toBe(false);
-    expect(heldFromFamily(['violence'])).toBe(false);
-    expect(heldFromFamily(['personal_contact'])).toBe(false);
-    expect(heldFromFamily([])).toBe(false);
+  // Owner decision (2026-09-25), a policy change and not a weakened test: this test asserted that
+  // abuse, sexual and secrecy reports start held from the family. Now the parent is the only
+  // person PencilLift sends a safety message to and the one who addresses the concern, so NO
+  // report is held: the list is empty and heldFromFamily is false for every category set.
+  it('holds no report from the family: the parent is the recipient of every flag', () => {
+    expect(FAMILY_HOLD_CATEGORIES).toEqual([]);
+    const n = SEVERE_SAFETY_CATEGORIES.length;
+    for (let mask = 0; mask < 1 << n; mask += 1) {
+      const set = SEVERE_SAFETY_CATEGORIES.filter((_, i) => (mask & (1 << i)) !== 0);
+      expect(heldFromFamily(set), set.join('+')).toBe(false);
+    }
+  });
+});
+
+describe('household-sensitive categories (the printed-prompt rule, round 5)', () => {
+  it('is the fixed set abuse, sexual, secrecy, independent of the hold list', () => {
+    // The structural rule that these codes never come from a printed worksheet prompt (screen.ts
+    // scan, CHK4-CS-4/5) keys on this set, so emptying the hold list did not switch it off.
+    expect(HOUSEHOLD_SENSITIVE_CATEGORIES).toEqual(['abuse', 'sexual', 'secrecy']);
+    expect(householdSensitive(['abuse'])).toBe(true);
+    expect(householdSensitive(['self_harm', 'sexual'])).toBe(true);
+    expect(householdSensitive(['violence', 'secrecy'])).toBe(true);
+    expect(householdSensitive(['self_harm'])).toBe(false);
+    expect(householdSensitive(['violence'])).toBe(false);
+    expect(householdSensitive(['personal_contact'])).toBe(false);
+    expect(householdSensitive([])).toBe(false);
+    for (const category of HOUSEHOLD_SENSITIVE_CATEGORIES) {
+      expect(FAMILY_HOLD_CATEGORIES).not.toContain(category);
+    }
   });
 });
 
@@ -137,6 +159,9 @@ describe('template version', () => {
       'safety-templates.v2': '5b6d311e294e09e3053f426a3de90173fd5f8ee8b49989914d96bdbd39bf17d1',
       // v3: the child messages are the same as v2; the parent wording changed (API test pin).
       'safety-templates.v3': '5b6d311e294e09e3053f426a3de90173fd5f8ee8b49989914d96bdbd39bf17d1',
+      // v4 (owner decision, 2026-09-25): the child messages are the same as v3; the hold list is
+      // empty (no flag is held from the family) and the parent wording changed (email, actions).
+      'safety-templates.v4': 'c18b6f3df516e3f58ea6eb3208a740348286ad1dba40bbc3925853bd30f68c33',
     };
     expect({ version: SAFETY_TEMPLATES_VERSION, digest }).toEqual({
       version: SAFETY_TEMPLATES_VERSION,

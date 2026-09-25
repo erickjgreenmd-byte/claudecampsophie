@@ -3,7 +3,8 @@
 // launch; SAFETY_TEMPLATES_STATUS is the flag the release-readiness report reads.
 //
 // Rules for every child-facing message: calm and short; thanks the child; never diagnoses; never
-// says or implies that a parent or anyone else was alerted (no alert is sent); never asks for
+// says or implies that a parent or anyone else was alerted (the guardian email a flag sends is the
+// parent's, and the child's notice does not mention it); never asks for
 // secrecy; always points to a grown-up the child trusts; names US resources for the launch
 // market: 911 for immediate danger, the 988 Suicide & Crisis Lifeline (call or text 988) for
 // self-harm, the Childhelp National Child Abuse Hotline (1-800-422-4453) for abuse, secrecy,
@@ -18,7 +19,11 @@ import type { SafetyAgeBand, SevereSafetyCategory } from './types.ts';
 
 // v3 (round 3, CHK2-CS-5): the child messages are unchanged; the parent wording gains `cleared`
 // for a visible flag a reviewer cleared as a false match.
-export const SAFETY_TEMPLATES_VERSION = 'safety-templates.v3';
+// v4 (owner decision, 2026-09-25): the child messages are unchanged again. The parent is the only
+// person PencilLift sends a safety message to, and the parent addresses the concern: no flag is
+// held from the family (FAMILY_HOLD_CATEGORIES is empty), every flag is emailed to the active
+// guardians and listed at once, and the parent can act on it (parent wording in contracts).
+export const SAFETY_TEMPLATES_VERSION = 'safety-templates.v4';
 
 /** Release-readiness flag: the templates below are drafts until approved. */
 export const SAFETY_TEMPLATES_STATUS = 'draft_pending_owner_and_educator_approval' as const;
@@ -83,18 +88,40 @@ const CHILDHELP_CATEGORIES: ReadonlySet<SevereSafetyCategory> = new Set([
 ]);
 
 /**
- * Screen categories whose system report is HELD from the family's report list until a reviewer
- * releases it (runbook 5.1): the concern may involve someone in the household, so the family is not
- * told first. Proposed default; owner and counsel to approve. `personal_contact` (a stranger or an
- * online contact) is not held: the family is the child's protection there.
+ * Screen categories whose concern may involve someone in the household: a disclosure of abuse,
+ * sexual content, or a secret an adult asked the child to keep. A FIXED set, not a policy switch:
+ * it keys the structural rules that must never read a printed worksheet prompt (round 5,
+ * CHK4-CS-4/5; screen.ts scan), because a body-safety or reading worksheet quotes exactly the words
+ * a disclosure uses. It does not decide who sees a flag.
  */
-export const FAMILY_HOLD_CATEGORIES: readonly SevereSafetyCategory[] = [
+export const HOUSEHOLD_SENSITIVE_CATEGORIES: readonly SevereSafetyCategory[] = [
   'abuse',
   'sexual',
   'secrecy',
 ];
 
-/** True when a system report with these categories starts held from the family list. */
+/** True when any of these categories is one of HOUSEHOLD_SENSITIVE_CATEGORIES. */
+export function householdSensitive(categories: readonly SevereSafetyCategory[]): boolean {
+  return categories.some((c) => HOUSEHOLD_SENSITIVE_CATEGORIES.includes(c));
+}
+
+/**
+ * Screen categories whose system report would start HELD from the family's report list until a
+ * reviewer releases it (migration 0760 `family_visible`, the admin release; runbook 5.1).
+ *
+ * EMPTY by owner decision (2026-09-25): the parent is the only person PencilLift sends a safety
+ * message to, and the parent addresses the concern, so no flag (abuse, sexual and secrecy
+ * included) is ever held from the family; every flag is listed at once and emailed to the active
+ * guardians. The hold mechanism stays in the schema and the API, unused: the API never files a
+ * held report. The lead advised holding the household-sensitive categories until a reviewer
+ * looked (Threat_Model T34) and was overruled; counsel is to confirm (Owner action #24).
+ */
+export const FAMILY_HOLD_CATEGORIES: readonly SevereSafetyCategory[] = [];
+
+/**
+ * True when a system report with these categories starts held from the family list: always false
+ * while FAMILY_HOLD_CATEGORIES is empty (owner decision, 2026-09-25).
+ */
 export function heldFromFamily(categories: readonly SevereSafetyCategory[]): boolean {
   return categories.some((c) => FAMILY_HOLD_CATEGORIES.includes(c));
 }

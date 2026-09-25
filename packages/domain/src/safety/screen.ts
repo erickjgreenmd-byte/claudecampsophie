@@ -25,7 +25,7 @@ import {
   type CompactStream,
   type NormalizedText,
 } from './normalize.ts';
-import { heldFromFamily } from './templates.ts';
+import { HOUSEHOLD_SENSITIVE_CATEGORIES } from './templates.ts';
 import {
   SENSITIVE_TOPICS,
   SEVERE_SAFETY_CATEGORIES,
@@ -74,8 +74,11 @@ interface CompiledGuard {
 
 interface CompiledRule {
   readonly def: RuleDef;
-  /** Its category starts a system report held from the family (FAMILY_HOLD_CATEGORIES). */
-  readonly held: boolean;
+  /**
+   * Its category is one of HOUSEHOLD_SENSITIVE_CATEGORIES (abuse, sexual, secrecy): a fixed set,
+   * not the hold list. Such a rule never reads a printed prompt (round 5, CHK4-CS-4/5; see scan).
+   */
+  readonly householdSensitive: boolean;
   readonly sources: ReadonlySet<ScreenSource>;
   readonly slots: readonly Slot[];
   readonly notFollowedBy: Slot | null;
@@ -100,7 +103,8 @@ interface SignaturePhrase {
 
 interface CompiledSignature {
   readonly def: SignatureDef;
-  readonly held: boolean;
+  /** As CompiledRule.householdSensitive. */
+  readonly householdSensitive: boolean;
   readonly sources: ReadonlySet<ScreenSource>;
   readonly phrases: readonly SignaturePhrase[];
   readonly exempt: Exemption | null;
@@ -183,7 +187,8 @@ function compileRule(def: RuleDef): CompiledRule {
   }
   return {
     def,
-    held: def.category !== undefined && heldFromFamily([def.category]),
+    householdSensitive:
+      def.category !== undefined && HOUSEHOLD_SENSITIVE_CATEGORIES.includes(def.category),
     sources: new Set(def.sources),
     slots,
     notFollowedBy: def.notFollowedBy ? compileSlot(def.notFollowedBy, 0, false) : null,
@@ -222,7 +227,7 @@ function compileSignature(def: SignatureDef): CompiledSignature {
   }
   return {
     def,
-    held: heldFromFamily([def.category]),
+    householdSensitive: HOUSEHOLD_SENSITIVE_CATEGORIES.includes(def.category),
     sources: new Set(def.sources),
     phrases: [...phrases.values()],
     exempt: compileExemption(def.exempt),
@@ -580,12 +585,14 @@ interface Hits {
  *   keeps a tier-B word in a child's text from being exempt.
  * - `printed`: the printed prompt, screened for codes. It is the worksheet's text, not the child's
  *   statement: its first person never makes a tier-B word severe (CHK-CS-2: "In our unit we discuss
- *   child abuse."), answer-only rules skip it, and no rule or signature whose category is held from
- *   the family (abuse, sexual, secrecy: heldFromFamily) runs on it. Round 5 (CHK4-CS-4/5, lead
- *   decision): a body-safety or reading worksheet quotes exactly the words a disclosure uses ("Don't
- *   tell anyone, it's our secret", "I was touched by my coach at the award dinner", "My dad hits
- *   me," whispered the girl), so a held code, which starts the authorities-first review, never comes
- *   from a printed prompt. Self-harm, violence and contact rules still read it.
+ *   child abuse."), answer-only rules skip it, and no rule or signature whose category is
+ *   household-sensitive (abuse, sexual, secrecy: HOUSEHOLD_SENSITIVE_CATEGORIES, a fixed set that
+ *   is not the family-hold list) runs on it. Round 5 (CHK4-CS-4/5, lead decision): a body-safety
+ *   or reading worksheet quotes exactly the words a disclosure uses ("Don't tell anyone, it's our
+ *   secret", "I was touched by my coach at the award dinner", "My dad hits me," whispered the
+ *   girl), so such a code, which under the 2026-09-25 owner decision goes straight to the parent's
+ *   list and inbox, never comes from a printed prompt. Self-harm, violence and contact rules still
+ *   read it.
  * - `context`: the printed prompt read only for the topics it raises (model-output grounding); no
  *   code comes from it, so every rule but the answer-only ones runs.
  */
@@ -593,8 +600,10 @@ type Reader = 'own' | 'printed' | 'context';
 
 function scan(norm: NormalizedText, source: ScreenSource, reader: Reader): Hits {
   const firstPerson = reader === 'own';
-  // The one place held codes are kept off a printed prompt (rules and signatures alike).
-  const skipHeld = (compiled: { readonly held: boolean }) => reader === 'printed' && compiled.held;
+  // The one place household-sensitive codes are kept off a printed prompt (rules and signatures
+  // alike). Keyed on the fixed HOUSEHOLD_SENSITIVE_CATEGORIES, never on FAMILY_HOLD_CATEGORIES.
+  const skipOnPrinted = (compiled: { readonly householdSensitive: boolean }) =>
+    reader === 'printed' && compiled.householdSensitive;
   const rules = new Set<CompiledRule>();
   const personal = new Set<CompiledRule | CompiledSignature>();
   let sentences: ReadonlySet<number> | null = null;
@@ -611,7 +620,7 @@ function scan(norm: NormalizedText, source: ScreenSource, reader: Reader): Hits 
       const candidates = INDEX.get(token);
       if (candidates === undefined) continue;
       for (const rule of candidates) {
-        if (!rule.sources.has(source) || skipHeld(rule)) continue;
+        if (!rule.sources.has(source) || skipOnPrinted(rule)) continue;
         // A rule about the child's own answer never reads the printed prompt (CHK2-CS-4).
         if (rule.def.answerOnly && !firstPerson) continue;
         // A tier-B rule on a child's text keeps looking (still bounded: one check per position)
@@ -626,7 +635,7 @@ function scan(norm: NormalizedText, source: ScreenSource, reader: Reader): Hits 
   }
   const signatures = new Set<CompiledSignature>();
   for (const sig of COMPILED_SIGNATURES) {
-    if (!sig.sources.has(source) || skipHeld(sig)) continue;
+    if (!sig.sources.has(source) || skipOnPrinted(sig)) continue;
     if (norm.compacts.some((c) => sig.phrases.some((phrase) => anchored(c, phrase)))) {
       signatures.add(sig);
       if (
@@ -806,9 +815,10 @@ export function screenText(text: string, options: ScreenOptions): SafetyScreen {
  * of the printed question and subject) and the printed prompt itself (a child may have written in
  * it, or the extraction may have merged a margin note into it). The prompt's first person does not
  * make a tier-B word severe: a worksheet's "our class" or "we discuss" is not the child's statement
- * (CHK-CS-2), so a tier-B word in it is judged by subject and cues. Round 5 (CHK4-CS-4/5): no held
- * code (abuse, sexual, secrecy) comes from the prompt; its self-harm, violence and contact rules
- * still apply, so a margin note "i want to die" merged into it is still severe (see scan).
+ * (CHK-CS-2), so a tier-B word in it is judged by subject and cues. Round 5 (CHK4-CS-4/5): no
+ * household-sensitive code (abuse, sexual, secrecy) comes from the prompt; its self-harm, violence
+ * and contact rules still apply, so a margin note "i want to die" merged into it is still severe
+ * (see scan).
  */
 export function screenQuestion(input: {
   readonly prompt: string | null;
@@ -823,8 +833,9 @@ export function screenQuestion(input: {
   }
   if (input.prompt !== null && input.prompt.trim().length > 0) {
     screens.push(screenWith(input.prompt, 'child', contextInfo({ subject: input.subject }), false));
-    // The prompt still reports every topic it raises, a held rule's tier-B word included ("child
-    // abuse" in a rights lesson is `sexual_violence_topic`), though no held code comes from it.
+    // The prompt still reports every topic it raises, a household-sensitive rule's tier-B word
+    // included ("child abuse" in a rights lesson is `sexual_violence_topic`), though no
+    // household-sensitive code comes from it.
     screens.push(finish(new Set(), withPrompt.promptTopics, new Set(), false));
   }
   return mergeScreens(screens);

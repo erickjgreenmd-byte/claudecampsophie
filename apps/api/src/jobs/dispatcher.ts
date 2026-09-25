@@ -138,8 +138,140 @@ export const deletionPurgeHandler: JobHandler = async (deps, job) => {
   });
 };
 
+// ---------------------------------------------------------------------------------------------
+// Safety flag email (owner decision, 2026-09-25: the parent is the only safety recipient)
+// ---------------------------------------------------------------------------------------------
+
+/** Records that the provider refused the flag email; never overwrites a recorded delivery. */
+async function recordFlagEmailFailed(deps: JobDeps, reportId: string): Promise<void> {
+  await deps.db.asService(
+    (tx) => tx`
+      update public.safety_reports set parent_email_status = 'failed'
+       where id = ${reportId} and parent_email_status = 'not_sent'`,
+  );
+}
+
+/**
+ * When the scan job files a system report (a safety flag) it enqueues this job with the report id
+ * (scan-process.ts safetyResponse, once per report). The job emails every active guardian whose
+ * address is verified that PencilLift flagged an answer for them to look at, and where: the
+ * portal's privacy page. Template `safety_flag` with the portal address as its only parameter: no
+ * child name, no homework text, no category, no report id (providers/index.ts EMAIL_TEMPLATES).
+ *
+ * The delivery is recorded on the report (migration 0790) so the family's list never claims an
+ * email that was not sent: `sent` (with the instant) once at least one address accepted it,
+ * `failed` from the first refusal on (the ledger retries a bounded number of times with backoff,
+ * then dead-letters the job; the record stays `failed` unless a retry succeeds), `not_sent` when
+ * no verified address exists (nothing to retry: the job ends). A recorded delivery is final: a
+ * retry after it sends nothing, so no guardian is emailed twice for one flag.
+ *
+ * The labeled outbox mock is never used outside development and test (the inactivity-notice rule,
+ * L-016): elsewhere the job refuses, records `failed` and fails, so the refusal is in the ledger
+ * and the logs, never a "sent" that went nowhere.
+ */
+export const safetyFlagEmailHandler: JobHandler = Object.assign(
+  async (deps: JobDeps, job: JobRow): Promise<void> => {
+    const reportId = typeof job.payload.reportId === 'string' ? job.payload.reportId : null;
+    if (!reportId || !job.family_id) throw new Error('safety_flag_email job without report');
+    const now = deps.clock();
+    const [report] = await deps.db.asService(
+      (tx) => tx<{ email_status: string; visible: boolean }[]>`
+        select r.parent_email_status as email_status, r.family_visible as visible
+          from public.safety_reports r
+          join public.families f on f.id = r.family_id and f.deleted_at is null
+         where r.id = ${reportId} and r.family_id = ${job.family_id} and r.reporter_kind = 'system'`,
+    );
+    // Purged with the child or the family (the purge removes this job too), or not a flag.
+    if (!report) return;
+    // A retry after a recorded delivery: never a second email for one flag.
+    if (report.email_status === 'sent') return;
+    // Nothing for the family to look at while a report is held from its list (none is filed held
+    // since the owner decision; the mechanism stays as a support tool).
+    if (!report.visible) {
+      deps.log({ level: 'warn', event: 'safety_flag_email_skipped', code: 'REPORT_HELD' });
+      return;
+    }
+    if (deps.providers.email.isMock && !MOCK_ENVIRONMENTS.has(deps.config.environment)) {
+      // An email that goes to an in-memory outbox is not an email: refuse it in staging as in
+      // production (only development and test may use the labeled outbox).
+      deps.log({ level: 'error', event: 'safety_flag_email_blocked', code: 'EMAIL_PROVIDER_MOCK' });
+      await recordFlagEmailFailed(deps, reportId);
+      throw new Error('EMAIL_PROVIDER_MOCK');
+    }
+    const recipients = await deps.db.asService(
+      (tx) => tx<{ email: string | null; email_verified: boolean }[]>`
+        select e.email, e.email_verified
+          from public.family_memberships m
+          cross join lateral app.adult_auth_email(m.user_id) e
+         where m.family_id = ${job.family_id} and m.status = 'active'
+         order by m.role, m.created_at`,
+    );
+    const addresses = recipients.flatMap((r) => (r.email && r.email_verified ? [r.email] : []));
+    if (addresses.length === 0) {
+      deps.log({
+        level: 'warn',
+        event: 'safety_flag_email_undeliverable',
+        code: 'NO_VERIFIED_EMAIL',
+      });
+      return;
+    }
+    // The accept link of guardian invitations points at the same portal origin (guardians.ts).
+    const origin = deps.config.corsOrigins[0];
+    if (!origin) {
+      deps.log({ level: 'error', event: 'safety_flag_email_blocked', code: 'NO_PORTAL_ORIGIN' });
+      await recordFlagEmailFailed(deps, reportId);
+      throw new Error('NO_PORTAL_ORIGIN');
+    }
+    const portalUrl = `${origin}/app/privacy`;
+    let accepted = 0;
+    let refused = 0;
+    for (const to of addresses) {
+      try {
+        await deps.providers.email.send({ to, templateKey: 'safety_flag', params: { portalUrl } });
+        accepted += 1;
+      } catch {
+        refused += 1;
+      }
+    }
+    if (accepted === 0) {
+      deps.log({
+        level: 'error',
+        event: 'safety_flag_email_send_failed',
+        code: 'EMAIL_SEND_FAILED',
+      });
+      await recordFlagEmailFailed(deps, reportId);
+      throw new Error('EMAIL_SEND_FAILED');
+    }
+    await deps.db.asService(async (tx) => {
+      const stamped = await tx`
+        update public.safety_reports set parent_email_status = 'sent', parent_emailed_at = ${now}
+         where id = ${reportId} and parent_email_status <> 'sent'
+        returning id`;
+      if (stamped.length === 0) return;
+      // Counts and the provider only: no address, no homework (family members read this log).
+      await tx`
+        insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+        values (${job.family_id}, 'system', 'safety_report.guardian_emailed', 'safety_report', ${reportId},
+                ${JSON.stringify({ provider: deps.providers.email.name, recipients: accepted, refused })}::text::jsonb)`;
+    });
+    deps.log({
+      level: refused > 0 ? 'warn' : 'info',
+      event: 'safety_flag_email_sent',
+      code: refused > 0 ? 'PARTIAL' : 'ALL_GUARDIANS',
+    });
+  },
+  {
+    /** The worker died on the final attempt: the family's list must not keep saying "not sent". */
+    onDeadLetter: async (deps: JobDeps, job: JobRow): Promise<void> => {
+      const reportId = typeof job.payload.reportId === 'string' ? job.payload.reportId : null;
+      if (reportId) await recordFlagEmailFailed(deps, reportId);
+    },
+  },
+);
+
 export const DEFAULT_HANDLERS: Readonly<Record<string, JobHandler>> = {
   deletion_purge: deletionPurgeHandler,
+  safety_flag_email: safetyFlagEmailHandler,
 };
 
 export interface TickReport {

@@ -107,3 +107,7 @@ Rules:
 | Local quantity multiplier for extra children | Spec P11 forbids; capacity tiers are distinct store products in one subscription group. |
 | Computing billing periods as `+30 days` | Wrong for February/month-end; provider period boundaries are authoritative. |
 | Floats for money | Rounding drift; forbidden by spec F2. |
+
+## Safety flags go to the parent (owner decision, 2026-09-25)
+
+The parent is the only person PencilLift sends a safety message to, and the parent addresses the concern. Every flag the screen or provider moderation files is visible to the family at once and emailed to every active guardian (no homework text, child name or category in the email); the parent can mark a flag addressed or a false alarm from the portal and the app after a PIN unlock; the owner-admin queue remains a support tool. The family-hold mechanism (0760 `family_visible`, admin release) stays in the schema but `FAMILY_HOLD_CATEGORIES` is empty. The rule that abuse, sexual and secrecy codes never come from a printed prompt keys on `HOUSEHOLD_SENSITIVE_CATEGORIES`, not on the hold list. The lead's dissent: this can deliver a disclosure to the person it names; recorded in Owner action #24 and Threat_Model T34.

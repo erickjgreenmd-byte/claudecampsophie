@@ -534,8 +534,9 @@ describe('a severe answer in a scan (AC_SECURITY_02)', () => {
 
   it('records no model grade or solution for the flagged answer and logs codes only', async () => {
     // Decision (RV-child-safety-5): a flagged question is not graded (no verdict, no worked
-    // solution for a disclosure). The scan's status follows the other questions, so a held flag is
-    // never announced to the household as "needs your review".
+    // solution for a disclosure). The scan's status follows the other questions: a flag is not
+    // announced as "needs your review"; the parent learns of it from the report list and the flag
+    // email (owner decision, 2026-09-25).
     expect(
       await api.db.sql`select verdict from public.question_results where question_id = ${severeId}`,
     ).toEqual([]);
@@ -657,7 +658,7 @@ describe('a severe answer in a scan (AC_SECURITY_02)', () => {
       category: 'severe_risk',
       screenCategories: ['self_harm'],
       hasNote: false,
-      // self_harm is not held: the family list shows it at once (runbook 5.1).
+      // No flag is held (owner decision, 2026-09-25): the family list shows it at once.
       familyVisible: true,
       // The answer this report flagged was corrected later (the second report is for the edit).
       transcriptionCorrected: true,
@@ -846,14 +847,18 @@ describe('a correction keeps the safety notice of a flagged question (RV-child-s
     const aal2 = await parentToken(adminId, { aal: 'aal2' });
     const queue = await adminQueue(aal2, 'status=escalated');
     expect(queue.find((r) => r.questionId === abuseId)).toMatchObject({
-      familyVisible: false,
+      // Owner decision (2026-09-25): an abuse flag is visible to the family from the start.
+      familyVisible: true,
       transcriptionCorrected: true,
     });
   });
 });
 
-describe('a child’s "Get help" report on a held flag (RV-child-safety-6)', () => {
-  it('is held with the flag: the family list does not show the flagged question', async () => {
+describe('a child’s "Get help" report on an abuse flag (RV-child-safety-6)', () => {
+  // Owner decision (2026-09-25), a policy change and not a weakened test: this test asserted that
+  // the child's report started held with the held abuse flag. No flag is held now, so both are in
+  // the family's list at once, and a release changes nothing.
+  it('is listed at once with the flag; the reviewer sees both visible', async () => {
     const fam = await seedFamily(api.db, { childCount: 1 });
     await consent(fam);
     const { parent, child } = await childSession(fam);
@@ -868,24 +873,32 @@ describe('a child’s "Get help" report on a held flag (RV-child-safety-6)', () 
     });
     expect(filed.status).toBe(201);
     const raw = await (await api.request('/v1/safety-reports', { token: parent })).text();
-    expect(raw).not.toContain(abuseId);
-    expect(safetyReportsResponseSchema.parse(JSON.parse(raw)).reports).toEqual([]);
-    // The reviewer sees both, held, and can release each (forward only).
+    expect(raw).not.toContain(ABUSE_ANSWER);
+    const list = safetyReportsResponseSchema.parse(JSON.parse(raw)).reports;
+    expect(list.map((r) => [r.reporterKind, r.questionId]).sort()).toEqual([
+      ['child', abuseId],
+      ['system', abuseId],
+    ]);
+    // The reviewer sees both visible; a release of a visible report is a no-op (no audit row).
     const adminId = await seedOwnerAdmin(api.db);
     const aal2 = await parentToken(adminId, { aal: 'aal2' });
     const queue = await adminQueue(aal2, 'status=open');
     const childReport = queue.find((r) => r.questionId === abuseId && r.reporterKind === 'child');
-    expect(childReport).toMatchObject({ familyVisible: false, category: 'upsetting' });
+    expect(childReport).toMatchObject({ familyVisible: true, category: 'upsetting' });
     const released = await api.request(`/v1/admin/safety-reports/${childReport!.id}`, {
       method: 'PATCH',
       token: aal2,
       body: { familyVisible: true },
     });
     expect(released.status).toBe(200);
-    const list = safetyReportsResponseSchema.parse(
-      await json(await api.request('/v1/safety-reports', { token: parent })),
-    );
-    expect(list.reports.map((r) => [r.reporterKind, r.questionId])).toEqual([['child', abuseId]]);
+    expect(adminSafetyReportResponseSchema.parse(await json(released)).report).toMatchObject({
+      familyVisible: true,
+      status: 'open',
+    });
+    expect(
+      await api.db.sql`select id from public.audit_events
+                        where target_id = ${childReport!.id} and action = 'safety_report.released_to_family'`,
+    ).toEqual([]);
   });
 });
 
@@ -919,7 +932,11 @@ describe('the feedback step for a graded question (moderation before generation)
   });
 });
 
-describe('abuse-type flags are held from the family list until the owner releases them', () => {
+describe('abuse-type flags are listed for the family at once (owner decision, 2026-09-25)', () => {
+  // Owner decision (2026-09-25), a policy change and not a weakened test: these tests asserted that
+  // an abuse flag started held from the family's list, with no family id on its audit row, until
+  // the owner released it. The parent is now the only person PencilLift sends a safety message to
+  // and the one who addresses the concern, so the flag is filed visible like a self-harm flag.
   let scan: Scan;
   let client: ReturnType<typeof scriptedModel>;
   let abuseId: string;
@@ -951,43 +968,52 @@ describe('abuse-type flags are held from the family list until the owner release
     expect(rows[0]!.body).toContain('988');
   });
 
-  it('the abuse report is held; the self-harm report is visible; the family sees only that one', async () => {
+  it('the abuse report and the self-harm report are both visible; the family sees both, without text or codes', async () => {
     const reports = await systemReports(scan.fam.familyId);
     expect(reports.map((r) => r.question_id).sort()).toEqual([abuseId, writingId].sort());
-    const [held] = await api.db.sql<{ family_visible: boolean }[]>`
-      select family_visible from public.safety_reports where question_id = ${abuseId}`;
-    expect(held!.family_visible).toBe(false);
+    const [abuse] = await api.db.sql<{ family_visible: boolean; row_json: string }[]>`
+      select family_visible, row_to_json(r)::text as row_json from public.safety_reports r
+       where question_id = ${abuseId}`;
+    expect(abuse!.family_visible).toBe(true);
+    expect(abuse!.row_json).not.toContain(ABUSE_ANSWER);
 
     const token = await parentToken(scan.fam.ownerId);
     const raw = await (await api.request('/v1/safety-reports', { token })).text();
     const list = safetyReportsResponseSchema.parse(JSON.parse(raw));
-    expect(list.reports.map((r) => r.questionId)).toEqual([writingId]);
-    expect(raw).not.toContain(abuseId);
+    expect(list.reports.map((r) => r.questionId).sort()).toEqual([abuseId, writingId].sort());
+    expect(raw).not.toContain(ABUSE_ANSWER);
+    expect(raw).not.toMatch(/self_harm|screen/i); // the matched category stays admin-only
   });
 
-  it('a household member cannot find the held report through the audit log', async () => {
+  it('the report’s audit row carries the family id, and a family member can read it', async () => {
+    // What the API writes for a visible report (family members can read their family's audit log).
     const [report] = await api.db.sql<{ id: string }[]>`
       select id from public.safety_reports where question_id = ${abuseId}`;
-    const audit = await api.db.sql<{ family_id: string | null; action: string }[]>`
-      select family_id, action from public.audit_events where target_id = ${report!.id}`;
-    expect(audit).toEqual([{ family_id: null, action: 'safety_report.created' }]);
+    const audit = await api.db.sql<
+      { id: string; family_id: string | null; action: string; metadata: unknown }[]
+    >`select id, family_id, action, metadata from public.audit_events where target_id = ${report!.id}`;
+    expect(audit.map((a) => [a.family_id, a.action])).toEqual([
+      [scan.fam.familyId, 'safety_report.created'],
+    ]);
+    expect(JSON.stringify(audit)).not.toContain(ABUSE_ANSWER);
     const seen = await api.apiDb.asParent(
       { kind: 'parent', userId: scan.fam.ownerId, sessionId: randomUUID(), aal: 'aal1' },
       (tx) =>
         tx<{ id: string }[]>`select id from public.audit_events where target_id = ${report!.id}`,
     );
-    expect(seen).toEqual([]);
+    expect(seen).toEqual([{ id: audit[0]!.id }]);
   });
 
-  it('the owner admin sees it held and can release it to the family (forward only)', async () => {
+  it('the owner admin sees it visible; a release is a no-op and a hide is refused', async () => {
     const adminId = await seedOwnerAdmin(api.db);
     const aal2 = await parentToken(adminId, { aal: 'aal2' });
     const queue = await adminQueue(aal2, 'status=escalated');
-    const held = queue.find((r) => r.questionId === abuseId)!;
-    expect(held).toMatchObject({ screenCategories: ['abuse'], familyVisible: false });
+    const flag = queue.find((r) => r.questionId === abuseId)!;
+    expect(flag).toMatchObject({ screenCategories: ['abuse'], familyVisible: true });
 
+    // A report is never hidden through the API (forward only), and an empty body is refused.
     for (const body of [{ familyVisible: false }, {}]) {
-      const bad = await api.request(`/v1/admin/safety-reports/${held.id}`, {
+      const bad = await api.request(`/v1/admin/safety-reports/${flag.id}`, {
         method: 'PATCH',
         token: aal2,
         body,
@@ -995,23 +1021,15 @@ describe('abuse-type flags are held from the family list until the owner release
       expect(bad.status, JSON.stringify(body)).toBe(400);
     }
 
-    const released = await api.request(`/v1/admin/safety-reports/${held.id}`, {
+    // Releasing a visible report changes nothing: no audit row, no triage stamp.
+    const released = await api.request(`/v1/admin/safety-reports/${flag.id}`, {
       method: 'PATCH',
       token: aal2,
       body: { familyVisible: true },
     });
     expect(released.status).toBe(200);
     const after = adminSafetyReportResponseSchema.parse(await json(released)).report;
-    expect(after).toMatchObject({ familyVisible: true, status: 'escalated' });
-
-    // Releasing again is a no-op: no second audit row, no triage stamp change.
-    const again = await api.request(`/v1/admin/safety-reports/${held.id}`, {
-      method: 'PATCH',
-      token: aal2,
-      body: { familyVisible: true },
-    });
-    expect(again.status).toBe(200);
-    expect(adminSafetyReportResponseSchema.parse(await json(again)).report).toEqual(after);
+    expect(after).toMatchObject({ familyVisible: true, status: 'escalated', triagedAt: null });
 
     const token = await parentToken(scan.fam.ownerId);
     const list = safetyReportsResponseSchema.parse(
@@ -1020,21 +1038,46 @@ describe('abuse-type flags are held from the family list until the owner release
     expect(list.reports.map((r) => r.questionId).sort()).toEqual([abuseId, writingId].sort());
     const audit = await api.db.sql<{ action: string; metadata: unknown }[]>`
       select action, metadata from public.audit_events
-       where target_id = ${held.id} and action = 'safety_report.released_to_family'`;
-    expect(audit).toHaveLength(1);
+       where target_id = ${flag.id} and action = 'safety_report.released_to_family'`;
+    expect(audit).toHaveLength(0);
   });
 });
 
 describe('parent-facing wording (contracts PARENT_SAFETY_FLAG_COPY)', () => {
-  const NO_ALERT_CLAIM =
-    /\b(alerted|notified|we told|has been told|will be told|we sent|we emailed|we called|your child saw|your child was shown|your child read)\b/i;
-  it('is honest: flagged for a grown-up, no automatic alert, no claim about what the child saw', () => {
+  // Owner decision (2026-09-25), a policy change and not a weakened test: the summary used to claim
+  // "PencilLift sent no automatic alert". A flag now emails the family's guardians, so the honesty
+  // rule (AC_SECURITY_02 "notification claims match actual deliveries") is asserted this way: the
+  // summary and every outcome wording claim no alert or email at all, and only the wording the API
+  // shows for a RECORDED delivery (`emailSent`, migration 0790) says an email went out.
+  const DELIVERY_CLAIM =
+    /\b(alerted|notified|we told|has been told|will be told|we sent|we emailed|we called|emailed|sent an email|an email was sent)\b/i;
+  const CHILD_CLAIM = /\b(your child saw|your child was shown|your child read)\b/i;
+  it('is honest: flagged for a grown-up, a delivery claim only for a recorded delivery, no claim about what the child saw', () => {
     expect(PARENT_SAFETY_FLAG_COPY.summary).toMatch(
       /PencilLift flagged an answer for a grown-up to look at/,
     );
-    expect(PARENT_SAFETY_FLAG_COPY.summary).toMatch(/PencilLift sent no automatic alert/);
+    const noDeliveryClaim = [
+      PARENT_SAFETY_FLAG_COPY.category,
+      PARENT_SAFETY_FLAG_COPY.reporter,
+      PARENT_SAFETY_FLAG_COPY.summary,
+      PARENT_SAFETY_FLAG_COPY.resources,
+      PARENT_SAFETY_FLAG_COPY.addressed,
+      PARENT_SAFETY_FLAG_COPY.childReportAddressed,
+      PARENT_SAFETY_FLAG_COPY.actionsNeedUnlock,
+      PARENT_SAFETY_FLAG_COPY.cleared,
+      PARENT_SAFETY_FLAG_COPY.emailNotSent,
+      PARENT_SAFETY_FLAG_COPY.emailFailed,
+    ].join(' ');
+    expect(noDeliveryClaim).not.toMatch(DELIVERY_CLAIM);
+    // The recorded-delivery wording says an email went out and what it does not carry.
+    expect(PARENT_SAFETY_FLAG_COPY.emailSent).toMatch(/PencilLift emailed the guardians/);
+    expect(PARENT_SAFETY_FLAG_COPY.emailSent).toMatch(
+      /names no child, no question and no kind of concern/,
+    );
+    expect(PARENT_SAFETY_FLAG_COPY.emailNotSent).toMatch(/No email has been sent/);
+    expect(PARENT_SAFETY_FLAG_COPY.emailFailed).toMatch(/could not be sent/);
     const all = Object.values(PARENT_SAFETY_FLAG_COPY).join(' ');
-    expect(all).not.toMatch(NO_ALERT_CLAIM);
+    expect(all).not.toMatch(CHILD_CLAIM);
     expect(PARENT_SAFETY_FLAG_COPY.resources).toContain('988');
     expect(PARENT_SAFETY_FLAG_COPY.resources).toContain('1-800-422-4453');
     expect(PARENT_SAFETY_FLAG_COPY.resources).toContain('911');
@@ -1042,11 +1085,19 @@ describe('parent-facing wording (contracts PARENT_SAFETY_FLAG_COPY)', () => {
       PARENT_SAFETY_FLAG_COPY.category,
       PARENT_SAFETY_FLAG_COPY.reporter,
       PARENT_SAFETY_FLAG_COPY.summary,
+      PARENT_SAFETY_FLAG_COPY.emailSent,
+      PARENT_SAFETY_FLAG_COPY.emailNotSent,
+      PARENT_SAFETY_FLAG_COPY.emailFailed,
+      PARENT_SAFETY_FLAG_COPY.addressed,
+      PARENT_SAFETY_FLAG_COPY.childReportAddressed,
+      PARENT_SAFETY_FLAG_COPY.actionsNeedUnlock,
       PARENT_SAFETY_FLAG_COPY.cleared,
     ].join(' ');
-    // Round 3: a cleared flag says what changed for the child, and still claims no alert.
+    // Round 3: a cleared flag says what changed for the child; the guardian's "looked into" says
+    // that nothing changed for the child. Neither names the kind of concern.
     expect(PARENT_SAFETY_FLAG_COPY.cleared).toMatch(/not a concern/);
     expect(PARENT_SAFETY_FLAG_COPY.cleared).toMatch(/no longer show the message/);
+    expect(PARENT_SAFETY_FLAG_COPY.addressed).toMatch(/keep showing the message/);
     expect(described).not.toMatch(/abuse|suicid|self-harm|sexual|violen|threat/i);
   });
 
@@ -1061,6 +1112,13 @@ describe('parent-facing wording (contracts PARENT_SAFETY_FLAG_COPY)', () => {
       'safety-templates.v2': '547e9cfe6c51df40d0ddd377ac5e6a53e23800544b977f9227aec29df10da1d3',
       // v3 (round 3): `cleared` for a visible flag a reviewer cleared as a false match.
       'safety-templates.v3': '6512da2f8739561d559ada52dc55a6cb9391d83f0d1a05ca583a64b457d30853',
+      // v4 (owner decision, 2026-09-25): the summary no longer claims "no automatic alert";
+      // `emailSent`, `emailNotSent` and `emailFailed` state the recorded delivery of the flag email;
+      // `addressed` for the guardian's action; `cleared` no longer names a reviewer; and the keys
+      // `childReportAddressed` (a guardian looked into a child's own report) and
+      // `actionsNeedUnlock` (both actions need a recent parent PIN unlock) were added with the
+      // parent actions. Pinned over the settled contracts copy (packages/contracts/src/privacy.ts).
+      'safety-templates.v4': '25af2aa5bcbb74f5ba3eaed6119fc07f66122b097090a1b91d814be8c4b492bb',
     };
     expect({ version: SAFETY_TEMPLATES_VERSION, digest }).toEqual({
       version: SAFETY_TEMPLATES_VERSION,
@@ -1207,7 +1265,8 @@ describe('the admin queue reaches every report (RV-child-safety-9)', () => {
       values (${a!.id}, ${fam.familyId}, ${childId}, ${pageId}, '1', 'Synthetic prompt', 'synthetic', 'open_response', 'science', 's')
       returning id`;
     // 200 older escalated system reports (one question, a transcription each), all at one instant
-    // so the cursor must break ties by id, then one new held abuse report.
+    // so the cursor must break ties by id, then one new abuse report (visible, like every report
+    // since the 2026-09-25 owner decision).
     const old = new Date(api.now.value.getTime() - 86_400_000);
     await api.db.sql`
       insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id, status,
@@ -1217,9 +1276,9 @@ describe('the admin queue reaches every report (RV-child-safety-9)', () => {
         from generate_series(1, 200) as n`;
     const [newest] = await api.db.sql<{ id: string }[]>`
       insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id, status,
-                                         transcription_at, screen_categories, screen_version, family_visible)
+                                         transcription_at, screen_categories, screen_version)
       values (${fam.familyId}, ${childId}, 'system', 'severe_risk', ${q!.id}, 'escalated',
-              ${api.now.value}, array['abuse'], ${SAFETY_SCREEN_VERSION}, false)
+              ${api.now.value}, array['abuse'], ${SAFETY_SCREEN_VERSION})
       returning id`;
 
     const adminId = await seedOwnerAdmin(api.db);
@@ -1260,11 +1319,11 @@ describe('the admin queue reaches every report (RV-child-safety-9)', () => {
 
 // Documented false matches (packages/domain/src/safety/corpus.ts REVIEWER_CLEARED_PASS5 and index.ts
 // KNOWN LIMITS): everyday words that are also a disclosure, so the screen escalates them by design.
-const HELD_FALSE_MATCH_ANSWER = 'They don’t give me food I don’t like';
-const HELD_FALSE_MATCH: ScriptedQuestion = {
+const ABUSE_FALSE_MATCH_ANSWER = 'They don’t give me food I don’t like';
+const ABUSE_FALSE_MATCH: ScriptedQuestion = {
   number: '10',
   prompt: 'Write one sentence about dinner at your house.',
-  answer: HELD_FALSE_MATCH_ANSWER,
+  answer: ABUSE_FALSE_MATCH_ANSWER,
   kind: 'open_response',
   subject: 'grammar_writing',
   key: 'A complete sentence about dinner.',
@@ -1329,41 +1388,45 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
       values (${fam.familyId}, ${fam.children[0]!.id})`;
   }
 
-  it('a held flag: the child’s notice goes, the question is graded, the family never learns of it', async () => {
+  it('an abuse flag: the child’s notice goes, the question is graded, the family list says it was cleared', async () => {
+    // Owner decision (2026-09-25), a policy change and not a weakened test: this test asserted
+    // that a held abuse flag cleared as a false match was never released and never reached the
+    // family's list or audit log. No flag is held now: the abuse flag is in the family's list from
+    // the start, and its clearance shows there like a self-harm flag's.
     const fam = await seedFamily(api.db, { childCount: 1 });
     await consent(fam);
     const { parent, child } = await childSession(fam);
     const scan = await queuedScan(fam);
-    const client = scriptedModel([HELD_FALSE_MATCH, MATH]);
+    const client = scriptedModel([ABUSE_FALSE_MATCH, MATH]);
     expect((await runJobs(deps, handlers(client))).succeeded).toBe(1);
-    const flaggedId = await questionId(scan, HELD_FALSE_MATCH.prompt);
+    const flaggedId = await questionId(scan, ABUSE_FALSE_MATCH.prompt);
     const flagged = async () =>
       (await childDetail(scan, child)).questions.find((q) => q.id === flaggedId)!;
     expect((await flagged()).feedback.map((f) => f.kind)).toEqual(['safety']);
-    expect(gradingRequestsWith(client, HELD_FALSE_MATCH_ANSWER)).toEqual([]);
+    expect(gradingRequestsWith(client, ABUSE_FALSE_MATCH_ANSWER)).toEqual([]);
 
     const aal2 = await adminToken();
-    const [held] = (await adminQueue(aal2, 'status=escalated')).filter(
+    const [flag] = (await adminQueue(aal2, 'status=escalated')).filter(
       (r) => r.questionId === flaggedId,
     );
-    expect(held).toMatchObject({
+    expect(flag).toMatchObject({
       screenCategories: ['abuse'],
-      familyVisible: false,
+      familyVisible: true,
       resolution: null,
     });
 
-    // A clearance is part of resolving and is never combined with a release.
-    expect((await patch(aal2, held!.id, { resolution: 'false_match' })).status).toBe(400);
-    expect((await patch(aal2, held!.id, { ...CLEAR, familyVisible: true })).status).toBe(400);
+    // A clearance is part of resolving and never carries familyVisible (contract).
+    expect((await patch(aal2, flag!.id, { resolution: 'false_match' })).status).toBe(400);
+    expect((await patch(aal2, flag!.id, { ...CLEAR, familyVisible: true })).status).toBe(400);
 
-    const cleared = await patch(aal2, held!.id, CLEAR);
+    const cleared = await patch(aal2, flag!.id, CLEAR);
     expect(cleared.status).toBe(200);
     const body = adminSafetyReportResponseSchema.parse(await json(cleared));
     expect(body.recheck).toBe('queued');
     expect(body.report).toMatchObject({
       status: 'resolved',
       resolution: 'false_match',
-      familyVisible: false,
+      familyVisible: true,
     });
 
     // (a) At once, before the recheck runs: the child no longer sees the notice.
@@ -1371,11 +1434,16 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
     expect(waiting.assignment.status).toBe('checking');
     expect(waiting.questions.find((q) => q.id === flaggedId)!.feedback).toEqual([]);
 
-    // (c) The held flag is never released, and a second clearance is refused (resolved is final).
-    const release = await patch(aal2, held!.id, { familyVisible: true });
-    expect(release.status).toBe(422);
-    expect((await json<ErrorBody>(release)).error.rule).toBe('FALSE_MATCH_NOT_RELEASABLE');
-    const again = await patch(aal2, held!.id, CLEAR);
+    // (c) A release of the already visible report changes nothing (200, same report), and a
+    // second clearance is refused (resolved is final).
+    const release = await patch(aal2, flag!.id, { familyVisible: true });
+    expect(release.status).toBe(200);
+    expect(adminSafetyReportResponseSchema.parse(await json(release)).report).toMatchObject({
+      status: 'resolved',
+      resolution: 'false_match',
+      familyVisible: true,
+    });
+    const again = await patch(aal2, flag!.id, CLEAR);
     expect(again.status).toBe(422);
     expect((await json<ErrorBody>(again)).error.rule).toBe('INVALID_TRANSITION');
 
@@ -1385,8 +1453,10 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
     await dueNow(fam);
     expect((await runJobs(deps, handlers(client))).succeeded).toBe(1);
     const recheckRequests = { requests: client.requests.slice(before) };
-    expect(gradingRequestsWith(recheckRequests, HELD_FALSE_MATCH_ANSWER).length).toBeGreaterThan(0);
-    expect(coachedQuestions(recheckRequests)).toEqual([HELD_FALSE_MATCH.prompt]);
+    expect(gradingRequestsWith(recheckRequests, ABUSE_FALSE_MATCH_ANSWER).length).toBeGreaterThan(
+      0,
+    );
+    expect(coachedQuestions(recheckRequests)).toEqual([ABUSE_FALSE_MATCH.prompt]);
     expect(
       await api.db
         .sql`select verdict from public.question_results where question_id = ${flaggedId}`,
@@ -1403,17 +1473,20 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
       code: 'SAFETY_CLEARED',
     });
 
-    // (c) The family's list and audit log never show the held report.
+    // (c) The family's list shows the report as cleared, and its audit rows carry the family id
+    // (what the API writes for a visible report); neither carries the answer text.
     const raw = await (await api.request('/v1/safety-reports', { token: parent })).text();
-    expect(safetyReportsResponseSchema.parse(JSON.parse(raw)).reports).toEqual([]);
-    expect(raw).not.toContain(held!.id);
+    expect(raw).not.toContain(ABUSE_FALSE_MATCH_ANSWER);
+    expect(safetyReportsResponseSchema.parse(JSON.parse(raw)).reports).toMatchObject([
+      { id: flag!.id, status: 'resolved', questionId: flaggedId, clearedAsFalseMatch: true },
+    ]);
     const audit = await api.db.sql<
       { family_id: string | null; action: string; metadata: unknown }[]
     >`
-      select family_id, action, metadata from public.audit_events where target_id = ${held!.id} order by id`;
+      select family_id, action, metadata from public.audit_events where target_id = ${flag!.id} order by id`;
     expect(audit.map((a) => [a.family_id, a.action])).toEqual([
-      [null, 'safety_report.created'],
-      [null, 'safety_report.updated'],
+      [fam.familyId, 'safety_report.created'],
+      [fam.familyId, 'safety_report.updated'],
     ]);
     expect(audit[1]!.metadata).toEqual({
       from: 'escalated',
@@ -1424,9 +1497,9 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
 
     // (d) Nothing about the answer text is stored with the clearance or logged.
     const [row] = await api.db.sql<{ row_json: string }[]>`
-      select row_to_json(r)::text as row_json from public.safety_reports r where id = ${held!.id}`;
+      select row_to_json(r)::text as row_json from public.safety_reports r where id = ${flag!.id}`;
     expect(row!.row_json).not.toContain('food');
-    expect(JSON.stringify(api.logs)).not.toContain(HELD_FALSE_MATCH_ANSWER);
+    expect(JSON.stringify(api.logs)).not.toContain(ABUSE_FALSE_MATCH_ANSWER);
     expect(JSON.stringify(audit)).not.toContain('food');
   });
 
@@ -1537,9 +1610,9 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
     await paidSlot(fam);
     const { parent, child } = await childSession(fam);
     const scan = await queuedScan(fam);
-    const client = scriptedModel([HELD_FALSE_MATCH, MATH]);
+    const client = scriptedModel([ABUSE_FALSE_MATCH, MATH]);
     expect((await runJobs(deps, handlers(client))).succeeded).toBe(1);
-    const flaggedId = await questionId(scan, HELD_FALSE_MATCH.prompt);
+    const flaggedId = await questionId(scan, ABUSE_FALSE_MATCH.prompt);
     const flagged = async () =>
       (await childDetail(scan, child)).questions.find((q) => q.id === flaggedId)!;
     // A grown-up corrects the transcription to text that does not screen severe: the notice stays
@@ -1560,7 +1633,8 @@ describe('a reviewer clears a false match (round 3, CHK2-CS-5)', () => {
     const [flag] = (await adminQueue(aal2, 'status=escalated')).filter(
       (r) => r.questionId === flaggedId,
     );
-    expect(flag).toMatchObject({ transcriptionCorrected: true, familyVisible: false });
+    // Owner decision (2026-09-25): an abuse flag is visible to the family from the start.
+    expect(flag).toMatchObject({ transcriptionCorrected: true, familyVisible: true });
     const cleared = await patch(aal2, flag!.id, CLEAR);
     expect(cleared.status).toBe(200);
     expect(adminSafetyReportResponseSchema.parse(await json(cleared)).recheck).toBe('queued');

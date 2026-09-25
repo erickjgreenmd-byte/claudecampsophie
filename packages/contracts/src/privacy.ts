@@ -30,6 +30,10 @@ export const PRIVACY_RULES = {
   falseMatchNotReleasable: 'FALSE_MATCH_NOT_RELEASABLE',
   /** The flagged question's scan is still being checked; clear the flag once it is ready. */
   scanStillChecking: 'SCAN_STILL_CHECKING',
+  /** A parent's action on a report that is already resolved (by a guardian or a reviewer); 409. */
+  reportAlreadyResolved: 'REPORT_ALREADY_RESOLVED',
+  /** A parent's action applies to a flag or a child's report, not to the parent's own report. */
+  parentActionNotForReport: 'PARENT_ACTION_NOT_FOR_REPORT',
 } as const;
 
 // ---------------------------------------------------------------------------------------------
@@ -203,37 +207,108 @@ export const safetyScreenReportCategorySchema = z.enum(SAFETY_SCREEN_REPORT_CATE
  * the parent web bundle never loads the safety screen's rules.
  *
  * Honest by construction (AC_SECURITY_02 "notification claims match actual deliveries"): it states
- * what the product does, never what the child saw (opening the results is not recorded), and that
- * PencilLift sent no AUTOMATIC alert (a reviewer may still contact the family by email under
- * runbook 5.1, which this wording stays true for). It does not name the kind of concern.
+ * what the product does, never what the child saw (opening the results is not recorded), and
+ * whether the guardian email a flag sends was accepted (`emailSent`), not sent (`emailNotSent`) or
+ * refused by the provider (`emailFailed`) is taken from the recorded delivery (migration 0790),
+ * never assumed. It does not name the kind of concern.
+ *
+ * Owner decision (2026-09-25): the parent is the only person PencilLift sends a safety message
+ * to, and the parent addresses the concern. No flag is held from this list; every flag is emailed
+ * to the active guardians, and a guardian can mark it looked into (`addressed`) or a false alarm
+ * (`cleared`, the same clearing as a reviewer's).
  */
 export const PARENT_SAFETY_FLAG_COPY = {
   category: 'Answer flagged for a grown-up',
   reporter: 'Flagged by PencilLift',
   summary:
-    'PencilLift flagged an answer for a grown-up to look at. For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint. PencilLift sent no automatic alert (no email, text or notification); this list is where the flag appears. Please check in with your child.',
+    'PencilLift flagged an answer for a grown-up to look at. For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint, and PencilLift gives no hints on it. Please check in with your child.',
+  /** The recorded delivery: at least one active guardian's address accepted the flag email. */
+  emailSent:
+    'PencilLift emailed the guardians on this account about this flag when it was filed, so they know to look here. The email names no child, no question and no kind of concern.',
+  /**
+   * No email left PencilLift for this report (a flag's email has not been sent yet or no guardian
+   * address exists; nothing is sent for a child's or a parent's report).
+   */
+  emailNotSent: 'No email has been sent about this report; this list is where it appears.',
+  /** The email provider refused every guardian address (recorded; a bounded retry follows). */
+  emailFailed:
+    'PencilLift tried to email the guardians on this account about this flag, but the email could not be sent; this list is where it appears.',
   resources:
     'If your child may be in danger, call 911. Support is available any time from the 988 Suicide & Crisis Lifeline (call or text 988) and the Childhelp National Child Abuse Hotline (1-800-422-4453).',
   /**
-   * A visible flag a reviewer cleared as a false match (round 3, CHK2-CS-5). It replaces `summary`,
-   * which would no longer be true: the child's results stop showing the message for that question
-   * and the question is checked like the rest of the scan. A held flag is never listed.
+   * A guardian marked the flag looked into ("I've looked into this"). The child's notice for that
+   * question stays and PencilLift keeps giving no hints on it: nothing changes for the child.
+   */
+  addressed:
+    'A guardian on this account looked into this flag. Your child’s results keep showing the message about talking with a grown-up for that question, and PencilLift still gives no hints on it.',
+  /** A guardian marked a child's own report looked into (nothing changes for the child). */
+  childReportAddressed: 'A guardian on this account looked into this report.',
+  /** Under the two actions: the server checks the unlock (spec P3). */
+  actionsNeedUnlock: 'Both need a recent parent PIN unlock.',
+  /**
+   * A flag cleared as a false match, by a guardian ("This was a false alarm") or a reviewer
+   * (round 3, CHK2-CS-5). It replaces `summary`, which would no longer be true: the child's results
+   * stop showing the message for that question and the question is checked like the rest of the
+   * scan.
    */
   cleared:
-    'A PencilLift reviewer checked this flag and found it was not a concern. Your child’s results no longer show the message about talking with a grown-up for that question, and the question is checked like the rest of the scan.',
+    'This flag was checked and found not a concern. Your child’s results no longer show the message about talking with a grown-up for that question, and the question is checked like the rest of the scan.',
+} as const;
+
+/**
+ * The two actions a guardian can take on an unresolved flag (portal and app; both need a recent PIN
+ * unlock, and the report must be the family's own). Same wording on every surface. DRAFT with the
+ * copy above.
+ */
+export const PARENT_SAFETY_FLAG_ACTIONS = {
+  addressed: {
+    label: 'I’ve looked into this',
+    effect:
+      'Marks the report resolved. Your child’s results keep the message about talking with a grown-up for that question, and PencilLift gives no hints on it.',
+  },
+  falseMatch: {
+    label: 'This was a false alarm, check the question normally',
+    effect:
+      'Removes the message from your child’s results for that question and has PencilLift check the question like the rest of the scan. Choose this only when you are sure the answer is not a concern.',
+  },
 } as const;
 
 export const safetyReportStatusSchema = z.enum(['open', 'triaged', 'escalated', 'resolved']);
 export type SafetyReportStatus = z.infer<typeof safetyReportStatusSchema>;
 
 /**
- * How a reviewer resolved a system report, beyond its note (migration 0760 `resolution`).
+ * How a report was resolved, beyond the reviewer's note (migrations 0760 and 0790 `resolution`).
  * `false_match`: the safety screen's word match was wrong for that question and transcription; the
- * child's notice is hidden and the question is graded normally (runbook 5.1).
+ * child's notice is hidden and the question is graded normally (a reviewer's or a guardian's
+ * clearing). `addressed`: a guardian looked into the flag or the child's report; the child's notice
+ * stays and no AI runs on that question.
  */
-export const SAFETY_REPORT_RESOLUTIONS = ['false_match'] as const;
+export const SAFETY_REPORT_RESOLUTIONS = ['false_match', 'addressed'] as const;
 export const safetyReportResolutionSchema = z.enum(SAFETY_REPORT_RESOLUTIONS);
 export type SafetyReportResolution = z.infer<typeof safetyReportResolutionSchema>;
+
+/**
+ * PATCH /v1/safety-reports/:id (a guardian; recent PIN unlock; the family's own report).
+ * `addressed` resolves a flag or a child's report and changes nothing for the child; `false_match`
+ * clears a flag exactly as the reviewer's clearing does (system reports only).
+ */
+export const PARENT_REPORT_OUTCOMES = ['addressed', 'false_match'] as const;
+export const parentReportOutcomeSchema = z.enum(PARENT_REPORT_OUTCOMES);
+export type ParentReportOutcome = z.infer<typeof parentReportOutcomeSchema>;
+
+export const parentSafetyReportActionRequestSchema = z.strictObject({
+  outcome: parentReportOutcomeSchema,
+});
+export type ParentSafetyReportActionRequest = z.infer<typeof parentSafetyReportActionRequestSchema>;
+
+/**
+ * The recorded state of the guardian email a flag sends (migration 0790): `not_sent` until the job
+ * runs or when no guardian address exists, `sent` once at least one address accepted it, `failed`
+ * when the provider refused. Always `not_sent` for parent reports (nothing is sent for them).
+ */
+export const SAFETY_FLAG_EMAIL_STATUSES = ['sent', 'not_sent', 'failed'] as const;
+export const safetyFlagEmailStatusSchema = z.enum(SAFETY_FLAG_EMAIL_STATUSES);
+export type SafetyFlagEmailStatus = z.infer<typeof safetyFlagEmailStatusSchema>;
 
 export const SAFETY_NOTE_MAX_LENGTH = 500;
 export const RESOLUTION_NOTE_MAX_LENGTH = 1000;
@@ -263,10 +338,18 @@ export const safetyReportSchema = z.strictObject({
   triagedAt: isoDateTimeSchema.nullable(),
   resolvedAt: isoDateTimeSchema.nullable(),
   /**
-   * A system report a reviewer cleared as a false match (show PARENT_SAFETY_FLAG_COPY.cleared, not
-   * the summary). Always false for parent and child reports. A held report is never listed at all.
+   * A system report cleared as a false match, by a reviewer or a guardian (show
+   * PARENT_SAFETY_FLAG_COPY.cleared, not the summary). Always false for parent and child reports.
    */
   clearedAsFalseMatch: z.boolean(),
+  /** When a guardian acted on this report from the portal or the app; null otherwise. */
+  parentActionAt: isoDateTimeSchema.nullable(),
+  /** The guardian's outcome; null when no guardian acted (a reviewer may still have resolved it). */
+  parentOutcome: parentReportOutcomeSchema.nullable(),
+  /** When the flag email was accepted for at least one guardian; null otherwise. */
+  emailedAt: isoDateTimeSchema.nullable(),
+  /** The recorded delivery state of the flag email (never assumed). */
+  emailStatus: safetyFlagEmailStatusSchema,
 });
 export type SafetyReport = z.infer<typeof safetyReportSchema>;
 
@@ -306,9 +389,9 @@ export const adminSafetyReportSchema = z.strictObject({
   /** System reports only: the screen's category codes (never the matched text); else null. */
   screenCategories: z.array(safetyScreenReportCategorySchema).nullable(),
   /**
-   * False while a report is held from the family's list: a system report with screen codes abuse,
-   * sexual or secrecy, and a child's report about a question such a report flagged (runbook 5.1).
-   * Always true for parent reports.
+   * False while a report is held from the family's list (migration 0760). Owner decision
+   * (2026-09-25): the API never files a held report, so this is true for every report it files;
+   * the mechanism and the release stay as a support tool.
    */
   familyVisible: z.boolean(),
   /**
@@ -324,7 +407,10 @@ export const adminSafetyReportSchema = z.strictObject({
   triagedAt: isoDateTimeSchema.nullable(),
   resolvedAt: isoDateTimeSchema.nullable(),
   resolutionNote: z.string().nullable(),
-  /** System reports only: `false_match` once a reviewer cleared the flag; else null. */
+  /**
+   * `false_match` once a reviewer or a guardian cleared a flag, `addressed` once a guardian looked
+   * into a flag or a child's report; else null.
+   */
   resolution: safetyReportResolutionSchema.nullable(),
 });
 export type AdminSafetyReport = z.infer<typeof adminSafetyReportSchema>;
@@ -367,7 +453,8 @@ export const updateSafetyReportRequestSchema = z
     status: z.enum(['triaged', 'escalated', 'resolved']).optional(),
     resolutionNote: z.string().trim().min(1).max(RESOLUTION_NOTE_MAX_LENGTH).optional(),
     familyVisible: z.literal(true).optional(),
-    resolution: safetyReportResolutionSchema.optional(),
+    /** The reviewer's clearing only; `addressed` is the guardian's outcome (PATCH /v1/safety-reports/:id). */
+    resolution: z.literal('false_match').optional(),
   })
   .refine((b) => b.status !== undefined || b.familyVisible !== undefined, {
     message: 'Provide a status or familyVisible',

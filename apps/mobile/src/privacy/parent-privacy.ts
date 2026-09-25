@@ -9,12 +9,21 @@ import {
   dataExportsResponseSchema,
   deletionRequestResponseSchema,
   deletionRequestsResponseSchema,
+  PARENT_SAFETY_FLAG_ACTIONS,
+  PARENT_SAFETY_FLAG_COPY,
   PRIVACY_RETENTION,
   privacyFamilyViewSchema,
+  safetyReportResponseSchema,
+  safetyReportsResponseSchema,
   type CreateDeletionRequest,
   type DataExport,
   type DeletionRequest,
+  type ListedSafetyReportCategory,
+  type ParentReportOutcome,
   type PrivacyFamilyView,
+  type SafetyFlagEmailStatus,
+  type SafetyReport,
+  type SafetyReportStatus,
   type StandardExportKind,
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
@@ -184,6 +193,8 @@ export interface PrivacyOverview {
   readonly family: PrivacyFamilyView | null;
   readonly deletions: readonly DeletionRequest[];
   readonly exports: readonly DataExport[];
+  /** The family's safety reports, newest first (empty without a live family). */
+  readonly reports: readonly SafetyReport[];
 }
 
 const isNotFound = (error: unknown) =>
@@ -191,7 +202,7 @@ const isNotFound = (error: unknown) =>
 
 /** Loads everything the screen shows. A missing family is a state, not an error. */
 export async function loadPrivacyOverview(api: ApiClient): Promise<PrivacyOverview> {
-  const [family, deletions, exportsList] = await Promise.all([
+  const [family, deletions, exportsList, reportsList] = await Promise.all([
     api.get('/v1/family', privacyFamilyViewSchema).catch((error: unknown) => {
       if (isNotFound(error)) return null;
       throw error;
@@ -201,8 +212,17 @@ export async function loadPrivacyOverview(api: ApiClient): Promise<PrivacyOvervi
       if (isNotFound(error)) return { exports: [] };
       throw error;
     }),
+    api.get('/v1/safety-reports', safetyReportsResponseSchema).catch((error: unknown) => {
+      if (isNotFound(error)) return { reports: [] };
+      throw error;
+    }),
   ]);
-  return { family, deletions: deletions.requests, exports: exportsList.exports };
+  return {
+    family,
+    deletions: deletions.requests,
+    exports: exportsList.exports,
+    reports: reportsList.reports,
+  };
 }
 
 /** The family-wide deletion shown as the deleted-account state, if any. */
@@ -233,5 +253,155 @@ export function deletionStatusText(d: DeletionRequest): string {
       return `Deleted${d.completedAt ? ` on ${formatDate(d.completedAt)}` : ''}.`;
     case 'cancelled':
       return 'Cancelled.';
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Family safety reports (owner decision, 2026-09-25: the parent is the only safety recipient and
+// addresses the concern). Same copy as the web portal: everything shown comes from the contracts.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Honest by construction: no flag is held from this list, the guardian email's state is the
+ * recorded delivery (never assumed), and nothing promises a staffed review of every flag (Owner
+ * action #24). Reports are sent from the web portal, which has the form.
+ */
+export const SAFETY_REPORTS_INTRO =
+  'When your child picks one of the “Tell PencilLift” choices in the app, or you send a report from the parent portal on the web, it is saved to PencilLift’s review queue and its status is shown here. PencilLift also adds a report when its safety check flags one of your child’s answers for a grown-up to look at, and emails the guardians on this account so they know to look; each flag says whether that email was sent. For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint, and PencilLift gives no hints on it.';
+
+const REPORT_CATEGORY_LABELS: Record<ListedSafetyReportCategory, string> = {
+  unsafe_content: 'Unsafe or inappropriate content',
+  wrong_or_confusing: 'Wrong or confusing',
+  upsetting: 'Something upsetting',
+  answer_revealed: 'Showed an answer',
+  other: 'Something else',
+  severe_risk: PARENT_SAFETY_FLAG_COPY.category,
+};
+
+const REPORT_STATUS_LABELS: Record<SafetyReportStatus, string> = {
+  open: 'Waiting for review',
+  triaged: 'Being reviewed',
+  escalated: 'Escalated for urgent review',
+  resolved: 'Resolved',
+};
+
+/** The recorded delivery of the guardian email a flag sends (migration 0790). */
+const EMAIL_STATE_COPY: Record<SafetyFlagEmailStatus, string> = {
+  sent: PARENT_SAFETY_FLAG_COPY.emailSent,
+  not_sent: PARENT_SAFETY_FLAG_COPY.emailNotSent,
+  failed: PARENT_SAFETY_FLAG_COPY.emailFailed,
+};
+
+export interface SafetyReportAction {
+  readonly outcome: ParentReportOutcome;
+  readonly label: string;
+  readonly effect: string;
+}
+
+export interface SafetyReportView {
+  readonly id: string;
+  readonly title: string;
+  /** Who reported it, its status and its date. */
+  readonly meta: string;
+  readonly note: string | null;
+  /** What the row says: the flag's state, the email state, the hotlines (in reading order). */
+  readonly lines: readonly string[];
+  /** Empty for a resolved report and for a parent's own report (reviewed by PencilLift). */
+  readonly actions: readonly SafetyReportAction[];
+}
+
+const ADDRESSED_ACTION: SafetyReportAction = {
+  outcome: 'addressed',
+  ...PARENT_SAFETY_FLAG_ACTIONS.addressed,
+};
+const FALSE_MATCH_ACTION: SafetyReportAction = {
+  outcome: 'false_match',
+  ...PARENT_SAFETY_FLAG_ACTIONS.falseMatch,
+};
+
+function childNickname(family: PrivacyFamilyView | null, childId: string | null): string {
+  return family?.children.find((c) => c.id === childId)?.nickname ?? 'A removed child profile';
+}
+
+function reporterText(family: PrivacyFamilyView | null, report: SafetyReport): string {
+  switch (report.reporterKind) {
+    case 'child':
+      return `Reported by ${childNickname(family, report.childId)}`;
+    case 'parent':
+      return 'Reported by a parent';
+    case 'system':
+      return `${PARENT_SAFETY_FLAG_COPY.reporter} · about ${childNickname(family, report.childId)}`;
+  }
+}
+
+/** What a flag says about itself: the state after a clearing or a guardian's action, else the summary. */
+function flagText(report: SafetyReport): string {
+  if (report.clearedAsFalseMatch) return PARENT_SAFETY_FLAG_COPY.cleared;
+  if (report.parentOutcome === 'addressed') return PARENT_SAFETY_FLAG_COPY.addressed;
+  return PARENT_SAFETY_FLAG_COPY.summary;
+}
+
+/**
+ * One report row. A flag says what the product shows the child, whether the guardian email was
+ * sent and the hotlines; a child's report says no email was sent for it. While a flag or a child's
+ * report is unresolved the guardian can mark it looked into (nothing changes for the child) or,
+ * for a flag, a false alarm (the reviewer's clearing: the notice goes and the question is checked
+ * normally). Both need a recent PIN unlock, checked by the server.
+ */
+export function safetyReportView(
+  family: PrivacyFamilyView | null,
+  report: SafetyReport,
+): SafetyReportView {
+  const meta = `${reporterText(family, report)} · ${REPORT_STATUS_LABELS[report.status]} · ${formatDate(report.createdAt)}`;
+  const lines: string[] = [];
+  if (report.reporterKind === 'system') {
+    lines.push(
+      flagText(report),
+      EMAIL_STATE_COPY[report.emailStatus],
+      PARENT_SAFETY_FLAG_COPY.resources,
+    );
+  } else if (report.reporterKind === 'child') {
+    if (report.parentOutcome === 'addressed')
+      lines.push(PARENT_SAFETY_FLAG_COPY.childReportAddressed);
+    lines.push(EMAIL_STATE_COPY[report.emailStatus]);
+  }
+  const actionable = report.status !== 'resolved' && report.reporterKind !== 'parent';
+  const actions = actionable
+    ? report.reporterKind === 'system'
+      ? [ADDRESSED_ACTION, FALSE_MATCH_ACTION]
+      : [ADDRESSED_ACTION]
+    : [];
+  return {
+    id: report.id,
+    title: REPORT_CATEGORY_LABELS[report.category],
+    meta,
+    note: report.note,
+    lines,
+    actions,
+  };
+}
+
+/** PATCH /v1/safety-reports/:id with the guardian's outcome; the server checks the PIN unlock. */
+export async function reportOutcomeAction(
+  api: ApiClient,
+  reportId: string,
+  outcome: ParentReportOutcome,
+): Promise<ActionResult> {
+  try {
+    await api.send(
+      'PATCH',
+      `/v1/safety-reports/${reportId}`,
+      { outcome },
+      safetyReportResponseSchema,
+    );
+    return {
+      status: 'done',
+      message:
+        outcome === 'addressed'
+          ? 'Marked as looked into. Nothing changes for your child.'
+          : 'Cleared as a false alarm. The message is removed from your child’s results for that question, and PencilLift is checking it normally.',
+    };
+  } catch (error) {
+    return toResult(error);
   }
 }

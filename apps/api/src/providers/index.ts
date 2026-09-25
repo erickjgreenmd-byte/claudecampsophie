@@ -68,14 +68,69 @@ export interface StorageProvider {
   remove(paths: readonly string[]): Promise<void>;
 }
 
-/** Transactional email (guardian invitations, receipts of deletion requests). */
+/**
+ * The reviewed email templates. Every key selects copy the adapter owns; `params` never carry
+ * child homework, answers, a child's name or a safety category (the safety flag email says only
+ * that PencilLift flagged an answer and where to look).
+ */
+export const EMAIL_TEMPLATE_KEYS = [
+  'guardian_invitation',
+  'deletion_received',
+  'export_ready',
+  'inactivity_notice',
+  'safety_flag',
+] as const;
+export type EmailTemplateKey = (typeof EMAIL_TEMPLATE_KEYS)[number];
+
+/** Release-readiness flag: the template copy below is a draft until approved. */
+export const EMAIL_TEMPLATES_STATUS = 'draft_pending_owner_and_educator_approval' as const;
+
+/**
+ * The outbox mock's template table: subject and body for the templates whose copy is written in
+ * this repository. DRAFTS: the owner and an educator must approve this wording before launch, like
+ * the child safety templates (packages/domain safety/templates.ts). A real adapter (docs/Owner_Actions.md
+ * #14) renders the same copy from the same key.
+ *
+ * `safety_flag` (owner decision, 2026-09-25: the parent is the only person PencilLift sends a
+ * safety message to): sent to every active guardian when the safety screen flags a child's answer.
+ * By design it names no child, quotes no homework and states no category; the parent reads the
+ * flag in the portal's privacy page, where the child's notice and the two actions are explained.
+ */
+export const EMAIL_TEMPLATES: Readonly<
+  Partial<
+    Record<
+      EmailTemplateKey,
+      { readonly subject: string; readonly body: (params: Record<string, string>) => string }
+    >
+  >
+> = {
+  safety_flag: {
+    subject: 'PencilLift flagged an answer for you to look at',
+    body: (params) =>
+      [
+        'Hello,',
+        '',
+        'PencilLift’s safety check flagged one of the answers in a recent scan on your family account, so a grown-up can look at it.',
+        'For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint.',
+        '',
+        `Please sign in to the PencilLift parent portal and open Privacy & safety to see the flag and what you can do next: ${params.portalUrl ?? ''}`,
+        '',
+        'If your child may be in danger, call 911. Support is available any time from the 988 Suicide & Crisis Lifeline (call or text 988).',
+        '',
+        'This email names no child, quotes no homework and says nothing about the kind of concern; those details stay in your account.',
+        '— PencilLift',
+      ].join('\n'),
+  },
+};
+
+/** Transactional email (guardian invitations, receipts of deletion requests, safety flags). */
 export interface EmailProvider {
   readonly name: string;
   readonly isMock: boolean;
   /** `templateKey` selects reviewed copy; `params` must never contain child homework or answers. */
   send(input: {
     to: string;
-    templateKey: 'guardian_invitation' | 'deletion_received' | 'export_ready' | 'inactivity_notice';
+    templateKey: EmailTemplateKey;
     params: Record<string, string>;
   }): Promise<{ messageId: string }>;
 }
@@ -164,17 +219,32 @@ export function createMemoryStorageMock(): StorageProvider & {
   };
 }
 
-/** Records messages instead of sending them. Labeled mock. */
-export function createOutboxEmailMock(): EmailProvider & {
-  readonly outbox: { to: string; templateKey: string; params: Record<string, string> }[];
-} {
-  const outbox: { to: string; templateKey: string; params: Record<string, string> }[] = [];
+export interface OutboxMessage {
+  readonly to: string;
+  readonly templateKey: string;
+  readonly params: Record<string, string>;
+  /** Rendered from EMAIL_TEMPLATES when the key has copy in this repository. */
+  readonly subject?: string;
+  readonly body?: string;
+}
+
+/**
+ * Records messages instead of sending them, rendering the templates whose copy lives here so tests
+ * can read what a guardian would. Labeled mock; never used outside development/test.
+ */
+export function createOutboxEmailMock(): EmailProvider & { readonly outbox: OutboxMessage[] } {
+  const outbox: OutboxMessage[] = [];
   return {
     name: 'outbox_mock',
     isMock: true,
     outbox,
     send(input) {
-      outbox.push(input);
+      const template = EMAIL_TEMPLATES[input.templateKey];
+      outbox.push(
+        template
+          ? { ...input, subject: template.subject, body: template.body(input.params) }
+          : input,
+      );
       return Promise.resolve({ messageId: `mock-${outbox.length}` });
     },
   };

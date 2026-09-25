@@ -122,8 +122,8 @@ function isOpenAiCategory(category: string): category is OpenAiModerationCategor
 /**
  * PencilLift severe categories for the OpenAI categories reported on one input, sorted like the
  * word-list screen's. For the child's own words a violence-type flag maps to abuse AND violence: a
- * model cannot tell a victim's report ("he beats me") from a threat, so the report is held from the
- * family (templates.ts FAMILY_HOLD_CATEGORIES) and a reviewer releases or clears it (runbook 5.1).
+ * model cannot tell a victim's report ("he beats me") from a threat, so the parent sees both codes'
+ * message and can clear a false match (runbook 5.1; owner decision 2026-09-25: no report is held).
  * Unknown and unmapped categories (harassment, hate, illicit) yield nothing.
  */
 export function providerSafetyCategories(

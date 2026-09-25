@@ -59,10 +59,14 @@ describe('mapping OpenAI categories to PencilLift categories', () => {
     });
   }
 
-  it('a violence flag on the child’s words starts the report held from the family', () => {
-    expect(heldFromFamily(providerSafetyCategories(['violence'], 'child'))).toBe(true);
+  it('a violence flag on the child’s words is an abuse+violence report that the parent sees at once', () => {
+    // Owner decision (2026-09-25): the parent is the sole recipient of every flag, so no provider
+    // category holds a report from the family (FAMILY_HOLD_CATEGORIES is empty); the mapping that
+    // used to decide the hold still decides the report's categories.
+    expect(providerSafetyCategories(['violence'], 'child')).toEqual(['abuse', 'violence']);
+    expect(heldFromFamily(providerSafetyCategories(['violence'], 'child'))).toBe(false);
     expect(heldFromFamily(providerSafetyCategories(['self-harm'], 'child'))).toBe(false);
-    expect(heldFromFamily(providerSafetyCategories(['sexual/minors'], 'child'))).toBe(true);
+    expect(heldFromFamily(providerSafetyCategories(['sexual/minors'], 'child'))).toBe(false);
   });
 
   it('joins several flags, sorted like the word-list screen, and ignores unknown names', () => {

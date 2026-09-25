@@ -426,7 +426,9 @@ describe('provider moderation of the child’s answers before grading', () => {
     expectNoChildTextInLogs(PROVIDER_SELF_HARM_ANSWER, MATH.prompt);
   });
 
-  it('a provider violence flag on the child’s words is held from the family as possible abuse', async () => {
+  it('a provider violence flag on the child’s words is filed as possible abuse and violence, visible to the family', async () => {
+    // Owner decision (2026-09-25), a policy change and not a weakened test: this asserted that the
+    // report started held from the family with no family id on its audit row. No flag is held now.
     // Precondition: the word list alone does not flag these words (the mock marker does).
     expect(
       screenQuestion({
@@ -448,11 +450,11 @@ describe('provider moderation of the child’s answers before grading', () => {
     const [report] = await reports(scan);
     expect(report).toMatchObject({
       screen_categories: ['abuse', 'violence'],
-      family_visible: false,
+      family_visible: true,
     });
-    // A held report's audit row carries no family id (family members can read their audit log).
+    // A visible report's audit row carries the family id (family members can read their audit log).
     const [audit] = await createdAudit(report!.id);
-    expect(audit!.family_id).toBeNull();
+    expect(audit!.family_id).toBe(scan.fam.familyId);
     expect(audit!.metadata).toMatchObject({ providerCodes: ['PROVIDER_VIOLENCE'] });
     expectNoChildTextInLogs(PROVIDER_VIOLENCE_ANSWER);
   });
@@ -502,7 +504,7 @@ describe('provider moderation of the child’s answers before grading', () => {
     expectNoChildTextInLogs(answer);
   });
 
-  it('never sends the printed prompt to moderation (a flag there would hold a lesson)', async () => {
+  it('never sends the printed prompt to moderation (a flag there would flag a lesson)', async () => {
     const prompt = 'Read the story. [mock-moderation:violence] What did the wolf do?';
     const question: ScriptedQuestion = {
       ...PROVIDER_ONLY,
@@ -561,7 +563,10 @@ describe('provider moderation of the child’s answers before grading', () => {
 // ---------------------------------------------------------------------------------------------
 
 describe('a moderation failure grades nothing (fail closed)', () => {
-  it('a retryable error: no grading call, the job retries, the word-list flag is answered at once and held', async () => {
+  it('a retryable error: no grading call, the job retries, the word-list flag is answered and listed at once', async () => {
+    // Owner decision (2026-09-25), a policy change and not a weakened test: this asserted that a
+    // word-list flag filed during a moderation outage was held from the family (fail closed). No
+    // flag is held now, an outage included; the audit row still records that moderation failed.
     const scan = await queuedScan();
     const ai = scriptedModel([MATH, WORD_LIST_SEVERE]);
     const moderation = createMockModerationClient();
@@ -574,15 +579,15 @@ describe('a moderation failure grades nothing (fail closed)', () => {
       status: 'failed_retryable',
       error_code: 'MODERATION_FAILED',
     });
-    // The word-list flag is not delayed by the provider's failure; it is held (fail closed).
+    // The word-list flag is not delayed by the provider's failure, and it is listed at once.
     expect(await feedback(scan, WORD_LIST_SEVERE.prompt)).toEqual([
       { kind: 'safety', body: childSafetyMessage(['self_harm'], '8-10') },
     ]);
-    const [held] = await reports(scan);
-    expect(held).toMatchObject({ screen_categories: ['self_harm'], family_visible: false });
-    expect((await createdAudit(held!.id))[0]!.metadata).toMatchObject({
-      providerModeration: 'unavailable',
-    });
+    const [flag] = await reports(scan);
+    expect(flag).toMatchObject({ screen_categories: ['self_harm'], family_visible: true });
+    const [audit] = await createdAudit(flag!.id);
+    expect(audit!.family_id).toBe(scan.fam.familyId);
+    expect(audit!.metadata).toMatchObject({ providerModeration: 'unavailable' });
     expect(await feedback(scan, MATH.prompt)).toEqual([]);
 
     // The retry (after the backoff) moderates, grades and coaches; extraction is not repeated.
@@ -974,7 +979,8 @@ describe('explicit moderation provider selection (AC_DEPLOY_07)', () => {
 });
 
 describe('the refusing client in staging', () => {
-  it('never grades: the scan ends like a missing provider and a word-list flag is still answered, held', async () => {
+  it('never grades: the scan ends like a missing provider and a word-list flag is still answered and listed', async () => {
+    // Owner decision (2026-09-25): no flag is held, also while moderation is not available.
     const staging = config({
       APP_ENV: 'staging',
       ZDR_APPROVAL_EVIDENCE_REFERENCE: 'ZDR-TICKET-4471',
@@ -1001,7 +1007,7 @@ describe('the refusing client in staging', () => {
       expect((await feedback(scan, WORD_LIST_SEVERE.prompt)).map((f) => f.kind)).toEqual([
         'safety',
       ]);
-      expect((await reports(scan))[0]).toMatchObject({ family_visible: false });
+      expect((await reports(scan))[0]).toMatchObject({ family_visible: true });
       expectNoChildTextInLogs(SEVERE_ANSWER);
     } finally {
       await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;

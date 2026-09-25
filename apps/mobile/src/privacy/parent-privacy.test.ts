@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { DeletionRequest, PrivacyFamilyView } from '@pencillift/contracts';
+import {
+  PARENT_SAFETY_FLAG_ACTIONS,
+  PARENT_SAFETY_FLAG_COPY,
+  type DeletionRequest,
+  type PrivacyFamilyView,
+  type SafetyReport,
+} from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
   confirmationPhrase,
@@ -10,8 +16,11 @@ import {
   loadPrivacyOverview,
   MOBILE_EXPORT_OPTIONS,
   PRIVACY_RETENTION_LINES,
+  reportOutcomeAction,
   requestDeletionAction,
   requestExportAction,
+  SAFETY_REPORTS_INTRO,
+  safetyReportView,
   unlockAction,
 } from './parent-privacy.ts';
 
@@ -41,6 +50,41 @@ function request(overrides: Partial<DeletionRequest> = {}): DeletionRequest {
     completedAt: null,
     ...overrides,
   };
+}
+
+const REPORT = 'c07c8d9e-0f1a-4b2c-9d4e-5f6a7b8c9d0e';
+
+/** A family report with the contract's full shape; nothing acted on or sent unless overridden. */
+function report(overrides: Partial<SafetyReport> = {}): SafetyReport {
+  return {
+    id: REPORT,
+    reporterKind: 'child',
+    category: 'answer_revealed',
+    childId: RILEY,
+    questionId: null,
+    note: null,
+    status: 'open',
+    createdAt: '2026-09-23T15:00:00.000Z',
+    triagedAt: null,
+    resolvedAt: null,
+    clearedAsFalseMatch: false,
+    parentActionAt: null,
+    parentOutcome: null,
+    emailedAt: null,
+    emailStatus: 'not_sent',
+    ...overrides,
+  };
+}
+
+/** A safety-screen flag about Riley, escalated and unresolved unless overridden. */
+function flag(overrides: Partial<SafetyReport> = {}): SafetyReport {
+  return report({
+    reporterKind: 'system',
+    category: 'severe_risk',
+    questionId: 'e29e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2a',
+    status: 'escalated',
+    ...overrides,
+  });
 }
 
 interface Call {
@@ -197,6 +241,7 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     });
     const overview = await loadPrivacyOverview(api);
     expect(overview.family).toBeNull();
+    expect(overview.reports).toEqual([]);
     expect(familyDeletion(overview.deletions)).toEqual(familyRequest);
     expect(deletionStatusText(familyRequest)).toMatch(/processing has stopped/i);
   });
@@ -218,5 +263,194 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
   it('propagates other load failures so the screen can offer a retry', async () => {
     const { api } = fakeApi({ get: () => new ApiRequestError('NETWORK', 'offline', 0) });
     await expect(loadPrivacyOverview(api)).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  it('loads the family safety reports with the rest of the overview', async () => {
+    const { api, calls } = fakeApi({
+      get: (path) => {
+        if (path === '/v1/family') return FAMILY;
+        if (path === '/v1/deletion') return { requests: [] };
+        if (path === '/v1/exports') return { exports: [] };
+        if (path === '/v1/safety-reports') return { reports: [flag()] };
+        return new Error(`unexpected ${path}`);
+      },
+    });
+    const overview = await loadPrivacyOverview(api);
+    expect(overview.reports.map((r) => r.id)).toEqual([REPORT]);
+    expect(calls.map((c) => c.path)).toContain('/v1/safety-reports');
+  });
+});
+
+describe('family safety reports on the phone (owner decision, 2026-09-25)', () => {
+  // The parent is the only person PencilLift sends a safety message to and addresses the concern:
+  // every flag is listed at once, says truthfully whether the guardian email was sent, and offers
+  // the same two actions as the web portal, with the same wording (contracts).
+  it('explains flags, the guardian email and the actions without promising a staffed review', () => {
+    expect(SAFETY_REPORTS_INTRO).toMatch(/flags one of your child’s answers/i);
+    expect(SAFETY_REPORTS_INTRO).toMatch(/emails the guardians on this account/i);
+    expect(SAFETY_REPORTS_INTRO).toMatch(/says whether that email was sent/i);
+    expect(SAFETY_REPORTS_INTRO).not.toMatch(
+      /kept off this list|reviewer releases|no automatic alert/i,
+    );
+    expect(SAFETY_REPORTS_INTRO).not.toMatch(
+      /looks at every flag|reviews every flag|every flag is reviewed/i,
+    );
+  });
+
+  it('shows a flag honestly: what the child sees, the recorded email state, the hotlines, both actions', () => {
+    const view = safetyReportView(FAMILY, flag());
+    expect(view.title).toBe(PARENT_SAFETY_FLAG_COPY.category);
+    expect(view.meta).toMatch(/flagged by pencillift/i);
+    expect(view.meta).toMatch(/about riley/i);
+    expect(view.meta).toMatch(/escalated for urgent review/i);
+    expect(view.meta).toMatch(/sep 23, 2026/i);
+    expect(view.lines).toEqual([
+      PARENT_SAFETY_FLAG_COPY.summary,
+      PARENT_SAFETY_FLAG_COPY.emailNotSent,
+      PARENT_SAFETY_FLAG_COPY.resources,
+    ]);
+    expect(view.actions).toEqual([
+      { outcome: 'addressed', ...PARENT_SAFETY_FLAG_ACTIONS.addressed },
+      { outcome: 'false_match', ...PARENT_SAFETY_FLAG_ACTIONS.falseMatch },
+    ]);
+    // Same wording as the portal; the false-alarm action says what it does to the results.
+    expect(view.actions[1]!.effect).toMatch(/removes the message from your child’s results/i);
+    const all = [view.title, view.meta, ...view.lines].join(' ');
+    // Never claims a delivery that did not happen; never names the kind of concern.
+    expect(all.replace(PARENT_SAFETY_FLAG_COPY.emailNotSent, '')).not.toMatch(
+      /alerted|notified|we (?:emailed|texted|sent)|pencillift emailed/i,
+    );
+    expect(all.replace(PARENT_SAFETY_FLAG_COPY.resources, '')).not.toMatch(
+      /self-harm|suicid|abuse|sexual|violen/i,
+    );
+    expect(all).not.toMatch(/your child saw/i);
+  });
+
+  it('says an email was sent only from the recorded delivery, and says when it failed', () => {
+    const sent = safetyReportView(
+      FAMILY,
+      flag({ emailStatus: 'sent', emailedAt: '2026-09-23T15:00:05.000Z' }),
+    );
+    expect(sent.lines).toContain(PARENT_SAFETY_FLAG_COPY.emailSent);
+    const failed = safetyReportView(FAMILY, flag({ emailStatus: 'failed' }));
+    expect(failed.lines).toContain(PARENT_SAFETY_FLAG_COPY.emailFailed);
+    expect(failed.lines).not.toContain(PARENT_SAFETY_FLAG_COPY.emailSent);
+    expect(PARENT_SAFETY_FLAG_COPY.emailFailed).toMatch(/could not be sent/i);
+  });
+
+  it('a resolved flag shows its outcome and offers no action', () => {
+    const addressed = safetyReportView(
+      FAMILY,
+      flag({
+        status: 'resolved',
+        resolvedAt: '2026-09-24T15:00:00.000Z',
+        parentActionAt: '2026-09-24T15:00:00.000Z',
+        parentOutcome: 'addressed',
+        emailStatus: 'sent',
+        emailedAt: '2026-09-23T15:00:05.000Z',
+      }),
+    );
+    expect(addressed.meta).toMatch(/resolved/i);
+    expect(addressed.lines[0]).toBe(PARENT_SAFETY_FLAG_COPY.addressed);
+    expect(addressed.lines).not.toContain(PARENT_SAFETY_FLAG_COPY.summary);
+    expect(addressed.actions).toEqual([]);
+    // Cleared as a false match, by a guardian or a reviewer: the summary would no longer be true.
+    for (const parentOutcome of ['false_match', null] as const) {
+      const cleared = safetyReportView(
+        FAMILY,
+        flag({
+          status: 'resolved',
+          resolvedAt: '2026-09-24T15:00:00.000Z',
+          clearedAsFalseMatch: true,
+          parentActionAt: parentOutcome ? '2026-09-24T15:00:00.000Z' : null,
+          parentOutcome,
+        }),
+      );
+      expect(cleared.lines[0]).toBe(PARENT_SAFETY_FLAG_COPY.cleared);
+      expect(cleared.actions).toEqual([]);
+    }
+  });
+
+  it('a child’s report offers "looked into" only; a parent’s report offers nothing', () => {
+    const child = safetyReportView(FAMILY, report());
+    expect(child.title).toBe('Showed an answer');
+    expect(child.meta).toMatch(/reported by riley/i);
+    expect(child.meta).toMatch(/waiting for review/i);
+    expect(child.lines).toEqual([PARENT_SAFETY_FLAG_COPY.emailNotSent]);
+    expect(child.actions.map((a) => a.outcome)).toEqual(['addressed']);
+    const looked = safetyReportView(
+      FAMILY,
+      report({
+        status: 'resolved',
+        resolvedAt: '2026-09-24T15:00:00.000Z',
+        parentActionAt: '2026-09-24T15:00:00.000Z',
+        parentOutcome: 'addressed',
+      }),
+    );
+    expect(looked.lines).toEqual([
+      PARENT_SAFETY_FLAG_COPY.childReportAddressed,
+      PARENT_SAFETY_FLAG_COPY.emailNotSent,
+    ]);
+    expect(looked.actions).toEqual([]);
+    const parent = safetyReportView(
+      FAMILY,
+      report({
+        reporterKind: 'parent',
+        category: 'wrong_or_confusing',
+        childId: SAM,
+        note: 'The hint did not match the worksheet.',
+      }),
+    );
+    expect(parent.meta).toMatch(/reported by a parent/i);
+    expect(parent.note).toBe('The hint did not match the worksheet.');
+    expect(parent.actions).toEqual([]);
+    // A removed child profile is named as such, never by a stale id.
+    expect(safetyReportView(null, report()).meta).toMatch(/a removed child profile/i);
+  });
+
+  it('sends the outcome and maps step-up, an already-resolved report and offline honestly', async () => {
+    const resolved = flag({
+      status: 'resolved',
+      resolvedAt: '2026-09-24T15:00:00.000Z',
+      parentActionAt: '2026-09-24T15:00:00.000Z',
+      parentOutcome: 'false_match',
+      clearedAsFalseMatch: true,
+    });
+    const { api, calls } = fakeApi({ send: () => ({ report: resolved }) });
+    const done = await reportOutcomeAction(api, REPORT, 'false_match');
+    expect(calls).toEqual([
+      { method: 'PATCH', path: `/v1/safety-reports/${REPORT}`, body: { outcome: 'false_match' } },
+    ]);
+    expect(done).toEqual({ status: 'done', message: expect.stringMatching(/false alarm/i) });
+    expect(
+      await reportOutcomeAction(
+        fakeApi({ send: () => ({ report: { ...resolved, parentOutcome: 'addressed' } }) }).api,
+        REPORT,
+        'addressed',
+      ),
+    ).toEqual({ status: 'done', message: expect.stringMatching(/looked into/i) });
+    expect(
+      await reportOutcomeAction(
+        fakeApi({ send: () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your PIN', 403) }).api,
+        REPORT,
+        'addressed',
+      ),
+    ).toEqual({ status: 'step_up' });
+    expect(
+      await reportOutcomeAction(
+        fakeApi({
+          send: () => new ApiRequestError('CONFLICT', 'This report is already resolved', 409),
+        }).api,
+        REPORT,
+        'addressed',
+      ),
+    ).toEqual({ status: 'error', message: 'This report is already resolved' });
+    expect(
+      await reportOutcomeAction(
+        fakeApi({ send: () => new ApiRequestError('NETWORK', 'offline', 0) }).api,
+        REPORT,
+        'addressed',
+      ),
+    ).toEqual({ status: 'error', message: expect.stringMatching(/offline/i) });
   });
 });

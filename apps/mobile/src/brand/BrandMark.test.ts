@@ -117,7 +117,7 @@ const uiSource = readFileSync(join(import.meta.dirname, '..', 'family', 'ui.tsx'
  * fails on any skipped test): it asserts the documented gap, so it fails the moment the mark lands
  * and the entry must then be deleted for the normal check to cover that screen again.
  */
-const OWNED_ELSEWHERE = new Set(['(parent)/privacy.tsx']);
+const OWNED_ELSEWHERE = new Set<string>();
 
 function screenFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {

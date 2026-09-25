@@ -7,6 +7,7 @@ import {
   deletionRequestResponseSchema,
   deletionRequestsResponseSchema,
   privacyFamilyViewSchema,
+  PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
   PRIVACY_RETENTION,
   SAFETY_NOTE_MAX_LENGTH,
@@ -17,8 +18,10 @@ import {
   type DataExport,
   type DeletionRequest,
   type ExportKind,
+  type ParentReportOutcome,
   type PrivacyFamilyView,
   type ListedSafetyReportCategory,
+  type SafetyFlagEmailStatus,
   type SafetyReport,
   type SafetyReportCategory,
   type SafetyReportStatus,
@@ -79,6 +82,13 @@ const REPORT_STATUS_LABELS: Record<SafetyReportStatus, string> = {
   triaged: 'Being reviewed',
   escalated: 'Escalated for urgent review',
   resolved: 'Resolved',
+};
+
+/** The recorded delivery of the guardian email a flag sends (never assumed; migration 0790). */
+const EMAIL_STATE_COPY: Record<SafetyFlagEmailStatus, string> = {
+  sent: PARENT_SAFETY_FLAG_COPY.emailSent,
+  not_sent: PARENT_SAFETY_FLAG_COPY.emailNotSent,
+  failed: PARENT_SAFETY_FLAG_COPY.emailFailed,
 };
 
 const STORE_SUBSCRIPTION_NOTICE =
@@ -953,10 +963,11 @@ function SafetyReportsSection({
       </p>
       <p>
         PencilLift also adds a report here when its safety check flags one of your child’s answers
-        for a grown-up to look at. For that question, your child’s results show a calm message about
-        talking with a grown-up they trust instead of a hint. PencilLift sends no automatic alert
-        (no email, text or notification). Some flags are kept off this list until a PencilLift
-        reviewer releases them.
+        for a grown-up to look at, and emails the guardians on this account so they know to look;
+        each flag below says whether that email was sent. For that question, your child’s results
+        show a calm message about talking with a grown-up they trust instead of a hint, and
+        PencilLift gives no hints on it. Once you have looked into a flag, mark it below; if you are
+        sure it was a false alarm, you can have the question checked normally.
       </p>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <label htmlFor={categoryId}>What happened?</label>
@@ -1010,29 +1021,127 @@ function SafetyReportsSection({
       ) : list.length > 0 ? (
         <ul aria-label="Family safety reports">
           {list.map((r) => (
-            <li key={r.id}>
-              <strong>{CATEGORY_LABELS[r.category]}</strong>
-              {` · ${reporterText(family, r)} · ${REPORT_STATUS_LABELS[r.status]} · ${formatDate(r.createdAt)}`}
-              {r.note ? <div style={{ color: 'var(--muted)' }}>{`“${r.note}”`}</div> : null}
-              {r.reporterKind === 'system' ? (
-                <div>
-                  {/* A flag a reviewer cleared as a false match: the summary is no longer true. */}
-                  <p style={{ margin: '4px 0 0' }}>
-                    {r.clearedAsFalseMatch
-                      ? PARENT_SAFETY_FLAG_COPY.cleared
-                      : PARENT_SAFETY_FLAG_COPY.summary}
-                  </p>
-                  <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
-                    {PARENT_SAFETY_FLAG_COPY.resources}
-                  </p>
-                </div>
-              ) : null}
-            </li>
+            <ReportItem key={r.id} family={family} report={r} onChanged={reportsQuery.reload} />
           ))}
         </ul>
       ) : (
         <p>No safety reports yet.</p>
       )}
     </Section>
+  );
+}
+
+/** What a flag row says about itself: the state after a clearing or a guardian's action, else the summary. */
+function flagText(report: SafetyReport): string {
+  if (report.clearedAsFalseMatch) return PARENT_SAFETY_FLAG_COPY.cleared;
+  if (report.parentOutcome === 'addressed') return PARENT_SAFETY_FLAG_COPY.addressed;
+  return PARENT_SAFETY_FLAG_COPY.summary;
+}
+
+/**
+ * One family report. A flag says what the product shows the child, whether the guardian email was
+ * sent (the recorded delivery, never assumed) and the hotlines. While a flag or a child's report is
+ * unresolved a guardian can act on it (owner decision, 2026-09-25): "I've looked into this" resolves
+ * it and changes nothing for the child; "This was a false alarm" (flags only) clears it exactly as a
+ * reviewer's clearing does. Both need a recent PIN unlock, checked by the server; a resolved report
+ * shows its outcome and offers nothing.
+ */
+function ReportItem({
+  family,
+  report,
+  onChanged,
+}: {
+  family: PrivacyFamilyView;
+  report: SafetyReport;
+  onChanged: () => void;
+}) {
+  const { api } = useSession();
+  const action = useAction();
+  const [pending, setPending] = useState<ParentReportOutcome | null>(null);
+  const [lastLabel, setLastLabel] = useState<string>(PARENT_SAFETY_FLAG_ACTIONS.addressed.label);
+  const isFlag = report.reporterKind === 'system';
+  const actionable = report.status !== 'resolved' && report.reporterKind !== 'parent';
+
+  const act = async (outcome: ParentReportOutcome) => {
+    const label =
+      PARENT_SAFETY_FLAG_ACTIONS[outcome === 'addressed' ? 'addressed' : 'falseMatch'].label;
+    setLastLabel(label);
+    setPending(outcome);
+    const ok = await action.run(async () => {
+      await api.send(
+        'PATCH',
+        `/v1/safety-reports/${report.id}`,
+        { outcome },
+        safetyReportResponseSchema,
+      );
+      return outcome === 'addressed'
+        ? 'Marked as looked into. Nothing changes for your child.'
+        : 'Cleared as a false alarm. The message is removed from your child’s results for that question, and PencilLift is checking it normally.';
+    });
+    setPending(null);
+    if (ok) onChanged();
+  };
+
+  return (
+    <li>
+      <strong>{CATEGORY_LABELS[report.category]}</strong>
+      {` · ${reporterText(family, report)} · ${REPORT_STATUS_LABELS[report.status]} · ${formatDate(report.createdAt)}`}
+      {report.note ? <div style={{ color: 'var(--muted)' }}>{`“${report.note}”`}</div> : null}
+      {isFlag ? (
+        <div>
+          <p style={{ margin: '4px 0 0' }}>{flagText(report)}</p>
+          <p style={{ margin: '4px 0 0' }}>{EMAIL_STATE_COPY[report.emailStatus]}</p>
+          <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
+            {PARENT_SAFETY_FLAG_COPY.resources}
+          </p>
+        </div>
+      ) : null}
+      {report.reporterKind === 'child' ? (
+        <div>
+          {report.parentOutcome === 'addressed' ? (
+            <p style={{ margin: '4px 0 0' }}>{PARENT_SAFETY_FLAG_COPY.childReportAddressed}</p>
+          ) : null}
+          <p style={{ margin: '4px 0 0' }}>{EMAIL_STATE_COPY[report.emailStatus]}</p>
+        </div>
+      ) : null}
+      {actionable ? (
+        <div>
+          <div style={buttonRow}>
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={action.busy}
+              onClick={() => void act('addressed')}
+            >
+              {pending === 'addressed' ? 'Saving…' : PARENT_SAFETY_FLAG_ACTIONS.addressed.label}
+            </button>
+            {isFlag ? (
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={action.busy}
+                onClick={() => void act('false_match')}
+              >
+                {pending === 'false_match'
+                  ? 'Saving…'
+                  : PARENT_SAFETY_FLAG_ACTIONS.falseMatch.label}
+              </button>
+            ) : null}
+          </div>
+          <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
+            {`“${PARENT_SAFETY_FLAG_ACTIONS.addressed.label}”: ${PARENT_SAFETY_FLAG_ACTIONS.addressed.effect}`}
+          </p>
+          {isFlag ? (
+            <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
+              {`“${PARENT_SAFETY_FLAG_ACTIONS.falseMatch.label}”: ${PARENT_SAFETY_FLAG_ACTIONS.falseMatch.effect}`}
+            </p>
+          ) : null}
+          <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
+            {PARENT_SAFETY_FLAG_COPY.actionsNeedUnlock}
+          </p>
+          <ActionOutcome outcome={action.outcome} actionLabel={lastLabel} />
+        </div>
+      ) : null}
+    </li>
   );
 }

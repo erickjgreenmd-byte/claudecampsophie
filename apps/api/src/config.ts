@@ -3,6 +3,7 @@ import { isValidIanaZone } from '@pencillift/domain';
 import { SAFETY_TEMPLATES_APPROVED, SAFETY_TEMPLATES_STATUS } from '@pencillift/domain/safety';
 import type { Db } from './db.ts';
 import { MIN_STORAGE_SERVICE_KEY_LENGTH, storageUrlProblem } from './providers/supabase-storage.ts';
+import { EMAIL_TEMPLATES_STATUS } from './providers/index.ts';
 
 /**
  * Runtime configuration. Only names appear in source; values come from Worker secrets/vars.
@@ -404,7 +405,7 @@ export function productionReadiness(
     item(
       'safety_templates',
       SAFETY_TEMPLATES_APPROVED,
-      `Child safety messages and parent wording (${SAFETY_TEMPLATES_STATUS}), the family-hold default and the runbook 5.1 escalation steps need owner, educator and counsel approval`,
+      `Child safety messages and parent wording (${SAFETY_TEMPLATES_STATUS}), the parent flag email (${EMAIL_TEMPLATES_STATUS}), the two parent actions and the runbook 5.1 procedure need owner, educator and counsel approval`,
     ),
     item(
       'ai_moderation',

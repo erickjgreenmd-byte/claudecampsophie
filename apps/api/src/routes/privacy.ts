@@ -6,6 +6,7 @@ import {
   createExportRequestSchema,
   createSafetyReportRequestSchema,
   childReportRequestSchema,
+  parentSafetyReportActionRequestSchema,
   PRIVACY_RULES,
   safetyReportStatusSchema,
   updateSafetyReportRequestSchema,
@@ -15,13 +16,15 @@ import {
   type DataExport,
   type DeletionRequest,
   type ExportKind,
+  type ParentReportOutcome,
   type SafetyClearanceRecheck,
+  type SafetyFlagEmailStatus,
   type SafetyReport,
   type SafetyReportResolution,
   type SafetyReportStatus,
 } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
-import { stateRequestInstant } from '../db.ts';
+import { stateRequestInstant, type Tx } from '../db.ts';
 import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
 import {
   assertOwnerAdmin,
@@ -36,8 +39,8 @@ import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
 /**
  * Privacy vertical (spec P4, P8, P10, P14, E4 Deletion; AC_ACCESS_10, AC_SECURITY_01,
  * AC_SECURITY_05, AC_LEARNING_10 request side). Paths under /v1:
- *   /deletion, /exports, /exports/answer-key, /safety-reports, /child/reports,
- *   /admin/safety-reports, /admin/safety-reports/:id
+ *   /deletion, /exports, /exports/answer-key, /safety-reports, /safety-reports/:id,
+ *   /child/reports, /admin/safety-reports, /admin/safety-reports/:id
  *
  * Access model (spec E4 tenant isolation):
  * - Reads a family member may make run as the caller (`asParent`), so RLS is a second layer.
@@ -70,14 +73,19 @@ export const CHILD_REPORT_THANKS =
  * report). Serious safety concerns (`upsetting`, `unsafe_content`) follow the escalation steps in
  * docs/Deployment_Runbook.md, section "Safety reports: moderation and escalation". System reports
  * (`reporter_kind = 'system'`, category `severe_risk`, filed by the scan job's safety screen) start
- * `escalated`; migration 0760 keeps them `escalated` or `resolved`. A system report whose screen
- * codes include abuse, sexual or secrecy starts held from the family's list (`family_visible =
- * false`); the owner admin releases it with `familyVisible: true` (forward only, runbook 5.1). A
- * child's report about a question with a held system report starts held too (migration 0760
- * child_report_content, RV-child-safety-6) and is released the same way. A system report may be
- * cleared as a false match in the request that resolves it (`resolution: 'false_match'`; round 3,
- * CHK2-CS-5): the flagged question is then re-checked like a corrected answer, and a held report
- * stays held for good (migration 0760 refuses its release too).
+ * `escalated`; migration 0760 keeps them `escalated` or `resolved`. A system report may be cleared
+ * as a false match in the request that resolves it (`resolution: 'false_match'`; round 3,
+ * CHK2-CS-5): the flagged question is then re-checked like a corrected answer.
+ *
+ * Owner decision (2026-09-25; the lead's dissent is recorded in docs/Threat_Model.md): the parent
+ * is the only person PencilLift sends a safety message to, and the parent addresses the concern.
+ * No report is held from the family (the 0760 hold and the admin release `familyVisible: true`
+ * stay in the schema and here, unused: the scan job files every report visible), every flag is
+ * emailed to the active guardians (jobs/dispatcher.ts safetyFlagEmailHandler; the list shows the
+ * recorded delivery), and a guardian resolves a flag or a child's report from the portal or the app
+ * (PATCH /safety-reports/:id: `addressed` keeps the child's notice, `false_match` clears the flag
+ * exactly as the reviewer's clearing does). The owner admin queue stays as a support tool; a report
+ * a guardian resolved is final for it too.
  */
 const REPORT_TRANSITIONS: Readonly<Record<SafetyReportStatus, readonly SafetyReportStatus[]>> = {
   open: ['triaged', 'escalated', 'resolved'],
@@ -140,7 +148,14 @@ interface ReportRow {
   triaged_at: Date | null;
   resolved_at: Date | null;
   resolution: SafetyReportResolution | null;
+  parent_action_at: Date | null;
+  parent_emailed_at: Date | null;
+  parent_email_status: SafetyFlagEmailStatus;
 }
+
+/** The family view's columns (granted to `authenticated`: never the screen codes or the note). */
+const REPORT_COLUMNS = `id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at,
+    resolved_at, resolution, parent_action_at, parent_emailed_at, parent_email_status`;
 
 interface AdminReportRow {
   id: string;
@@ -213,6 +228,11 @@ function toReport(row: ReportRow): SafetyReport {
     triagedAt: iso(row.triaged_at),
     resolvedAt: iso(row.resolved_at),
     clearedAsFalseMatch: row.reporter_kind === 'system' && row.resolution === 'false_match',
+    parentActionAt: iso(row.parent_action_at),
+    // The stamp says a guardian acted; the resolution is then theirs (0790 parent_action_shape).
+    parentOutcome: row.parent_action_at !== null ? row.resolution : null,
+    emailedAt: iso(row.parent_emailed_at),
+    emailStatus: row.parent_email_status,
   };
 }
 
@@ -332,6 +352,80 @@ async function withdrawExports(
 
 const DELETION_COLUMNS =
   'id, scope, target_child_id, status, requested_at, complete_by, completed_at';
+
+// ---------------------------------------------------------------------------------------------
+// False-match clearing, shared by the reviewer's path (PATCH /admin/safety-reports/:id) and the
+// guardian's ("This was a false alarm", PATCH /safety-reports/:id). Both run inside the service
+// transaction that resolves the report with `resolution = 'false_match'`: the child's notice is
+// then hidden (the child API reads the clearance for that transcription) and the flagged question
+// is graded normally by a recheck.
+// ---------------------------------------------------------------------------------------------
+
+interface FlaggedScan {
+  id: string;
+  status: AssignmentStatus;
+  child_id: string;
+}
+
+interface ClearableReport {
+  question_id: string;
+  family_id: string;
+}
+
+/**
+ * Locks the flagged question's scan and refuses a clearance while it is mid-run: the run may
+ * already have passed its pre-grading screen and would leave the cleared question unchecked.
+ */
+async function lockFlaggedScan(tx: Tx, report: ClearableReport): Promise<FlaggedScan | undefined> {
+  const [scan] = await tx<FlaggedScan[]>`
+    select a.id, a.status, a.child_id from public.assignments a
+      join public.extracted_questions q on q.assignment_id = a.id and q.family_id = a.family_id
+     where q.id = ${report.question_id} and a.family_id = ${report.family_id}
+       for update of a`;
+  if (scan && SCAN_STILL_CHECKING.includes(scan.status)) {
+    throw businessRule(
+      PRIVACY_RULES.scanStillChecking,
+      'This scan is still being checked. Clear the flag once it is ready.',
+    );
+  }
+  return scan;
+}
+
+/**
+ * Re-checks the cleared question: the same re-check a parent's transcription correction queues
+ * (homework.ts). The scan job grades it normally because its pre-grading screen honours the
+ * clearance for this transcription (scan-process.ts screenBeforeGrading). Call after the report
+ * row carries the clearance, in the same transaction.
+ */
+async function queueClearanceRecheck(
+  tx: Tx,
+  now: Date,
+  report: ClearableReport,
+  scan: FlaggedScan | undefined,
+): Promise<SafetyClearanceRecheck> {
+  const [family] = await tx<{ active: boolean }[]>`
+    select app.family_is_active(${report.family_id}) as active`;
+  if (!scan || !family?.active) return 'none';
+  if (RECHECK_NOW.includes(scan.status)) {
+    await tx`
+      update public.assignments set status = 'checking'
+       where id = ${scan.id} and family_id = ${report.family_id}`;
+    const [jobs] = await tx<{ n: number }[]>`
+      select count(*)::int as n from public.jobs
+       where family_id = ${report.family_id} and idempotency_key like ${`scan:${scan.id}:v%`}`;
+    await tx`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+      values ('scan_process', ${`scan:${scan.id}:v${(jobs?.n ?? 0) + 1}`}, ${report.family_id},
+              ${scan.child_id},
+              ${tx.json({ assignmentId: scan.id, mode: 'recheck', questionIds: [report.question_id] })},
+              ${now})`;
+    return 'queued';
+  }
+  // The scan's own retry grades every stored question again and honours the clearance.
+  if (scan.status === 'failed_retryable') return 'on_retry';
+  // The scan cannot be graded (failed for good, cancelled, sent back for a retake).
+  return 'none';
+}
 
 // ---------------------------------------------------------------------------------------------
 // Routes
@@ -587,7 +681,7 @@ export function privacyRoutes(): Hono<AppEnv> {
         insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id, note)
         select ${familyId}, ${childId}::uuid, 'parent', ${body.category}, ${questionId}::uuid, ${body.note ?? null}
          where app.family_is_active(${familyId})
-        returning id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at, resolved_at, resolution`;
+        returning ${tx.unsafe(REPORT_COLUMNS)}`;
       const created = rows[0];
       if (created) {
         await tx`
@@ -605,22 +699,107 @@ export function privacyRoutes(): Hono<AppEnv> {
   // The family list includes system reports (the safety screen flagged a child's answer). Their
   // screen category codes are not selected (and not granted to `authenticated`, migration 0760):
   // the family sees that an answer was flagged for a grown-up, never which kind of concern the word
-  // match suggested. No alert is sent and the response claims none. A held report (abuse, sexual or
-  // secrecy codes) is filtered by RLS until the owner releases it; `family_visible` itself is not
-  // granted to `authenticated`, so this query cannot and does not name it. A visible flag a
-  // reviewer cleared as a false match is marked so (round 3): its summary would no longer be true.
+  // match suggested. The guardian email's recorded delivery (migration 0790) is returned as stored,
+  // so the list never claims an email that was not sent. RLS still filters a held report and
+  // `family_visible` itself is not granted, so this query cannot and does not name it (the API files
+  // none since the owner decision). A flag cleared as a false match is marked so (round 3): its
+  // summary would no longer be true; a guardian's own action is returned as `parentOutcome`.
   r.get('/safety-reports', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     const rows = await deps.db.asParent(
       parent,
       (tx) => tx<ReportRow[]>`
-        select id, reporter_kind, category, child_id, question_id, note, status, created_at, triaged_at, resolved_at,
-               resolution
+        select ${tx.unsafe(REPORT_COLUMNS)}
           from public.safety_reports
          where family_id = ${familyId} order by created_at desc limit 100`,
     );
     return c.json({ reports: rows.map(toReport) });
+  });
+
+  // A guardian acts on the family's own report (owner decision, 2026-09-25): "I've looked into
+  // this" (`addressed`: resolved, the child's notice stays, no AI on that question) or "This was a
+  // false alarm" (`false_match`: the reviewer's clearing, system reports only). A recent PIN unlock
+  // is required (spec P3) and a resolved report is final for everyone (409). The update runs as the
+  // service role on exactly the report the handler verified as the caller's family's; `authenticated`
+  // has no update grant (migration 0790).
+  r.patch('/safety-reports/:id', requireParent, async (c) => {
+    const { deps, parent } = c.var;
+    const id = uuidSchema.safeParse(c.req.param('id'));
+    if (!id.success) throw new ApiError('NOT_FOUND', 'Report not found');
+    const body = await readJson(c, parentSafetyReportActionRequestSchema);
+    const familyId = await currentFamilyId(c);
+    await assertRecentUnlock(c);
+    const now = deps.clock();
+    const outcome: ParentReportOutcome = body.outcome;
+    const result = await deps.db.asService(async (tx) => {
+      // Scoped to the caller's family, and to what the family can see (a held report is not the
+      // family's to act on; none is filed since the owner decision).
+      const [current] = await tx<
+        {
+          status: SafetyReportStatus;
+          reporter_kind: SafetyReport['reporterKind'];
+          question_id: string | null;
+        }[]
+      >`select status, reporter_kind, question_id from public.safety_reports
+         where id = ${id.data} and family_id = ${familyId} and family_visible
+           for update`;
+      if (!current) throw new ApiError('NOT_FOUND', 'Report not found');
+      if (current.status === 'resolved') {
+        throw new ApiError('CONFLICT', 'This report is already resolved', {
+          rule: PRIVACY_RULES.reportAlreadyResolved,
+        });
+      }
+      if (current.reporter_kind === 'parent') {
+        throw businessRule(
+          PRIVACY_RULES.parentActionNotForReport,
+          'A report you sent is reviewed by PencilLift; this action is for flags and your child’s reports',
+        );
+      }
+      if (
+        outcome === 'false_match' &&
+        (current.reporter_kind !== 'system' || !current.question_id)
+      ) {
+        throw businessRule(
+          PRIVACY_RULES.falseMatchSystemOnly,
+          'Only a flag from PencilLift’s safety screen can be cleared as a false alarm',
+        );
+      }
+      const clearable: ClearableReport | null =
+        outcome === 'false_match' && current.question_id
+          ? { question_id: current.question_id, family_id: familyId }
+          : null;
+      const scan = clearable ? await lockFlaggedScan(tx, clearable) : undefined;
+      const [updated] = await tx<ReportRow[]>`
+        update public.safety_reports
+           set status = 'resolved',
+               triaged_at = coalesce(triaged_at, ${now}),
+               resolved_at = ${now},
+               resolution = ${outcome},
+               parent_action_at = ${now},
+               parent_action_by = ${parent.userId}
+         where id = ${id.data} and family_id = ${familyId}
+         returning ${tx.unsafe(REPORT_COLUMNS)}`;
+      const recheck = clearable ? await queueClearanceRecheck(tx, now, clearable, scan) : undefined;
+      // Ids and codes only: never the note or homework text.
+      await tx`
+        insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
+        values (${familyId}, ${parent.userId}, 'parent', 'safety_report.parent_action', 'safety_report', ${id.data},
+                ${JSON.stringify({
+                  from: current.status,
+                  to: 'resolved',
+                  outcome,
+                  ...(recheck !== undefined ? { recheck } : {}),
+                })}::text::jsonb)`;
+      return { report: updated!, recheck };
+    });
+    deps.log({
+      level: 'info',
+      event: 'safety_report_parent_action',
+      code: `${outcome.toUpperCase()}${result.recheck !== undefined ? `_RECHECK_${result.recheck.toUpperCase()}` : ''}`,
+      requestId: c.var.requestId,
+    });
+    return c.json({ report: toReport(result.report) });
   });
 
   // ----- Child help/report button ---------------------------------------------------------------
@@ -762,22 +941,13 @@ export function privacyRoutes(): Hono<AppEnv> {
           'A held flag cleared as a false match is never released to the family',
         );
       }
-      // A clearance re-checks the flagged question, so its scan must not be mid-run: the run may
-      // already have passed its pre-grading screen and would leave the question unchecked.
-      let scan: { id: string; status: AssignmentStatus; child_id: string } | undefined;
-      if (clearing) {
-        [scan] = await tx<{ id: string; status: AssignmentStatus; child_id: string }[]>`
-          select a.id, a.status, a.child_id from public.assignments a
-            join public.extracted_questions q on q.assignment_id = a.id and q.family_id = a.family_id
-           where q.id = ${current.question_id} and a.family_id = ${current.family_id}
-             for update of a`;
-        if (scan && SCAN_STILL_CHECKING.includes(scan.status)) {
-          throw businessRule(
-            PRIVACY_RULES.scanStillChecking,
-            'This scan is still being checked. Clear the flag once it is ready.',
-          );
-        }
-      }
+      // A clearance re-checks the flagged question, so its scan must not be mid-run (shared with
+      // the guardian's clearing above).
+      const clearable: ClearableReport | null =
+        clearing && current.question_id
+          ? { question_id: current.question_id, family_id: current.family_id }
+          : null;
+      const scan = clearable ? await lockFlaggedScan(tx, clearable) : undefined;
       const nextStatus = body.status ?? current.status;
       // Forward only: a held report can be released to the family list, never hidden again.
       const released = body.familyVisible === true && !current.family_visible;
@@ -803,33 +973,9 @@ export function privacyRoutes(): Hono<AppEnv> {
           returning ${ADMIN_COLUMNS}`,
         [id.data, nextStatus, note, visible, clearing ? 'false_match' : null],
       );
-      let recheck: SafetyClearanceRecheck | undefined;
-      if (clearing) {
-        recheck = 'none';
-        const [family] = await tx<{ active: boolean }[]>`
-          select app.family_is_active(${current.family_id}) as active`;
-        if (scan && family?.active && RECHECK_NOW.includes(scan.status)) {
-          // The same re-check a parent's transcription correction queues (homework.ts): the scan
-          // job grades this question normally, because its pre-grading screen honours the
-          // clearance for this transcription (scan-process.ts screenBeforeGrading).
-          await tx`
-            update public.assignments set status = 'checking'
-             where id = ${scan.id} and family_id = ${current.family_id}`;
-          const [jobs] = await tx<{ n: number }[]>`
-            select count(*)::int as n from public.jobs
-             where family_id = ${current.family_id} and idempotency_key like ${`scan:${scan.id}:v%`}`;
-          await tx`
-            insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
-            values ('scan_process', ${`scan:${scan.id}:v${(jobs?.n ?? 0) + 1}`}, ${current.family_id},
-                    ${scan.child_id},
-                    ${tx.json({ assignmentId: scan.id, mode: 'recheck', questionIds: [current.question_id!] })},
-                    ${deps.clock()})`;
-          recheck = 'queued';
-        } else if (scan && family?.active && scan.status === 'failed_retryable') {
-          // The scan's own retry grades every stored question again and honours the clearance.
-          recheck = 'on_retry';
-        }
-      }
+      const recheck: SafetyClearanceRecheck | undefined = clearable
+        ? await queueClearanceRecheck(tx, deps.clock(), clearable, scan)
+        : undefined;
       // A held report's audit rows carry no family_id: family members can read their family's
       // audit log (0001 audit_member_read), and it must not point them at a held report.
       const auditFamily = visible ? current.family_id : null;

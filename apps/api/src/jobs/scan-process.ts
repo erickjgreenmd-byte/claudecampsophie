@@ -1991,12 +1991,12 @@ class ScanRun {
   ): Promise<void> {
     const screen = input.screen;
     const categories = screen.categories.filter(isReportCategory);
-    // Runbook 5.1: abuse-type codes may involve someone in the household, so the report starts
-    // held from the family's list and its audit row carries no family_id (family members can read
-    // their family's audit log) until the owner releases it. A word-list flag answered while
-    // provider moderation failed is held too (fail closed): the provider's categories might have
-    // been held ones, and a report is filed once per transcription.
-    const held = heldFromFamily(screen.categories) || moderationUnavailable;
+    // Owner decision (2026-09-25): the parent is the sole recipient of every flag, so no report is
+    // held from the family (FAMILY_HOLD_CATEGORIES is empty and heldFromFamily() is always false;
+    // the hold mechanism stays in the schema as a support tool). A word-list flag answered while
+    // provider moderation failed is filed visible like any other; the outage is recorded in the
+    // audit row's metadata (providerModeration: 'unavailable') for the reviewer, never as a hold.
+    const held = heldFromFamily(screen.categories);
     const body = childSafetyMessage(screen.categories, this.ctx.ageBand);
     const filed = await this.guardedWrite(async (tx) => {
       const [current] = await tx<{ corrected_at: Date | null }[]>`
@@ -2043,6 +2043,19 @@ class ScanRun {
                   ...(input.providerCodes.length > 0 ? { providerCodes: input.providerCodes } : {}),
                   ...(moderationUnavailable ? { providerModeration: 'unavailable' } : {}),
                 })}::text::jsonb)`;
+      // Owner decision (2026-09-25): the parent is the only person PencilLift sends a safety
+      // message to. A report in the family's list is announced to the active guardians by email,
+      // as durable work in the job ledger (dispatcher.ts safetyFlagEmailHandler), once per report
+      // and with the report id only; due at this job's clock like the other inserts of this run.
+      // A held report has nothing for the family to look at (none is filed held since the
+      // decision; the mechanism stays as a support tool).
+      if (!held) {
+        await tx`
+          insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+          values ('safety_flag_email', ${`safety-flag-email:${report.id}`}, ${this.ctx.familyId},
+                  ${this.ctx.childId}, ${tx.json({ reportId: report.id })}, ${this.deps.clock()})
+          on conflict (idempotency_key) do nothing`;
+      }
       return true;
     });
     if (filed) {

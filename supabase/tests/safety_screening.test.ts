@@ -212,9 +212,35 @@ describe('system safety reports (0760)', () => {
     ).rejects.toThrow(/permission denied/);
   });
 
-  it('a held system report is hidden from the family until a reviewer releases it', async () => {
-    // Runbook 5.1: abuse-type reports (abuse, sexual, secrecy) may involve someone in the household,
-    // so the family list does not show them until the owner decides.
+  it('a report filed with the column default is visible to the family at once, whatever its codes (owner decision, 2026-09-25)', async () => {
+    // Owner decision (2026-09-25): the parent is the only person PencilLift sends a safety message
+    // to and the one who addresses the concern, so no flag is held from the family. The scan job
+    // writes `family_visible = not held`, which is always true while FAMILY_HOLD_CATEGORIES is
+    // empty; this test pins the column default and the RLS listing behind it: abuse, sexual and
+    // secrecy reports are listed at once like a self-harm one. The tests below keep exercising the
+    // 0760 hold mechanism, which stays in the schema unused by the API.
+    const s = await scanned();
+    const ids: string[] = [];
+    for (const category of ['abuse', 'sexual', 'secrecy', 'self_harm']) {
+      const target = await scanned(s.fam);
+      const [report] = await systemReport(target, { screen_categories: [category] });
+      ids.push(report!.id);
+      const [stored] = await db.sql<{ family_visible: boolean }[]>`
+        select family_visible from public.safety_reports where id = ${report!.id}`;
+      expect(stored, category).toEqual({ family_visible: true });
+    }
+    const listed = await db.asParent(
+      s.fam.ownerId,
+      (tx) =>
+        tx<{ id: string }[]>`select id from public.safety_reports where reporter_kind = 'system'`,
+    );
+    expect(listed.map((r) => r.id).sort()).toEqual([...ids].sort());
+  });
+
+  it('hold mechanism (0760, unused by the API): a system report set family_visible false by hand is hidden until released', async () => {
+    // Owner decision (2026-09-25): the API files no held report (the test above pins that); the
+    // 0760 hold stays in the schema, so this test sets family_visible false by hand and checks that
+    // the mechanism still hides the report and releases it as designed.
     const s = await scanned();
     const [held] = await systemReport(s, { screen_categories: ['abuse'], family_visible: false });
     const familyView = () =>
@@ -231,7 +257,8 @@ describe('system safety reports (0760)', () => {
     expect(await familyView()).toEqual([{ id: held!.id }]);
   });
 
-  it('only system reports, and child reports about a held flag, can be held from the family', async () => {
+  it('hold mechanism (0760): only system reports, and child reports about a hidden flag, can be hidden from the family', async () => {
+    // Owner decision (2026-09-25): unused by the API; the constraint stays with the schema's mechanism.
     const s = await scanned();
     await expect(
       db.asService(
@@ -286,8 +313,9 @@ describe('system safety reports (0760)', () => {
   });
 
   it('families cannot read the reviewer’s resolution note (RV-child-safety-8)', async () => {
-    // Runbook 5.1 tells the reviewer to record authority and family-contact decisions in the note;
-    // it is internal. A released, resolved report still shows the family only its status.
+    // Runbook 5.1: the reviewer's note is internal support material (owner decision, 2026-09-25: the
+    // parent addresses the concern; the reviewer clears false matches on request). A resolved report
+    // still shows the family only its status.
     const s = await scanned();
     const [held] = await systemReport(s, { screen_categories: ['abuse'], family_visible: false });
     await db.asService(
@@ -309,10 +337,11 @@ describe('system safety reports (0760)', () => {
     ).toEqual([{ status: 'resolved' }]);
   });
 
-  it('a child’s report about a held flagged question is held with it (RV-child-safety-6)', async () => {
-    // The results screen's "Get help" button files a child report linked to the flagged question
-    // and its safety row. Child reports are otherwise visible at once, which would show the
-    // household the held question through the ordinary report list.
+  it('hold mechanism (0760): a child’s report about a flagged question hidden by hand is hidden with it (RV-child-safety-6)', async () => {
+    // Owner decision (2026-09-25): the API files no held report, so this path is unused; the schema
+    // keeps it. The results screen's "Get help" button files a child report linked to the flagged
+    // question and its safety row. Child reports are otherwise visible at once, which would show
+    // the household a hidden question through the ordinary report list.
     const s = await scanned();
     const [held] = await systemReport(s, { screen_categories: ['abuse'], family_visible: false });
     const familyView = () =>
@@ -363,9 +392,10 @@ describe('system safety reports (0760)', () => {
     expect((await familyView()).map((r) => r.id)).not.toContain(byFeedback);
   });
 
-  it('a child’s report naming a held flag’s feedback row is held, whatever question it names', async () => {
-    // child_report_content checks that the question and the feedback are the child's own, not that
-    // they belong together: the feedback row's own question decides the hold too.
+  it('hold mechanism (0760): a child’s report naming a hidden flag’s feedback row is hidden, whatever question it names', async () => {
+    // Owner decision (2026-09-25): unused by the API; kept with the mechanism. child_report_content
+    // checks that the question and the feedback are the child's own, not that they belong together:
+    // the feedback row's own question decides the hold too.
     const s = await scanned();
     await systemReport(s, { screen_categories: ['secrecy'], family_visible: false });
     const other = await scanned(s.fam);
@@ -499,7 +529,9 @@ describe('false-match clearance (0760, round 3: CHK2-CS-5)', () => {
     ).rejects.toThrow(/resolution is final/);
   });
 
-  it('a held report cleared as a false match is never released; the family never sees it', async () => {
+  it('hold mechanism (0760): a report hidden by hand and cleared as a false match is never released; the family never sees it', async () => {
+    // Owner decision (2026-09-25): the API files no held report; the never-released rule stays with
+    // the schema's mechanism and is exercised here with family_visible set false by hand.
     const s = await scanned();
     const [held] = await systemReport(s, { screen_categories: ['abuse'], family_visible: false });
     // Clearing and releasing in one update is refused.

@@ -35,11 +35,13 @@ import {
 import * as lexicon from './lexicon.ts';
 import { NORMALIZATION_TABLES } from './normalize.ts';
 import {
+  FAMILY_HOLD_CATEGORIES,
+  HOUSEHOLD_SENSITIVE_CATEGORIES,
   MAX_SCREEN_CHARS,
   SAFETY_RULES,
   SAFETY_SCREEN_VERSION,
   SEVERE_SAFETY_CATEGORIES,
-  heldFromFamily,
+  householdSensitive,
   normalizeForScreen,
   screenModelOutput,
   screenQuestion,
@@ -502,8 +504,8 @@ describe('pass 6: recall first (a lone "I", "ill", wrists, notes, endorsement gu
         screenQuestion({ prompt, answer: 'ok', subject: 'reading', ageBand: '8-10' }).level,
       ).toBe('severe');
     }
-    // Round 5 (CHK4-CS-4/5): an abuse note merged into the printed prompt is not read for a held
-    // code (index.ts KNOWN LIMITS); the same words as the child's answer are.
+    // Round 5 (CHK4-CS-4/5): an abuse note merged into the printed prompt is not read for a
+    // household-sensitive code (index.ts KNOWN LIMITS); the same words as the child's answer are.
     for (const note of ['PART I WAS RAPED', 'At St. Mary I was abused']) {
       const asPrompt = screenQuestion({
         prompt: note,
@@ -511,7 +513,7 @@ describe('pass 6: recall first (a lone "I", "ill", wrists, notes, endorsement gu
         subject: 'reading',
         ageBand: '8-10',
       });
-      expect(heldFromFamily(asPrompt.categories)).toBe(false);
+      expect(householdSensitive(asPrompt.categories)).toBe(false);
       const asAnswer = screenQuestion({
         prompt: 'Why?',
         answer: note,
@@ -519,12 +521,19 @@ describe('pass 6: recall first (a lone "I", "ill", wrists, notes, endorsement gu
         ageBand: '8-10',
       });
       expect(asAnswer.level).toBe('severe');
-      expect(heldFromFamily(asAnswer.categories)).toBe(true);
+      expect(householdSensitive(asAnswer.categories)).toBe(true);
     }
   });
 });
 
-describe('pass 7: recall first, no held code from a printed prompt (round 5, CHK4-CS-1..9)', () => {
+describe('pass 7: recall first, no household-sensitive code from a printed prompt (round 5, CHK4-CS-1..9)', () => {
+  // Owner decision (2026-09-25): FAMILY_HOLD_CATEGORIES is empty, so the printed-prompt rule is
+  // keyed on the fixed HOUSEHOLD_SENSITIVE_CATEGORIES (abuse, sexual, secrecy). These cases prove
+  // it kept working after the hold list was emptied: a hold-keyed rule would now read every prompt.
+  it('the rule is keyed on a fixed set, not on the (empty) hold list', () => {
+    expect(FAMILY_HOLD_CATEGORIES).toEqual([]);
+    expect(HOUSEHOLD_SENSITIVE_CATEGORIES).toEqual(['abuse', 'sexual', 'secrecy']);
+  });
   const screen = (c: { text: string; subject?: string; prompt?: string }) =>
     screenQuestion({
       prompt: c.prompt ?? null,
@@ -540,14 +549,17 @@ describe('pass 7: recall first, no held code from a printed prompt (round 5, CHK
     });
   }
   for (const c of PROMPT_NOT_HELD_PASS7) {
-    it(`printed prompt carries no held code: ${describeCase(c.prompt)} (${c.subject})`, () => {
+    it(`printed prompt carries no abuse, sexual or secrecy code: ${describeCase(c.prompt)} (${c.subject})`, () => {
       const result = screenQuestion({
         prompt: c.prompt,
         answer: c.answer,
         subject: c.subject,
         ageBand: '8-10',
       });
-      expect(heldFromFamily(result.categories)).toBe(false);
+      expect(householdSensitive(result.categories)).toBe(false);
+      for (const category of HOUSEHOLD_SENSITIVE_CATEGORIES) {
+        expect(result.categories).not.toContain(category);
+      }
       if (c.contact) expect(result.categories).toEqual(['personal_contact']);
       else expect(result.level).not.toBe('severe');
     });
@@ -559,9 +571,9 @@ describe('pass 7: recall first, no held code from a printed prompt (round 5, CHK
     });
   }
 
-  it('no held category ever comes from a printed prompt; self-harm, violence and contact still do', () => {
-    // One sentence per held category, and the same words as the child's own answer.
-    const held = [
+  it('no abuse, sexual or secrecy code ever comes from a printed prompt; self-harm, violence and contact still do', () => {
+    // One sentence per household-sensitive category, and the same words as the child's own answer.
+    const sentences = [
       'My dad hits me',
       'He touches my private parts',
       'He told me not to tell anyone',
@@ -569,21 +581,22 @@ describe('pass 7: recall first, no held code from a printed prompt (round 5, CHK
       'I was raped',
       'Our little secret',
     ];
-    for (const sentence of held) {
+    for (const sentence of sentences) {
       const asPrompt = screenQuestion({
         prompt: `Read: "${sentence}." Why?`,
         answer: 'ok',
         subject: 'reading',
         ageBand: '8-10',
       });
-      expect(heldFromFamily(asPrompt.categories)).toBe(false);
+      expect(householdSensitive(asPrompt.categories), sentence).toBe(false);
       const asAnswer = screenQuestion({
         prompt: 'Why?',
         answer: sentence,
         subject: 'reading',
         ageBand: '8-10',
       });
-      expect(heldFromFamily(asAnswer.categories)).toBe(true);
+      expect(asAnswer.level, sentence).toBe('severe');
+      expect(householdSensitive(asAnswer.categories), sentence).toBe(true);
     }
     for (const [prompt, category] of [
       ['Read: "I want to die," said the boy. Why?', 'self_harm'],
@@ -592,7 +605,8 @@ describe('pass 7: recall first, no held code from a printed prompt (round 5, CHK
       const result = screenQuestion({ prompt, answer: 'ok', subject: 'reading', ageBand: '8-10' });
       expect(result.categories).toEqual([category]);
     }
-    // The prompt's held tier-B word is still reported as a topic ("child abuse" in a rights lesson).
+    // The prompt's household-sensitive tier-B word is still reported as a topic ("child abuse" in a
+    // rights lesson).
     const rights = screenQuestion({
       prompt: 'Why is child abuse against the law?',
       answer: 'it hurts kids',
@@ -814,7 +828,9 @@ describe('rules are documented and stable', () => {
       // holders, frames, a lone "I", wrists, notes, endorsement guards, quote words, negation only
       // across NEGATION_BRIDGES, the body-safety guard stops at a first person).
       'safety-screen.v3': '37bf323ff22cb481404fb4c1d7ce74285543ef7dcdb973c73c1f803943df7a42',
-      // v4, round 5 (CHK4-CS-1..9): no held code from a printed prompt, no guard on a phrase that
+      // v4, round 5 (CHK4-CS-1..9): no abuse, sexual or secrecy code from a printed prompt (keyed
+      // on the fixed HOUSEHOLD_SENSITIVE_CATEGORIES since the 2026-09-25 owner decision emptied the
+      // hold list; the rules did not change, so the digest did not), no guard on a phrase that
       // names the child, no quote words, round-4 holders, wrist accident tails or body-safety
       // guard, bridges only "to" and adverbs, "try to", restored "can stay alive", canonical
       // first-person rules.

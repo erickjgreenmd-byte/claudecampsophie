@@ -71,12 +71,13 @@
 // never makes a tier-B word severe (CHK-CS-2: "In our unit we discuss child abuse."), it reads a
 // lone "I" as a numeral in three exact idioms ("World War I", "Act I", "Queen Elizabeth I"),
 // SELF_HARM_ONLY_WAY_OUT does not read it, and (round 5, CHK4-CS-4/5, lead decision) no rule or
-// signature whose category is held from the family (abuse, sexual, secrecy) runs on it: one
+// signature whose category is household-sensitive (abuse, sexual, secrecy:
+// HOUSEHOLD_SENSITIVE_CATEGORIES, a fixed set that is not the family-hold list) runs on it: one
 // condition in screen.ts scan. A body-safety or reading worksheet quotes exactly the words a
 // disclosure uses ("Don't tell anyone, it's our secret", "\"My dad hits me,\" whispered the girl", "I
-// was touched by my coach at the award dinner"), and a held code starts the authorities-first
-// review. Its self-harm, violence and contact rules still apply, and its held tier-B words are
-// still reported as topics. First-person rules ("I want to die", "I was raped") never have an
+// was touched by my coach at the award dinner"), and such a code goes straight to the parent's
+// list and inbox (owner decision, 2026-09-25). Its self-harm, violence and contact rules still
+// apply, and its household-sensitive tier-B words are still reported as topics. First-person rules ("I want to die", "I was raped") never have an
 // exemption at all; "suicide is the only way out" or endorsed ("... is the answer", "... is the way
 // to go") is severe in the child's answer unless a third person within seven words holds the view
 // ("Teens may think ...", "Romeo thinks ...", "According to Cleopatra, ..."; CHK2-CS-4; a "To ..."
@@ -119,8 +120,9 @@
 //
 // PRECEDENCE. A report's categories may combine; abuse-type codes (abuse, sexual, secrecy) take
 // precedence: the child's template leaves out the anger message meant for a child who threatens
-// someone, and the system report is held from the family's list until a reviewer releases it
-// (FAMILY_HOLD_CATEGORIES; runbook 5.1).
+// someone. No code holds the system report from the family's list: FAMILY_HOLD_CATEGORIES is empty
+// by owner decision (2026-09-25; the parent is the only recipient of a flag and addresses it;
+// runbook 5.1). The hold mechanism (0760 family_visible, the admin release) stays unused.
 //
 // NORMALIZATION (normalize.ts). Case, NFKC with accents stripped, zero-width and bidi characters
 // removed, Cyrillic/Greek look-alikes, Latin small capitals ("ᴅɪᴇ"), the dotless i, a capital "I"
@@ -175,17 +177,19 @@
 //     after a capitalized word ("Sam II want ...") is read as a numeral. A lone "I" is the
 //     pronoun in the child's words (round 4, CHK3-CS-1), so "World War I", "Act I", "Chapter I" or
 //     "Elizabeth I" with a tier-B word or an abuse phrase escalates ("Many soldiers in World War I
-//     committed suicide", "In World War I, many soldiers were victims of abuse" as an answer is a
-//     held abuse flag); a reviewer clears it. A printed prompt reads a lone "I" as a numeral only
+//     committed suicide", "In World War I, many soldiers were victims of abuse" as an answer is an
+//     abuse flag); a reviewer clears it. A printed prompt reads a lone "I" as a numeral only
 //     after "World War", a Titlecase section word ("Act I", not "PART I") or a monarch's or pope's
 //     title and a name ("Queen Elizabeth I", not "St. Louis I").
-//   - A printed prompt never yields a held code (round 5, CHK4-CS-4/5; screen.ts scan): a
+//   - A printed prompt never yields a household-sensitive code (round 5, CHK4-CS-4/5; screen.ts
+//     scan; keyed on the fixed HOUSEHOLD_SENSITIVE_CATEGORIES, not on the empty hold list): a
 //     disclosure the extraction model misplaces into the prompt field ("Why do plants need
 //     sunlight? My dad hits me", "PART I WAS RAPED") is not read for abuse, sexual or secrecy
 //     codes, and a sexual-violence or sexual-health word in a prompt is a topic only. The
 //     prompt's self-harm, violence and contact rules still apply ("... i want to die" merged into a
 //     prompt is severe), so a worksheet can still carry a contact code ("A grown-up tells you to keep
-//     a secret about touching. What should you do?" is `personal_contact`, which is not held). A
+//     a secret about touching. What should you do?" is `personal_contact`, which is not
+//     household-sensitive). A
 //     prompt's first person never makes its tier-B word severe, so a child's note merged into the
 //     prompt ("... suicide is my plan") is judged by subject and cues.
 //   - A threat or death wish against someone named ("I want to kill Sam") is read from the word
@@ -247,21 +251,21 @@
 //     "I" and "ill" readings above; accidents with a blade or in a room ("I cut myself again with
 //     the scissors in art", "I keep hurting myself in the kitchen", "I cut my wrists running") and
 //     "I'm going to stop hurting myself"; "I want to die of shame" ("of shame" is no longer a
-//     hyperbole tail); "I was touched by my teacher when she gave me a hug" (ABUSE_TOUCHED_BY, a
-//     held abuse flag); a holder or non-person after the only-way-out phrase ("Suicide is the
+//     hyperbole tail); "I was touched by my teacher when she gave me a hug" (ABUSE_TOUCHED_BY, an
+//     abuse flag); a holder or non-person after the only-way-out phrase ("Suicide is the
 //     answer for some people, but ...", "For the salmon, dying is the only way to spawn"); a
 //     body-safety answer with a first person after the phrase ("... tell a trusted adult like my
-//     mom", a held sexual flag). A body-safety lesson that names no lesson word or third person
+//     mom", a sexual flag). A body-safety lesson that names no lesson word or third person
 //     ("Someone said touching private parts is a game. That is wrong.", "We learned it is not ok
 //     when someone says rape is ok") also escalates, as does a game after "destroy myself" ("I will
 //     destroy myself in Minecraft").
 //   - Reviewer-cleared by the round-5 recall decision (corpus.ts REVIEWER_CLEARED_PASS7; lead
 //     decision: a precision device that cancelled a report is gone, and a canonical disclosure has a
 //     plain rule): a body-safety lesson whose phrase names the child ("No one is allowed to touch my
-//     private parts", "Never let anyone touch my private parts"; a held abuse flag); a lesson that
+//     private parts", "Never let anyone touch my private parts"; an abuse flag); a lesson that
 //     quotes a phrase naming the child ("If someone tells you touching private parts is our secret,
 //     you should tell", "Never say sex is our secret", "Circle the unsafe secret: 'Touching private
-//     parts is our secret.'"; a held sexual flag) or has "should" or "book" before an endorsement
+//     parts is our secret.'"; a sexual flag) or has "should" or "book" before an endorsement
 //     phrase ("No one should ever say rape is ok", "The book says sex is a secret topic for some
 //     families"); a third-person lesson that only a round-4 holder held ("Brutus decides suicide is
 //     the right choice", "The question is whether suicide is the answer", "To Cleopatra, suicide is
@@ -272,7 +276,7 @@
 //     hard"), "When I was cooking I cut myself.", "I cut my legs shaving", "I took all my pills this
 //     morning", "I want it to be over so I can play outside", "I don't want to wake up tomorrow
 //     because it is a school day", "I don't want to be here anymore, this party is boring", "My team
-//     would be better without me", "The character felt there was no reason to live", and held abuse
+//     would be better without me", "The character felt there was no reason to live", and abuse
 //     flags for "My mom pulls my hair when she braids it", "My mom locked me out of the house by
 //     accident", "In tag he touched me.", "My mom makes me do things I don't like, like cleaning my
 //     room", "I have bruises from my brother at soccer" and "My dad gave me a black eye by accident
@@ -280,7 +284,7 @@
 //   - An adjective "ill" before a verb reads as "I'll" (above), so the first-person overdose rules
 //     read everyday health answers without any tier-B word ("People who are ill take all their pills
 //     on time", "When you are ill take all the medicine the doctor gives you" in science;
-//     CHK4-CS-9); the code is self_harm, not held, and a reviewer clears it.
+//     CHK4-CS-9); the code is self_harm, and a reviewer clears it.
 //   - The endorsement rules' lesson guard (ENDORSED_LESSON_GUARD) still holds a phrase that does
 //     not name the child when a lesson word or a third person ("if", "rule", "people", "story", "a
 //     bully", a negated "say") is within six words before it and no first person is in the
@@ -323,10 +327,12 @@ export {
 export {
   CHILD_SAFETY_MESSAGE_MAX_LENGTH,
   FAMILY_HOLD_CATEGORIES,
+  HOUSEHOLD_SENSITIVE_CATEGORIES,
   SAFETY_RESOURCES_US,
   SAFETY_TEMPLATES_APPROVED,
   SAFETY_TEMPLATES_STATUS,
   SAFETY_TEMPLATES_VERSION,
   childSafetyMessage,
   heldFromFamily,
+  householdSensitive,
 } from './templates.ts';

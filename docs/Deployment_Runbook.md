@@ -67,7 +67,10 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 1. **Verify the tree**: `scripts/verify.sh` (format → lint → typecheck → all tests → finance model → release
    artifact build, secret scan and negative control, §3.2) exits 0 on the exact commit; CI green on the same SHA.
 2. **Database**: `supabase link --project-ref <staging-ref>` then `supabase db push`. Migrations are forward-only
-   and ordered by file name (0001 … 0770 at the time of writing; list `supabase/migrations`). 0720 creates a trigger on
+   and ordered by file name (0001 … 0810 at the time of writing; list `supabase/migrations`). Numbers were allocated
+   per area, so a lower number can land after a higher one (0790 parent flag review was committed after 0800 Amazon
+   Appstore): an environment that already applied a higher number needs `supabase db push --include-all`, which
+   the CLI otherwise refuses for a local migration older than the remote's last one. 0720 creates a trigger on
    `auth.sessions`: confirm the hosted project accepts it (Owner Action 20) — if it is refused the migration fails
    loudly and a Supabase Auth hook must replace it. Before production, rehearse on a restored copy (§6). Confirm
    `select count(*) from pg_policies` and run the schema invariant queries from `supabase/tests/schema_invariants.test.ts`
@@ -205,89 +208,139 @@ allowance released; the parent can resubmit.
 | Consent withdrawal | Parent action | Queued work is cancelled in the same transaction; verify no new `scan_process` jobs start for the family |
 | Deletion request | `deletion_requests` | Purge job runs on the next tick; `purge_report` records counts; storage objects are removed before rows |
 
-### 5.1 Safety reports: moderation and escalation (spec P4, P14; AC_SECURITY_01, AC_SECURITY_02)
+### 5.1 Safety reports: the parent as the recipient, and the support queue (spec P4, P14; AC_SECURITY_01, AC_SECURITY_02)
+
+Owner decision (2026-09-25; the lead's dissent is recorded in Owner action #24 and Threat_Model T34): the
+parent is the only person PencilLift sends a safety message to, and the parent addresses the concern. No
+flag is held from the family, every flag is emailed to the family's active guardians, and a guardian acts
+on it from the portal and the app. The owner-admin queue (below) is a support tool. No PencilLift-initiated
+contact with authorities is part of this procedure (owner decision; counsel to confirm it is lawful in the
+launch states, including any mandated-reporting duty, before launch: Owner action #24).
 
 Reports come from the child's "Tell PencilLift" choices (`POST /v1/child/reports`: `upsetting`,
 `wrong_or_confusing`, `answer_revealed`, `other`), from parents (`POST /v1/safety-reports`, which also
 offers `unsafe_content`) and from PencilLift's safety screen (system reports, below). The child's "Tell a
-grown-up" card sends nothing, and PencilLift sends no automatic parent alert; never tell a family that one
-was sent.
+grown-up" card sends nothing. The child's side is unchanged by the owner decision: the fixed notice, no
+chat, the hotlines; the child's notice never says or implies that anyone was alerted.
 
-System reports (migration 0760). The scan job screens every extracted answer and printed prompt with the
-deterministic first-layer screen (`@pencillift/domain/safety`, version `SAFETY_SCREEN_VERSION`) and sends
-the child's answers (never the printed prompt) to provider moderation (OpenAI omni-moderation; labeled mock
-until the key and ZDR approval exist) BEFORE any grading call. Audit rows of system reports carry `source`
-(`safety_screen`, `provider_moderation` or both), `providerCodes` (`PROVIDER_*`) and
-`providerModeration: 'unavailable'` when a word-list flag was held because moderation failed. A provider
-violence flag on the child's own words arrives as a held abuse+violence report: the model cannot tell a
-victim's report from a threat, so the reviewer decides. If moderation fails (outage, timeout) no model call
-runs; a retryable failure retries, a final one ends the scan as MODERATION_NOT_AVAILABLE. On a severe-risk result that question gets no
-model call at all (no grading, verification or coaching; it gets no verdict and no worked solution), the
-child is shown the reviewed safety template (feedback kind `safety`: talk to a trusted grown-up; 988 for
-self-harm; Childhelp 1-800-422-4453 for abuse, secrecy, sexual content or stranger contact; 911 for
-immediate danger) and one report is filed per question per transcription: `reporter_kind = 'system'`,
-category `severe_risk`, status `escalated` from the start (serious by default; the database keeps it
-`escalated` or `resolved`). Both are written before grading starts, so a grading failure, a spend-ceiling
-pause or a dead-lettered scan cannot delay or drop them. The scan's status follows its other questions (a
-flag never moves it to parent review, so a held flag is not announced to the household); the parent sees
-the flagged question as not checked. The report holds ids and the screen's category codes only, never
-homework text. The child's results screen shows the template as its header and body as soon as it is
-filed, whatever the scan's status (still being checked, waiting for a retry, failed for good; the child
-API returns the latest notice before any result is visible), and hints and "Try again" are hidden for that
-question. If a grown-up later corrects the flagged answer's transcription, the child keeps the template
-(also while the recheck waits), the tutor is still not called and no new report is filed unless the
-corrected text screens severe again; the queue marks the original report `transcriptionCorrected: true`
-(never the corrected text), so check whether the edit was an honest transcription fix. Until a reviewer
-clears it, a flagged question stays unchecked (a parent's verdict override answers "No result to
-override") and keeps its template even after a correction. The screen leans toward escalation for a
-child's first-person words (a missed disclosure is worse than a false flag), so false matches are
-expected and are cleared by a person (below; the documented ones are listed in the screen's KNOWN LIMITS). The screen also reads the printed prompt,
-but never for a held category (round 5): an `abuse`, `sexual` or `secrecy` flag always comes from the
-child's own answer, while a `self_harm`, `violence` or `personal_contact` flag can come from the printed
-prompt (a worksheet that quotes "I want to die" or asks what to do when a grown-up wants a secret kept), so
-check the prompt first when reviewing one of those. A first person in the prompt ("In our unit we discuss
-...") is the worksheet's, never the child's, and a child's disclosure that the extraction put into the
-prompt field is not read for the held categories (KNOWN LIMITS). The family
-sees a visible report in its report list as "Answer flagged for a grown-up", "Flagged by PencilLift", with a
-note that PencilLift sent no automatic alert and the same resources; the family never sees the category
-codes. Family hold (proposed default; owner and counsel to approve): a report whose codes include `abuse`,
-`sexual` or `secrecy` starts HELD (`family_visible = false`): the family's list does not show it (RLS) and
-its audit rows carry no `family_id` (family members can read their family's audit log) until the owner
-releases it. The hold only stops PencilLift from drawing the household's attention to the flag; it does not
-hide the child's own answer, which the family can always see in the scan, or the child's feedback rows.
-`self_harm`, `violence` and `personal_contact` reports are visible at once. A child's own report (the results
-screen's "Get help" button, `POST /v1/child/reports`) about a question with a held system report, or naming
-its template row, starts held too (`familyVisible: false` in the queue); otherwise it would show the
-household the held question at once. Release it on its own, like the system report. The child templates and parent
-wording are drafts until the owner and an educator approve them (`SAFETY_TEMPLATES_STATUS`). Blocked model output (coaching, rubric labels, practice intros and stories) is
-logged as a code only (`coaching_blocked_by_safety`, `rubric_label_blocked_by_safety`,
-`practice_ai_blocked_by_safety`) and creates no report: watch the rates as with `coaching_blocked_by_guard`.
+System reports (migrations 0760 and 0790). The scan job screens every extracted answer and printed prompt
+with the deterministic first-layer screen (`@pencillift/domain/safety`, version `SAFETY_SCREEN_VERSION`)
+and sends the child's answers (never the printed prompt) to provider moderation (OpenAI omni-moderation;
+labeled mock until the key and ZDR approval exist) BEFORE any grading call. If moderation fails (outage,
+timeout) no model call runs; a retryable failure retries, a final one ends the scan as
+MODERATION_NOT_AVAILABLE; a question the word list flags in that attempt is still answered and its report
+listed at once (its audit row carries `providerModeration: 'unavailable'`; Owner action #26 is closed by
+the decision). Audit rows of system reports carry `source` (`safety_screen`, `provider_moderation` or
+both) and `providerCodes` (`PROVIDER_*`). A provider violence flag on the child's own words arrives as an
+abuse+violence report, listed like every flag: the model cannot tell a victim's report from a threat, and
+the parent, who knows the child, decides. On a severe-risk result that question gets no model call at all
+(no grading, verification or coaching; it gets no verdict and no worked solution), the child is shown the
+reviewed safety template (feedback kind `safety`: talk to a trusted grown-up; 988 for self-harm; Childhelp
+1-800-422-4453 for abuse, secrecy, sexual content or stranger contact; 911 for immediate danger) and one
+report is filed per question per transcription: `reporter_kind = 'system'`, category `severe_risk`, status
+`escalated` from the start (serious by default; the database keeps it `escalated` or `resolved`),
+`family_visible = true` whatever its codes (`FAMILY_HOLD_CATEGORIES` is empty; the 0760 hold mechanism and
+the admin release stay in the schema and the API, unused: the API never files a held report) and an audit
+row that carries the family id. Both are written before grading starts, so a grading failure, a
+spend-ceiling pause or a dead-lettered scan cannot delay or drop them. The scan's status follows its other
+questions (a flag never moves it to parent review; the parent learns of it from the flag email and the
+report list); the parent sees the flagged question as not checked. The report holds ids and the screen's
+category codes only, never homework text. The child's results screen shows the template as its header and
+body as soon as it is filed, whatever the scan's status (still being checked, waiting for a retry, failed
+for good; the child API returns the latest notice before any result is visible), and hints and "Try again"
+are hidden for that question. If a grown-up later corrects the flagged answer's transcription, the child
+keeps the template (also while the recheck waits), the tutor is still not called and no new report is
+filed unless the corrected text screens severe again; the queue marks the original report
+`transcriptionCorrected: true` (never the corrected text). Until the flag is cleared as a false alarm (by a
+guardian or a reviewer, below), a flagged question stays unchecked (a parent's verdict override answers
+"No result to override") and keeps its template even after a correction. The screen leans toward
+escalation for a child's first-person words (a missed disclosure is worse than a false flag), so false
+matches are expected, and the parent clears them (the documented ones are listed in the screen's KNOWN
+LIMITS and at the end of the clearing steps below). The screen also reads the printed prompt, but never for
+`abuse`, `sexual` or `secrecy` (`HOUSEHOLD_SENSITIVE_CATEGORIES`, a fixed set that does not depend on the
+empty hold list; round 5): such a flag always comes from the child's own answer, while a `self_harm`,
+`violence` or `personal_contact` flag can come from the printed prompt (a worksheet that quotes "I want to
+die" or asks what to do when a grown-up wants a secret kept), so a reviewer helping a parent with one of
+those checks the prompt first. A first person in the prompt ("In our unit we discuss ...") is the
+worksheet's, never the child's, and a child's disclosure that the extraction put into the prompt field is
+not read for those three categories (KNOWN LIMITS).
 
-Queue: an owner admin with MFA (aal2) lists `GET /v1/admin/safety-reports?status=open` (oldest first; use
-`?status=escalated` for system reports) and moves a report with `PATCH /v1/admin/safety-reports/:id`. A page
-holds at most 200 reports; while `nextCursor` is not null, fetch the next page with `&after=<nextCursor>`
-and keep going to the end, because a new severe flag is the newest item. There is no admin web screen yet;
-use the API. Reviewers see ids, category, status, timestamps and whether a note
-exists, never homework text, the child's nickname or the parent's note. A system report adds
-`screenCategories` (`self_harm`, `abuse`, `violence`, `sexual`, `secrecy`, `personal_contact`) and
-`familyVisible` and `transcriptionCorrected`, and links the question (`questionId`) and the template shown
+The flag email (migration 0790; job `safety_flag_email`). When the scan job files a system report it
+enqueues one `safety_flag_email` job (payload: the report id only). The job emails every active guardian of
+the family through the configured `EmailProvider` (the labeled outbox mock in development and test;
+elsewhere the refusing provider until a real one is configured, so nothing is ever sent silently or
+claimed): the email says only that PencilLift flagged an answer for a grown-up to look at and where to
+find it (the safety list in the portal or the app). It carries NO homework text, NO child name and NO
+category. Delivery is recorded on the report (`parent_email_status`: `not_sent` until the job runs or when
+no verified guardian address exists; `sent`, with `parent_emailed_at`, once at least one address accepted
+it; `failed` when the provider refused every address, after which a bounded retry follows) and the family's
+list states exactly that (`emailStatus`; wording `PARENT_SAFETY_FLAG_COPY.emailSent`, `emailNotSent`,
+`emailFailed`): never claim an email that was not recorded (AC_SECURITY_02 "notification claims match
+actual deliveries"). Only system reports are emailed; a child's or a parent's own report sends nothing
+(`not_sent`). A child's own "Get help" report about a flagged question is listed at once, next to the flag.
+
+The family's list (`GET /v1/safety-reports`) shows a flag as "Answer flagged for a grown-up", "Flagged by
+PencilLift", with the email state and the same resources; it never shows the category codes, the matched
+text or the screen version, and the parent API and web never return the child's `safety` feedback rows
+(the Supabase Data API path is Owner action #25).
+
+The parent's two actions (`PATCH /v1/safety-reports/:id`, body `{"outcome": "addressed" | "false_match"}`;
+portal and app, same wording on both, `PARENT_SAFETY_FLAG_ACTIONS`). Both need a recent PIN unlock (spec
+P3 step-up) and the family's own report (a child token gets 401; another family's guardian or an unknown
+id 404):
+- `addressed` ("I've looked into this"): the report is resolved with `resolution: 'addressed'`; the
+  child's notice for that question stays and PencilLift still runs no AI on that question. Allowed for a
+  system report or a child's report; it changes nothing for the child.
+- `false_match` ("This was a false alarm, check the question normally"): exactly the reviewer's
+  false-match clearing below, for a system report only: the child's notice is hidden at once and the
+  question is rechecked (`recheck` as below; `SCAN_STILL_CHECKING` while the scan is being checked). The
+  wording tells the guardian to choose it only when sure the answer is not a concern.
+The action stamps `parentActionAt` and `parentOutcome` on the report (the queue shows them too). A
+resolved report is final (`REPORT_ALREADY_RESOLVED`, 409); a child's report can be looked into, never
+cleared as a false alarm; a parent's own `POST /v1/safety-reports` report is reviewed by PencilLift, not
+self-resolved (`PARENT_ACTION_NOT_FOR_REPORT`); the body is strict (the two outcomes, nothing else). The
+child templates and parent wording are drafts until the owner and an educator approve them
+(`SAFETY_TEMPLATES_STATUS`; `safety-templates.v4`). Blocked model output (coaching, rubric labels, practice
+intros and stories) is logged as a code only (`coaching_blocked_by_safety`,
+`rubric_label_blocked_by_safety`, `practice_ai_blocked_by_safety`) and creates no report: watch the rates
+as with `coaching_blocked_by_guard`.
+
+Support queue (the owner-admin queue). An owner admin with MFA (aal2) lists
+`GET /v1/admin/safety-reports?status=open` (oldest first; use `?status=escalated` for system reports) and
+moves a report with `PATCH /v1/admin/safety-reports/:id`. A page holds at most 200 reports; while
+`nextCursor` is not null, fetch the next page with `&after=<nextCursor>` and keep going to the end, because
+a new severe flag is the newest item. There is no admin web screen yet; use the API. Reviewers see ids,
+category, status, timestamps, whether a note exists and the guardian's outcome and stamp, never homework
+text, the child's nickname or the parent's note. A system report adds `screenCategories` (`self_harm`,
+`abuse`, `violence`, `sexual`, `secrecy`, `personal_contact`), `familyVisible` (true for every report the
+API files) and `transcriptionCorrected`, and links the question (`questionId`) and the template shown
 (`feedbackId`). The resolution note is internal: the family's list and the family's database access show a
 report's status and timestamps, never its resolution note (migration 0760 grants no family read of it), so
-record authority and family-contact decisions there as the steps below say. Every change
-writes an `audit_events` row (`safety_report.updated`, from/to status); a system report's creation writes
-`safety_report.created` with actor `system`. To release a held report to the family's list, send
-`PATCH /v1/admin/safety-reports/:id` with `{"familyVisible": true}` (alone or with a status); it is
-forward only (a report is never hidden again) and writes `safety_report.released_to_family`.
+record what was done there. Every change writes an `audit_events` row (`safety_report.updated`, from/to
+status); a system report's creation writes `safety_report.created` with actor `system`. The release
+(`{"familyVisible": true}`, forward only, `safety_report.released_to_family`) stays in the API for a report
+hidden by hand; the API files none, so on a visible report it changes nothing.
 
-Clearing a false match (round 3; spec P4 "human review procedures"). When the review shows the screen's
-word match was wrong (a house rule, homework hyperbole, a game, a lesson; read the one question's
-transcription through the service role only if ids and categories cannot settle it, and record that access
-in the note, never the text), resolve the system report with
-`PATCH /v1/admin/safety-reports/:id` and `{"status": "resolved", "resolution": "false_match",
-"resolutionNote": "<the screen category and the kind of false match>"}`. The queue shows the screen
-categories (`screenCategories`), not the rule that fired, so the note names the category and the kind of
-false match in general words ("self_harm; homework hyperbole", "abuse; a house rule about snacks"), never
-the text. The clearance is that report's question and transcription, and it is final.
+What the queue is for under the owner decision: (1) clearing a false match when a guardian asks for help
+or cannot tell a false alarm from a concern (Owner action #27); (2) answering a guardian's question about a
+flag, by email to that guardian (the only person PencilLift sends a safety message to; record the contact
+in the note, never the text); (3) the parent's own reports (`unsafe_content`, `answer_revealed`,
+`wrong_or_confusing`, `other`) and child reports the parent has not addressed; (4) watching the screen's
+false-match rate so the rules can be tuned in a new `SAFETY_SCREEN_VERSION`. A reviewer does not contact a
+family unasked about a system flag (the flag email and the list already did) and does not contact
+authorities (owner decision; counsel, Owner action #24). A household-sensitive code (`abuse`, `sexual`,
+`secrecy`) that came from a printed prompt is a screen defect: record it in the Bug Ledger.
+
+Clearing a false match (round 3; spec P4 "human review procedures"). A guardian clears a flag with the
+`false_match` action above; a reviewer clears one on request when the review shows the screen's word match
+was wrong (a house rule, homework hyperbole, a game, a lesson; read the one question's transcription
+through the service role only if ids and categories cannot settle it, and record that access in the note,
+never the text): resolve the system report with `PATCH /v1/admin/safety-reports/:id` and
+`{"status": "resolved", "resolution": "false_match", "resolutionNote": "<the screen category and the kind
+of false match>"}`. The queue shows the screen categories (`screenCategories`), not the rule that fired, so
+the note names the category and the kind of false match in general words ("self_harm; homework
+hyperbole", "abuse; a house rule about snacks"), never the text. The clearance is that report's question
+and transcription, and it is final.
 
 Clear every system report on the question (round 4). A question can carry several system reports, one per
 transcription (the original and a grown-up's correction that screened severe again): find them in the
@@ -305,17 +358,9 @@ clearance answers with its own `recheck` value (below); the one for the last rep
   failed for good, was cancelled or sent back for a retake, or the family is being deleted; nothing is
   graded). A scan that is still being checked is refused (`SCAN_STILL_CHECKING`): clear it once the scan
   settles, and the report stays `escalated` until then.
-- A held report stays held for good: combining the clearance with `familyVisible` is refused (400), and a
-  later release answers `FALSE_MATCH_NOT_RELEASABLE` (migration 0760 refuses it too). Its audit rows carry
-  no `family_id` and the re-check job is not family-readable, so the family never learns of a held report
-  that was cleared; they can see only that the scan was checked again and that the question now has a
-  result. A child's own "Get help" report about the question stays held until you release it on its own,
-  and so does one filed LATER (a cleared held report stays held, so a report about a hint the recheck
-  wrote starts held too, migration 0760 `child_report_content`): after clearing a held flag, check the
-  queue for the question's child reports (`?status=open`) for as long as the scan's results are shown, and
-  release each one on its own when the review allows it. A visible report stays in the family's list as
-  resolved, with wording that a reviewer found it was not a concern and that the child's results no longer
-  show the message (`clearedAsFalseMatch`; draft wording `safety-templates.v3`).
+- A cleared report stays in the family's list as resolved, with wording that the flag was checked and
+  found not a concern and that the child's results no longer show the message (`clearedAsFalseMatch`;
+  draft wording `safety-templates.v4`). A clearance never carries `familyVisible` (400).
 - If a grown-up later corrects the transcription, the new text is screened afresh: a new severe match files
   a new report and shows the notice again, and needs its own review.
 - Only system reports can be cleared (`FALSE_MATCH_SYSTEM_ONLY`). Record the category and the kind of false
@@ -330,49 +375,40 @@ clearance answers with its own `recheck` value (below); the one for the last rep
 |---|---|---|
 | `open` | Not reviewed yet | `triaged`, `escalated`, `resolved` |
 | `triaged` | Category confirmed; routine follow-up in progress | `escalated`, `resolved` |
-| `escalated` | Serious concern with the owner (the escalation contact) | `resolved` |
-| `resolved` | Closed with a required resolution note; final (a new concern is a new report) | none |
+| `escalated` | Serious concern; a system flag is the parent's to address, the queue supports | `resolved` |
+| `resolved` | Closed with a required resolution note (a guardian's action needs none); final (a new concern is a new report) | none |
 
 Triage. Target: every `open` report reviewed within 1 business day (proposed; owner to approve).
 
 1. `upsetting` and `unsafe_content` are serious by default: set `escalated` at once, then follow the
-   escalation steps.
+   review steps.
 2. `answer_revealed`: follow the "Leak report" row above, then resolve with the guard finding in the note.
 3. `wrong_or_confusing`: check the grading or hint path by ids (`question_results`, `child_feedback`), fix or
    record the defect, then resolve.
 4. `other`: triage by ids and escalate anything that could involve a child's safety.
-5. `severe_risk` (system) arrives `escalated`: go straight to the escalation steps. The screen is a word
-   match and can be wrong (fiction, quotes, a sibling squabble, a house rule); a false match is cleared
-   as above (`resolution: "false_match"`, every system report on the question) with a note naming the
-   category and the kind of false match so the rule can be tuned, never with the text.
+5. `severe_risk` (system) arrives `escalated` and belongs to the parent, who was emailed and sees it in the
+   list: the queue's part is support (a false match a guardian asks about is cleared as above, every
+   system report on the question, with a note naming the category and the kind of false match, never the
+   text). A guardian's own action (`parentOutcome`) closes it without a reviewer.
 
-Escalation (serious concerns). Target: owner review within 1 hour of `escalated` (proposed; owner to approve).
+Review of an escalated report (support). Target: a reviewer looks at every `escalated` report a guardian
+has not acted on within 1 business day (proposed; owner to approve).
 
-1. The owner reviews the linked item through ids and audit records only; no casual browsing of child content.
+1. The reviewer looks at the linked item through ids and audit records only; no casual browsing of child
+   content. If ids and codes cannot settle it, the reviewer may read that one question's transcription
+   through the service role; the access is recorded in the resolution note (never the text itself).
 2. If generated content is involved, switch child coaching to reviewed templates (withhold the AI key) until
    the cause is fixed and the answer-leak and moderation tests pass again.
-3. If a child may be at risk of harm, the owner contacts the family owner by email and, where the law
-   requires, the appropriate authorities, following the owner-approved safety policy. That policy and its
-   message templates are an owner action that must be complete before launch (spec P4: "Safety templates
-   and human review procedures must exist before launch").
-   For a system report, the screen code decides the first step (proposed; owner and counsel to approve).
-   Precedence when a report carries several codes: `abuse`, `sexual` or `secrecy` first (their step
-   replaces the family contact of the others), then `self_harm`, then `personal_contact`, then `violence`.
-   - `abuse`, `sexual`, `secrecy` (held from the family list): the concern may involve someone in the
-     household, so do not contact the family first; follow the safety policy for the authorities (child
-     protective services, or 911 if the danger is immediate). Release the report to the family only when
-     the policy allows it, and record the decision in the resolution note.
-   - `self_harm`: contact the family owner by email the same day with the 988 Lifeline information; 911 if
-     the danger is immediate. This is a person's message, not an automatic alert, so the family list's
-     "PencilLift sent no automatic alert" stays true; record the contact in the resolution note.
-   - `personal_contact`: the request came from someone outside the household (a stranger or an online
-     contact), so contact the family owner the same day; follow the safety policy for the authorities if
-     the child was asked to meet or to send pictures.
-   - `violence`: contact the family owner; if a specific school or person is named as a target, follow the
-     safety policy for the school or the authorities. A victim's words ("he said if I tell he will hurt my
-     mom") screen as `abuse`, not `violence`.
-   If ids and codes cannot settle it, the owner may read that one question's transcription through the
-   service role; the access is recorded in the resolution note (never the text itself).
+3. A system flag is addressed by the parent, not by PencilLift. The reviewer's part is the support above:
+   clear a false match on request, answer a guardian's question by email, and record a screen defect. What
+   the codes mean, for that help: `abuse`, `sexual` and `secrecy` are a disclosure in the child's own words
+   (never from the printed prompt); `self_harm`; `personal_contact` (someone outside the household asked
+   for contact, pictures, a meeting or a secret); `violence` (a victim's words such as "he said if I tell he
+   will hurt my mom" screen as `abuse`, not `violence`). When a report carries several codes, the child's
+   template gives the abuse-type codes precedence (it leaves out the anger message). Under this procedure
+   PencilLift does not contact authorities and sends no safety message to anyone but the family's
+   guardians (owner decision, 2026-09-25); a change to that is a new owner decision, counsel's confirmation
+   and a runbook change, not a reviewer's call.
 4. Resolve with a note stating the outcome and any product change, without homework text or names.
 
 ## 6. Backup, restore and rollback (not yet rehearsed)
