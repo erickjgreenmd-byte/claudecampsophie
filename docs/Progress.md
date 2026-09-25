@@ -4,7 +4,7 @@ Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on 
 Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
 (1–4 paid slots) — unchanged.
 
-## Current state (2026-09-25; code at `6d0d5d0`)
+## Current state (2026-09-25; code at `54ca934`)
 
 Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
 approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
@@ -22,14 +22,20 @@ gaps closed — in-app account closure (soft delete through the Supabase Auth Ad
 gate before every pre-PIN outbound link, in-app legal links, subscription disclosures, native config (privacy
 manifest, permissions, export compliance, no push stack, EAS linkage with loud variables), web legal pages final
 under `VITE_LEGAL_REVIEWED`, security headers; the store submission checklist is in `docs/Release_Readiness.md`
-and the owner-side rows are Owner actions #33–#37. MCP connectors for Supabase, Stripe and Expo are attached to
+and the owner-side rows are Owner actions #33–#37. Then hardening round 1 (`54ca934`): the fifteen findings the
+adversarial bug hunt confirmed in its first round (BUG-116..130) fixed with a failing regression test each — control
+characters refused in every free-text field, keyset paging for scans and points, per-family limits and a PIN-set
+budget, the K-8 under-13 scope in the contracts (T38), parent sign-out on the device, honest sign-in and reset
+errors, request timeouts with a stoppable upload, one page in memory at a time, honest reminder copy on both
+planners, pairing recovery, a way home from every child screen, the sign-in offered to a signed-out parent, the
+client-side unlock in memory only (privacy screen included) and store names per build. MCP connectors for Supabase, Stripe and Expo are attached to
 the build session but no project, account or EAS project of PencilLift's exists yet (Connections).
 Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with its gap): integration_tested 33,
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `6d0d5d0`:
-api 931, domain 3,656, db 341, web 526, mobile 554, ai 49, contracts 15, ui-tokens 4 (6,076 tests, 0 failed,
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `54ca934`:
+api 952, domain 3,656, db 341, web 530, mobile 591, ai 49, contracts 20, ui-tokens 4 (6,143 tests, 0 failed,
 0 skipped), gate audit, finance, release-artifact scan with negative control. Earlier gates caught BUG-114 (a
 stale function re-creation, L-026) and BUG-115 (a pinned-clock time bomb, L-027) before their commits. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
 there is the source of truth; a records-only commit may still have its run in progress).
@@ -58,17 +64,20 @@ moderation built but never run live (no key).
 
 ## In flight
 
-- Adversarial bug hunt across every area (read-only, workflow `wf_2a9a8aa6-7c4`, finder rounds with three-lens
-  verification); its confirmed findings go to a fix workflow (failing test first, checkers, isolated gate).
-  The four store audits of the same workflow are done and their code gaps are closed (`wf_b0de02d8-ca2`; store
-  checklist in `docs/Release_Readiness.md`); the owner-side rows are Owner actions #33–#37.
+- Adversarial bug hunt across every area (read-only, workflow `wf_2a9a8aa6-7c4`, two finder rounds with three-lens
+  verification, still verifying its round-1 findings for billing, safety-privacy, database, jobs-AI and web). Its
+  first fifteen confirmed findings (API auth/validation and mobile runtime) are fixed in `54ca934`
+  (`wf_8b66cd30-e71`, BUG-116..130); the remaining confirmed findings go to a second fix workflow (failing test
+  first, checkers, isolated gate). The four store audits of the same workflow are done and their code gaps are
+  closed (`wf_b0de02d8-ca2`; store checklist in `docs/Release_Readiness.md`); the owner-side rows are Owner
+  actions #33–#37.
 
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Owner decisions from the dashboard work: who works the support queue (#31), the refund and complaint policy
-   and store fee rates (#32).
-3. Owner actions in `docs/Owner_Actions.md` (#1–#32) unblock everything else: accounts (Apple, Google Play, Amazon
+2. When the bug hunt finishes: verify its remaining confirmed findings, run the second fix workflow, gate, commit,
+   record (`docs/ECC_Runs.md`, `docs/Bug_Ledger.md`).
+3. Owner actions in `docs/Owner_Actions.md` (#1–#37) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety

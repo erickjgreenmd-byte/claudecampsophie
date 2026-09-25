@@ -15,7 +15,7 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 | Store products / agreements | **No** | Owner actions #1, #4, #11 |
 | Submitted / approved | **No** | — |
 
-## Store submission checklist (audited 2026-09-25, workflow `wf_2a9a8aa6-7c4`; code gaps being closed in `wf_b0de02d8-ca2`)
+## Store submission checklist (audited 2026-09-25, workflow `wf_2a9a8aa6-7c4`; code gaps closed in `wf_b0de02d8-ca2` (`6d0d5d0`); round-1 bug-hunt fixes in `wf_8b66cd30-e71` (`54ca934`))
 
 Evidence levels as in `docs/Provider_Capability_Matrix.md`: `doc-verified` (read in the store's current documentation
 during the audit), `secondary`, `candidate` (documentation unreachable from the build environment — Amazon and
