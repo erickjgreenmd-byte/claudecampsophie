@@ -8,7 +8,9 @@ import { Link, useLocation } from 'react-router';
  * Supabase then either reports `error` / `error_code` / `error_description` (query or hash), or,
  * when this browser holds no code verifier, silently leaves the unexchanged `?code=` in the address.
  * A hash `access_token` that this PKCE client refuses (for example a reset link made by an
- * implicit-flow client) also means the link could not sign the adult in here.
+ * implicit-flow client) also means the link could not sign the adult in here. The one exception is
+ * `/update-password` (R2C-WEB-3): a mobile-started reset link (`type=recovery` with both tokens) is
+ * adopted there by UpdatePasswordPage, which passes `problem` itself if the auth server refuses it.
  *
  * - `expired`: Supabase says the link expired or was already used (`error_code=otp_expired`).
  * - `failed`: any other error, or a link that was not exchanged in this browser.
@@ -46,12 +48,19 @@ const HEADLINE: Record<AuthLinkProblem, string> = {
 export function AuthLinkNotice({
   requestHref,
   purpose,
+  problem: known,
 }: {
   requestHref: string;
   purpose: 'reset' | 'sign_in';
+  /**
+   * R2C-WEB-3: a problem the caller already established (a mobile recovery link whose tokens the
+   * auth server refused, after the page cleared them from the address). Without it the notice
+   * reads the address, as before.
+   */
+  problem?: AuthLinkProblem;
 }) {
   const location = useLocation();
-  const problem = readAuthLinkProblem(location.search, location.hash);
+  const problem = known ?? readAuthLinkProblem(location.search, location.hash);
   if (!problem) return null;
   return (
     <div className="error" role="alert" style={{ marginBottom: 16 }}>

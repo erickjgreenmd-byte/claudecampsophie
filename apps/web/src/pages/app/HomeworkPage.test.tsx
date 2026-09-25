@@ -1023,3 +1023,191 @@ describe('rubric feedback for written work (AC_GRADING_03)', () => {
     expect(within(scans).queryByRole('button', { name: /Show older/ })).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// R2C-WEB-1: bounded scans (HOMEWORK_SCAN_MAX_TOTAL_BYTES, 15 MiB) and in-browser downscaling
+// ---------------------------------------------------------------------------------------------
+
+const MIB = 1024 * 1024;
+const SCAN_TOO_LARGE_COPY =
+  'These pages add up to more than 15 MB, which is more than one scan can hold. Take the photos again at a smaller size, or split the pages into two scans.';
+
+/** A synthetic "phone photo" of `bytes` bytes (zeros after a marker; never decoded for real). */
+function phonePhoto(name: string, bytes = 4 * MIB): File {
+  const data = new Uint8Array(bytes);
+  data.set(new TextEncoder().encode(name));
+  return new File([data], name, { type: 'image/jpeg' });
+}
+
+/**
+ * Capture routes of a fake server that enforces the scan bound the real one enforces at page
+ * registration (SCAN_TOO_LARGE with the API's parent copy), for any number of pages.
+ */
+function boundedCaptureSend(options: { refuseAll?: boolean } = {}) {
+  return (call: Call): unknown => {
+    if (call.path === '/v1/assignments') return state('draft', 5);
+    if (call.path.endsWith('/uploads')) {
+      const pages = (call.body as { pages: { pageNumber: number; byteSize: number }[] }).pages;
+      const total = pages.reduce((sum, p) => sum + p.byteSize, 0);
+      if (options.refuseAll || total > 15 * MIB) {
+        return new ApiRequestError('BUSINESS_RULE', SCAN_TOO_LARGE_COPY, 422, 'SCAN_TOO_LARGE');
+      }
+      return {
+        ...state('uploading', pages.length),
+        uploads: pages.map((p) => ({
+          pageId: `00000000-0000-4000-8000-00000000000${p.pageNumber}`,
+          pageNumber: p.pageNumber,
+          uploadUrl: `https://storage.example.test/upload/${p.pageNumber}?token=t`,
+          method: 'PUT',
+          expiresAt: AT,
+          alreadyUploaded: false,
+        })),
+      };
+    }
+    if (call.path.endsWith('/finalize')) return state('queued', 5);
+    if (call.path.endsWith('/cancel')) return state('cancelled', 5);
+    return new Error(`unexpected ${call.method} ${call.path}`);
+  };
+}
+
+/**
+ * LABELED FAKE browser image pipeline (jsdom has no decoder or canvas encoder): createImageBitmap
+ * reports a 4032 × 3024 photo; OffscreenCanvas records its size and encodes a 300 KB "JPEG".
+ */
+function stubBrowserDownscale() {
+  const decoded: string[] = [];
+  const canvases: { width: number; height: number; quality: number | undefined }[] = [];
+  vi.stubGlobal(
+    'createImageBitmap',
+    vi.fn((file: File) => {
+      decoded.push(file.name);
+      return Promise.resolve({ width: 4032, height: 3024, close: () => undefined });
+    }),
+  );
+  class FakeOffscreenCanvas {
+    constructor(
+      public width: number,
+      public height: number,
+    ) {}
+    getContext() {
+      return { fillStyle: '', fillRect: () => undefined, drawImage: () => undefined };
+    }
+    convertToBlob(options: { type: string; quality?: number }) {
+      canvases.push({ width: this.width, height: this.height, quality: options.quality });
+      return Promise.resolve(new Blob([new Uint8Array(300_000)], { type: 'image/jpeg' }));
+    }
+  }
+  vi.stubGlobal('OffscreenCanvas', FakeOffscreenCanvas);
+  return { decoded, canvases };
+}
+
+const FIVE_PHOTOS = ['p1.jpg', 'p2.jpg', 'p3.jpg', 'p4.jpg', 'p5.jpg'];
+const measuredPhoneSizes = Object.fromEntries(
+  FIVE_PHOTOS.map((name) => [name, { width: 4032, height: 3024 }]),
+);
+
+describe('bounded web scans (R2C-WEB-1)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows the per-scan bound in the limits line', async () => {
+    const { api } = fakeApi({ send: captureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    expect(within(card).getByText(/up to 15 MB per scan/)).toBeTruthy();
+  });
+
+  it('five 4 MB phone photos are shrunk to 2,000 px JPEGs before registration and fit one scan', async () => {
+    const puts = stubStorage();
+    stubImageSizes(measuredPhoneSizes);
+    const browser = stubBrowserDownscale();
+    const { api, sends } = fakeApi({ send: boundedCaptureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(
+      within(card).getByLabelText('Choose page photos'),
+      FIVE_PHOTOS.map((name) => phonePhoto(name)),
+    );
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 5 pages' }));
+    expect(await within(card).findByText(/Sent!/)).toBeTruthy();
+    const registered = (sends[1]!.body as { pages: { mimeType: string; byteSize: number }[] })
+      .pages;
+    expect(registered).toHaveLength(5);
+    for (const page of registered) {
+      expect(page).toMatchObject({ mimeType: 'image/jpeg', byteSize: 300_000 });
+    }
+    expect(browser.canvases).toEqual(
+      FIVE_PHOTOS.map(() => ({ width: 2000, height: 1500, quality: 0.85 })),
+    );
+    expect(puts).toHaveLength(5);
+    expect(puts.every((p) => p.type === 'image/jpeg' && p.body.length === 300_000)).toBe(true);
+  });
+
+  it('a retry uploads the same shrunk bytes (each photo is encoded once)', async () => {
+    stubStorage();
+    stubImageSizes({ 'p1.jpg': { width: 4032, height: 3024 } });
+    const browser = stubBrowserDownscale();
+    let finalizeLost = true;
+    let createStatus: AssignmentSummary['status'] = 'draft';
+    const bounded = boundedCaptureSend();
+    const { api, sends } = fakeApi({
+      send: (call) => {
+        if (call.path === '/v1/assignments') return state(createStatus, 1);
+        if (call.path.endsWith('/finalize') && finalizeLost) {
+          finalizeLost = false;
+          createStatus = 'uploading';
+          return new ApiRequestError('NETWORK', 'You appear to be offline.', 0);
+        }
+        return bounded(call);
+      },
+    });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      phonePhoto('p1.jpg'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 1 page' }));
+    expect((await within(card).findByRole('alert')).textContent).toMatch(/offline/);
+    await userEvent.click(within(card).getByRole('button', { name: 'Try again' }));
+    expect(await within(card).findByText(/Sent!/)).toBeTruthy();
+    const registrations = sends.filter((c) => c.path.endsWith('/uploads'));
+    expect(registrations).toHaveLength(2);
+    expect(registrations[1]!.body).toEqual(registrations[0]!.body);
+    expect(browser.decoded).toEqual(['p1.jpg']);
+  });
+
+  it('refuses a set over 15 MB before any API call when the browser can’t shrink the photos', async () => {
+    // jsdom: no createImageBitmap, so the originals (5 × 4 MB) would be uploaded as they are.
+    const puts = stubStorage();
+    const { api, sends } = fakeApi({ send: boundedCaptureSend() });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(
+      within(card).getByLabelText('Choose page photos'),
+      FIVE_PHOTOS.map((name) => phonePhoto(name)),
+    );
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 5 pages' }));
+    const alert = await within(card).findByRole('alert');
+    expect(alert.textContent).toMatch(/These pages add up to more than 15 MB/);
+    expect(alert.textContent).toMatch(/Your pages are still selected/);
+    expect(sends).toHaveLength(0);
+    expect(puts).toHaveLength(0);
+  });
+
+  it('maps the server’s SCAN_TOO_LARGE to its parent copy and keeps the pages selected', async () => {
+    const puts = stubStorage();
+    const { api } = fakeApi({ send: boundedCaptureSend({ refuseAll: true }) });
+    renderPage(<HomeworkPage />, { api });
+    const card = await openUploader();
+    await userEvent.upload(within(card).getByLabelText('Choose page photos'), [
+      file('page.jpg', 'image/jpeg', 'only page'),
+    ]);
+    await userEvent.click(within(card).getByRole('button', { name: 'Send 1 page' }));
+    const alert = await within(card).findByRole('alert');
+    expect(alert.textContent).toContain(SCAN_TOO_LARGE_COPY);
+    expect(alert.textContent).toMatch(/Your pages are still selected — remove a page/);
+    expect(within(card).getByRole('list', { name: 'Pages to send' })).toBeTruthy();
+    expect(puts).toHaveLength(0);
+  });
+});

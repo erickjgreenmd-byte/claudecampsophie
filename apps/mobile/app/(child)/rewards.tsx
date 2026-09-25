@@ -315,7 +315,8 @@ const styles = StyleSheet.create({
   button: {
     minHeight: minTouchTarget,
     borderRadius: radii.pill,
-    backgroundColor: colors.teal,
+    // White text needs the text teal (5.9:1), not the brand teal (4.07:1) (R2C-MOB-1).
+    backgroundColor: colors.tealText,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: spacing.lg,

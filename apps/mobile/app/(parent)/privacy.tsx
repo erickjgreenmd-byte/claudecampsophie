@@ -688,7 +688,7 @@ const styles = StyleSheet.create({
   button: {
     minHeight: minTouchTarget,
     borderRadius: radii.pill,
-    backgroundColor: colors.teal,
+    backgroundColor: colors.tealText,
     borderWidth: 2,
     borderColor: colors.teal,
     paddingHorizontal: spacing.lg,

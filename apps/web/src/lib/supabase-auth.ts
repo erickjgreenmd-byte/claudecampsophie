@@ -18,6 +18,54 @@ function failure(message: string): AuthOutcome {
   return { ok: false, message };
 }
 
+/**
+ * R2C-WEB-3: a password reset requested in the mobile app. The app's Supabase client uses the
+ * implicit flow, so its reset link lands on `/update-password#access_token=…&refresh_token=…&
+ * type=recovery`. This PKCE client ignores that hash (`detectSessionInUrl` only exchanges a PKCE
+ * `?code=` here), so the update-password page adopts it explicitly and only there. Every other flow
+ * stays PKCE.
+ */
+export interface RecoveryLinkTokens {
+  readonly accessToken: string;
+  readonly refreshToken: string;
+}
+
+export type RecoveryLinkOutcome =
+  { readonly ok: true; readonly email: string } | { readonly ok: false };
+
+/** Optional account capability (the Supabase adapter has it; simple test adapters need not). */
+export interface RecoveryLinkAuth {
+  /** Signs in with the link's tokens after the auth server verifies them; never throws. */
+  acceptRecoveryLink(tokens: RecoveryLinkTokens): Promise<RecoveryLinkOutcome>;
+}
+
+export function recoveryLinkAuth(account: AccountAuth | undefined): RecoveryLinkAuth | null {
+  const candidate = account as (AccountAuth & Partial<RecoveryLinkAuth>) | undefined;
+  return typeof candidate?.acceptRecoveryLink === 'function'
+    ? (candidate as AccountAuth & RecoveryLinkAuth)
+    : null;
+}
+
+/**
+ * The tokens of an implicit-flow recovery link, or null. Only `type=recovery` with both an access
+ * and a refresh token qualifies; any other hash keeps today's handling (AuthLinkNotice).
+ */
+export function readRecoveryLinkTokens(hash: string): RecoveryLinkTokens | null {
+  const fragment = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+  const accessToken = fragment.get('access_token');
+  const refreshToken = fragment.get('refresh_token');
+  if (fragment.get('type') !== 'recovery' || !accessToken || !refreshToken) return null;
+  return { accessToken, refreshToken };
+}
+
+/** `pat.parent@example.test` → `p•••@example.test`: enough to notice someone else's link. */
+export function maskEmail(email: string): string {
+  const at = email.lastIndexOf('@');
+  const local = at >= 0 ? email.slice(0, at) : email;
+  const domain = at >= 0 ? email.slice(at) : '';
+  return `${local.slice(0, 1)}•••${domain}`;
+}
+
 export function createSupabaseAuth(
   config: WebConfig,
   factory: (url: string, key: string) => Client = (url, key) =>
@@ -36,7 +84,7 @@ export function createSupabaseAuth(
   const client = factory(config.supabaseUrl, config.supabasePublishableKey);
   const auth = client.auth;
 
-  const account: AccountAuth = {
+  const account: AccountAuth & RecoveryLinkAuth = {
     async signInWithPassword(email, password) {
       const { error } = await auth.signInWithPassword({ email, password });
       if (error) {
@@ -78,6 +126,21 @@ export function createSupabaseAuth(
       return error
         ? failure('The password could not be changed. Open the newest email link and try again.')
         : { ok: true, next: 'done' };
+    },
+    async acceptRecoveryLink({ accessToken, refreshToken }) {
+      try {
+        // setSession verifies the access token with the auth server (or refreshes an expired one)
+        // before it stores the session, so a forged or revoked token signs nobody in.
+        const { data, error } = await auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        });
+        const email = data.user?.email ?? data.session?.user.email;
+        if (error || !data.session || !email) return { ok: false };
+        return { ok: true, email };
+      } catch {
+        return { ok: false };
+      }
     },
     async assuranceLevel() {
       const { data, error } = await auth.mfa.getAuthenticatorAssuranceLevel();

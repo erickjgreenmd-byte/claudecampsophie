@@ -2,7 +2,7 @@ import type { z } from 'zod';
 import {
   MAX_PROMO_BUDGET_CENTS,
   promoTemplateInputSchema,
-  type channelSchema,
+  channelSchema,
   type promoTemplateSchema,
 } from '@pencillift/contracts';
 import { DEFAULT_MAX_PAID_SLOTS, formatUsd } from '@pencillift/domain';
@@ -214,7 +214,8 @@ export function validateTemplateForm(
     codeMode: values.codeMode,
     ...(individualCodeCount === undefined ? {} : { individualCodeCount }),
     ...(sharedCodeUsageCap === undefined ? {} : { sharedCodeUsageCap }),
-    channels: ordered(values.channels, ['app_store', 'play_store', 'stripe'] as Channel[]),
+    // Contract order; a hard-coded list silently dropped amazon_appstore on save (R2C-WEB-2).
+    channels: ordered(values.channels, channelSchema.options),
   };
   // Final guard: exactly the shared contract the API validates.
   const parsed = promoTemplateInputSchema.safeParse(candidate);

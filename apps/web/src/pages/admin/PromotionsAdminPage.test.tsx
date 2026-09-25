@@ -2,13 +2,15 @@ import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/re
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
-import type {
-  campaignSummarySchema,
-  generationPreviewResponseSchema,
-  promoTemplateSchema,
+import {
+  channelSchema,
+  type campaignSummarySchema,
+  type generationPreviewResponseSchema,
+  type promoTemplateSchema,
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { renderPage } from '../../test/render.tsx';
+import { CHANNEL_LABEL } from './components/template-form.ts';
 import PromotionsAdminPage from './PromotionsAdminPage.tsx';
 
 // Synthetic data only.
@@ -503,5 +505,61 @@ describe('PromotionsAdminPage — review fixes (RV-p17-ui-3, RV-p17-ui-7)', () =
       ),
     );
     expect(sends).toHaveLength(0);
+  });
+});
+
+describe('PromotionsAdminPage — Amazon Appstore in promo campaigns (R2C-WEB-2)', () => {
+  it('offers every billing channel from channelSchema, the Amazon Appstore included', async () => {
+    const { api } = fakeApi();
+    renderPage(<PromotionsAdminPage />, { api });
+    const form = await openNewTemplateForm();
+    const group = within(form).getByRole('group', { name: 'Billing channels' });
+    expect(
+      within(group)
+        .getAllByRole('checkbox')
+        .map((box) => box.closest('label')?.textContent),
+    ).toEqual(channelSchema.options.map((channel) => CHANNEL_LABEL[channel]));
+  });
+
+  it('creates a campaign template that targets the Amazon Appstore', async () => {
+    const { api, sends } = fakeApi({
+      send: () =>
+        template({ name: 'October families', channels: ['play_store', 'amazon_appstore'] }),
+    });
+    renderPage(<PromotionsAdminPage />, { api });
+    const form = await openNewTemplateForm();
+    await fillValidTemplate(form);
+    await userEvent.click(
+      within(form).getByRole('checkbox', { name: 'Amazon Appstore (no store codes)' }),
+    );
+    await userEvent.click(within(form).getByRole('button', { name: 'Create template' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]!.method).toBe('POST');
+    expect((sends[0]!.body as { channels: string[] }).channels).toEqual([
+      'play_store',
+      'amazon_appstore',
+    ]);
+  });
+
+  it('keeps the Amazon Appstore when a saved Amazon template is edited', async () => {
+    const saved = template({ channels: ['app_store', 'amazon_appstore'] });
+    const { api, sends } = fakeApi({
+      templates: [saved],
+      send: (call) => ({ ...saved, ...(call.body as object) }),
+    });
+    renderPage(<PromotionsAdminPage />, { api });
+    const card = await screen.findByRole('article', { name: 'Back to school' });
+    await userEvent.click(within(card).getByRole('button', { name: 'Edit' }));
+    const form = await screen.findByRole('form', { name: 'Edit Back to school' });
+    const amazon = within(form).getByRole('checkbox', { name: 'Amazon Appstore (no store codes)' });
+    expect((amazon as HTMLInputElement).checked).toBe(true);
+    await userEvent.click(within(form).getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]!.method).toBe('PATCH');
+    expect((sends[0]!.body as { channels: string[] }).channels).toEqual([
+      'app_store',
+      'amazon_appstore',
+    ]);
+    expect(await screen.findByText('Template updated.')).toBeTruthy();
   });
 });

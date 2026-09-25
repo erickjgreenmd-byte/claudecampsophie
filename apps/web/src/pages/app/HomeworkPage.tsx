@@ -17,6 +17,7 @@ import {
   FINALIZED_ASSIGNMENT_STATUSES,
   HOMEWORK_IMAGE_LIMITS,
   HOMEWORK_READABLE_MIME_TYPES,
+  HOMEWORK_SCAN_MAX_TOTAL_BYTES,
   OVERRIDE_REASON_MAX_LENGTH,
   TRANSCRIPTION_TEXT_MAX_LENGTH,
   assignmentDetailResponseSchema,
@@ -26,6 +27,7 @@ import {
   correctTranscriptionResponseSchema,
   homeworkImageSizeProblem,
   homeworkRubricSchema,
+  homeworkScanFits,
   overrideResultResponseSchema,
   uploadLimitsResponseSchema,
   uploadPagesResponseSchema,
@@ -42,6 +44,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
+import { downscaleForUpload } from '../../lib/image-downscale.ts';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 
 /**
@@ -549,6 +552,8 @@ class UploadStoppedError extends Error {}
 class ScanStoppedError extends Error {}
 /** A page's photo is over the picture size limits (found when its measurement finished late). */
 class PictureTooBigError extends Error {}
+/** R2C-WEB-1: the prepared pages together are over HOMEWORK_SCAN_MAX_TOTAL_BYTES. */
+class ScanTooLargeError extends Error {}
 /** A PUT to a signed storage URL failed (page number and status only; never the signed URL). */
 class PageTransferError extends Error {
   readonly pageNumber: number;
@@ -589,6 +594,10 @@ function readableTypes(limits: HomeworkUploadLimits): HomeworkMimeType[] {
 }
 
 const MEGAPIXELS = HOMEWORK_IMAGE_LIMITS.maxPixels / 1_000_000;
+const SCAN_MAX_MB = Math.floor(HOMEWORK_SCAN_MAX_TOTAL_BYTES / (1024 * 1024));
+/** R2C-WEB-1: the same words the API uses for SCAN_TOO_LARGE (parent copy). */
+const SCAN_TOO_LARGE_COPY = `These pages add up to more than ${SCAN_MAX_MB} MB, which is more than one scan can hold. Take the photos again at a smaller size, or split the pages into two scans.`;
+const SCAN_TOO_LARGE_NEXT = 'Your pages are still selected — remove a page to send the rest.';
 const MEASURE_TIMEOUT_MS = 10_000;
 
 /**
@@ -657,6 +666,8 @@ async function sendParentScan(args: {
   api: ApiClient;
   childId: string;
   pages: readonly PickedPage[];
+  /** The file actually uploaded for a page (shrunk in the browser when it can; R2C-WEB-1). */
+  prepare: (page: PickedPage, size: ImageSize | null) => Promise<File>;
   attempt: UploadAttempt;
   signal: AbortSignal;
   onAttempt: (attempt: UploadAttempt) => void;
@@ -677,14 +688,20 @@ async function sendParentScan(args: {
     args.onProgress('preparing', i);
     // A measurement still running when Send was pressed is waited for, so an over-limit photo is
     // refused before the scan is created.
-    const tooBig = pictureSizeProblem(page.file.name, await page.measured);
+    const measured = await page.measured;
+    const tooBig = pictureSizeProblem(page.file.name, measured);
     if (tooBig) throw new PictureTooBigError(tooBig);
     stopIfAborted();
-    const bytes = new Uint8Array(await page.file.arrayBuffer());
+    const upload = await args.prepare(page, measured);
+    stopIfAborted();
+    const bytes = new Uint8Array(await upload.arrayBuffer());
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-    prepared.push({ pageNumber: i + 1, mimeType: page.file.type, bytes, sha256: toHex(digest) });
+    prepared.push({ pageNumber: i + 1, mimeType: upload.type, bytes, sha256: toHex(digest) });
   }
   stopIfAborted();
+  // R2C-WEB-1: the server refuses a scan over the bound at registration (SCAN_TOO_LARGE); checking
+  // the prepared bytes here first means no scan is created and nothing is sent.
+  if (!homeworkScanFits(prepared.map((p) => p.bytes.length))) throw new ScanTooLargeError();
   const created = await api.send(
     'POST',
     '/v1/assignments',
@@ -755,6 +772,10 @@ function parentUploadMessage(error: unknown): string {
   }
   if (error instanceof PictureTooBigError) {
     return `${error.message} Your pages are still selected — remove that page to send the rest.`;
+  }
+  if (error instanceof ScanTooLargeError) return `${SCAN_TOO_LARGE_COPY} ${SCAN_TOO_LARGE_NEXT}`;
+  if (error instanceof ApiRequestError && error.rule === 'SCAN_TOO_LARGE') {
+    return `${error.message} ${SCAN_TOO_LARGE_NEXT}`;
   }
   if (error instanceof PageTransferError) {
     return `Page ${error.pageNumber} didn’t finish uploading. Your pages are still selected — try again to send the rest.`;
@@ -860,6 +881,9 @@ function UploadPanel({
   const [notice, setNotice] = useState<string | null>(null);
   const [state, setState] = useState<SendState>({ kind: 'idle' });
   const attemptRef = useRef<UploadAttempt>(newAttempt());
+  // R2C-WEB-1: each picked photo is shrunk once; a retry of the same scan uploads the same bytes
+  // (the server compares a resumed scan's pages with what was registered).
+  const preparedRef = useRef(new WeakMap<File, Promise<File>>());
   const controllerRef = useRef<AbortController | null>(null);
   const inputId = useId();
   const limitsId = useId();
@@ -959,6 +983,17 @@ function UploadPanel({
         api,
         childId,
         pages,
+        prepare: (page, size) => {
+          // Only a photo whose pixel size the browser measured, within the limits, is decoded
+          // again to shrink it; anything else is sent as picked (the server checks it).
+          if (!size) return Promise.resolve(page.file);
+          let upload = preparedRef.current.get(page.file);
+          if (!upload) {
+            upload = downscaleForUpload(page.file);
+            preparedRef.current.set(page.file, upload);
+          }
+          return upload;
+        },
         attempt: attemptRef.current,
         signal: controller.signal,
         onAttempt: (attempt) => {
@@ -998,8 +1033,9 @@ function UploadPanel({
     <div style={{ marginTop: 12 }}>
       <p id={limitsId} style={{ margin: '0 0 8px' }}>
         Up to {limits.maxPages} pages per scan, each{' '}
-        {Math.floor(limits.maxPageBytes / (1024 * 1024))} MB or smaller, as {typeNames} photos of up
-        to {MEGAPIXELS} megapixels. Lay each page flat in good light so every word shows.
+        {Math.floor(limits.maxPageBytes / (1024 * 1024))} MB or smaller, up to {SCAN_MAX_MB} MB per
+        scan, as {typeNames} photos of up to {MEGAPIXELS} megapixels. Large photos are made smaller
+        on this device before they are sent. Lay each page flat in good light so every word shows.
       </p>
       {notYet.length > 0 ? (
         <p style={{ margin: '0 0 8px' }}>

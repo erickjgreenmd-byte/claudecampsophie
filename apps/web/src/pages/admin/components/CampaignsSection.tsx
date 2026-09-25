@@ -2,6 +2,7 @@ import { useId, useState } from 'react';
 import type { z } from 'zod';
 import {
   campaignCodesResponseSchema,
+  channelSchema,
   listCampaignsResponseSchema,
   type campaignStatusSchema,
 } from '@pencillift/contracts';
@@ -44,7 +45,8 @@ const STATUS_LABEL: Record<CampaignStatus, string> = {
   failed: 'Failed provisioning',
 };
 
-const CHANNELS: readonly Channel[] = ['app_store', 'play_store', 'stripe'];
+/** R2C-WEB-2: every billing channel from the contract (Amazon Appstore included), as admin-ui's CHANNELS. */
+const CHANNELS: readonly Channel[] = channelSchema.options;
 
 type CampaignAction = 'pause' | 'resume' | 'revoke';
 

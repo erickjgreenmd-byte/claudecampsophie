@@ -17,6 +17,7 @@
 import {
   FINALIZED_ASSIGNMENT_STATUSES,
   assignmentStateResponseSchema,
+  homeworkScanFits,
   uploadPagesResponseSchema,
   type AssignmentState,
   type HomeworkUploadLimits,
@@ -92,6 +93,18 @@ export class PageLimitError extends Error {
     this.name = 'PageLimitError';
     this.pageNumber = pageNumber;
     this.problem = problem;
+  }
+}
+
+/**
+ * All pages together are over HOMEWORK_SCAN_MAX_TOTAL_BYTES (R2C-MOB-2). With the 2,000 px downscale
+ * only the fallback path (the downscale failed and the original photo is sent) can reach it. Found
+ * on the device before any API call, so no scan is created and no allowance is reserved.
+ */
+export class ScanTooLargeError extends Error {
+  constructor() {
+    super('scan too large');
+    this.name = 'ScanTooLargeError';
   }
 }
 
@@ -180,6 +193,9 @@ export async function uploadScan(args: {
     });
   }
   checkCancelled(signal);
+  // The server refuses the same bound at registration (SCAN_TOO_LARGE); checking here first means
+  // an oversize scan never creates a draft or reserves allowance.
+  if (!homeworkScanFits(prepared.map((p) => p.byteSize))) throw new ScanTooLargeError();
 
   // 2. Create (or, with the same key, find) the scan. A child never names a child id.
   const created = await cancellable(signal, () =>
@@ -284,6 +300,8 @@ const CODE_COPY: Partial<Record<ApiRequestError['code'], string>> = {
   NOT_CONFIGURED: 'We couldn’t send your pages just now. Let’s try again in a moment.',
 };
 
+const SCAN_TOO_LARGE_COPY = 'These pictures are too big to send together. Ask a grown-up to help.';
+
 const RULE_COPY: Record<string, string> = {
   QUOTA_EXCEEDED: 'That’s a lot of scanning this month! Ask a grown-up to help with this one.',
   CONSENT_REQUIRED: 'A grown-up needs to finish setting up PencilLift before you can scan.',
@@ -298,11 +316,14 @@ const RULE_COPY: Record<string, string> = {
     'One page is a kind of file PencilLift can’t read yet. Try taking a photo of the page instead.',
   // The server removed pages that arrived different from what was registered; a retry re-sends them.
   UPLOAD_MISMATCH: 'Some pages got mixed up on the way. Let’s try sending them again.',
+  // All pages together are over HOMEWORK_SCAN_MAX_TOTAL_BYTES (R2C-MOB-2).
+  SCAN_TOO_LARGE: SCAN_TOO_LARGE_COPY,
 };
 
 /** Calm, blame-free words for every failure; raw server text is never shown to a child. */
 export function childUploadMessage(error: unknown): string {
   if (error instanceof ScanCancelledError) return 'Stopped. Your pages are still here.';
+  if (error instanceof ScanTooLargeError) return SCAN_TOO_LARGE_COPY;
   if (error instanceof ScanStoppedError) {
     return 'That scan was stopped. Your pages are still here — tap “Try again” to send them as a new scan.';
   }

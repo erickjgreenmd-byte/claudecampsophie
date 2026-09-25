@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_HOMEWORK_UPLOAD_LIMITS } from '@pencillift/contracts';
+import {
+  DEFAULT_HOMEWORK_UPLOAD_LIMITS,
+  HOMEWORK_SCAN_MAX_TOTAL_BYTES,
+} from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { toScanPage, type ScanPage } from './scan-session.ts';
 import {
   PageLimitError,
   ScanCancelledError,
   ScanStoppedError,
+  ScanTooLargeError,
   UploadTransferError,
   cancelScan,
   childUploadMessage,
@@ -365,6 +369,60 @@ describe('picture size and server capture rules (AC_CAPTURE_02)', () => {
     expect(childUploadMessage(rule('UPLOAD_MISMATCH'))).toBe(
       'Some pages got mixed up on the way. Let’s try sending them again.',
     );
+  });
+});
+
+describe('a scan too large to send together (R2C-MOB-2, SCAN_TOO_LARGE)', () => {
+  const COPY = 'These pictures are too big to send together. Ask a grown-up to help.';
+
+  it('gives the child its own words for the server’s SCAN_TOO_LARGE rule, never the generic line', () => {
+    const error = new ApiRequestError('BUSINESS_RULE', 'raw server text', 422, 'SCAN_TOO_LARGE');
+    expect(childUploadMessage(error)).toBe(COPY);
+    expect(childUploadMessage(error)).not.toContain('raw server text');
+  });
+
+  it('refuses pages that add up to more than the scan bound before contacting the API', async () => {
+    const { api, calls } = fakeApi();
+    // Each page is under the per-page limit; together they are over HOMEWORK_SCAN_MAX_TOTAL_BYTES
+    // (the fallback path, where the downscale failed and the original photo would be sent).
+    const pageBytes = Math.floor(HOMEWORK_SCAN_MAX_TOTAL_BYTES / 2) + 1;
+    expect(pageBytes).toBeLessThanOrEqual(limits.maxPageBytes);
+    const { io, puts } = fakeIo({ readBytes: () => Promise.resolve(new Uint8Array(pageBytes)) });
+    const error = await uploadScan({
+      api,
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: newAttempt(newKey),
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ScanTooLargeError);
+    expect(childUploadMessage(error)).toBe(COPY);
+    expect(calls).toHaveLength(0);
+    expect(puts).toHaveLength(0);
+  });
+
+  it('still sends pages that add up to exactly the bound', async () => {
+    const { api, calls } = fakeApi();
+    const pageBytes = HOMEWORK_SCAN_MAX_TOTAL_BYTES / 2;
+    const { io, puts } = fakeIo({ readBytes: () => Promise.resolve(new Uint8Array(pageBytes)) });
+    const result = await uploadScan({
+      api,
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: newAttempt(newKey),
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    });
+    expect(result.assignment.status).toBe('queued');
+    expect(calls.map((c) => c.path)).toEqual([
+      '/v1/assignments',
+      `/v1/assignments/${ASSIGNMENT}/uploads`,
+      `/v1/assignments/${ASSIGNMENT}/finalize`,
+    ]);
+    expect(puts).toHaveLength(2);
   });
 });
 

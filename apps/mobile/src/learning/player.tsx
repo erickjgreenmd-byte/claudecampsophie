@@ -456,7 +456,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     marginVertical: spacing.xs,
   },
-  choiceSelected: { backgroundColor: colors.teal },
+  choiceSelected: { backgroundColor: colors.tealText },
   choiceText: { fontSize: typography.scale.lg, fontWeight: '800', color: colors.tealText },
   choiceTextSelected: { color: colors.white },
   notice: {
@@ -489,7 +489,7 @@ const styles = StyleSheet.create({
   button: {
     minHeight: CHILD_TOUCH,
     borderRadius: radii.pill,
-    backgroundColor: colors.teal,
+    backgroundColor: colors.tealText,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: spacing.lg,

@@ -629,7 +629,7 @@ const styles = StyleSheet.create({
   button: {
     minHeight: minTouchTarget,
     borderRadius: radii.pill,
-    backgroundColor: colors.teal,
+    backgroundColor: colors.tealText,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: spacing.lg,

@@ -1,6 +1,6 @@
 import { useId, useState, type FormEvent, type ReactNode } from 'react';
 import type { z } from 'zod';
-import type { schoolAdminSchema } from '@pencillift/contracts';
+import { channelSchema, type schoolAdminSchema } from '@pencillift/contracts';
 import { formatUsd, monthlyPriceCents } from '@pencillift/domain';
 import { discountedCents, applePricePointProblem } from './admin-money.ts';
 import { buttonRow, FieldError } from './admin-ui.tsx';
@@ -303,7 +303,8 @@ export function TemplateForm({
       </fieldset>
 
       <CheckboxGroup legend="Billing channels" error={errors.channels} errorId={errId('channels')}>
-        {(['app_store', 'play_store', 'stripe'] as const).map((channel: Channel) => (
+        {/* Every contract channel, the Amazon Appstore included (R2C-WEB-2). */}
+        {channelSchema.options.map((channel: Channel) => (
           <label key={channel} style={inlineLabel}>
             <input
               type="checkbox"

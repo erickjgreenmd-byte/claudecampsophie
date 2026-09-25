@@ -630,7 +630,7 @@ export const styles = StyleSheet.create({
   button: {
     minHeight: minTouchTarget,
     borderRadius: radii.pill,
-    backgroundColor: colors.teal,
+    backgroundColor: colors.tealText,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: spacing.lg,
@@ -671,7 +671,7 @@ export const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: spacing.md,
   },
-  chipSelected: { backgroundColor: colors.teal },
+  chipSelected: { backgroundColor: colors.tealText },
   chipText: { color: colors.tealText, fontWeight: '800', fontSize: typography.scale.md },
   chipTextSelected: { color: colors.white },
   code: {

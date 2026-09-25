@@ -92,7 +92,8 @@ const styles = StyleSheet.create({
     minHeight: minTouchTarget,
     minWidth: 260,
     borderRadius: 999,
-    backgroundColor: colors.teal,
+    // White text needs the text teal (5.9:1), not the brand teal (4.07:1) (R2C-MOB-1).
+    backgroundColor: colors.tealText,
     alignItems: 'center',
     justifyContent: 'center',
     marginVertical: spacing.sm,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   campaignSummarySchema,
+  channelSchema,
   MAX_PROMO_BUDGET_CENTS,
   promoTemplateInputSchema,
 } from '@pencillift/contracts';
@@ -124,5 +125,19 @@ describe('unsavedSettings compares the stored template with the submitted form',
     const result = validateTemplateForm(form({ eligibleTiers: [1, 2] }));
     if (!result.ok) throw new Error('expected a valid form');
     expect(unsavedSettings(result.input, saved({ eligibleTiers: [2, 1] }))).toEqual([]);
+  });
+});
+
+describe('Amazon Appstore channel (R2C-WEB-2)', () => {
+  it('keeps every contract channel, in channelSchema order, when the form is validated', () => {
+    const result = validateTemplateForm(
+      form({ channels: ['amazon_appstore', 'stripe', 'play_store', 'app_store'] }),
+    );
+    expect(result.ok && result.input.channels).toEqual(channelSchema.options);
+  });
+
+  it('round-trips a saved Amazon template through the edit form unchanged', () => {
+    const result = validateTemplateForm(templateToForm(saved({ channels: ['amazon_appstore'] })));
+    expect(result.ok && result.input.channels).toEqual(['amazon_appstore']);
   });
 });
