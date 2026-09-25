@@ -15,6 +15,43 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 | Store products / agreements | **No** | Owner actions #1, #4, #11 |
 | Submitted / approved | **No** | — |
 
+## Store submission checklist (audited 2026-09-25, workflow `wf_2a9a8aa6-7c4`; code gaps being closed in `wf_b0de02d8-ca2`)
+
+Evidence levels as in `docs/Provider_Capability_Matrix.md`: `doc-verified` (read in the store's current documentation
+during the audit), `secondary`, `candidate` (documentation unreachable from the build environment — Amazon and
+RevenueCat pages are blocked by the egress proxy). **Nothing has run on a real device or as a native build**: every
+row below is a code or listing fact, not a device test. Owner-side rows are numbered in `docs/Owner_Actions.md`.
+
+| Store | Requirement | State | Who / where |
+|---|---|---|---|
+| Apple (Kids Category) | No third-party analytics, ads or tracking SDKs; ATT not needed; custom camera/photo/Face ID purpose strings; IAP only through RevenueCat with restore and Ask-to-Buy handling; parent area behind password + server-verified PIN; children enter no personal information; Sign in with Apple not required (no social login); iPad supported | Compliant (`doc-verified`) | — |
+| Apple | 5.1.1(v) account deletion in the app: the parent's sign-in itself, not only the family's data; guardians can remove themselves | **Code gap, blocker** — being built (`POST /v1/account/close`, soft delete through the Supabase Admin API, job after the purge) | Lead |
+| Apple / Play | Outbound links reachable without the parent PIN sit behind a parental gate (sign-in links, child scan 'Open Settings') | Code gap — being built | Lead |
+| Apple / Play | Privacy policy and terms links inside the app | Code gap — being built (parent home, plan, sign-in) | Lead |
+| Apple 3.1.2 | Subscription disclosure before purchase: title, monthly length, price per period, auto-renewal until cancelled, charged to the store account, links to terms and privacy | Code gap — being built | Lead |
+| Apple | Info.plist usage strings only for used permissions (no default microphone string); privacy manifest lists collected data types; export compliance declared; no push entitlement while notifications are unused | Code gap — being built (`app.config.ts`) | Lead |
+| Apple 2.1 | No placeholder UI: export job registered (or section hidden), legal pages final | Code gap — being built | Lead / Owner #15 |
+| Apple 2.1(b) | Four auto-renewable products in one subscription group, mapped in `store_product_mappings`, RevenueCat offerings | Owner — blocked on **Owner action #1** (iOS cannot charge $49.98 / $59.97 / $69.96) | Owner #1, #4 |
+| Apple | App Privacy labels: Email Address, Photos or Videos, Other User Content, Purchase History, User ID — linked, App Functionality, no tracking (identical to the privacy manifest) | Owner (App Store Connect) | Owner #33 |
+| Apple | Age rating: every descriptor None, Parental controls Yes, Unrestricted Web Access No → 4+; Kids Category, one age band (locked after approval) | Owner | Owner #33 |
+| Apple 1.3 / 5.1.4 | Sponsor cards and affiliate links (P16) stay switched off for v1; say so in review notes | Owner decision | Owner #16 |
+| Apple 5.1.4(a) | Verifiable parental consent through a vendor before any child data | Owner — vendor choice; the adapter follows | Owner #7 |
+| Apple 2.3 | Screenshots from a TestFlight build (6.9-inch iPhone, 13-inch iPad), metadata without price promises, demo account in review notes | Owner | Owner #33 |
+| Apple | Bundle id registered, App Store Connect record, `eas.json` submit profile (appleId, ascAppId, teamId), version 1.0.0 | Owner + lead | Owner #11, #34 |
+| Google Play (Families) | Target SDK 36 met (RN 0.86); Play Billing 8.x through react-native-purchases 10.x; CAMERA and USE_BIOMETRIC only with location and others blocked; no ads; no social login | Compliant (`doc-verified` / `secondary`) | — |
+| Play | Account deletion in-app + public URL; privacy link in-app; parental gate; no free-text child input at pairing | Code gap — being built | Lead |
+| Play | Unused push stack (expo-notifications) removed from the build; IP-address storage stated in the policy | Code gap — being built | Lead |
+| Play | Target audience (6-8, 9-12 plus adult bands), IARC questionnaire, Data safety form from the data inventory, 'no ads' declaration, Play App Signing, package name reserved | Owner (Play Console) | Owner #35 |
+| Play | RevenueCat attribution / advertising-id collection off; its data statement for Data safety | Owner (RevenueCat dashboard) | Owner #4 |
+| Play | Mixed-audience age determination: confirm 'parent login + parent-issued child code' satisfies the policy, else a neutral age screen | Owner / counsel (`candidate`) | Owner #35 |
+| Amazon Appstore | No Google services or FCM at runtime; permissions limited to CAMERA and USE_BIOMETRIC | Code gap — being built (removal of expo-notifications; blocked permissions) | Lead |
+| Amazon | Legal pages name the Amazon Appstore as a payment channel | Code gap — being built | Lead |
+| Amazon | RevenueCat Amazon flavour / IAP receiver in the manifest for the Amazon profiles | `candidate` — being checked against the installed SDK | Lead |
+| Amazon | Four monthly subscription items at the approved totals; `store_product_mappings` rows; App Tester sandbox run of buy / cancel / restore per tier; content rating questionnaire; listing assets (114 / 512 icons, ≥3 screenshots, promo image) | Owner | Owner #29, #36 |
+| All stores | EAS project linked (`extra.eas.projectId`), `eas init` run once, required public variables per profile fail loudly when missing | Code gap (loud failures) — being built; project id is the owner's | Owner #34 |
+| All stores | Public pages live over HTTPS: privacy, terms, support, account deletion; URLs recorded for each console | Owner (deploy) | Owner #8, #15 |
+| All stores | Listing graphics from the brand assets (feature graphic 1024×500, Amazon icons) and a screenshot checklist | Lead (export script) + Owner (captures) | Owner #33, #36 |
+
 ## Hard release blockers (any one blocks production)
 
 | Blocker | Why it blocks | Unblocked by |
