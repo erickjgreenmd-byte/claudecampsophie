@@ -23,29 +23,66 @@ import {
 
 type Ctx = Context<AppEnv>;
 
+const subscriberRef = z.string().min(1).max(200);
+
+const revenueCatEventFields = {
+  id: z.string().min(1).max(200),
+  original_app_user_id: z.string().max(200).optional(),
+  aliases: z.array(z.string().max(200)).max(50).optional(),
+  product_id: z.string().max(200).optional(),
+  store: z.string().max(40).optional(),
+  purchased_at_ms: z.number().int().optional(),
+  expiration_at_ms: z.number().int().nullable().optional(),
+  price_in_purchased_currency: z.number().nullable().optional(),
+  currency: z.string().max(8).nullable().optional(),
+  period_type: z.string().max(40).optional(),
+  offer_code: z.string().max(200).nullable().optional(),
+  transaction_id: z.string().max(200).optional(),
+  cancel_reason: z.string().max(60).optional(),
+  event_timestamp_ms: z.number().int().optional(),
+  environment: z.string().max(20).optional(),
+};
+
+/**
+ * BILL-R1-4: a TRANSFER names the subscriber identities a purchase moved between and, per
+ * RevenueCat's documented sample (app_id, event_timestamp_ms, id, store, transferred_from,
+ * transferred_to, type), carries no `app_user_id`. The field list is the builder's understanding
+ * (docs/Provider_Capability_Matrix.md §2b; the owner confirms it against the live docs); the
+ * schema accepts the identity fields when present and requires both lists.
+ */
+const revenueCatTransferSchema = z.object({
+  ...revenueCatEventFields,
+  type: z.literal('TRANSFER'),
+  app_user_id: subscriberRef.optional(),
+  transferred_from: z.array(subscriberRef).min(1).max(50),
+  transferred_to: z.array(subscriberRef).min(1).max(50),
+});
+
+/** Every other event type is about one subscriber and must name it. */
+const revenueCatSubscriberEventSchema = z.object({
+  ...revenueCatEventFields,
+  type: z
+    .string()
+    .min(1)
+    .max(60)
+    .refine((t) => t !== 'TRANSFER', 'TRANSFER events use the transfer shape'),
+  app_user_id: subscriberRef,
+});
+
 const revenueCatBodySchema = z.object({
-  event: z.object({
-    id: z.string().min(1).max(200),
-    type: z.string().min(1).max(60),
-    app_user_id: z.string().min(1).max(200),
-    original_app_user_id: z.string().max(200).optional(),
-    aliases: z.array(z.string().max(200)).max(50).optional(),
-    product_id: z.string().max(200).optional(),
-    store: z.string().max(40).optional(),
-    purchased_at_ms: z.number().int().optional(),
-    expiration_at_ms: z.number().int().nullable().optional(),
-    price_in_purchased_currency: z.number().nullable().optional(),
-    currency: z.string().max(8).nullable().optional(),
-    period_type: z.string().max(40).optional(),
-    offer_code: z.string().max(200).nullable().optional(),
-    transaction_id: z.string().max(200).optional(),
-    cancel_reason: z.string().max(60).optional(),
-    event_timestamp_ms: z.number().int().optional(),
-    environment: z.string().max(20).optional(),
-    // TRANSFER events name the subscriber identities a purchase moved between.
-    transferred_from: z.array(z.string().max(200)).max(50).optional(),
-    transferred_to: z.array(z.string().max(200)).max(50).optional(),
-  }),
+  event: z.union([revenueCatTransferSchema, revenueCatSubscriberEventSchema]),
+});
+
+type RevenueCatTransferEvent = z.infer<typeof revenueCatTransferSchema>;
+type RevenueCatParsedEvent = z.infer<typeof revenueCatBodySchema>['event'];
+
+function isTransfer(e: RevenueCatParsedEvent): e is RevenueCatTransferEvent {
+  return e.type === 'TRANSFER';
+}
+
+/** The minimum a refused body must carry for its refusal to be traceable. */
+const rejectedEventIdentitySchema = z.object({
+  event: z.object({ id: z.string().min(1).max(200), type: z.string().min(1).max(60) }),
 });
 
 /** Thrown inside a ledger transaction when the family was tombstoned meanwhile (RV-lead-billing-p17-10). */
@@ -93,6 +130,41 @@ async function recordEvent(
     `,
   );
   return rows.length > 0;
+}
+
+/**
+ * BILL-R1-4: a well-formed JSON body whose shape the schema refuses still leaves a trace, so a
+ * provider event the code does not understand is visible in the admin attention list instead of
+ * vanishing behind a 400. Recorded once (no lease reopening: a retry of the same body is refused
+ * again and keeps the single row); never the body, only its digest, id and type. A body without
+ * even an id and a type is logged by count only.
+ */
+async function traceRejectedEvent(
+  c: Ctx,
+  provider: 'revenuecat' | 'stripe',
+  parsedJson: unknown,
+  raw: string,
+): Promise<void> {
+  const identity = rejectedEventIdentitySchema.safeParse(parsedJson);
+  if (!identity.success) {
+    c.var.deps.log({
+      level: 'warn',
+      event: 'billing_event_rejected',
+      requestId: c.var.requestId,
+      code: 'UNEXPECTED_SHAPE',
+    });
+    return;
+  }
+  const { id, type } = identity.data.event;
+  const digest = await sha256Hex(raw);
+  await c.var.deps.db.asService(
+    (tx) => tx`
+      insert into public.billing_provider_events
+        (provider, provider_event_id, event_type, payload_sha256, status, processed_at, error_code)
+      values (${provider}, ${id}, ${type}, ${digest}, 'ignored', now(), 'UNEXPECTED_SHAPE')
+      on conflict (provider, provider_event_id) do nothing
+    `,
+  );
 }
 
 async function finishEvent(
@@ -266,12 +338,18 @@ async function processStripeEvent(
     );
     return;
   }
+  // The disputed amount (Stripe allows partial disputes); without one the whole charge is
+  // treated as clawed back, and given back when the dispute is won (BILL-R1-1).
+  const disputed =
+    typeof object.amount === 'number' && Number.isSafeInteger(object.amount) && object.amount >= 0
+      ? object.amount
+      : null;
   if (event.type === 'charge.dispute.created') {
-    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback', null);
+    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback', disputed);
     return;
   }
   if (event.type === 'charge.dispute.closed' && object.status === 'won') {
-    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback_reversed', null);
+    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback_reversed', disputed);
   }
 }
 
@@ -294,8 +372,56 @@ export function webhooksRoutes(): Hono<AppEnv> {
       throw new ApiError('VALIDATION_FAILED', 'Invalid JSON');
     }
     const parsed = revenueCatBodySchema.safeParse(parsedJson);
-    if (!parsed.success) throw new ApiError('VALIDATION_FAILED', 'Unexpected event shape');
+    if (!parsed.success) {
+      await traceRejectedEvent(c, 'revenuecat', parsedJson, raw);
+      throw new ApiError('VALIDATION_FAILED', 'Unexpected event shape');
+    }
     const e = parsed.data.event;
+    if (!(await recordEvent(c, 'revenuecat', e.id, e.type, raw))) {
+      return c.json({ status: 'duplicate' });
+    }
+    // Sandbox (TestFlight / review) purchases never enter the production ledger and vice versa
+    // (RV-lead-billing-p17-4). Production requires the event to say PRODUCTION. A TRANSFER that
+    // does not say (the documented sample carries no environment) is still processed: it writes
+    // nothing from its payload, and each family's complete fetch is environment-checked by the
+    // ledger itself.
+    const expectedEnv = deps.config.billingEnvironment === 'production' ? 'PRODUCTION' : 'SANDBOX';
+    const eventEnv = e.environment?.toUpperCase();
+    const envUnstated = eventEnv === undefined && (expectedEnv === 'SANDBOX' || isTransfer(e));
+    if (eventEnv !== expectedEnv && !envUnstated) {
+      await finishEvent(c, 'revenuecat', e.id, 'ignored', null, 'ENVIRONMENT_MISMATCH');
+      return c.json({ status: 'ignored' });
+    }
+    const refs = [e.app_user_id, e.original_app_user_id, ...(e.aliases ?? [])].filter(
+      (x): x is string => typeof x === 'string' && x.length > 0,
+    );
+    if (isTransfer(e)) {
+      // A restore moved a purchase between subscriber identities. Each named family is re-verified
+      // from its OWN complete provider state in its own transaction (no nested family locks), so
+      // the purchase grants exactly where the provider now lists it (RV-billing-1).
+      const named = [...new Set([...refs, ...e.transferred_from, ...e.transferred_to])];
+      const families = await liveFamiliesForRefs(c, named);
+      if (families.length === 0) {
+        await finishEvent(c, 'revenuecat', e.id, 'ignored', null, 'UNKNOWN_SUBSCRIBER');
+        return c.json({ status: 'ignored' });
+      }
+      try {
+        const now = deps.clock();
+        for (const f of families) await syncFamilyFromProvider(deps, f.id, f.billing_ref, now);
+      } catch (error) {
+        await finishEvent(
+          c,
+          'revenuecat',
+          e.id,
+          'failed',
+          families[0]!.id,
+          error instanceof Error ? error.name : 'Error',
+        );
+        throw new ApiError('PROVIDER_UNAVAILABLE', 'Temporary failure; retry');
+      }
+      await finishEvent(c, 'revenuecat', e.id, 'processed', families[0]!.id);
+      return c.json({ status: 'processed' });
+    }
     const event: RevenueCatEvent = {
       id: e.id,
       type: e.type,
@@ -314,50 +440,6 @@ export function webhooksRoutes(): Hono<AppEnv> {
       cancel_reason: e.cancel_reason,
       event_timestamp_ms: e.event_timestamp_ms,
     };
-
-    if (!(await recordEvent(c, 'revenuecat', event.id, event.type, raw))) {
-      return c.json({ status: 'duplicate' });
-    }
-    // Sandbox (TestFlight / review) purchases never enter the production ledger and vice versa
-    // (RV-lead-billing-p17-4). Production requires the event to say PRODUCTION.
-    const expectedEnv = deps.config.billingEnvironment === 'production' ? 'PRODUCTION' : 'SANDBOX';
-    const eventEnv = e.environment?.toUpperCase();
-    if (eventEnv !== expectedEnv && !(eventEnv === undefined && expectedEnv === 'SANDBOX')) {
-      await finishEvent(c, 'revenuecat', event.id, 'ignored', null, 'ENVIRONMENT_MISMATCH');
-      return c.json({ status: 'ignored' });
-    }
-    const refs = [event.app_user_id, event.original_app_user_id, ...(event.aliases ?? [])].filter(
-      (x): x is string => typeof x === 'string' && x.length > 0,
-    );
-    if (event.type === 'TRANSFER') {
-      // A restore moved a purchase between subscriber identities. Each named family is re-verified
-      // from its OWN complete provider state in its own transaction (no nested family locks), so
-      // the purchase grants exactly where the provider now lists it (RV-billing-1).
-      const named = [...refs, ...(e.transferred_from ?? []), ...(e.transferred_to ?? [])].filter(
-        (x) => x.length > 0,
-      );
-      const families = await liveFamiliesForRefs(c, named);
-      if (families.length === 0) {
-        await finishEvent(c, 'revenuecat', event.id, 'ignored', null, 'UNKNOWN_SUBSCRIBER');
-        return c.json({ status: 'ignored' });
-      }
-      try {
-        const now = deps.clock();
-        for (const f of families) await syncFamilyFromProvider(deps, f.id, f.billing_ref, now);
-      } catch (error) {
-        await finishEvent(
-          c,
-          'revenuecat',
-          event.id,
-          'failed',
-          families[0]!.id,
-          error instanceof Error ? error.name : 'Error',
-        );
-        throw new ApiError('PROVIDER_UNAVAILABLE', 'Temporary failure; retry');
-      }
-      await finishEvent(c, 'revenuecat', event.id, 'processed', families[0]!.id);
-      return c.json({ status: 'processed' });
-    }
     const family = await familyForRefs(c, refs);
     if (!family) {
       await finishEvent(c, 'revenuecat', event.id, 'ignored', null, 'UNKNOWN_SUBSCRIBER');
@@ -453,8 +535,16 @@ export function webhooksRoutes(): Hono<AppEnv> {
     } catch {
       throw new ApiError('VALIDATION_FAILED', 'Invalid JSON');
     }
-    if (typeof event.id !== 'string' || typeof event.type !== 'string')
+    if (typeof event.id !== 'string' || typeof event.type !== 'string') {
+      // No id to trace by; the refusal is still counted (BILL-R1-4).
+      deps.log({
+        level: 'warn',
+        event: 'billing_event_rejected',
+        requestId: c.var.requestId,
+        code: 'UNEXPECTED_SHAPE',
+      });
       throw new ApiError('VALIDATION_FAILED', 'Unexpected event shape');
+    }
     if (!(await recordEvent(c, 'stripe', event.id, event.type, raw)))
       return c.json({ status: 'duplicate' });
     let familyId: string | null = null;

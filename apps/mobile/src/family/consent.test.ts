@@ -62,6 +62,13 @@ describe('consent banner', () => {
     expect(consentBanner(status({ state: 'withdrawn' })).tone).toBe('blocked');
   });
 
+  it('says what withdrawal stops: homework, practice and paired devices (CS-R1-01)', () => {
+    const body = consentBanner(status({ state: 'withdrawn' })).body;
+    expect(body).toMatch(/won’t process new homework or build practice/);
+    expect(body).toMatch(/devices are signed out and can’t be paired/);
+    expect(body).toMatch(/records already collected stay until you delete them/);
+  });
+
   it('fails closed when the status could not be loaded', () => {
     expect(consentBanner(null)).toMatchObject({ tone: 'blocked', action: 'none' });
   });

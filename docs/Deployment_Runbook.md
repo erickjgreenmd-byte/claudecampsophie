@@ -347,6 +347,11 @@ One Cron Trigger calls `runScheduledTick` (`apps/api/src/jobs/dispatcher.ts`): m
 expiry of unsubmitted promo reservations (30 min), raw scan retention purge (30 days), spend alerts at the owner's thresholds, re-sync of stale/lapsed entitlements (lost-webhook safety net), the daily inactivity sweep (03:00 UTC, only when enabled), then due jobs from
 `public.jobs` claimed with `FOR UPDATE SKIP LOCKED`. Every step is idempotent; overlapping ticks are safe.
 
+Job ledger retention (BUG-139, migration 0840): the tick's `job_retention` step calls `app.prune_terminal_jobs(interval
+'90 days')`, deleting succeeded, cancelled and dead-lettered jobs whose terminal instant is older than 90 days; the
+`deletion_purge` and `account_close` rows are kept for the audit trail. Queued, retrying and running jobs are never
+touched. A longer horizon needs only the interval changed in `runScheduledTick`.
+
 Dead letters: `select id, kind, attempts, last_error_code, updated_at from public.jobs where status = 'dead_letter'`.
 Error codes are payload-free (exception class names or pipeline codes such as `EXTRACTION_PROVIDER_FAILED`).
 To retry after fixing the cause, insert a **new** job with a new idempotency key version (e.g. `scan:<id>:v3`);

@@ -67,7 +67,7 @@ import {
 } from '@pencillift/domain/scheduling';
 import { acceptsTestProviderConsent } from '../config.ts';
 import type { Tx } from '../db.ts';
-import { hasVerifiedConsent } from '../services/consent.ts';
+import { consentAllowsChildAccess, hasVerifiedConsent } from '../services/consent.ts';
 import type { JobDeps, JobHandler, JobRow } from './dispatcher.ts';
 import {
   acquireSpendHold,
@@ -1719,9 +1719,12 @@ export async function enqueueDueLearningJobs(
        order by c.id
        limit ${limit}`,
   );
+  const allowTestProvider = acceptsTestProviderConsent(deps.config.environment);
   for (const child of children) {
     try {
       await deps.db.asService(async (tx) => {
+        // Practice is built from the child's evidence: none while consent is withdrawn (CS-R1-01).
+        if (!(await consentAllowsChildAccess(tx, child.family_id, { allowTestProvider }))) return;
         const ctx = await loadChildContext(tx, child.family_id, child.id);
         if (!ctx) return;
         report.children += 1;

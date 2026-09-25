@@ -37,15 +37,36 @@ export function accountRoutes(): Hono<AppEnv> {
     const userId = parent.userId;
 
     // Service role because a tombstoned family is invisible under RLS; scoped to the verified caller.
+    // A family-scope deletion releases memberships at request time (migration 0840, DB-R1-02), so
+    // a membership the deletion itself released still counts here while that deletion is open: the
+    // owner's sign-in closes only once the purge has finished (the job defers with PURGE_PENDING).
     const memberships = await deps.db.asService(
-      (tx) => tx<{ family_id: string; role: 'owner' | 'guardian'; deleted_at: Date | null }[]>`
-        select m.family_id, m.role, f.deleted_at
+      (tx) => tx<
+        {
+          family_id: string;
+          role: 'owner' | 'guardian';
+          status: string;
+          deleted_at: Date | null;
+        }[]
+      >`
+        select m.family_id, m.role, m.status, f.deleted_at
           from public.family_memberships m
           join public.families f on f.id = m.family_id
-         where m.user_id = ${userId} and m.status = 'active'
+         where m.user_id = ${userId}
+           and (m.status = 'active'
+                or (f.deleted_at is not null and m.revoked_at >= f.deletion_requested_at
+                    and exists (
+                      select 1 from public.deletion_requests d
+                       where d.family_id = f.id and d.scope = 'family'
+                         and d.status in ('requested', 'processing'))))
          order by m.accepted_at, m.id`,
     );
-    const owned = memberships.find((m) => m.role === 'owner') ?? null;
+    // A live family the caller owns comes first: after deleting one family a parent may start
+    // another (DB-R1-02), and that live family must block the closure, not the tombstoned one.
+    const owned =
+      memberships.find((m) => m.role === 'owner' && m.deleted_at === null) ??
+      memberships.find((m) => m.role === 'owner') ??
+      null;
     if (owned) {
       const requested = await deps.db.asService(
         (tx) => tx<{ id: string }[]>`
@@ -64,7 +85,9 @@ export function accountRoutes(): Hono<AppEnv> {
     }
 
     await deps.db.asService(async (tx) => {
-      for (const m of memberships.filter((x) => x.role === 'guardian')) {
+      // Only a still-active guardian membership is removed here; one the deletion released is
+      // already revoked.
+      for (const m of memberships.filter((x) => x.role === 'guardian' && x.status === 'active')) {
         await removeGuardian(tx, m.family_id, userId, now);
       }
       await enqueueClose(tx, userId, now);

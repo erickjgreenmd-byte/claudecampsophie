@@ -26,7 +26,7 @@ export type DonationCents = typeof DONATION_CENTS;
 export const DONATION_POLICY = 'full_price_only';
 
 /** Version tag stored in every snapshot so audits know which rule text produced it. */
-export const DONATION_RULES_VERSION = 'p17-f7-full-price-only-v1';
+export const DONATION_RULES_VERSION = 'p17-f7-full-price-only-v2';
 
 /**
  * Ineligibility reasons in evaluation order; the first failing rule is the reported reason.
@@ -38,6 +38,7 @@ export const DONATION_RULES_VERSION = 'p17-f7-full-price-only-v1';
  *   below the regular price disqualifies the whole period, even when a positive payment remains.
  * NOT_REGULAR_TIER_PRICE: the regular amount is not the approved tier price for the paid slots,
  *   or the charged amount differs from it.
+ * NOT_USD_CURRENCY: the charge was made in another currency, so its amount is not USD cents.
  * NO_SCHOOL_DESIGNATION: no designated school for the donation month.
  * SCHOOL_INACTIVE: the designated school is inactive or unknown.
  */
@@ -45,6 +46,7 @@ export const DONATION_INELIGIBLE_REASONS = [
   'NOT_SUBSCRIPTION_PERIOD',
   'NOT_SETTLED',
   'REFUNDED_OR_CHARGED_BACK',
+  'NOT_USD_CURRENCY',
   'DISCOUNTED',
   'NOT_REGULAR_TIER_PRICE',
   'NO_SCHOOL_DESIGNATION',
@@ -59,6 +61,7 @@ export type DonationRule =
   | 'subscription_period'
   | 'settled'
   | 'not_refunded'
+  | 'usd_currency'
   | 'undiscounted'
   | 'regular_tier_price'
   | 'school_designated'
@@ -68,6 +71,7 @@ const RULE_FAILURE: Readonly<Record<DonationRule, DonationIneligibleReason>> = {
   subscription_period: 'NOT_SUBSCRIPTION_PERIOD',
   settled: 'NOT_SETTLED',
   not_refunded: 'REFUNDED_OR_CHARGED_BACK',
+  usd_currency: 'NOT_USD_CURRENCY',
   undiscounted: 'DISCOUNTED',
   regular_tier_price: 'NOT_REGULAR_TIER_PRICE',
   school_designated: 'NO_SCHOOL_DESIGNATION',
@@ -121,6 +125,8 @@ export interface DonationEligibilitySnapshot {
   /** Approved tier price for `paidSlots`, or null when the slot count is not a configured tier. */
   readonly approvedTierPriceCents: Cents | null;
   readonly chargedAmountCents: Cents;
+  /** ISO 4217 code of the charge ('USD' when the fact carries none). */
+  readonly currency: string;
   readonly discountCents: Cents;
   readonly discountSources: readonly DiscountSource[];
   readonly settlement: SettlementStatus;
@@ -196,6 +202,10 @@ export function evaluateDonationEligibility(
       rule: 'not_refunded',
       passed: settlement === 'collected' && period.refundedCents === 0,
     },
+    // A charge in another currency is minor units of that currency, not USD cents, so no price
+    // comparison below is meaningful for it (BILL-R1-5; the launch market is the US, Owner
+    // action #38).
+    { rule: 'usd_currency', passed: (period.currency ?? 'USD') === 'USD' },
     {
       rule: 'undiscounted',
       passed:
@@ -228,6 +238,7 @@ export function evaluateDonationEligibility(
     regularAmountCents: period.regularAmountCents,
     approvedTierPriceCents: tier.ok ? tier.value : null,
     chargedAmountCents: period.chargedAmountCents,
+    currency: period.currency ?? 'USD',
     discountCents: period.discountCents,
     discountSources: [...period.discountSources],
     settlement: period.settlement,

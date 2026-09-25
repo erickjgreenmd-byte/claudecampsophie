@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestDb, type TestDb } from './harness.ts';
-import { childClaims, seedFamily, type SeededFamily } from './fixtures.ts';
+import { childClaims, grantAdultUnlock, seedFamily, type SeededFamily } from './fixtures.ts';
 
 let db: TestDb;
 
@@ -90,6 +90,27 @@ describe('family purge (AC_ACCESS_10, AC_SECURITY_05)', () => {
     >`select display_name, deleted_at from public.families where id = ${fam.familyId}`;
     expect(family).toMatchObject({ display_name: 'Deleted family' });
     expect(family!.deleted_at).not.toBeNull();
+  });
+
+  it('[DB-R1-02] after request_deletion released the adults, the purge’s own revoke is a no-op that keeps the release instant', async () => {
+    const fam = await seedFamily(db, { childCount: 1 });
+    await populate(fam, 0);
+    await grantAdultUnlock(db, fam.ownerId);
+    await db.asParent(
+      fam.ownerId,
+      (tx) => tx`select public.request_deletion(${fam.familyId}, null)`,
+    );
+    const [released] = await db.sql<{ status: string; revoked_at: Date }[]>`
+      select status, revoked_at from public.family_memberships where family_id = ${fam.familyId}`;
+    expect(released!.status).toBe('revoked');
+    await db.asService((tx) => tx`select app.purge_family_data(${fam.familyId})`);
+    const [after] = await db.sql<{ status: string; revoked_at: Date }[]>`
+      select status, revoked_at from public.family_memberships where family_id = ${fam.familyId}`;
+    expect(after).toEqual({ status: 'revoked', revoked_at: released!.revoked_at });
+    expect(await count('public.child_profiles', fam.familyId)).toBe(0);
+    const [req] = await db.sql<{ status: string }[]>`
+      select status from public.deletion_requests where family_id = ${fam.familyId}`;
+    expect(req!.status).toBe('completed');
   });
 
   it('a child-scoped purge removes only that child and needs an open request', async () => {

@@ -4,6 +4,7 @@ import { stateRequestInstant, type Tx } from '../db.ts';
 import type { AppDeps } from '../middleware/context.ts';
 import { runIdentityHousekeeping } from '../auth/housekeeping.ts';
 import {
+  TERMINAL_STATUSES,
   resolveUnreachableRedemptions,
   reverifyFormerHolders,
   syncFamilyFromProvider,
@@ -57,6 +58,8 @@ export type JobHandler = ((deps: JobDeps, job: JobRow) => Promise<void | JobDefe
 };
 
 export const RAW_SCAN_RETENTION_DAYS = 30;
+/** Terminal job rows are kept this long (BUG-139); must stay above RAW_SCAN_RETENTION_DAYS. */
+export const JOB_RETENTION_DAYS = 90;
 /**
  * A claimed job's lease. Longer than a Cron Trigger invocation can live (15 minutes wall time), so a
  * lease only expires when its worker is really gone (RV-lead-jobs-ai-1).
@@ -337,9 +340,17 @@ export const accountCloseHandler: JobHandler = async (deps, job) => {
                 where m.user_id = ${userId}::uuid and m.status = 'active' and f.deleted_at is null
              ) as live_family,
              exists (
+               -- A family-scope deletion releases memberships at request time (migration 0840,
+               -- DB-R1-02): a membership the deletion itself released still holds the closure
+               -- until that family's purge has completed.
                select 1 from public.family_memberships m
                  join public.families f on f.id = m.family_id
-                where m.user_id = ${userId}::uuid and m.status = 'active' and f.deleted_at is not null
+                where m.user_id = ${userId}::uuid and f.deleted_at is not null
+                  and (m.status = 'active' or m.revoked_at >= f.deletion_requested_at)
+                  and exists (
+                    select 1 from public.deletion_requests d
+                     where d.family_id = f.id and d.scope = 'family'
+                       and d.status in ('requested', 'processing'))
              ) as purge_pending`,
   );
   if (state?.closed) return;
@@ -386,6 +397,8 @@ export interface TickReport {
   identityHousekeeping: { rateLimitBuckets: number; endedAuthSessions: number };
   /** Daily, Thursday and top-up jobs queued this tick (0 when learning handlers are not registered). */
   learningJobsEnqueued: number;
+  /** Terminal job rows older than JOB_RETENTION_DAYS deleted this tick (BUG-139, migration 0840). */
+  prunedJobs: number;
   jobs: { succeeded: number; retried: number; deadLettered: number };
   /** Steps that failed this tick (logged by code); the other steps still ran. */
   failedSteps: string[];
@@ -755,22 +768,33 @@ export async function recordSpendAlerts(deps: JobDeps): Promise<number[]> {
   });
 }
 
+/** A row past its period end is re-verified at most this often until the provider moves it. */
+export const STALE_ENTITLEMENT_RECHECK_MS = 3600_000;
+
 /**
  * Entitlement safety net (spec P11): webhooks can be lost, so entitlements that are stale (not
  * fetched for a day) or past their period end are re-fetched from the provider and reconciled.
+ * BILL-R1-3: rows in a terminal state (expired, revoked, refunded) never grant again and are
+ * skipped; a row past its period end is re-checked hourly, not on every tick; families are taken
+ * oldest verification first, so a fixed batch limit rotates through every stale family instead of
+ * re-fetching the same first `limit` ids forever.
  */
 export async function reconcileStaleEntitlements(deps: JobDeps, limit = 25): Promise<number> {
   const now = deps.clock();
   const staleBefore = new Date(now.getTime() - 86_400_000);
+  const recheckBefore = new Date(now.getTime() - STALE_ENTITLEMENT_RECHECK_MS);
+  const terminal = [...TERMINAL_STATUSES];
   const families = await deps.db.asService(
     (tx) => tx<{ id: string; billing_ref: string }[]>`
-      select f.id, f.billing_ref from public.families f
-       where f.deleted_at is null and exists (
-         select 1 from public.family_entitlements e
-          where e.family_id = f.id and e.status not in ('expired', 'revoked')
-            and (e.fetched_at < ${staleBefore} or e.period_end < ${now})
-       )
-       order by f.id
+      select f.id, f.billing_ref
+        from public.families f
+        join public.family_entitlements e on e.family_id = f.id
+       where f.deleted_at is null
+         and not (e.status = any(${terminal}))
+         and (e.fetched_at < ${staleBefore}
+              or (e.period_end < ${now} and e.fetched_at < ${recheckBefore}))
+       group by f.id, f.billing_ref
+       order by min(e.fetched_at), f.id
        limit ${limit}
     `,
   );
@@ -1030,6 +1054,21 @@ export async function runScheduledTick(
   );
   // Learning jobs are queued only where a worker will run them, and before the job ledger so a due
   // set is built in the same tick.
+  // Job ledger retention (BUG-139): terminal rows older than the horizon go; the deletion_purge and
+  // account_close kinds stay as the audit trail of a deletion. The horizon must exceed the raw scan
+  // retention (30 days): homework.ts derives the next scan version key from the assignment's job
+  // count, so a kept failed_final row and a pruned earlier one could otherwise collide.
+  const prunedJobs = await step(
+    'job_retention',
+    0,
+    async () =>
+      (
+        await deps.db.asService(
+          (tx) => tx<{ n: number }[]>`
+            select app.prune_terminal_jobs(make_interval(days => ${JOB_RETENTION_DAYS})) as n`,
+        )
+      )[0]?.n ?? 0,
+  );
   const learningJobsEnqueued = await step('learning_enqueue', 0, async () => {
     if (!handlers.daily_set_generate) return 0;
     const r = await enqueueDueLearningJobs(deps, now);
@@ -1051,6 +1090,7 @@ export async function runScheduledTick(
     inactivity,
     identityHousekeeping,
     learningJobsEnqueued,
+    prunedJobs,
     jobs,
     failedSteps,
   };

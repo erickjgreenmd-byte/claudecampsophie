@@ -996,8 +996,11 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
             returning id`;
           reservationId = created!.id;
         }
+        // The next version follows the HIGHEST kept one, never a count: job retention prunes old
+        // terminal rows (BUG-139), so a count could re-derive a key a kept later row still holds.
         const [jobs] = await tx<{ n: number }[]>`
-          select count(*)::int as n from public.jobs
+          select coalesce(max(substring(idempotency_key from ':v([0-9]+)$')::int), 0) as n
+            from public.jobs
            where family_id = ${caller.familyId} and idempotency_key like ${`scan:${id}:v%`}`;
         // Payload holds references only, never homework content (migration 0600).
         await tx`
@@ -1364,8 +1367,10 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
           update public.assignments set status = 'checking'
            where id = ${assignment.id} and family_id = ${familyId}
           returning ${tx(ASSIGNMENT_COLUMNS)}`;
+        // Highest kept version + 1, never a count (job retention, BUG-139; see the scan route).
         const [jobs] = await tx<{ n: number }[]>`
-          select count(*)::int as n from public.jobs
+          select coalesce(max(substring(idempotency_key from ':v([0-9]+)$')::int), 0) as n
+            from public.jobs
            where family_id = ${familyId} and idempotency_key like ${`scan:${assignment.id}:v%`}`;
         await tx`
           insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)

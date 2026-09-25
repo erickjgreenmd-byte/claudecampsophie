@@ -25,7 +25,10 @@ import {
  * Limits are stated, not glossed over (RV-public-site-1, -3, -4): photo metadata is removed on the
  * device where possible and always by the scan job before any processing (image-metadata.ts); the
  * retention exceptions match app.purge_family_data (billing, consent records, audit log, family
- * tombstone) plus the pseudonymous auth id after account closure (migration 0830).
+ * tombstone) plus the pseudonymous auth id after account closure (migration 0830). Photo deletion
+ * before the 30-day sweep happens only through scan cancellation before processing
+ * (routes/homework.ts cancel, CANCELLABLE_ASSIGNMENT_STATUSES) and child/family deletion: there is
+ * no photo-only deletion control, so the copy promises none (CS-R1-03, BUG-031 precedent).
  *
  * Notices are by email only (APL-28 / PLAY-25): the apps register no push notification channel.
  * IP addresses: the API reads the client address only when a pairing code is redeemed
@@ -121,7 +124,9 @@ export default function PrivacyPage() {
             those details before the photo is processed or sent to AI.
           </li>
           <li>
-            Raw homework photos are deleted after 30 days by default. You can delete them sooner.
+            Raw homework photos are deleted after 30 days by default. They are deleted sooner when
+            you cancel a scan before it is processed, or when you delete the child’s data or your
+            account.
           </li>
           <li>
             Learning history is kept while your account is active. Our planned rule is deletion
@@ -203,7 +208,7 @@ export default function PrivacyPage() {
             Ask for a copy (export) of your family’s information. Files are prepared within minutes
             and can be downloaded from the parent portal for a limited time.
           </li>
-          <li>Delete homework photos, a child’s data, or your whole account.</li>
+          <li>Delete a child’s data, or your whole account.</li>
           <li>Withdraw consent for your child’s information to be processed.</li>
         </ul>
       </Section>

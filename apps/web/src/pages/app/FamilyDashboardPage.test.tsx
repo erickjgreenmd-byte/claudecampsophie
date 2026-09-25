@@ -227,12 +227,24 @@ describe('FamilyDashboardPage', () => {
     expect(await screen.findByText(/^Consent verified on/)).toBeTruthy();
     expect(screen.getByText(/this consent came from a development test service/)).toBeTruthy();
     await user.click(screen.getByRole('button', { name: 'Withdraw consent' }));
+    // The confirmation says what withdrawal stops (CS-R1-01): devices out, no pairing, no practice,
+    // and that an already-filed safety notice is still sent (CS-R1-02).
+    const confirm = screen.getByRole('group', { name: 'Confirm withdrawal' }).textContent ?? '';
+    expect(confirm).toMatch(/every paired child device is signed out/);
+    expect(confirm).toMatch(/no device can be paired until consent is given again/);
+    expect(confirm).toMatch(/no new practice is built/);
+    expect(confirm).toMatch(/safety notice that was already on its way is still sent/);
     await user.click(screen.getByRole('button', { name: 'Yes, withdraw consent' }));
     expect(
-      await screen.findByText('Consent withdrawn. 2 waiting homework tasks were cancelled.'),
+      await screen.findByText(
+        'Consent withdrawn. 2 waiting homework tasks were cancelled and your children’s devices were signed out.',
+      ),
     ).toBeTruthy();
     expect(sends).toEqual([{ method: 'POST', path: '/v1/consent/withdraw', body: {} }]);
     expect(await screen.findByText('Consent was withdrawn.')).toBeTruthy();
+    expect(
+      screen.getByText(/devices stay signed out until you pair them again/).textContent,
+    ).toMatch(/won’t process new homework or build practice/);
     expect(screen.getByRole('button', { name: 'Start consent' })).toBeTruthy();
   });
 

@@ -66,6 +66,14 @@ Rules:
 - Core helper functions (migration 0001): `app.current_user_id()`, `app.is_family_member(family uuid)`, `app.is_family_owner(family uuid)`, `app.has_recent_adult_unlock()`, `app.current_child_id()`, `app.current_child_family_id()`, `app.is_owner_admin()`, `app.prevent_mutation()` (trigger for append-only ledgers).
 - Families are tombstoned (`deleted_at`) before purge; helper functions treat tombstoned families as inaccessible, and job/webhook handlers must refuse to write into tombstoned families (no resurrection).
 - Financial and learning ledgers are append-only (`app.prevent_mutation()` trigger); corrections are new adjustment rows.
+- The job ledger (`public.jobs`) is not append-only: terminal rows (succeeded, cancelled, dead-lettered) older than
+  90 days are pruned by the tick's `job_retention` step (`app.prune_terminal_jobs`, migration 0840), except the
+  `deletion_purge` and `account_close` kinds, which stay as the audit trail of a deletion. Per-family reads of the
+  ledger use `jobs_family_child`; lease recovery uses `jobs_running`.
+- A family-scope deletion request releases the adults' memberships in the same transaction as the tombstone
+  (`revoked_at = deletion_requested_at`, migration 0840), so a parent can start a new family before the purge
+  runs; the deletion view, account closure and the account-close job treat a membership the deletion itself
+  released like an active one until that purge completes.
 - Migration files: `NNNN_area.sql`, applied in lexicographic order. Areas: `0001_core_identity`, `0100_learning`, `0200_billing`, `0300_promotions_schools`, `0400_rewards`, `0600_operations` … `0720_identity_hardening` (monetization is `0640`, learning runtime `0650`). Until any shared environment applies a migration it may be edited in place; after that, changes are new migrations only. `0710` and `0720` redefine deletion, purge, inactivity and rate-limit functions: later migrations must start from those versions. An area migration may reference only `0001` and lower-numbered areas it explicitly depends on (`0300` depends on `0200`).
 - Tests run against real Postgres 16 via `@pencillift/db/testing` (fresh database per file, Supabase shim, real `SET ROLE` + claims). `PL_MIGRATIONS_ONLY=0001,0300` limits applied files while authoring; CI applies all.
 

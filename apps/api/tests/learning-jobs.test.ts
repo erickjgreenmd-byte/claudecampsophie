@@ -123,6 +123,12 @@ async function consent(fam: SeededFamily) {
     values (${fam.familyId}, ${fam.ownerId}, 'mock', 'mock', 'child_learning_data', 'v1', 'verified', true, now())`;
 }
 
+async function withdrawConsent(fam: SeededFamily) {
+  await api.db.sql`
+    update public.consent_records set status = 'withdrawn', withdrawn_at = now()
+     where family_id = ${fam.familyId} and status <> 'withdrawn'`;
+}
+
 async function homeworkAttempt(
   fam: SeededFamily,
   subject: string,
@@ -273,6 +279,26 @@ describe('Thursday review scheduling in the family zone (AC_LEARNING_08)', () =>
       [`review:${child}:math:2026-W39:s1`, 'queued', '2026-09-24T23:00:00.000Z'], // 16:00 PDT
     ]);
     expect(w39[0]!.run_after.toISOString()).toBe('2026-09-24T21:00:00.000Z');
+  });
+});
+
+describe('practice generation stops with consent (CS-R1-01)', () => {
+  it('a child whose family withdrew consent gets no daily set, review or top-up jobs until consent is verified again', async () => {
+    const fam = await family('America/New_York');
+    const child = fam.children[0]!.id;
+    await consent(fam);
+    await onlySubjects(fam, ['math']);
+    await withdrawConsent(fam);
+    at('2026-03-02T12:00:00Z'); // Monday: the daily set and two Thursday reviews would be due
+    const report = await enqueueDueLearningJobs(deps, api.now.value);
+    expect(report).toMatchObject({ children: 0, dailyJobs: 0, reviewJobs: 0, topUpJobs: 0 });
+    expect(await jobs(child, 'daily_set_generate')).toEqual([]);
+    expect(await jobs(child, 'thursday_review_generate')).toEqual([]);
+    // Consent given again (a new verified record) resumes generation on the next tick.
+    await consent(fam);
+    const resumed = await enqueueDueLearningJobs(deps, api.now.value);
+    expect(resumed.children).toBe(1);
+    expect(resumed.dailyJobs + resumed.reviewJobs).toBeGreaterThan(0);
   });
 });
 

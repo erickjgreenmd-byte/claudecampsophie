@@ -215,7 +215,12 @@ describe('privacy review findings', () => {
     // Spec P14: "deleted-account states"; AC_UX_02 meaningful states. GET /v1/deletion returns only
     // requests the caller made plus a *live* family's requests, so the other guardian gets an empty
     // list; the privacy page then tells them "There is no family on this account yet. Set up your
-    // family", and creating one fails (409) until the purge runs.
+    // family".
+    // DB-R1-02 (migration 0840): the deletion request releases every membership of the family in
+    // the same transaction as the tombstone, so "set up your family" is no longer a dead end: the
+    // 409 this test first pinned was the defect (memberships stayed 'active' on the tombstoned
+    // family until the purge job ran, indefinitely when it dead-lettered). The guardian can start
+    // over at once, and still sees the deletion of the family they were released from.
     const { family, token } = await unlockedFamily(1);
     const guardian = await unlockedGuardian(family);
     const del = await requestDeletion(token, { scope: 'family' });
@@ -227,7 +232,7 @@ describe('privacy review findings', () => {
       token: guardian.token,
       body: { displayName: 'Another family', timezone: 'America/Chicago' },
     });
-    expect(create.status).toBe(409); // the "set up your family" path is a dead end meanwhile
+    expect(create.status).toBe(201);
 
     const seen = deletionRequestsResponseSchema.parse(
       await (await api.request('/v1/deletion', { token: guardian.token })).json(),

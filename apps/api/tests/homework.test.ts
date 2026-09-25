@@ -402,14 +402,24 @@ describe('creating a scan (spec P5, P3 consent gate)', () => {
     expect((await errorOf(await create(t, body()))).rule).toBe('CONSENT_REQUIRED');
     await consent(pending.familyId, pending.ownerId, 'verified');
     expect((await create(t, body())).status).toBe(201);
+    // Paired while consent is verified: after a withdrawal no new device can pair (CS-R1-01), and
+    // this SQL-inserted record revokes nothing, so the child's token stays valid for the check below.
+    const kid = await childToken(pending, t, 0);
     // Withdrawal (the latest record) stops new scans immediately.
     await consent(pending.familyId, pending.ownerId, 'withdrawn');
     expect((await errorOf(await create(t, body()))).rule).toBe('CONSENT_REQUIRED');
     // The child route is gated the same way.
-    const kid = await childToken(pending, t, 0);
     expect((await errorOf(await create(kid, { pageCount: 1, idempotencyKey: key() }))).rule).toBe(
       'CONSENT_REQUIRED',
     );
+    // And so is the parent side of pairing (CS-R1-01): no new device joins a withdrawn family.
+    const code = await api.request(`/v1/children/${pending.children[0]!.id}/pairing-code`, {
+      method: 'POST',
+      token: t,
+      body: {},
+    });
+    expect(code.status).toBe(422);
+    expect((await errorOf(code)).rule).toBe('CONSENT_REQUIRED');
   });
 
   it('a development/test consent record never enables production processing', async () => {
@@ -1531,5 +1541,54 @@ describe('child detail view after the final lead review (LJA-F7, -F10)', () => {
       expect(q1.promptText).toBe(prompt);
       if (i === 0) expect(q1.studentAnswerText).toBe('The answer is 7 because 7 is more than 3.');
     }
+  });
+});
+
+describe('scan versions after job retention (BUG-139 follow-up)', () => {
+  /** Moves a scan job to `status`, last written `ageDays` before the pinned clock (L-027). */
+  async function ageJob(key: string, status: string, ageDays: number): Promise<void> {
+    const stamp = new Date(api.now.value.getTime() - ageDays * 86_400_000);
+    await api.db.sql.begin(async (tx) => {
+      // app.guard_job stamps updated_at on every write, so the age is set with triggers off.
+      await tx`set local session_replication_role = replica`;
+      await tx`
+        update public.jobs set status = ${status}, updated_at = ${stamp}, created_at = ${stamp}
+         where idempotency_key = ${key}`;
+    });
+  }
+
+  it('a correction after the first version was pruned gets a fresh key, not a kept one', async () => {
+    const seeded = await readyScan(fam, token);
+    const key = (v: number) => `scan:${seeded.assignmentId}:v${v}`;
+    const path = `/v1/questions/${seeded.questionId}/correction`;
+    await ageJob(key(1), 'succeeded', 100);
+    const first = await api.request(path, {
+      method: 'POST',
+      token,
+      body: { studentAnswerText: '7/8' },
+    });
+    expect(first.status).toBe(200);
+    await ageJob(key(2), 'succeeded', 10);
+    await advance(seeded.assignmentId, ['verifying', 'ready']);
+    // The retention step (90 days) removes v1 and keeps v2.
+    const [pruned] = await api.db.asService(
+      (tx) => tx<{ n: number }[]>`select app.prune_terminal_jobs(interval '90 days') as n`,
+    );
+    expect(pruned!.n).toBeGreaterThanOrEqual(1);
+    const kept = await api.db.sql<{ idempotency_key: string }[]>`
+      select idempotency_key from public.jobs where idempotency_key like ${`scan:${seeded.assignmentId}:v%`}`;
+    expect(kept.map((j) => j.idempotency_key)).toEqual([key(2)]);
+    // A count would derive v2 again (a unique-key conflict, answered 409); the highest kept
+    // version gives v3.
+    const second = await api.request(path, {
+      method: 'POST',
+      token,
+      body: { promptText: 'What is 3/4 + 1/4?' },
+    });
+    expect(second.status).toBe(200);
+    const after = await api.db.sql<{ idempotency_key: string }[]>`
+      select idempotency_key from public.jobs
+       where idempotency_key like ${`scan:${seeded.assignmentId}:v%`} order by idempotency_key`;
+    expect(after.map((j) => j.idempotency_key)).toEqual([key(2), key(3)]);
   });
 });

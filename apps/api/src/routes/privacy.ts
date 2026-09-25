@@ -526,10 +526,12 @@ export function privacyRoutes(): Hono<AppEnv> {
   r.get('/deletion', requireParent, async (c) => {
     const { deps, parent } = c.var;
     // Read with the service role because a deleted family is tombstoned and invisible to RLS.
-    // Explicitly scoped to the verified caller: requests they made, plus the requests of a
-    // tombstoned family they are still an active member of — so the other guardian sees the
-    // deleted-account state instead of "set up your family" until the purge revokes their
-    // membership (spec P14 deleted-account state, RV-privacy-5).
+    // Explicitly scoped to the verified caller: requests they made, plus the open requests of a
+    // tombstoned family whose membership the deletion itself released (migration 0840 revokes
+    // memberships at request time, DB-R1-02, with revoked_at = deletion_requested_at) — so the
+    // other guardian sees the deleted-account state instead of "set up your family" until the
+    // purge completes, while a guardian removed before the request does not (spec P14
+    // deleted-account state, RV-privacy-5).
     const own = await deps.db.asService((tx) =>
       tx.unsafe<DeletionRow[]>(
         `select ${DELETION_COLUMNS} from public.deletion_requests d
@@ -538,7 +540,9 @@ export function privacyRoutes(): Hono<AppEnv> {
                   select 1 from public.family_memberships m
                     join public.families f on f.id = m.family_id
                    where m.family_id = d.family_id and m.user_id = $1::uuid
-                     and m.status = 'active' and f.deleted_at is not null)
+                     and f.deleted_at is not null
+                     and (m.status = 'active' or m.revoked_at >= f.deletion_requested_at)
+                     and d.status in ('requested', 'processing'))
           order by d.requested_at desc limit 50`,
         [parent.userId],
       ),

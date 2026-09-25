@@ -97,7 +97,7 @@ export function consentBanner(status: ConsentStatus | null): ConsentBanner {
       return {
         tone: 'blocked',
         title: 'Consent was withdrawn',
-        body: 'PencilLift won’t process new homework until consent is given again.',
+        body: 'PencilLift won’t process new homework or build practice until consent is given again. Your children’s devices are signed out and can’t be paired until then; records already collected stay until you delete them.',
         testNote,
         action: 'start',
         actionLabel: 'Give consent again',

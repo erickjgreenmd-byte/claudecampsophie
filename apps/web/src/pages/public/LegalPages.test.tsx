@@ -98,6 +98,14 @@ describe('PrivacyPage draft content (spec P3, P4, P16.1)', () => {
     expect(text).toMatch(/children don.t need an email address/i);
     expect(text).toMatch(/private storage/i);
     expect(text).toMatch(/raw homework photos are deleted after 30 days by default/i);
+    // No photo-only deletion control exists (CS-R1-03): early deletion is scan cancellation
+    // before processing, or child/account deletion, and the copy promises nothing more.
+    expect(text).toMatch(
+      /deleted sooner when you cancel a scan before it is processed, or when you delete the child.s data or your account/i,
+    );
+    expect(text).not.toMatch(/you can delete them sooner/i);
+    expect(text).not.toMatch(/delete homework photos/i);
+    expect(text).toMatch(/delete a child.s data, or your whole account/i);
     expect(text).toMatch(/processing stops immediately/i);
     expect(text).toMatch(/within 30 days/i);
     expect(text).toMatch(/backups expire on a documented schedule/i);

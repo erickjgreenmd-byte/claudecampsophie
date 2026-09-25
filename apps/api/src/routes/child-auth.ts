@@ -1,10 +1,11 @@
 import { Hono } from 'hono';
 import { childPairRequestSchema, childRefreshRequestSchema } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
+import { acceptsTestProviderConsent } from '../config.ts';
 import { issueChildAccessToken } from '../auth/child.ts';
 import { normalizePairingCode, pairingCodeHash } from '../auth/pairing.ts';
 import type { ChildPrincipal, Tx } from '../db.ts';
-import { ApiError } from '../errors.ts';
+import { ApiError, businessRule } from '../errors.ts';
 import { requireChild } from '../middleware/auth.ts';
 import type { AppDeps, AppEnv } from '../middleware/context.ts';
 import {
@@ -15,6 +16,7 @@ import {
   rateLimitedError,
 } from '../middleware/rate-limit.ts';
 import { randomToken, sha256Hex, toHex } from '../security/crypto.ts';
+import { consentAllowsChildAccess } from '../services/consent.ts';
 
 /**
  * Session and refresh-token lifetimes are stored and compared with the database clock: the
@@ -90,6 +92,7 @@ export function childAuthRoutes(): Hono<AppEnv> {
     }
     if (!reservation.allowed) throw rateLimitedError(reservation.retryAfterSeconds);
     const hashHex = toHex(await pairingCodeHash(deps.config.hashPepper, code));
+    const allowTestProvider = acceptsTestProviderConsent(deps.config.environment);
 
     const result = await deps.db.asService(async (tx) => {
       // Single use: the conditional update is the atomic claim; a concurrent redeem gets zero rows.
@@ -105,6 +108,14 @@ export function childAuthRoutes(): Hono<AppEnv> {
         returning p.family_id, p.child_id
       `;
       if (!claimed) return null;
+      // A code minted before consent was withdrawn must not pair a device (CS-R1-01). Throwing
+      // rolls the claim back, so the code stays unredeemed for after consent is given again.
+      if (!(await consentAllowsChildAccess(tx, claimed.family_id, { allowTestProvider }))) {
+        throw businessRule(
+          'CONSENT_REQUIRED',
+          'This device can’t connect right now. Ask a grown-up to check PencilLift’s family page.',
+        );
+      }
       const [device] = await tx<{ id: string }[]>`
         insert into public.child_devices (family_id, child_id, label, platform)
         values (${claimed.family_id}, ${claimed.child_id}, ${body.deviceLabel}, ${body.platform}) returning id
@@ -198,6 +209,15 @@ export function childAuthRoutes(): Hono<AppEnv> {
         return { kind: 'reused' as const };
       }
       if (!row.live) return { kind: 'invalid' as const };
+      // Withdrawal revokes the session, so this only matters for a session that outlived a
+      // consent change made another way; the child sees the same "connect again" answer.
+      if (
+        !(await consentAllowsChildAccess(tx, row.family_id, {
+          allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
+        }))
+      ) {
+        return { kind: 'invalid' as const };
+      }
       await enforceRateLimit(
         deps.rateLimiter,
         `refresh:${row.session_id}`,

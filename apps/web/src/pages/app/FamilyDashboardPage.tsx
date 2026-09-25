@@ -196,7 +196,7 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
       );
       return `Consent withdrawn. ${result.cancelledJobs} waiting homework ${
         result.cancelledJobs === 1 ? 'task was' : 'tasks were'
-      } cancelled.`;
+      } cancelled and your children’s devices were signed out.`;
     });
     setConfirmWithdraw(false);
     if (ok) onChanged();
@@ -232,7 +232,10 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
       ) : status.state === 'withdrawn' ? (
         <p style={{ margin: '4px 0' }}>
           {status.withdrawnAt ? `Withdrawn on ${formatDate(status.withdrawnAt)}. ` : ''}PencilLift
-          won’t process new homework until consent is given again.
+          won’t process new homework or build practice until consent is given again, and your
+          children’s devices stay signed out until you pair them again. Records already collected
+          stay until you delete them on the privacy page. A safety notice that was already on its
+          way is still sent.
         </p>
       ) : (
         <p style={{ margin: '4px 0' }}>
@@ -297,8 +300,11 @@ function ConsentBanner({ status, onChanged }: { status: ConsentStatus; onChanged
       {confirmWithdraw ? (
         <div role="group" aria-label="Confirm withdrawal" style={sectionStyle}>
           <p style={{ margin: 0 }}>
-            Withdraw consent? New homework won’t be processed and waiting homework tasks are
-            cancelled. Existing records stay until you delete them on the privacy page.
+            Withdraw consent? PencilLift stops collecting and using your children’s information: new
+            homework won’t be processed, waiting homework tasks are cancelled, no new practice is
+            built, and every paired child device is signed out (no device can be paired until
+            consent is given again). Existing records stay until you delete them on the privacy
+            page, and a safety notice that was already on its way is still sent.
           </p>
           <div style={buttonRow}>
             <button

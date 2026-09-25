@@ -1,3 +1,4 @@
+import { ACCOUNT_CLOSE_RULES } from '@pencillift/contracts';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { cryptoRandom } from '@pencillift/domain';
@@ -538,4 +539,37 @@ describe('Supabase Auth Admin adapter (labeled fake fetch; untested against a li
     await expect(admin.closeUser('../admin/users?x=1')).rejects.toThrow(/UUID/);
     expect(calls).toHaveLength(0);
   });
+});
+
+describe('a live second family blocks the closure (DB-R1-02 follow-up)', () => {
+  for (const purgeFirst of [true, false]) {
+    it(`an owner who deleted a family and started another is refused (first purge ${
+      purgeFirst ? 'completed' : 'still pending'
+    })`, async () => {
+      const fam = await seedFamily(api.db, { childCount: 1 });
+      const token = await unlockedToken(fam.ownerId);
+      await requestFamilyDeletion(fam, token);
+      if (purgeFirst) {
+        const report = await runJobs(deps, DEFAULT_HANDLERS);
+        expect(report.succeeded).toBeGreaterThanOrEqual(1);
+        const [req] = await api.db.sql<{ status: string }[]>`
+          select status from public.deletion_requests where family_id = ${fam.familyId}`;
+        expect(req!.status).toBe('completed');
+      }
+      // Possible before the purge since memberships are released at request time.
+      const create = await api.request('/v1/families', {
+        method: 'POST',
+        token,
+        body: { displayName: 'Fresh start', timezone: 'America/Chicago' },
+      });
+      expect(create.status).toBe(201);
+      const res = await close(token);
+      expect(res.status).toBe(409);
+      expect((await json<{ error: { rule: string } }>(res)).error.rule).toBe(
+        ACCOUNT_CLOSE_RULES.familyDeletionRequired,
+      );
+      expect(await closeJobs(fam.ownerId)).toHaveLength(0);
+      expect(await isClosed(fam.ownerId)).toBe(false);
+    });
+  }
 });

@@ -36,6 +36,7 @@ import {
   type SupportPolicy,
 } from '@pencillift/domain/ops';
 import type { Tx } from '../db.ts';
+import { REVENUE_CURRENCY } from './billing-sync.ts';
 
 /**
  * Database reads behind the owner's company overview (spec: the owner watches the company on one
@@ -145,8 +146,17 @@ export const STORE_FEE_RATES_NOTES: readonly string[] = [
 // ---------------------------------------------------------------------------------------------
 
 const REVENUE_SOURCE = 'public.billing_periods';
-const REVENUE_DEFINITION =
-  'Charged periods (settlement settled, refunded, partially_refunded or chargeback) bucketed by the UTC month of settled_at (period_start when unsettled); gross = charged_amount_cents, refunds = refunded_cents attributed to the month of the charge they reverse, fee = estimate at the channel rate, net = gross − refunds − fee.';
+const REVENUE_DEFINITION = `Charged periods in ${REVENUE_CURRENCY} (settlement settled, refunded, partially_refunded or chargeback) bucketed by the UTC month of settled_at (period_start when unsettled); gross = charged_amount_cents, refunds = refunded_cents attributed to the month of the charge they reverse (a chargeback counts as a refund of the disputed amount, or of the whole charge when the store reports none), fee = estimate at the channel rate, net = gross − refunds − fee. A period charged in another currency is counted in the notes, never in these sums.`;
+
+/** The revenue note listing periods left out because they were not charged in USD (BILL-R1-5). */
+export function foreignCurrencyNote(counts: ReadonlyMap<string, number>): string | null {
+  const total = [...counts.values()].reduce((sum, n) => sum + n, 0);
+  if (total === 0) return null;
+  const perChannel = CHANNELS.filter((c) => (counts.get(c) ?? 0) > 0)
+    .map((c) => `${c} ${counts.get(c)}`)
+    .join(', ');
+  return `Excluded from every figure above: ${total} billing period${total === 1 ? '' : 's'} not charged in ${REVENUE_CURRENCY} (${perChannel}). The stores are meant to sell in the United States only; see Owner action #38 and the billing.unexpected_currency audit events.`;
+}
 
 export async function loadRevenueMonths(
   tx: Tx,
@@ -158,19 +168,34 @@ export async function loadRevenueMonths(
   const start = utcMonthBounds(months[0]!).start;
   const end = utcMonthBounds(months[months.length - 1]!).end;
   const rows = await tx<
-    { month: string; channel: string; periods: number; gross: string; refunds: string }[]
+    {
+      month: string;
+      channel: string;
+      periods: number;
+      gross: string;
+      refunds: string;
+      foreign_periods: number;
+    }[]
   >`
     select to_char(coalesce(settled_at, period_start) at time zone 'UTC', 'YYYY-MM') as month,
            channel,
-           count(*)::int as periods,
-           coalesce(sum(charged_amount_cents), 0)::text as gross,
-           coalesce(sum(refunded_cents), 0)::text as refunds
+           count(*) filter (where currency = ${REVENUE_CURRENCY})::int as periods,
+           coalesce(sum(charged_amount_cents) filter (where currency = ${REVENUE_CURRENCY}), 0)::text as gross,
+           coalesce(sum(refunded_cents) filter (where currency = ${REVENUE_CURRENCY}), 0)::text as refunds,
+           count(*) filter (where currency <> ${REVENUE_CURRENCY})::int as foreign_periods
       from public.billing_periods
      where settlement in ('settled', 'refunded', 'partially_refunded', 'chargeback')
        and coalesce(settled_at, period_start) >= ${start}
        and coalesce(settled_at, period_start) < ${end}
      group by 1, 2
   `;
+  const foreignByChannel = new Map<string, number>();
+  for (const r of rows) {
+    if (r.foreign_periods > 0) {
+      foreignByChannel.set(r.channel, (foreignByChannel.get(r.channel) ?? 0) + r.foreign_periods);
+    }
+  }
+  const currencyNote = foreignCurrencyNote(foreignByChannel);
   const byCell = new Map(rows.map((r) => [`${r.month}|${r.channel}`, r]));
   const monthBodies: RevenueMonth[] = months.map((month) => {
     const channels = CHANNELS.map((channel) => {
@@ -196,7 +221,7 @@ export async function loadRevenueMonths(
     asOf: now.toISOString(),
     months: monthBodies,
     feeRates: rates,
-    notes: [...STORE_FEE_RATES_NOTES],
+    notes: [...STORE_FEE_RATES_NOTES, ...(currencyNote === null ? [] : [currencyNote])],
     source: REVENUE_SOURCE,
     definition: REVENUE_DEFINITION,
   };

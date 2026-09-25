@@ -10,7 +10,7 @@ import { generatePairingCode, pairingCodeHash } from '../auth/pairing.ts';
 import { acceptsTestProviderConsent } from '../config.ts';
 import type { Tx } from '../db.ts';
 import { ApiError, businessRule } from '../errors.ts';
-import { hasVerifiedConsent } from '../services/consent.ts';
+import { consentAllowsChildAccess, hasVerifiedConsent } from '../services/consent.ts';
 import { assertRecentUnlock, currentFamilyId, requireParent } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
 import { enforceRateLimit, RATE_RULES } from '../middleware/rate-limit.ts';
@@ -153,6 +153,18 @@ export function familyRoutes(): Hono<AppEnv> {
         {
           rule: 'CHILD_NOT_ACTIVE',
         },
+      );
+    }
+    // Withdrawn (or otherwise no longer verified) consent stops new devices too (CS-R1-01).
+    const consentOk = await deps.db.asService((tx) =>
+      consentAllowsChildAccess(tx, familyId, {
+        allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
+      }),
+    );
+    if (!consentOk) {
+      throw businessRule(
+        'CONSENT_REQUIRED',
+        'Parental consent is needed before a device can be paired. Give consent again on the family page first.',
       );
     }
     const code = generatePairingCode(deps.random);

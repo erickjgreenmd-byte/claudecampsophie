@@ -297,6 +297,57 @@ async function loadRecords(tx: Tx, familyId: string): Promise<EntitlementRecord[
   }));
 }
 
+/** The provider state of a ledger row, without its observation instants. */
+function materialState(r: ProviderSubscriptionSnapshot): string {
+  return JSON.stringify([
+    r.productId,
+    r.status,
+    r.periodStart.toISOString(),
+    r.periodEnd.toISOString(),
+    r.autoRenew,
+    r.pendingProductId ?? null,
+    r.pendingEffectiveAt?.toISOString() ?? null,
+  ]);
+}
+
+/**
+ * BILL-R1-2: every snapshot reaching the ledger comes from a COMPLETE provider fetch (never from an
+ * event payload), and a complete fetch is authoritative for state removals. RevenueCat derives no
+ * last-modified instant, so `providerUpdatedAt` is the latest of the markers present; when a
+ * marker is cleared (auto-renew turned back on clears `unsubscribe_detected_at`, a recovered
+ * billing issue clears `billing_issues_detected_at`) the new snapshot's instant falls back to an
+ * older one and the domain would discard the provider's current answer as stale until the next
+ * renewal. A fetch made LATER than the stored observation that reports DIFFERENT state is
+ * therefore ordered by its fetch instant. Every LATER fetch of the same, unchanged state still
+ * carries the provider's older instant (the stamp lives only in our row), so it is ordered by the
+ * stored observation instead: the domain records it as `refreshed` and `fetched_at` advances,
+ * which the stale-entitlement sweep relies on to rotate past the family (BILL-R1-3). A fetch made
+ * earlier (two reconciliations racing, the older one committing last) keeps the provider's own
+ * instant and stays ignored, and a fetch at the very same instant falls back to the domain's
+ * fail-closed tie rule. Replayed webhook events never reach this code with their own timestamps.
+ */
+function orderCompleteFetch(
+  records: readonly EntitlementRecord[],
+  snapshot: ProviderSubscriptionSnapshot,
+): ProviderSubscriptionSnapshot {
+  const stored = records.find(
+    (r) =>
+      r.channel === snapshot.channel &&
+      r.providerSubscriptionId === snapshot.providerSubscriptionId,
+  );
+  if (!stored) return snapshot;
+  const storedObservedAt = Math.min(stored.providerUpdatedAt.getTime(), stored.fetchedAt.getTime());
+  if (
+    snapshot.providerUpdatedAt.getTime() < storedObservedAt &&
+    snapshot.fetchedAt.getTime() > stored.fetchedAt.getTime()
+  ) {
+    return materialState(snapshot) !== materialState(stored)
+      ? { ...snapshot, providerUpdatedAt: snapshot.fetchedAt }
+      : { ...snapshot, providerUpdatedAt: new Date(storedObservedAt) };
+  }
+  return snapshot;
+}
+
 /**
  * Reconciles fetched provider snapshots into the family ledger and recomputes paid capacity (MAX,
  * never a sum). If capacity falls below the number of assigned slots, the most recently assigned
@@ -322,7 +373,13 @@ export async function applySnapshots(
   });
   for (const snapshot of bounded) {
     records = [
-      ...reconcileEntitlements(records, snapshot, mappings, runtimeEnvironment, now).records,
+      ...reconcileEntitlements(
+        records,
+        orderCompleteFetch(records, snapshot),
+        mappings,
+        runtimeEnvironment,
+        now,
+      ).records,
     ];
   }
   for (const r of records) {
@@ -394,6 +451,13 @@ function resolveSlots(
   return mapping ? mapping.paidSlots : null;
 }
 
+/**
+ * The only currency the price table, the donation rule and the revenue view are defined in. The
+ * launch market is the United States (Owner action #38); a period in any other currency is still
+ * recorded with its currency, audited, and left out of every USD sum (BILL-R1-5).
+ */
+export const REVENUE_CURRENCY = 'USD';
+
 /** Records a provider billing period (idempotent by channel + provider id). Returns its row id. */
 export async function recordBillingPeriod(
   tx: Tx,
@@ -409,7 +473,7 @@ export async function recordBillingPeriod(
   const discountCents =
     period.reportedDiscountCents ??
     (period.discountSources.length > 0 ? Math.max(0, regularCents - period.chargedCents) : 0);
-  const [row] = await tx<{ id: string }[]>`
+  const [row] = await tx<{ id: string; inserted: boolean }[]>`
     insert into public.billing_periods (family_id, channel, provider_period_id, kind, period_start, period_end, paid_slots,
       regular_amount_cents, charged_amount_cents, discount_cents, discount_sources, settlement, settled_at, currency)
     values (${familyId}, ${period.channel}, ${period.providerPeriodId}, ${period.kind}, ${period.periodStart}, ${period.periodEnd},
@@ -419,8 +483,18 @@ export async function recordBillingPeriod(
       settlement = case when public.billing_periods.settlement in ('refunded', 'partially_refunded', 'chargeback')
                         then public.billing_periods.settlement else 'settled' end,
       settled_at = coalesce(public.billing_periods.settled_at, excluded.settled_at)
-    returning id
+    returning id, (xmax = 0) as inserted
   `;
+  if (row!.inserted && period.currency !== REVENUE_CURRENCY) {
+    // BILL-R1-5 / Owner action #38: launch is US-only and every amount downstream is USD cents.
+    // The period is kept with its currency for the record; the owner is told (no amounts: the
+    // audit trail states the fact, the period row holds the figure).
+    await tx`
+      insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+      values (${familyId}, 'system', 'billing.unexpected_currency', 'billing_period', ${period.providerPeriodId},
+              ${JSON.stringify({ channel: period.channel, currency: period.currency })}::text::jsonb)
+    `;
+  }
   // A refund that arrived before this charge is applied now (RV-lead-billing-p17-3).
   const [parked] = await tx<{ kind: SettlementEvent; refunded_cents: number | null }[]>`
     delete from public.pending_refunds
@@ -543,7 +617,12 @@ export type SettlementEvent = 'refund' | 'partial_refund' | 'chargeback' | 'char
  * Refund/chargeback (and a won dispute): marks the period and records at most one donation
  * reversal (or reinstatement). A full `refund` with a provider amount below the charge is recorded
  * as partial (RV-lead-billing-p17-7). An event for a period we have not recorded yet is parked in
- * `pending_refunds` and applied when the period arrives (RV-lead-billing-p17-3).
+ * `pending_refunds` and applied when the period arrives (RV-lead-billing-p17-3). A `chargeback`
+ * reverses the disputed amount, or the whole charge when the provider reports none (BILL-R1-1):
+ * the revenue view and the admin case detail read `refunded_cents`, so a lost dispute must never
+ * look like kept revenue. A `chargeback_reversed` (dispute won) gives that amount back, so the
+ * period returns to settled/0 (and the $1 donation is reinstated) unless an earlier partial refund
+ * remains; `refundedCents` is then the reversed amount, null meaning the whole charge.
  */
 export async function applyRefund(
   tx: Tx,
@@ -553,6 +632,9 @@ export async function applyRefund(
   kind: SettlementEvent,
   refundedCents: number | null,
 ): Promise<{ adjusted: boolean; pending?: boolean }> {
+  if (refundedCents !== null && (!Number.isSafeInteger(refundedCents) || refundedCents < 0)) {
+    throw new RangeError('refundedCents must be null or a non-negative integer number of cents');
+  }
   const [current] = await tx<{ id: string; charged_amount_cents: number; settlement: string }[]>`
     select id, charged_amount_cents, settlement from public.billing_periods
      where family_id = ${familyId} and channel = ${channel} and provider_period_id = ${providerPeriodId}
@@ -576,6 +658,13 @@ export async function applyRefund(
     kind === 'refund' && refundedCents !== null && refundedCents < current.charged_amount_cents
       ? 'partial_refund'
       : kind;
+  // BILL-R1-1: a chargeback reverses the disputed amount (the whole charge when the provider
+  // reports none) ON TOP of what was refunded before it, capped at the charge, so the revenue view
+  // never counts clawed-back money as kept. A repeated dispute event for a period already in
+  // 'chargeback' only ever raises the figure (idempotent replay, never a double count). A won
+  // dispute (chargeback_reversed) gives the reversed amount back: with Stripe's dispute `amount`
+  // (always present on a Dispute object) an earlier genuine partial refund survives the win as
+  // 'partially_refunded'; without an amount the whole charge is treated as disputed and restored.
   const [period] = await tx<
     {
       id: string;
@@ -586,14 +675,24 @@ export async function applyRefund(
     update public.billing_periods
        set settlement = case
              when ${effective} = 'chargeback_reversed' then
-               case when settlement = 'chargeback' then 'settled' else settlement end
+               case when settlement <> 'chargeback' then settlement
+                    when greatest(0, refunded_cents - coalesce(${refundedCents}::int, charged_amount_cents)) > 0
+                      then 'partially_refunded'
+                    else 'settled' end
              when ${effective} = 'chargeback' then 'chargeback'
              when ${effective} = 'partial_refund' then
                case when settlement in ('refunded', 'chargeback') then settlement else 'partially_refunded' end
              else 'refunded' end,
            refunded_cents = case
-             when ${effective} = 'chargeback_reversed' then refunded_cents
+             when ${effective} = 'chargeback_reversed' then
+               case when settlement <> 'chargeback' then refunded_cents
+                    else greatest(0, refunded_cents - coalesce(${refundedCents}::int, charged_amount_cents)) end
              when ${effective} = 'refund' then greatest(refunded_cents, ${refundedCents ?? 0}, charged_amount_cents)
+             when ${effective} = 'chargeback' then
+               case when settlement = 'chargeback'
+                      then greatest(refunded_cents, coalesce(${refundedCents}::int, charged_amount_cents))
+                    else least(charged_amount_cents,
+                               refunded_cents + coalesce(${refundedCents}::int, charged_amount_cents)) end
              else greatest(refunded_cents, ${refundedCents ?? 0}) end
      where id = ${current.id}
      returning id, settlement, refunded_cents
@@ -708,8 +807,12 @@ export async function resolveUnreachableRedemptions(
 
 type Channel = BillingChannel;
 
-/** Provider states after which a subscription can never grant again without a new observation. */
-const TERMINAL_STATUSES: ReadonlySet<EntitlementStatus> = new Set([
+/**
+ * Provider states after which a subscription can never grant again without a new observation.
+ * The scheduled re-verification sweep skips rows in these states too (BILL-R1-3): a refunded row
+ * stays past its period end forever and would otherwise be re-fetched on every tick.
+ */
+export const TERMINAL_STATUSES: ReadonlySet<EntitlementStatus> = new Set([
   'expired',
   'revoked',
   'refunded',

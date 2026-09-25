@@ -516,14 +516,15 @@ describe('consent (spec P3, AC_ACCESS_01/02)', () => {
     expect((await errorOf(res)).rule).toBe('CONSENT_ALREADY_VERIFIED');
   });
 
-  it('withdrawal needs step-up, stops processing jobs and keeps privacy jobs', async () => {
+  it('withdrawal needs step-up, stops processing jobs and keeps privacy and safety-flag jobs', async () => {
     const jobs = await api.db.sql<{ id: string; kind: string }[]>`
       insert into public.jobs (kind, idempotency_key, family_id, status) values
         ('scan_process', ${`scan:${consentFam.familyId}:1`}, ${consentFam.familyId}, 'queued'),
         ('daily_set_generate', ${`daily:${consentFam.familyId}:1`}, ${consentFam.familyId}, 'failed_retryable'),
         ('deletion_purge', ${`purge:${consentFam.familyId}:1`}, ${consentFam.familyId}, 'queued'),
         ('scan_process', ${`scan:${consentFam.familyId}:2`}, ${consentFam.familyId}, 'succeeded'),
-        ('scan_process', ${`scan:${other.familyId}:1`}, ${other.familyId}, 'queued')
+        ('scan_process', ${`scan:${other.familyId}:1`}, ${other.familyId}, 'queued'),
+        ('safety_flag_email', ${`safety-flag-email:${consentFam.familyId}:1`}, ${consentFam.familyId}, 'queued')
       returning id, kind`;
 
     const denied = await api.request('/v1/consent/withdraw', { method: 'POST', token, body: {} });
@@ -538,11 +539,14 @@ describe('consent (spec P3, AC_ACCESS_01/02)', () => {
     const statuses = await api.db.sql<{ id: string; status: string }[]>`
       select id, status from public.jobs where id in ${api.db.sql(jobs.map((j) => j.id))}`;
     const byId = new Map(statuses.map((s) => [s.id, s.status]));
+    // The safety-flag email stays queued (CS-R1-02): every flag reaches the parent (owner
+    // decision 2026-09-25) and its payload is a report id, not child data.
     expect(jobs.map((j) => byId.get(j.id))).toEqual([
       'cancelled',
       'cancelled',
       'queued',
       'succeeded',
+      'queued',
       'queued',
     ]);
 

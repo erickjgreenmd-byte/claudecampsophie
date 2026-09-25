@@ -50,6 +50,19 @@ source, and none is sandbox-verified (Amazon App Tester needs the owner's develo
 | Distribution | APK from the `preview-amazon` / `production-amazon` EAS profiles, uploaded by hand (EAS Submit has no Amazon target) | `candidate` |
 | Push notifications on Fire OS | No Google services, so no FCM; Amazon Device Messaging would be needed later — none today | `candidate` |
 
+## 2b. RevenueCat webhook event shapes and currencies (billing hardening round 1)
+
+RevenueCat's docs (https://www.revenuecat.com/docs/integrations/webhooks/event-types-and-fields) were not
+reachable from this environment (egress policy), so the rows below are `candidate` and are to be confirmed by
+the owner against the live docs before the first production webhook (Owner action: lead adds the row).
+
+| Item | What the code does | Evidence |
+|---|---|---|
+| `TRANSFER` field list (BILL-R1-4) | The body schema is a union: a `TRANSFER` requires non-empty `transferred_from` and `transferred_to` and accepts `app_user_id` / `original_app_user_id` / `aliases` only when present; every other event type requires `app_user_id`. The documented sample is understood to carry exactly `app_id`, `event_timestamp_ms`, `id`, `store`, `transferred_from`, `transferred_to`, `type` — no `app_user_id`, `product_id` or `transaction_id` — and `apps/api/tests/billing-hardening.review.test.ts` posts that shape verbatim. Every family named in either list is re-verified from its own complete provider fetch | `candidate` — confirm the sample's field list, and whether `environment` is present on `TRANSFER` |
+| `environment` on `TRANSFER` | A `TRANSFER` that does not state `environment` is still processed: nothing from its payload is written, and each family's fetch is environment-checked by the ledger. Every other event without `environment` is processed only under the sandbox runtime (RV-lead-billing-p17-4 unchanged) | `candidate` |
+| Refused shapes | A JSON body the schema refuses is answered 400 and traced once in `billing_provider_events` (status `ignored`, error `UNEXPECTED_SHAPE`, digest + id + type, never the body), so it shows in the admin attention list; a body without an id and type is only counted in the logs | `doc-verified` against the code (tested) |
+| Non-USD `currency` / `price_in_purchased_currency` (BILL-R1-5) | Launch is US-only (Owner action #38). A period in another currency is recorded with its currency, audited as `billing.unexpected_currency` (family, channel, currency; no amounts) and left out of every USD revenue sum; the revenue response names the excluded count per channel in its notes. Restricting store availability to the United States is the owner's setting in each store console; the `$1` donation exclusion for such a period is a lead change in the domain (see the hardening report) | `candidate` — confirm that the webhook's `currency` is the purchase currency (ISO 4217) and that `price` is the USD amount |
+
 ## 3. Design consequences implemented in code
 
 1. **Internal code first, provider offer second.** A family enters a PencilLift code; the server validates it

@@ -193,6 +193,7 @@ interface PeriodRow {
   paid_slots: number;
   regular_amount_cents: number;
   charged_amount_cents: number;
+  currency: string;
   discount_cents: number;
   discount_sources: BillingPeriodFact['discountSources'][number][];
   settlement: BillingPeriodFact['settlement'];
@@ -211,6 +212,7 @@ function toFact(row: PeriodRow): BillingPeriodFact {
     paidSlots: row.paid_slots,
     regularAmountCents: row.regular_amount_cents,
     chargedAmountCents: row.charged_amount_cents,
+    currency: row.currency,
     discountCents: row.discount_cents,
     discountSources: row.discount_sources,
     settlement: row.settlement,
@@ -271,6 +273,7 @@ export async function runDonationAccrual(
         join public.families f on f.id = p.family_id and f.deleted_at is null
        where p.kind = 'subscription_period' and p.period_start >= ${windowStart} and p.period_start < ${windowEnd}
          and p.settlement = 'settled' and p.settled_at is not null and p.refunded_cents = 0
+         and p.currency = 'USD'
          and exists (
            select 1 from public.family_school_designations d
             where d.family_id = p.family_id
@@ -294,7 +297,7 @@ export async function runDonationAccrual(
       if (!live || live.deleted_at) return { inserted: 0, skipped: 0 };
       const periods = await tx<PeriodRow[]>`
         select id, family_id, channel, provider_period_id, kind, period_start, period_end, paid_slots, regular_amount_cents,
-               charged_amount_cents, discount_cents, discount_sources, settlement, settled_at, refunded_cents
+               charged_amount_cents, currency, discount_cents, discount_sources, settlement, settled_at, refunded_cents
           from public.billing_periods
          where family_id = ${familyId} and period_start >= ${windowStart} and period_start < ${windowEnd}
       `;

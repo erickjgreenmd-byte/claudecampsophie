@@ -36,6 +36,11 @@ export interface BillingPeriodFact {
   readonly regularAmountCents: Cents;
   /** Amount the family was charged for the subscription itself (excluding tax). */
   readonly chargedAmountCents: Cents;
+  /**
+   * ISO 4217 code of the charge; absent means USD. Amounts are minor units of this currency, so
+   * only USD periods compare with the approved price table (BILL-R1-5; Owner action #38).
+   */
+  readonly currency?: string;
   /** Total discount applied to this period's subscription charge (0 when none). */
   readonly discountCents: Cents;
   readonly discountSources: readonly DiscountSource[];

@@ -307,9 +307,55 @@ describe('deletion requests (spec P4, E4 Deletion; AC_ACCESS_10, AC_SECURITY_05)
     expect((await api.request('/v1/deletion')).status).toBe(401);
   });
 
+  it('[DB-R1-02] the owner can start a new family right after requesting deletion, before the purge runs', async () => {
+    // Migration 0840: the deletion request releases the family's memberships with the tombstone.
+    // Before it, the owner's membership stayed 'active' on the invisible family until the purge job
+    // ran, so POST /v1/families answered 409 "You already have a family" while GET /v1/family
+    // answered 404 (indefinitely if the purge dead-lettered).
+    const { family, token: t } = await unlockedFamily(1);
+    const res = await api.request('/v1/deletion', {
+      method: 'POST',
+      token: t,
+      body: { scope: 'family' },
+    });
+    expect(res.status).toBe(202);
+    const { deletion } = deletionRequestResponseSchema.parse(await res.json());
+    expect((await api.request('/v1/family', { token: t })).status).toBe(404);
+    const [job] = await api.db.sql<{ status: string }[]>`
+      select status from public.jobs where idempotency_key = ${'deletion:' + deletion.id}`;
+    expect(job!.status).toBe('queued'); // nothing has purged yet
+
+    const create = await api.request('/v1/families', {
+      method: 'POST',
+      token: t,
+      body: { displayName: 'Fresh start', timezone: 'America/Chicago' },
+    });
+    expect(create.status).toBe(201);
+    const { familyId } = await json<{ familyId: string }>(create);
+    expect(familyId).not.toBe(family.familyId);
+    const fresh = await api.request('/v1/family', { token: t });
+    expect(fresh.status).toBe(200);
+    expect((await json<{ id: string }>(fresh)).id).toBe(familyId);
+    // The requester still follows the old family's deletion to completion.
+    const seen = async () =>
+      deletionRequestsResponseSchema
+        .parse(await (await api.request('/v1/deletion', { token: t })).json())
+        .requests.map((r) => [r.id, r.status]);
+    expect(await seen()).toEqual([[deletion.id, 'requested']]);
+    await runPurge(deletion.id);
+    expect(await seen()).toEqual([[deletion.id, 'completed']]);
+    // The purge touched only the old family.
+    expect((await api.request('/v1/family', { token: t })).status).toBe(200);
+    expect(await countRows('public.child_profiles', 'family_id', family.familyId)).toBe(0);
+  });
+
   it('another guardian of a deleted family sees its deletion; a removed guardian does not', async () => {
     // RV-privacy-5 (spec P14 deleted-account state): the tombstoned family is invisible to RLS, so
-    // the list is read for the verified caller's own active memberships only.
+    // the list is read for the verified caller's own memberships only.
+    // DB-R1-02 (migration 0840): the deletion request now releases the guardian's membership with
+    // the tombstone (revoked_at = families.deletion_requested_at), so the route must count a
+    // membership the family's own deletion released as still "in the deleted family" while the
+    // purge is pending; a guardian the owner removed earlier (revoked_at before the request) is not.
     const { family, token: t } = await unlockedFamily(1);
     const guardian = async (status: 'active' | 'revoked'): Promise<string> => {
       const userId = await api.db.createUser();

@@ -48,6 +48,11 @@ const RULES = {
  * run (cancelling them would keep child data longer), a parent's export is their own data, and
  * billing/promotion reconciliation must finish so provider state never goes unreconciled. Using a
  * keep-list (not a cancel-list) means any new child-data job kind is cancelled by default.
+ *
+ * `safety_flag_email` stays too (CS-R1-02): the owner decision of 2026-09-25 is that every safety
+ * flag reaches the parent, the job's payload is the report id only (no child data), and the email
+ * tells the parent about a flag already filed rather than processing anything new. Cancelling it
+ * would leave the report 'not_sent' forever, because a cancelled job never dead-letters.
  */
 const JOBS_KEPT_ON_CONSENT_WITHDRAWAL = [
   'deletion_purge',
@@ -59,6 +64,7 @@ const JOBS_KEPT_ON_CONSENT_WITHDRAWAL = [
   'promo_reconcile',
   'donation_accrue',
   'payout_prepare',
+  'safety_flag_email',
 ] as const;
 
 interface Membership {
@@ -646,13 +652,32 @@ export function guardiansRoutes(): Hono<AppEnv> {
            and status in ('queued', 'failed_retryable')
            and kind <> all(${JOBS_KEPT_ON_CONSENT_WITHDRAWAL})
         returning id`;
+      // Withdrawal stops the children's own traffic, not only server-side processing (CS-R1-01):
+      // the same statements as archiving (routes/family.ts) sign every paired device out, and
+      // unredeemed pairing codes stop working. Profiles keep their status and paid slots (releasing
+      // a slot is a billing decision); pairing, refresh and practice generation re-check consent.
+      const revokedSessions = await tx<{ id: string }[]>`
+        update public.child_sessions set revoked_at = ${now}, revoke_reason = 'consent_withdrawn'
+         where family_id = ${membership.familyId} and revoked_at is null
+        returning id`;
+      const revokedDevices = await tx<{ id: string }[]>`
+        update public.child_devices set revoked_at = ${now}
+         where family_id = ${membership.familyId} and revoked_at is null
+        returning id`;
+      await tx`
+        update private.child_pairing_codes set consumed_at = ${now}
+         where family_id = ${membership.familyId} and consumed_at is null`;
       await insertAudit(tx, {
         familyId: membership.familyId,
         actorUserId: parent.userId,
         action: 'consent.withdrawn',
         targetType: 'consent_record',
         targetId: latest.id,
-        metadata: { cancelledJobs: cancelled.length },
+        metadata: {
+          cancelledJobs: cancelled.length,
+          revokedSessions: revokedSessions.length,
+          revokedDevices: revokedDevices.length,
+        },
       });
       return { kind: 'withdrawn' as const, cancelledJobs: cancelled.length };
     });
