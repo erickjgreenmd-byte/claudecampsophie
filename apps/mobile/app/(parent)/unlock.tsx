@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Linking, Switch, Text, TextInput, View } from 'react-native';
+import { Switch, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
 import { colors } from '@pencillift/ui-tokens';
 import { enterParentMode } from '../../src/lib/mode.ts';
@@ -22,6 +22,8 @@ import {
   styles,
   Title,
   useRelockOnBackground,
+  GatedButton,
+  openExternalUrl,
 } from '../../src/family/ui.tsx';
 import {
   lockParentArea,
@@ -197,10 +199,13 @@ function PinResetHelp() {
     <>
       <Body muted>{guidance.text}</Body>
       {url ? (
-        <Button
+        // The unlock screen sits after sign-in but before the PIN, so leaving the app for the
+        // portal is a grown-up's step behind the parental gate (Apple 1.3 / Play Families).
+        <GatedButton
           label="Reset PIN in the parent portal"
+          purpose="open the parent portal"
           secondary
-          onPress={() => void Linking.openURL(url).catch(() => undefined)}
+          onPassed={() => void openExternalUrl(url)}
         />
       ) : null}
     </>

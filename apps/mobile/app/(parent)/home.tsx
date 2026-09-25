@@ -18,6 +18,7 @@ import {
   Card,
   ErrorBox,
   Heading,
+  LegalLinks,
   Loading,
   Notice,
   ParentAccessState,
@@ -119,6 +120,8 @@ function FamilyHome({ api }: { api: ApiClient }) {
       />
       <Button label="Privacy and data" secondary onPress={() => router.push('/(parent)/privacy')} />
       <Button label="Support" secondary onPress={() => router.push('/(parent)/support')} />
+      <Body muted>Our full policies, on the parent portal:</Body>
+      <LegalLinks />
 
       {guardianView ? (
         <>

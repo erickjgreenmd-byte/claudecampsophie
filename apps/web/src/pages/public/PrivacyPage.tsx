@@ -1,17 +1,37 @@
 import { Link } from 'react-router';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
-import { lead, muted, PageTitle, Section, SupportEmail } from './common.tsx';
+import {
+  DraftOnly,
+  lead,
+  LegalStatus,
+  PageTitle,
+  PAYMENT_STORES,
+  ReviewedOnly,
+  Section,
+  SupportEmail,
+} from './common.tsx';
 
 /**
- * Draft privacy policy (spec P3, P4, P16.1, P15 privacy URL). It must describe the implemented
- * design exactly: consent before child data, private storage, 30-day raw-scan retention,
- * tombstone-first deletion within 30 days, AI only under zero data retention, and no ads or
- * affiliate links in children's areas. Anything not yet decided is marked "to be confirmed".
+ * Privacy policy (spec P3, P4, P16.1, P15 privacy URL). It must describe the implemented design
+ * exactly: consent before child data, private storage, 30-day raw-scan retention, tombstone-first
+ * deletion within 30 days, AI only under zero data retention, and no ads or affiliate links in
+ * children's areas.
  *
- * Limits are stated, not glossed over (RV-public-site-1, -2, -4): photo metadata is removed on the
- * device where possible and always by the scan job before any processing (image-metadata.ts); export
- * files are not built by any deployed job yet; the retention exceptions match
- * app.purge_family_data (billing, consent records, audit log, family tombstone, adult sign-in).
+ * Draft vs reviewed (WEB-06 / APL-20): while `VITE_LEGAL_REVIEWED` is not "true" the page carries
+ * the DraftBanner, "to be confirmed" notes and the placeholder mailbox. A reviewed build shows the
+ * effective date (`VITE_LEGAL_EFFECTIVE_DATE`) and the confirmed mailbox (`VITE_SUPPORT_EMAIL`)
+ * and none of the draft wording; legal.test.tsx enforces both states.
+ *
+ * Limits are stated, not glossed over (RV-public-site-1, -3, -4): photo metadata is removed on the
+ * device where possible and always by the scan job before any processing (image-metadata.ts); the
+ * retention exceptions match app.purge_family_data (billing, consent records, audit log, family
+ * tombstone) plus the pseudonymous auth id after account closure (migration 0830).
+ *
+ * Notices are by email only (APL-28 / PLAY-25): the apps register no push notification channel.
+ * IP addresses: the API reads the client address only when a pairing code is redeemed
+ * (routes/child-auth.ts, `cf-connecting-ip`) and keeps it only as a short-lived abuse counter in
+ * private.rate_limit_buckets (cleared about a day after its 15-minute window); operational log
+ * events carry no address (middleware/context.ts LogEvent).
  */
 export default function PrivacyPage() {
   return (
@@ -20,10 +40,12 @@ export default function PrivacyPage() {
       <PageTitle title="Privacy policy" />
       <h1>Privacy policy</h1>
       <p style={lead}>
-        PencilLift is built for families with children in grades K–8. This draft explains what
-        information PencilLift collects, how it is used, and the choices parents have.
+        PencilLift is built for families with children in grades K–8. This{' '}
+        <DraftOnly>draft</DraftOnly>
+        <ReviewedOnly>policy</ReviewedOnly> explains what information PencilLift collects, how it is
+        used, and the choices parents have.
       </p>
-      <p style={muted}>Status: draft, not yet in effect. Effective date to be confirmed.</p>
+      <LegalStatus />
 
       <Section title="The short version">
         <ul>
@@ -63,8 +85,7 @@ export default function PrivacyPage() {
             keep identity documents unless that is required and reviewed.
           </li>
           <li>
-            Subscription status reported by the App Store or Google Play. We don’t receive your card
-            number.
+            Subscription status reported by {PAYMENT_STORES}. We don’t receive your card number.
           </li>
         </ul>
         <h3>About children</h3>
@@ -103,8 +124,9 @@ export default function PrivacyPage() {
             Raw homework photos are deleted after 30 days by default. You can delete them sooner.
           </li>
           <li>
-            Learning history is kept while your account is active, with a yearly review for you and
-            deletion after a period of inactivity (proposed: 12 months, to be confirmed).
+            Learning history is kept while your account is active. Our planned rule is deletion
+            after 12 months of inactivity, with a notice to you first
+            <DraftOnly> (to be confirmed)</DraftOnly>. You can delete it sooner at any time.
           </li>
         </ul>
       </Section>
@@ -143,17 +165,34 @@ export default function PrivacyPage() {
 
       <Section title="Who we share information with">
         <p>
-          We share information only with service providers that help run PencilLift, such as hosting
-          and database services, the consent provider, the AI provider (under zero data retention),
-          and the App Store or Google Play for payments. The final list of providers is to be
-          confirmed. We may also disclose information when the law requires it.
+          We share information only with service providers that help run PencilLift: our hosting and
+          database services (Cloudflare and Supabase), our subscription service (RevenueCat), our
+          email service (Resend), the consent provider that verifies parental consent, the AI
+          provider (OpenAI, under zero data retention), and {PAYMENT_STORES} for payments. Each
+          provider may use the information only to provide its service to us. We may also disclose
+          information when the law requires it.
         </p>
       </Section>
 
-      <Section title="Notifications">
+      <Section title="Notices and email">
         <p>
-          Notifications go to parents’ devices by default and use general wording. They never
-          include answers, homework photos or sensitive details about how your child is doing.
+          We contact parents by email: for example about consent, your subscription, a safety
+          notice, an inactivity notice or changes to this policy. PencilLift does not send push
+          notifications. Emails use general wording and never include answers, homework photos or
+          sensitive details about how your child is doing.
+        </p>
+      </Section>
+
+      <Section title="IP addresses and technical information">
+        <p>
+          When a device connects to PencilLift, our hosting provider (Cloudflare) sees the device’s
+          IP address in order to deliver the connection, as the host of every website does. Our own
+          servers do not store IP addresses with your account or your child’s information, and IP
+          addresses are never written to our own logs. The one exception is abuse protection: when a
+          device redeems a pairing code, the network address (for IPv6, its prefix) is kept as a
+          counter for a short time and deleted within about a day. It is never linked to a family or
+          a child. Our sign-in service (Supabase) records parent sign-in events, including the
+          address used, in its own security log; children never sign in through it.
         </p>
       </Section>
 
@@ -161,9 +200,8 @@ export default function PrivacyPage() {
         <ul>
           <li>Review and correct your child’s profile.</li>
           <li>
-            Ask for a copy (export) of your family’s information. Export files aren’t available yet:
-            a request is saved, but there is nothing to download until the export service is
-            switched on.
+            Ask for a copy (export) of your family’s information. Files are prepared within minutes
+            and can be downloaded from the parent portal for a limited time.
           </li>
           <li>Delete homework photos, a child’s data, or your whole account.</li>
           <li>Withdraw consent for your child’s information to be processed.</li>
@@ -174,8 +212,9 @@ export default function PrivacyPage() {
         <p>
           When you ask us to delete your account or a child’s data, processing stops immediately:
           your child’s devices are signed out and pending work is cancelled. Deletion from our
-          active systems completes within 30 days. Backups expire on a documented schedule (length
-          to be confirmed). Only the family owner can delete the whole family account.
+          active systems completes within 30 days. Backups expire on a documented schedule
+          <DraftOnly> (length to be confirmed)</DraftOnly>. Only the family owner can delete the
+          whole family account.
         </p>
         <p>After deletion we keep only:</p>
         <ul>
@@ -192,11 +231,16 @@ export default function PrivacyPage() {
             When the whole family account is deleted, a minimal record that the family was deleted,
             so late store notices can’t bring any data back.
           </li>
+          <li>
+            When a parent sign-in is closed, a pseudonymous account id that those records point to.
+            The email address, phone number and password are removed from it.
+          </li>
         </ul>
         <p>
-          Deleting the whole family account does not close your parent sign-in (your email address
-          and password), but that sign-in no longer opens any of the family’s information. To have
-          the sign-in closed as well, email us.
+          When the family owner deletes the whole family account, the owner’s parent sign-in closes
+          automatically once that deletion has finished. Any parent can also close their own sign-in
+          from the app or the parent portal (“Delete my account”). If you can no longer sign in,
+          email us.
         </p>
         <p>
           <Link to="/account-deletion">How to delete your account</Link>
@@ -214,15 +258,20 @@ export default function PrivacyPage() {
 
       <Section title="Changes to this policy">
         <p>
-          We will tell parents about important changes before they take effect and ask for new
-          consent where it is required.
+          We will tell parents by email about important changes before they take effect and ask for
+          new consent where it is required.
         </p>
       </Section>
 
       <Section title="Contact">
         <p>
-          Email <SupportEmail />. Our business name, mailing address and phone number for privacy
-          questions are to be confirmed.
+          Email <SupportEmail /> with privacy questions, including requests to review, correct or
+          delete your child’s information.
+          <DraftOnly>
+            {' '}
+            Our business name, mailing address and phone number for privacy questions are to be
+            confirmed.
+          </DraftOnly>
         </p>
       </Section>
     </>

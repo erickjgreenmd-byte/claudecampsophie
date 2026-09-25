@@ -11,3 +11,4 @@ export * from './monetization.ts';
 export * from './billing.ts';
 export * from './support.ts';
 export * from './admin-ops.ts';
+export * from './account.ts';

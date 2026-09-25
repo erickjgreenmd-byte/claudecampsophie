@@ -1,5 +1,11 @@
 import { useEffect, useId, type CSSProperties, type ReactNode } from 'react';
 import { Link } from 'react-router';
+import {
+  formatEffectiveDate,
+  isLegalReviewed,
+  readLegalConfig,
+  type LegalConfig,
+} from '../../lib/config.ts';
 
 /**
  * Shared building blocks for the public site (spec P14 public screens). Styling uses the CSS
@@ -7,19 +13,78 @@ import { Link } from 'react-router';
  */
 
 /**
- * Decision: the support mailbox is a placeholder until the owner confirms it. It is shown as plain
- * text marked "to be confirmed", not as a mailto link, so nobody relies on an inbox that may not
- * be monitored yet for urgent, privacy or deletion requests.
+ * The mailbox shown while the owner has not confirmed one. It is plain text marked "to be
+ * confirmed", never a mailto link, so nobody relies on an inbox that may not be monitored yet for
+ * urgent, privacy or deletion requests. A reviewed build shows `VITE_SUPPORT_EMAIL` instead.
  */
-export const SUPPORT_EMAIL = 'support@pencillift.com';
+export const PLACEHOLDER_SUPPORT_EMAIL = 'support@pencillift.com';
+/** @deprecated Use {@link PLACEHOLDER_SUPPORT_EMAIL}; kept for existing imports. */
+export const SUPPORT_EMAIL = PLACEHOLDER_SUPPORT_EMAIL;
 
+/**
+ * The legal configuration as the page copy sees it. The startup gate in lib/config.ts has already
+ * thrown for a reviewed build that lacks a date or a mailbox, so a real build never reaches the
+ * fallback; it exists for tests that stub only `VITE_LEGAL_REVIEWED`, where the copy fails safe to
+ * the draft wording for the missing value.
+ */
+export function legalState(env: Readonly<Record<string, unknown>> = import.meta.env): LegalConfig {
+  try {
+    return readLegalConfig(env);
+  } catch {
+    return { reviewed: isLegalReviewed(env), effectiveDate: null, supportEmail: null };
+  }
+}
+
+/** Renders its children only while the page is a draft (legal review not recorded). */
+export function DraftOnly({ children }: { children: ReactNode }) {
+  return isLegalReviewed() ? null : <>{children}</>;
+}
+
+/** Renders its children only once legal review is recorded in the build. */
+export function ReviewedOnly({ children }: { children: ReactNode }) {
+  return isLegalReviewed() ? <>{children}</> : null;
+}
+
+/** "draft " while a draft, "" once reviewed; for link text such as "Read the draft privacy policy". */
+export function draftPrefix(): string {
+  return isLegalReviewed() ? '' : 'draft ';
+}
+
+/**
+ * The support mailbox. Reviewed build: the confirmed mailbox as a mailto link. Draft build: the
+ * configured or placeholder address as plain text marked "to be confirmed".
+ */
 export function SupportEmail() {
+  const { reviewed, supportEmail } = legalState();
+  if (reviewed && supportEmail) {
+    return <a href={`mailto:${supportEmail}`}>{supportEmail}</a>;
+  }
   return (
     <>
-      <strong>{SUPPORT_EMAIL}</strong> (to be confirmed)
+      <strong>{supportEmail ?? PLACEHOLDER_SUPPORT_EMAIL}</strong> (to be confirmed)
     </>
   );
 }
+
+/** The status line under a legal page's h1: the effective date once reviewed, else the draft note. */
+export function LegalStatus() {
+  const { reviewed, effectiveDate } = legalState();
+  if (reviewed && effectiveDate) {
+    return (
+      <p style={muted}>
+        Effective date: <time dateTime={effectiveDate}>{formatEffectiveDate(effectiveDate)}</time>.
+      </p>
+    );
+  }
+  return <p style={muted}>Status: draft, not yet in effect. Effective date to be confirmed.</p>;
+}
+
+/**
+ * The three payment channels, named together wherever the legal pages name any of them (AMZ-17):
+ * Apple's App Store (iPhone, iPad), Google Play (Android) and the Amazon Appstore (Fire tablets).
+ */
+export const PAYMENT_STORES =
+  'the App Store or Google Play (or the Amazon Appstore on a Fire tablet)';
 
 /** The six launch subjects (spec P1), in the order the product presents them. */
 export const SUBJECTS = [

@@ -28,6 +28,7 @@ import {
   Choice,
   ErrorBox,
   Heading,
+  LegalLinks,
   Loading,
   Notice,
   ParentAccessState,
@@ -488,6 +489,8 @@ function PreferencesCard({
         />
       </View>
       <Button label="Save choices" secondary busy={busy} onPress={() => void save()} />
+      <Body muted>How sponsor cards and shopping links use data is described in our policies:</Body>
+      <LegalLinks />
       {message ? (
         message.ok ? (
           <View accessibilityLiveRegion="polite">

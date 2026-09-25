@@ -1,16 +1,13 @@
 import { useId } from 'react';
+import { isLegalReviewed } from '../lib/config.ts';
 
 /**
  * True only when the build records that the owner and legal counsel reviewed the public legal and
  * support pages (`VITE_LEGAL_REVIEWED=true`). Any other value, including a missing one, keeps the
- * draft label visible.
- *
- * Decision: only the exact string "true" counts. A typo or "1" fails safe to showing the draft
- * banner, because presenting an unreviewed draft as a final policy is the worse error.
+ * draft label visible. The rule lives in lib/config.ts (one source for the banner, the page copy
+ * and the startup gate that requires the effective date and support mailbox in a reviewed build).
  */
-export function isLegalReviewed(env: Readonly<Record<string, unknown>> = import.meta.env): boolean {
-  return env.VITE_LEGAL_REVIEWED === 'true';
-}
+export { isLegalReviewed };
 
 /**
  * Labels a public page as a draft pending owner and legal review (spec P15 support, privacy and

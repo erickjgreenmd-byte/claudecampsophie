@@ -85,18 +85,21 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 5. **Webhooks**: RevenueCat → `https://<api>/webhooks/revenuecat` with the `Authorization` value; send a sandbox
    test event and confirm a `billing_provider_events` row with `status = 'processed'` or `'ignored'`.
 6. **Web portal**: `pnpm --filter @pencillift/web build` with the release public values (`VITE_API_BASE_URL`,
-   `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`; nothing else), then scan that exact build:
-   `node scripts/scan-secrets.mjs --artifacts apps/web/dist` must pass before it is uploaded (§3.2). Deploy
-   `apps/web/dist` (Cloudflare Pages or the chosen static host) with `Referrer-Policy: no-referrer` and a CSP
-   allowing only the API origin. Public pages (privacy, terms, support, account deletion) must be reachable
-   before store review (AC_DEPLOY_04).
+   `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, and the legal values once counsel has signed off;
+   nothing else — §3.5 lists them and the startup gate that refuses a build without them), then scan that
+   exact build: `node scripts/scan-secrets.mjs --artifacts apps/web/dist` must pass before it is uploaded
+   (§3.2). Deploy `apps/web/dist` to Cloudflare Pages: the security headers (CSP, `Referrer-Policy:
+   no-referrer`, HSTS, frame denial) ship in `dist/_headers` (§3.5); another static host must apply the
+   same headers itself. Public pages (privacy, terms, support, account deletion) must be reachable before
+   store review (AC_DEPLOY_04).
 7. **Mobile**: before each EAS build, with the `EXPO_PUBLIC_*` values that build uses, scan the public config it
    embeds: `cd apps/mobile && mkdir -p <dir> && npx expo config --type public --json > <dir>/app.config.json`,
    then `node scripts/scan-secrets.mjs --artifacts <dir>` must pass (§3.2).
    `eas build --platform ios --profile preview` and `eas build --platform android --profile preview`
-   (internal), then the `production` profile; `app.config.ts` needs `extra.eas.projectId` from the owner's Expo
-   project, app icons/splash (brand assets), and an iOS privacy manifest that declares the collected data types
-   (photos, email address, user content) — signing and store metadata per owner actions #5 and #11.
+   (internal), then the `production` profile. `app.config.ts` reads the project id and owner from
+   `EAS_PROJECT_ID` / `EXPO_OWNER` and fails loudly for a release profile without them, ships the brand icons and
+   splash, declares the collected data types in the iOS privacy manifest and export compliance (§3.4) — signing
+   and store metadata per owner actions #5, #11 and #34.
 8. **DNS and TLS**: point `pencillift.com` (public site and portal) and the API hostname at Cloudflare (owner action
    #8); certificates are issued by Cloudflare's edge. Enforce HTTPS-only and HSTS on both hostnames, and confirm the
    public legal pages load over HTTPS before store review. Record the hostnames in `docs/Connections.md`.
@@ -207,6 +210,128 @@ a different key (Owner action #29; `docs/Provider_Capability_Matrix.md` §2a):
 5. The first sandbox webhook from an Amazon purchase must arrive with store `AMAZON` and produce a billing period
    (BUG-113); record it in `docs/Connections.md`.
 
+### 3.4 Native build configuration (`apps/mobile/app.config.ts`, `apps/mobile/eas.json`)
+
+The config is dynamic: every rule runs when `eas build`, `expo prebuild` or `expo config` renders it, and a
+wrong value stops the build with a message that names the variable. Regression tests:
+`apps/mobile/src/app-config.test.ts` (loads the file under environment fixtures) and
+`apps/mobile/src/brand/assets.test.ts`. Prove the native output with `cd apps/mobile && npx expo config --type
+introspect` (the prebuild result: Info.plist, entitlements, merged AndroidManifest) and `--type public` (what
+`expo-constants` embeds).
+
+**EAS linkage (MOB-03, owner, once).** Run `npx eas init` in `apps/mobile` signed in to the Expo account that
+will own the project; the CLI prints the project id (a UUID) and the account slug. Because the config is
+dynamic the id is never written into the file: set `EAS_PROJECT_ID=<uuid>` and `EXPO_OWNER=<account slug>` as
+EAS environment variables (plain text, they are public) for every profile except `development`, or export
+them in the shell for a local `eas build --local` / `expo config` run. A `preview*`/`production*` render
+without them fails: "EAS_PROJECT_ID is not set but the … profile requires it … run `npx eas init`". The
+`development` profile, `expo start`, the tests and the web export may leave both unset.
+
+**Required public variables per profile (MOB-07).** EAS Build sets `EAS_BUILD_PROFILE` (and
+`EAS_BUILD_PLATFORM`); the config reads them. A profile name outside `development`, `preview`, `production`,
+`preview-amazon`, `production-amazon` is refused. Everything in `EXPO_PUBLIC_*` ships inside the app.
+
+| Variable | `development` | `preview`, `preview-amazon` | `production`, `production-amazon` |
+|---|---|---|---|
+| `EXPO_PUBLIC_API_BASE_URL` (eas.json sets it) | optional, defaults to `http://localhost:8787` | required, https, not loopback | same |
+| `EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | optional (sign-in off) | required (URL https) | same |
+| `EXPO_PUBLIC_PORTAL_URL` | optional | required, https | same |
+| `EXPO_PUBLIC_ANDROID_STORE` (eas.json sets it) | `play` default | must match the profile: `amazon` on `-amazon`, `play`/unset otherwise | same |
+| `EXPO_PUBLIC_REVENUECAT_IOS_KEY` (`appl_…`) | optional | optional (purchases off; the plan screen says so) | required for an iOS build of `production` |
+| `EXPO_PUBLIC_REVENUECAT_ANDROID_KEY` (`goog_…`) | optional | optional | required for an Android build of `production` |
+| `EXPO_PUBLIC_REVENUECAT_AMAZON_KEY` (`amzn_…`) | optional | optional | required for `production-amazon` |
+| `EAS_PROJECT_ID`, `EXPO_OWNER` | optional | required | required |
+
+A RevenueCat variable that holds anything but that store's public key shape fails every profile (the value
+is never printed). When `EAS_BUILD_PLATFORM` is unset (a local `expo config` check with
+`EAS_BUILD_PROFILE=production`), both store keys are demanded. `EXPO_PUBLIC_APP_ENV` in eas.json is informational
+(nothing reads it yet).
+
+**Permissions and privacy (APL-10/12/15/28, MOB-08/10/11, PLAY-08, AMZ-01/02).**
+- iOS usage strings: camera, photo library, Face ID only. Both `expo-camera` and `expo-image-picker` run with
+  `microphonePermission: false`, so the `NSMicrophoneUsageDescription` they would inject is gone; the image
+  picker carries the same camera string as the camera plugin. `expo-dev-client` (below) adds
+  `NSLocalNetworkUsageDescription`/`NSBonjourServices` to every build, as in every Expo app that ships the
+  dev client; it is tied to no data collection.
+- Privacy manifest: `NSPrivacyTracking: false`, no tracking domains; collected data types email address
+  (sign-in), photos or videos (homework photos), other user content (the child's answers), purchase history
+  (RevenueCat) and user id, each `Linked: true`, `Tracking: false`, purpose app functionality; required-reason
+  APIs UserDefaults `CA92.1`, file timestamp `C617.1`, system boot time `35F9.1`, disk space `E174.1` (what
+  React Native and the Expo modules call). Keep the App Store Connect "App Privacy" answers identical.
+- Export compliance: `ios.config.usesNonExemptEncryption: false` (`ITSAppUsesNonExemptEncryption` in the
+  plist; the app uses only the platform's TLS).
+- No push stack: `expo-notifications` was removed from the plugins and from `package.json` (nothing imported
+  it). The prebuild output carries no `aps-environment` entitlement, no FCM service or receiver and no
+  `POST_NOTIFICATIONS` permission — important for the Amazon build, which has no Google services. Push on
+  Fire tablets would need Amazon Device Messaging (§3.3).
+- Android: `permissions` are `CAMERA` and `USE_BIOMETRIC`; `blockedPermissions` strips fine/coarse location,
+  `RECORD_AUDIO`, `POST_NOTIFICATIONS` and `AD_ID` from the merged manifest whatever a library declares. The
+  merged manifest still carries the Expo template's `INTERNET`, `SYSTEM_ALERT_WINDOW`, `VIBRATE`,
+  `READ/WRITE_EXTERNAL_STORAGE` (the image picker's plugin adds the storage pair for Android ≤ 9) and
+  `USE_FINGERPRINT` (the pre-Android-9 spelling of `USE_BIOMETRIC`); none is a runtime-prompted dangerous
+  permission except the storage pair on old Android. Candidate: block `SYSTEM_ALERT_WINDOW` and `VIBRATE`
+  once a device run confirms the dev-client overlay is the only user.
+
+**Development client and updates (MOB-04, MOB-05).** `expo-dev-client ~57.0.19` (the SDK 57 bundled version)
+is installed, so the `development` profile's `developmentClient: true` builds; Expo applies its config plugin
+automatically. `expo-updates` is not installed and the profiles carry no `channel` keys: the app has no
+over-the-air update path, every change goes through store review, and nothing depends on an Expo project
+existing before the owner has run `eas init`. To add OTA updates later: `npx expo install expo-updates`,
+set `updates.url` to `https://u.expo.dev/<EAS_PROJECT_ID>`, `runtimeVersion: { policy: 'appVersion' }`, put
+the `channel` keys back, and treat each update as a release (scan the bundle, §3.2).
+
+**Amazon Appstore purchases (MOB-16, verified 2026-09-25, no config change needed).**
+`react-native-purchases 10.10.1` depends on `com.revenuecat.purchases:purchases-hybrid-common:19.2.0`, whose
+POM on Maven Central lists `purchases-store-amazon:10.22.1` at compile scope; that AAR's `AndroidManifest.xml`
+declares `com.amazon.device.iap.ResponseReceiver` (exported, permission
+`com.amazon.inapp.purchasing.Permission.NOTIFY`, action `com.amazon.inapp.purchasing.NOTIFY`), and Gradle's
+manifest merge puts it in the app. No gradle flavor, `expo-build-properties` entry or config plugin is
+needed; the Amazon path is selected at run time by `useAmazon: true` (`src/billing/revenuecat.ts`). The
+receiver ships in the Google Play build too (harmless, standard for every RevenueCat Android app). Confirm on
+the first Amazon APK: `aapt dump xmltree <apk> AndroidManifest.xml | grep -A3 ResponseReceiver`.
+
+**Release-artifact scan (AMZ-21).** `scripts/scan-release-artifacts.sh` renders the public config twice under
+the release rules (fake `EAS_PROJECT_ID`/`EXPO_OWNER`): the `production` profile and the `production-amazon`
+profile (`EXPO_PUBLIC_ANDROID_STORE=amazon`, an `amzn_` placeholder key), asserts each rendered for its store,
+and scans both. The negative control keeps the development rules on purpose: a release profile refuses the
+planted non-https portal URL before anything is embedded, and the control must prove the scan sees it.
+
+### 3.5 Web portal build (`apps/web`; WEB-01, WEB-02, WEB-06 / APL-20)
+
+Build variables (all public; Vite inlines them into the bundle, so scan the build afterwards, §3.2):
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `VITE_API_BASE_URL` | Production build | Worker origin, e.g. `https://api.<domain>` |
+| `VITE_SUPABASE_URL` | Production build | Supabase project URL (parent sign-in) |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | Production build | Supabase publishable (anon) key; never the service role key |
+| `VITE_LEGAL_REVIEWED` | Optional | Exactly `true` once the owner and legal counsel have signed off the public legal pages (Owner action #15). Any other value keeps the "Draft for review" banner and the "to be confirmed" notes |
+| `VITE_LEGAL_EFFECTIVE_DATE` | With `VITE_LEGAL_REVIEWED=true` | Effective date of the privacy policy and terms, `YYYY-MM-DD`; shown as "Effective date: October 1, 2026" |
+| `VITE_SUPPORT_EMAIL` | With `VITE_LEGAL_REVIEWED=true` | The monitored support mailbox; rendered as a `mailto:` link on the privacy, terms, support, contact and deletion pages. Until then the pages show the placeholder `support@pencillift.com (to be confirmed)` as plain text |
+
+Gates (`apps/web/src/lib/config.ts`, tested by `config.test.ts` and `pages/public/legal.test.tsx`): the module
+checks the environment once at startup, before any page renders. A production build (`import.meta.env.PROD`)
+that lacks any of the three public values throws `WebConfigError` naming the missing variables instead of
+pointing the portal at `/api` with sign-in "not configured"; a build with `VITE_LEGAL_REVIEWED=true` that
+lacks the date or the mailbox, or carries a malformed one, throws the same way. Dev and test builds keep the
+local defaults. The failure is a runtime one on first load (Vite cannot evaluate the module at build time), so
+after `vite build` open the build once (`pnpm --filter @pencillift/web preview`) and confirm the landing page
+renders; a blank page with `WebConfigError` in the console means a missing variable.
+
+Security headers: `apps/web/public/_headers` (Cloudflare Pages format) is copied unchanged into
+`apps/web/dist/_headers` by the build. It sets, for every path: `Content-Security-Policy` (`default-src 'self'`;
+scripts only from the portal origin, no inline or `eval`; `connect-src 'self' https:` because the API and
+Supabase origins are build variables a static file cannot name; `img-src 'self' data: blob:`; `style-src` with
+`'unsafe-inline'` for React's style attributes only; `frame-ancestors 'none'`; `object-src 'none'`; `base-uri`
+and `form-action 'self'`; `upgrade-insecure-requests`), `Referrer-Policy: no-referrer` (matching the meta in
+`index.html`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Permissions-Policy` denying
+camera, microphone, geolocation, payment, USB and FLoC, `Strict-Transport-Security: max-age=31536000;
+includeSubDomains`, `Cross-Origin-Opener-Policy: same-origin`, and a one-year immutable `Cache-Control` for
+`/assets/*` only. `apps/web/src/headers.test.ts` parses the file and asserts each value, checks `index.html`
+(and `dist/index.html` when a build exists) carries no inline script, and that `dist/_headers` equals the
+source. After deploying, confirm with `curl -sI https://<portal>/privacy` that every header above is present;
+Cloudflare Pages does not report a malformed `_headers` file.
+
 ## 4. Scheduled work and durable jobs
 
 One Cron Trigger calls `runScheduledTick` (`apps/api/src/jobs/dispatcher.ts`): monthly promo generation
@@ -219,6 +344,39 @@ Error codes are payload-free (exception class names or pipeline codes such as `E
 To retry after fixing the cause, insert a **new** job with a new idempotency key version (e.g. `scan:<id>:v3`);
 terminal job rows are immutable by trigger. Scans that exhausted retries are already `failed_final` with their
 allowance released; the parent can resubmit.
+
+### 4.1 Account closure (Apple 5.1.1(v), Google Play account deletion)
+
+A parent deletes their own sign-in from the app or the portal (`POST /v1/account/close`, parent token,
+recent PIN unlock, `{ "confirm": true }`). The sign-in is closed by a **soft delete** through the Supabase Auth
+Admin API: `DELETE {SUPABASE_URL}/auth/v1/admin/users/{id}` with the service-role key as `Authorization: Bearer`
+and `apikey`, JSON body `{ "should_soft_delete": true }` (`apps/api/src/providers/auth-admin.ts`; the shape
+supabase-js `auth.admin.deleteUser(id, true)` sends). GoTrue keeps the `auth.users` row with `deleted_at` set,
+replaces email and phone with hashes, empties the metadata and ends every session. A hard delete is refused by
+the schema on purpose: about forty columns reference `auth.users` without `ON DELETE` actions (migration 0830
+proves it), so the pseudonymous id stays referable from the security log, billing and consent records.
+
+- **Order for a family owner:** the family deletion comes first (`POST /v1/deletion`, scope `family`; otherwise
+  409 `FAMILY_DELETION_REQUIRED`). The route queues the durable job **`account_close`** (payload: the user id
+  only, no family, idempotency key `account_close:<user>`), which pauses (`PURGE_PENDING`, no attempt spent)
+  while the `deletion_purge` job is still due, closes the user once the purge has revoked the memberships, and
+  fails, retries and dead-letters like every other job when the auth service refuses (`AuthAdminRequestError`)
+  or when the user still owns a live family (`FAMILY_ACTIVE`: the deletion was cancelled). Retry a dead letter
+  as usual: a fresh in-app request queues a versioned successor (`account_close:<user>:v2`).
+- **Invited guardian or adult without a family:** removed from the family (the same retirements as the owner
+  removing them) and closed inline; the same job is queued as the backstop when the service was unreachable
+  (answer `pending`).
+- **After closure:** `app.auth_session_active` (re-created in 0830) answers false for a user with `deleted_at`,
+  so `requireParent` refuses the still-valid JWT at once; `app.adult_auth_email` returns no address, so no
+  notice can go to the hashed one. The API answers `signOut: true` and the device clears its session through
+  its normal sign-out path. Child devices of an owner's family keep working until the purge, which revokes them.
+- **Readiness item `auth_admin`:** ready only with `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (the same
+  secrets as storage). Staging/production without them get a provider that refuses every closure (never the
+  labeled local double, which only development and test wire, and whose database function
+  `app.close_auth_user_locally` refuses on a database marked staging or production). The Admin call is untested
+  against a live project: run one closure on staging and record it in `docs/Connections.md` before launch.
+- **Audit:** `audit_events` rows `account.close_requested` (parent), `guardian.left` (parent) and `account.closed`
+  (system or parent) carry the user id, provider name and outcome only.
 
 ## 5. Incident procedures
 

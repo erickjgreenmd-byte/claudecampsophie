@@ -1,13 +1,25 @@
 import { Link } from 'react-router';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
-import { lead, muted, PageTitle, Section, SupportEmail } from './common.tsx';
+import {
+  DraftOnly,
+  lead,
+  LegalStatus,
+  PageTitle,
+  PAYMENT_STORES,
+  ReviewedOnly,
+  Section,
+  SupportEmail,
+} from './common.tsx';
 
 /**
- * Draft terms of use (spec P3, P6, P9, P11, P16). Plain-language summary of how the service is
- * designed to work.
+ * Terms of use (spec P3, P6, P9, P11, P16). Plain-language summary of how the service is designed
+ * to work. Subscriptions are sold by Apple's App Store, Google Play and the Amazon Appstore (Fire
+ * tablets), named together wherever any of them is named (AMZ-17).
  *
- * Decision: liability, dispute resolution and governing-law clauses are deliberately left out and
- * marked as pending. Legal counsel must write them; inventing them here could mislead families.
+ * Decision: liability, dispute resolution and governing-law clauses are not invented here; while a
+ * draft the page says they are pending. A reviewed build (`VITE_LEGAL_REVIEWED=true`) records that
+ * legal counsel has settled the text of this page as published, so the pending note is dropped
+ * rather than promising clauses that were never written (legal.test.tsx).
  */
 export default function TermsPage() {
   return (
@@ -16,10 +28,10 @@ export default function TermsPage() {
       <PageTitle title="Terms of use" />
       <h1>Terms of use</h1>
       <p style={lead}>
-        These draft terms explain how PencilLift works for your family and what we expect from
-        everyone who uses it.
+        These <DraftOnly>draft </DraftOnly>terms explain how PencilLift works for your family and
+        what we expect from everyone who uses it.
       </p>
-      <p style={muted}>Status: draft, not yet in effect. Effective date to be confirmed.</p>
+      <LegalStatus />
 
       <Section title="Who can use PencilLift">
         <p>
@@ -41,16 +53,16 @@ export default function TermsPage() {
       <Section title="Subscriptions and billing">
         <ul>
           <li>
-            Current regular prices are on the <Link to="/pricing">pricing page</Link>. Plans are not
-            yet available for purchase.
+            Current regular prices are on the <Link to="/pricing">pricing page</Link>.
+            <DraftOnly> Plans are not yet available for purchase.</DraftOnly>
           </li>
           <li>
-            Subscriptions are sold and billed by the App Store or Google Play. They show the exact
-            amount, tax and renewal date at checkout, and their refund policies apply.
+            Subscriptions are sold and billed by {PAYMENT_STORES}. The store shows the exact amount,
+            tax and renewal date at checkout, and its refund policy applies.
           </li>
           <li>
-            Subscriptions renew monthly until you cancel them in the App Store or Google Play.
-            Deleting your PencilLift account does not cancel a store subscription.
+            Subscriptions renew monthly until you cancel them in {PAYMENT_STORES}. Deleting your
+            PencilLift account does not cancel a store subscription.
           </li>
           <li>Only a parent can make purchases. Children can’t buy anything in PencilLift.</li>
         </ul>
@@ -100,12 +112,22 @@ export default function TermsPage() {
         </p>
       </Section>
 
-      <Section title="Terms still being written">
-        <p>
-          Sections covering liability, dispute resolution and governing law will be added after
-          legal review. We will tell parents before any updated terms take effect.
-        </p>
-      </Section>
+      <DraftOnly>
+        <Section title="Terms still being written">
+          <p>
+            Sections covering liability, dispute resolution and governing law will be added after
+            legal review. We will tell parents before any updated terms take effect.
+          </p>
+        </Section>
+      </DraftOnly>
+      <ReviewedOnly>
+        <Section title="Changes to these terms">
+          <p>
+            We will tell parents by email before any updated terms take effect. Continuing to use
+            PencilLift after that date means the updated terms apply.
+          </p>
+        </Section>
+      </ReviewedOnly>
 
       <Section title="Contact">
         <p>

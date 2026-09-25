@@ -9,12 +9,19 @@
 #    every public build variable (VITE_*, EXPO_PUBLIC_*) set to an obviously fake value of the
 #    documented public shape. Real release values never exist in CI; these make the bundles carry
 #    the variables the way a release build does, so the scan's public-value allowlist is exercised
-#    on real output. The scan must pass.
+#    on real output. The app config is rendered twice under the release rules of app.config.ts
+#    (EAS_BUILD_PROFILE, EAS_PROJECT_ID, EXPO_OWNER as EAS Build sets them): once for the
+#    Google Play / App Store `production` profile and once for the Amazon Appstore
+#    `production-amazon` profile (EXPO_PUBLIC_ANDROID_STORE=amazon, an `amzn_` key placeholder;
+#    AMZ-21), so a release-rule regression in app.config.ts fails here too. The scan must pass.
 # 2. Negative control: the web portal and the app config again, with a fake service-role key, a
 #    fake Supabase secret key, a fake Stripe test-mode secret key and a fake database URL with its
 #    password in public build variables. The scan must fail and name each planted detector. If a
 #    build stops embedding these variables where the scan looks, or the scan stops seeing one of
-#    them (LRD-3: test-mode keys and database URLs once passed unseen), this fails.
+#    them (LRD-3: test-mode keys and database URLs once passed unseen), this fails. The control
+#    renders the app config under the development rules on purpose: a release profile refuses a
+#    non-https portal URL before anything is embedded, and the control must prove the scan itself
+#    sees the planted value.
 #
 # The fake values are assembled at run time, so no credential-shaped literal is tracked.
 set -euo pipefail
@@ -41,6 +48,8 @@ const values = {
   FAKE_DATABASE_URL: ["postgres://postgres:", "Fake", "Passw0rd", "0000", "@db.fakeprojectref00000a.supabase.co:5432/postgres"].join(""),
   FAKE_IOS_KEY: ["appl", "FAKEfakeFAKEfake00"].join("_"),
   FAKE_ANDROID_KEY: ["goog", "FAKEfakeFAKEfake00"].join("_"),
+  FAKE_AMAZON_KEY: ["amzn", "FAKEfakeFAKEfake00"].join("_"),
+  FAKE_EAS_PROJECT_ID: "00000000-0000-4000-8000-000000000000",
 };
 for (const [name, value] of Object.entries(values)) console.log(`${name}=${value}`);
 ')"
@@ -57,6 +66,20 @@ public_env=(
   EXPO_PUBLIC_REVENUECAT_ANDROID_KEY="$FAKE_ANDROID_KEY"
   EXPO_NO_TELEMETRY=1
   WRANGLER_SEND_METRICS=false
+)
+# The variables EAS Build sets, plus the linkage every release profile requires (app.config.ts).
+release_env=(
+  "${public_env[@]}"
+  EAS_PROJECT_ID="$FAKE_EAS_PROJECT_ID"
+  EXPO_OWNER=fake-owner
+  EAS_BUILD_PROFILE=production
+)
+amazon_env=(
+  "${release_env[@]}"
+  EAS_BUILD_PROFILE=production-amazon
+  EAS_BUILD_PLATFORM=android
+  EXPO_PUBLIC_ANDROID_STORE=amazon
+  EXPO_PUBLIC_REVENUECAT_AMAZON_KEY="$FAKE_AMAZON_KEY"
 )
 leaked_env=(
   "${public_env[@]}"
@@ -84,10 +107,17 @@ echo "▶ build Worker bundle (dry run, nothing deployed)"
 (cd apps/api && env "${public_env[@]}" npx wrangler deploy --dry-run --env production --outdir "$out/worker")
 echo "▶ export mobile app for web"
 (cd apps/mobile && env "${public_env[@]}" npx expo export --platform web --output-dir "$out/expo-web")
-echo "▶ public app config (embedded in native builds)"
-app_config "$out/app-config" "${public_env[@]}"
+echo "▶ public app config (embedded in native builds; production profile)"
+app_config "$out/app-config" "${release_env[@]}"
+echo "▶ public app config (Amazon Appstore production-amazon profile)"
+app_config "$out/app-config-amazon" "${amazon_env[@]}"
+# The Amazon render must be the Amazon build, or the profile rules were not exercised.
+grep -Eq '"androidStore": ?"amazon"' "$out/app-config-amazon/app.config.json" ||
+  { echo "✗ the Amazon app config did not render as an Amazon build" >&2; exit 1; }
+grep -Eq '"androidStore": ?"play"' "$out/app-config/app.config.json" ||
+  { echo "✗ the production app config did not render as a Google Play build" >&2; exit 1; }
 echo "▶ artifact secret scan"
-node scripts/scan-secrets.mjs --artifacts "$out/web" "$out/worker" "$out/expo-web" "$out/app-config"
+node scripts/scan-secrets.mjs --artifacts "$out/web" "$out/worker" "$out/expo-web" "$out/app-config" "$out/app-config-amazon"
 
 echo "▶ negative control: a secret in a public build variable must fail the scan"
 build_web "$out/control/web" "${leaked_env[@]}"

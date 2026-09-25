@@ -1,4 +1,4 @@
-import { cleanup, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
@@ -14,8 +14,60 @@ import {
   PARENT_SAFETY_FLAG_COPY,
   type SafetyReport,
 } from '@pencillift/contracts';
+import { createMemoryRouter, RouterProvider, useLocation } from 'react-router';
+import type { AuthAdapter } from '../../lib/auth.ts';
+import { SessionProvider } from '../../lib/session.tsx';
 import { renderPage } from '../../test/render.tsx';
 import PrivacyControlsPage from './PrivacyControlsPage.tsx';
+
+/** Stands in for the public deletion page, echoing the router state the portal hands it. */
+function DeletionPageStub() {
+  const state = useLocation().state as { accountClosed?: string } | null;
+  return <p>{`deletion page: ${state?.accountClosed ?? 'no state'}`}</p>;
+}
+
+/** Renders the privacy page with a route for the public deletion page (account closure lands there). */
+function renderWithDeletionRoute(api: Partial<ApiClient>, auth: AuthAdapter) {
+  const router = createMemoryRouter(
+    [
+      { path: '/app/privacy', element: <PrivacyControlsPage /> },
+      { path: '/account-deletion', element: <DeletionPageStub /> },
+    ],
+    { initialEntries: ['/app/privacy'] },
+  );
+  const client: ApiClient = {
+    get: () => Promise.reject(new Error('unexpected GET')),
+    send: () => Promise.reject(new Error('unexpected send')),
+    ...api,
+  };
+  return render(
+    <SessionProvider
+      value={{
+        config: { apiBaseUrl: '/api', supabaseUrl: null, supabasePublishableKey: null },
+        auth,
+        api: client,
+      }}
+    >
+      <RouterProvider router={router} />
+    </SessionProvider>,
+  );
+}
+
+function signOutCounter(): { auth: AuthAdapter; count: () => number } {
+  let signedOut = 0;
+  return {
+    count: () => signedOut,
+    auth: {
+      configured: true,
+      currentSession: () =>
+        Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
+      signOut: () => {
+        signedOut += 1;
+        return Promise.resolve();
+      },
+    },
+  };
+}
 
 // Synthetic data only (Riley, Sam).
 const FAMILY_ID = '8b3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f60';
@@ -379,9 +431,13 @@ describe('PrivacyControlsPage', () => {
     expect(
       await screen.findByRole('heading', { name: /your family account is being deleted/i }),
     ).toBeTruthy();
-    // The stale family controls are gone, not kept on screen from the last good load.
+    // The stale family controls are gone, not kept on screen from the last good load; only the
+    // parent's own account closure remains (APL-07 / PLAY-10).
     expect(screen.queryByRole('region', { name: /export your data/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /delete/i })).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: /delete our family account|delete data/i }),
+    ).toBeNull();
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeTruthy();
   });
 
   it('shows a deleted-account state after the family was deleted', async () => {
@@ -396,7 +452,10 @@ describe('PrivacyControlsPage', () => {
       await screen.findByRole('heading', { name: /your family account is being deleted/i }),
     ).toBeTruthy();
     expect(screen.getByText(/oct/i)).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /delete/i })).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: /delete our family account|delete data/i }),
+    ).toBeNull();
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /request export/i })).toBeNull();
     expect(
       screen.getAllByText(/does not cancel an app store or google play subscription/i),
@@ -788,6 +847,172 @@ describe('PrivacyControlsPage', () => {
     await userEvent.click(screen.getByRole('button', { name: /try again/i }));
     await screen.findByRole('region', { name: /export your data/i });
     expect(gets.length).toBeGreaterThan(before);
+  });
+
+  it('[APL-20] no longer says exports are switched off; a ready export offers a one-minute download link', async () => {
+    const ready = {
+      id: EXPORT_ID,
+      kind: 'progress_csv',
+      childId: null,
+      status: 'ready',
+      createdAt: '2026-09-24T15:00:00.000Z',
+      expiresAt: '2026-10-01T15:00:00.000Z',
+    };
+    const { api, gets } = fakeApi({ exports: { exports: [ready] } });
+    const client = api as Partial<ApiClient> & { get: ApiClient['get'] };
+    const baseGet = client.get;
+    client.get = <S extends z.ZodType>(path: string, schema: S) => {
+      if (path === `/v1/exports/${EXPORT_ID}/download`) {
+        gets.push(path);
+        return Promise.resolve(
+          schema.parse({
+            url: 'https://storage.example.test/signed/progress.csv?token=abc',
+            expiresAt: '2026-09-24T15:01:00.000Z',
+          }),
+        );
+      }
+      return baseGet(path, schema);
+    };
+    renderPage(<PrivacyControlsPage />, { api });
+    const exportsRegion = await screen.findByRole('region', { name: /export your data/i });
+    expect(exportsRegion.textContent).not.toMatch(
+      /switched on|aren.t prepared|isn.t available yet/i,
+    );
+    expect(exportsRegion.textContent).toMatch(/ready to download/i);
+    await userEvent.click(
+      within(exportsRegion).getByRole('button', { name: /get download link/i }),
+    );
+    const link = await within(exportsRegion).findByRole('link', { name: /download file/i });
+    expect(link.getAttribute('href')).toBe(
+      'https://storage.example.test/signed/progress.csv?token=abc',
+    );
+    expect(gets).toContain(`/v1/exports/${EXPORT_ID}/download`);
+  });
+
+  it('a download that needs a fresh PIN shows the step-up prompt instead of a link', async () => {
+    const ready = {
+      id: EXPORT_ID,
+      kind: 'family_data',
+      childId: null,
+      status: 'ready',
+      createdAt: '2026-09-24T15:00:00.000Z',
+      expiresAt: '2026-10-01T15:00:00.000Z',
+    };
+    const { api } = fakeApi({ exports: { exports: [ready] } });
+    const client = api as Partial<ApiClient> & { get: ApiClient['get'] };
+    const baseGet = client.get;
+    client.get = (path, schema) =>
+      path.endsWith('/download') ? Promise.reject(stepUp()) : baseGet(path, schema);
+    renderPage(<PrivacyControlsPage />, { api });
+    const exportsRegion = await screen.findByRole('region', { name: /export your data/i });
+    await userEvent.click(
+      within(exportsRegion).getByRole('button', { name: /get download link/i }),
+    );
+    expect(
+      await within(exportsRegion).findByRole('group', { name: /enter your parent pin/i }),
+    ).toBeTruthy();
+    expect(within(exportsRegion).queryByRole('link', { name: /download file/i })).toBeNull();
+  });
+
+  it('[APL-07 / PLAY-10] "Delete my account" needs the box ticked, then sends the confirmation, signs the device out and lands on the public page', async () => {
+    const { auth, count } = signOutCounter();
+    const { api, sends } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close' ? { status: 'closed', signOut: true } : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    expect(card.textContent).toMatch(/closes your PencilLift sign-in/i);
+    expect(card.textContent).toMatch(/delete your whole family account first/i);
+    expect(card.textContent).toMatch(
+      /does not cancel an App Store, Google Play or Amazon Appstore subscription/i,
+    );
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await within(card).findByText(/tick the box/i)).toBeTruthy();
+    expect(sends).toHaveLength(0);
+    expect(count()).toBe(0);
+
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('deletion page: closed')).toBeTruthy();
+    expect(count()).toBe(1);
+    expect(sends).toEqual([{ method: 'POST', path: '/v1/account/close', body: { confirm: true } }]);
+  });
+
+  it('a family owner is told to delete the family account first (409 rule), and nothing signs out', async () => {
+    let signedOut = 0;
+    const { api } = fakeApi({
+      send: () =>
+        new ApiRequestError(
+          'CONFLICT',
+          'Delete your whole family account first',
+          409,
+          'FAMILY_DELETION_REQUIRED',
+        ),
+    });
+    renderPage(<PrivacyControlsPage />, {
+      api,
+      auth: {
+        configured: true,
+        currentSession: () =>
+          Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
+        signOut: () => {
+          signedOut += 1;
+          return Promise.resolve();
+        },
+      },
+    });
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(text(await within(card).findByRole('alert'))).toMatch(
+      /delete your whole family account first, then delete your account/i,
+    );
+    expect(signedOut).toBe(0);
+    // The family deletion form is still on the page for them to use.
+    expect(screen.getByRole('group', { name: /delete your whole family account/i })).toBeTruthy();
+  });
+
+  it('asks for the parent PIN when deleting the account needs a step-up', async () => {
+    const { api } = fakeApi({ send: () => stepUp() });
+    renderPage(<PrivacyControlsPage />, { api });
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await within(card).findByRole('group', { name: /enter your parent pin/i })).toBeTruthy();
+  });
+
+  it('the owner can still delete their account after the family was deleted, from the deleted-account state', async () => {
+    const { auth, count } = signOutCounter();
+    const { api, sends } = fakeApi({
+      family: new ApiRequestError('NOT_FOUND', 'Create your family first', 404),
+      exports: new ApiRequestError('NOT_FOUND', 'Create your family first', 404),
+      reports: new ApiRequestError('NOT_FOUND', 'Create your family first', 404),
+      deletion: { requests: [deletion('family')] },
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', signOut: true }
+          : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    await screen.findByRole('heading', { name: /your family account is being deleted/i });
+    const card = screen.getByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('deletion page: pending')).toBeTruthy();
+    expect(count()).toBe(1);
+    expect(sends).toEqual([{ method: 'POST', path: '/v1/account/close', body: { confirm: true } }]);
+  });
+
+  it('an adult without a family can delete their sign-in too', async () => {
+    const { api } = fakeApi({
+      family: new ApiRequestError('NOT_FOUND', 'Create your family first', 404),
+      exports: new ApiRequestError('NOT_FOUND', 'Create your family first', 404),
+      reports: new ApiRequestError('NOT_FOUND', 'Create your family first', 404),
+    });
+    renderPage(<PrivacyControlsPage />, { api });
+    await screen.findByText(/there is no family on this account yet/i);
+    expect(screen.getByRole('region', { name: /delete my account/i })).toBeTruthy();
   });
 
   it('asks a signed-out visitor to sign in and calls nothing', async () => {

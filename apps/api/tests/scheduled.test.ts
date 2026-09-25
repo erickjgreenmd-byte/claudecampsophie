@@ -868,6 +868,13 @@ describe('a removal is final only after the upload window (RV-lead-jobs-ai-5, -2
         ],
       },
     });
+    // BUG-115: the row's created_at is a database default (real time) while this suite pins the
+    // request clock at helpers.ts's date; the sweep measures age from the pinned clock, so the
+    // fixture is stamped with it too — otherwise the 31-day jump lands under 30 days once real
+    // time is a day past the pin (a time bomb that fired on 2026-09-25).
+    await api.db
+      .sql`update public.source_pages set created_at = ${api.now.value} where assignment_id = ${id}`;
+    await api.db.sql`update public.assignments set created_at = ${api.now.value} where id = ${id}`;
     expect(uploaded.status).toBe(200);
     const [page] = await api.db.sql<{ storage_path: string }[]>`
       select storage_path from public.source_pages where assignment_id = ${id}`;

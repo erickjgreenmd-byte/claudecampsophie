@@ -1,3 +1,4 @@
+import type { Db } from '../db.ts';
 import type { StripeBillingClient, SubscriberStateProvider } from './billing.ts';
 
 /**
@@ -166,12 +167,34 @@ export interface EmailProvider {
   }): Promise<{ messageId: string }>;
 }
 
+/**
+ * Closes a parent's Supabase sign-in when they delete their account (Apple 5.1.1(v), Google Play
+ * account deletion; POST /v1/account/close and the `account_close` job). A SOFT delete by design:
+ * about forty columns reference auth.users without ON DELETE actions (migration 0830), so the row
+ * stays with deleted_at set, its email and phone replaced, its metadata emptied and every session
+ * ended. The pseudonymous id remains referable from the security log, billing and consent records.
+ */
+export interface AuthAdminProvider {
+  readonly name: string;
+  readonly isMock: boolean;
+  /**
+   * Idempotent: a user already closed, or unknown to the auth service, answers `already_closed`.
+   * Rejects when the service could not be reached or refused (the job retries and dead-letters).
+   */
+  closeUser(userId: string): Promise<{ readonly outcome: 'closed' | 'already_closed' }>;
+}
+
 export interface Providers {
   readonly consent: ConsentProvider;
   readonly storage: StorageProvider;
   readonly email: EmailProvider;
   readonly subscriptions: SubscriberStateProvider;
   readonly stripe: StripeBillingClient;
+  /**
+   * Absent only in dependency sets built by hand (tests): the Worker always selects one
+   * (src/index.ts selectAuthAdmin), and the account-close route and job fail closed without it.
+   */
+  readonly authAdmin: AuthAdminProvider;
 }
 
 /**
@@ -246,6 +269,28 @@ export function createMemoryStorageMock(): StorageProvider & {
         measured.delete(p);
       }
       return Promise.resolve();
+    },
+  };
+}
+
+/**
+ * Development/test double for the Supabase Auth Admin API. Labeled mock: never wired outside
+ * development and test (src/index.ts), and the database function it calls refuses on a database
+ * marked staging or production. It emulates GoTrue's soft delete on the local auth.users shim
+ * (migration 0830 app.close_auth_user_locally): deleted_at set, email and phone replaced by a
+ * pseudonym, metadata emptied, every session ended the way a sign-out ends it, step-ups revoked.
+ * Takes the database lazily because the Worker selects providers before it opens a client.
+ */
+export function createLocalAuthAdminDouble(db: () => Db): AuthAdminProvider {
+  return {
+    name: 'local_double',
+    isMock: true,
+    async closeUser(userId) {
+      const [row] = await db().asService(
+        (tx) => tx<{ closed: boolean }[]>`
+          select app.close_auth_user_locally(${userId}::uuid) as closed`,
+      );
+      return { outcome: row?.closed === true ? 'closed' : 'already_closed' };
     },
   };
 }

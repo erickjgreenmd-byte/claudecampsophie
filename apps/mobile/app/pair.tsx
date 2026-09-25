@@ -9,8 +9,9 @@ import {
   formatPairingInput,
   validatePairingCode,
 } from '../src/family/pairing-code.ts';
+import { deviceNameChoices } from '../src/family/parental-gate.ts';
 import { childSession, devicePlatform, modeEffects } from '../src/family/runtime.ts';
-import { Body, Button, Card, ErrorBox, Screen, styles, Title } from '../src/family/ui.tsx';
+import { Body, Button, Card, Choice, ErrorBox, Screen, styles, Title } from '../src/family/ui.tsx';
 
 /** This root route has no native header, so the screen applies the top inset itself. */
 const ROOT_EDGES = ['top', 'left', 'right', 'bottom'] as const;
@@ -19,9 +20,12 @@ const ROOT_EDGES = ['top', 'left', 'right', 'bottom'] as const;
  * Connect a child's device (spec P3; AC_ACCESS_04/07). A grown-up gives the child a one-time code
  * from the parent area. Redeeming it creates a child-only session; it can never open the parent
  * area. After pairing, the device switches to child mode, which clears any parent data from it.
+ * The device name is a fixed choice, never free text, so a child cannot type personal information
+ * here (PLAY-05); a parent can rename the device in the parent area.
  */
 export default function PairScreen() {
   const platform = devicePlatform();
+  const nameChoices = deviceNameChoices(platform);
   const [code, setCode] = useState('');
   const [label, setLabel] = useState(defaultDeviceLabel(platform));
   const [busy, setBusy] = useState(false);
@@ -96,16 +100,11 @@ export default function PairScreen() {
           placeholderTextColor={colors.muted}
           onSubmitEditing={() => void connect()}
         />
-        <Text style={styles.label} nativeID="labelLabel">
-          Device name (a grown-up can change this)
-        </Text>
-        <TextInput
-          accessibilityLabel="Device name"
-          accessibilityLabelledBy="labelLabel"
-          style={styles.input}
+        <Choice
+          label="What is this device? (a grown-up can rename it later)"
+          options={nameChoices}
           value={label}
-          maxLength={60}
-          onChangeText={setLabel}
+          onChange={setLabel}
         />
         <Button
           label={busy ? 'Connecting…' : 'Connect'}

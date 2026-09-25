@@ -13,6 +13,7 @@ import {
 } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { GatedButton } from '../../src/family/ui.tsx';
 import { childApi } from '../../src/homework/child-api.ts';
 import { nativeUploadIo, normalizePhoto } from '../../src/homework/native-io.ts';
 import {
@@ -381,8 +382,15 @@ export default function ScanScreen() {
                 }
                 onPress={() => void (permissionHelp === 'camera' ? choosePhotos() : openCamera())}
               />
-              <Button label="Open Settings" secondary onPress={() => void openSettings()} />
             </View>
+            {/* Leaving the app for Settings is a grown-up's step: it sits behind the parental gate
+                (APL-02 / PLAY-07). */}
+            <GatedButton
+              label="Grown-ups: open Settings"
+              purpose="open the device Settings"
+              secondary
+              onPassed={() => void openSettings()}
+            />
           </View>
         ) : null}
 

@@ -1,7 +1,11 @@
 import { useEffect, useId, useState, type FormEvent, type ReactNode } from 'react';
-import { Link } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import {
+  ACCOUNT_CLOSE_COPY,
+  ACCOUNT_CLOSE_RULES,
   adultUnlockResponseSchema,
+  closeAccountResponseSchema,
+  exportDownloadResponseSchema,
   dataExportResponseSchema,
   dataExportsResponseSchema,
   deletionRequestResponseSchema,
@@ -37,8 +41,11 @@ import { RequireParent, useApiQuery, useSession, type QueryState } from '../../l
  * whole family (typed confirmation + server-enforced PIN step-up), read how long information is
  * kept, and follow the family's safety reports.
  *
- * Every control calls the real API; nothing is simulated. Export files are not built yet (no
- * builder job exists), so the page says so and offers no download control.
+ * Every control calls the real API; nothing is simulated. Export files are built by the
+ * `export_build` job and downloaded through a short-lived signed link (GET
+ * /v1/exports/:id/download, step-up for every kind but the child-safe questions sheet). The
+ * parent's own sign-in is closed from here too (POST /v1/account/close; Apple 5.1.1(v), Google
+ * Play account deletion), including after the family was deleted.
  */
 export default function PrivacyControlsPage() {
   return (
@@ -62,7 +69,7 @@ const EXPORT_KIND_LABELS: Record<ExportKind, string> = {
 
 const EXPORT_STATUS_LABELS: Record<DataExport['status'], string> = {
   queued: 'Requested — waiting to be prepared',
-  ready: 'Ready — downloading from the portal isn’t available yet',
+  ready: 'Ready to download',
   failed: 'Couldn’t be prepared — please request it again',
   expired: 'Expired — request a new copy',
 };
@@ -338,6 +345,7 @@ function PrivacyControls() {
         <>
           {heading}
           <DeletedAccount request={familyDeletion} />
+          <AccountCloseSection />
         </>
       );
     }
@@ -349,6 +357,7 @@ function PrivacyControls() {
           manage exports and deletion.
         </Notice>
         <RetentionSection />
+        <AccountCloseSection />
       </>
     );
   }
@@ -383,6 +392,7 @@ function PrivacyControls() {
         deletions={deletions}
         onChanged={reloadAll}
       />
+      <AccountCloseSection />
       <SafetyReportsSection family={family} reportsQuery={reportsQuery} reports={reports} />
     </>
   );
@@ -535,10 +545,11 @@ function ExportsSection({
         Exports contain private family information, so each request needs a recent parent PIN
         unlock. Children can’t request exports.
       </p>
-      <Notice>
-        Export files aren’t prepared automatically yet. Your request is saved and its status is
-        shown below; there is nothing to download until the export service is switched on.
-      </Notice>
+      <p>
+        Files are prepared in the background, usually within a few minutes; refresh this page to see
+        the status. A ready file can be downloaded for a limited time, then it expires and you can
+        request a new copy. Downloading needs a recent PIN unlock too.
+      </p>
       <form onSubmit={(e) => void requestExport(e)} noValidate>
         <label htmlFor={kindId}>What to export</label>
         <select
@@ -634,11 +645,153 @@ function ExportsSection({
             <li key={e.id}>
               <strong>{EXPORT_KIND_LABELS[e.kind]}</strong>
               {` · ${e.childId ? childName(family, e.childId) : 'Whole family'} · ${EXPORT_STATUS_LABELS[e.status]} · requested ${formatDate(e.createdAt)}`}
+              {e.status === 'ready' ? <ExportDownload exportId={e.id} /> : null}
             </li>
           ))}
         </ul>
       ) : (
         <p>No exports requested yet.</p>
+      )}
+    </Section>
+  );
+}
+
+/**
+ * A ready export is fetched through a one-minute signed link (never a durable URL): the parent
+ * asks for the link, then opens it. The API checks the family and the step-up.
+ */
+function ExportDownload({ exportId }: { exportId: string }) {
+  const { api } = useSession();
+  const action = useAction();
+  const [link, setLink] = useState<{ url: string; expiresAt: string } | null>(null);
+  const label = 'Get download link';
+  const fetchLink = async () => {
+    const ok = await action.run(async () => {
+      setLink(await api.get(`/v1/exports/${exportId}/download`, exportDownloadResponseSchema));
+      return 'Your download link is ready.';
+    });
+    if (!ok) setLink(null);
+  };
+  return (
+    <div style={{ marginTop: 4 }}>
+      {link ? (
+        <p style={{ margin: 0 }}>
+          <a href={link.url} rel="noreferrer">
+            Download file
+          </a>
+          {` (link valid until ${formatTime(link.expiresAt)})`}
+        </p>
+      ) : (
+        <button
+          type="button"
+          className="btn secondary"
+          disabled={action.busy}
+          onClick={() => void fetchLink()}
+        >
+          {action.busy ? 'Preparing…' : label}
+        </button>
+      )}
+      {link ? null : <ActionOutcome outcome={action.outcome} actionLabel={label} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Account closure (the parent's own sign-in; Apple 5.1.1(v), Google Play account deletion)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Closes the parent's sign-in. Shown with a live family, after the family was deleted and with no
+ * family at all, because a family owner's sign-in is closed only after the family deletion (the
+ * server enforces the order: FAMILY_DELETION_REQUIRED). On success the device is signed out through
+ * the normal sign-out path and the public deletion page shows what happened.
+ */
+function AccountCloseSection() {
+  const { api, auth } = useSession();
+  const navigate = useNavigate();
+  const action = useAction();
+  const [confirmed, setConfirmed] = useState(false);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  const confirmId = useId();
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!confirmed) {
+      setConfirmError('Tick the box to confirm.');
+      return;
+    }
+    setConfirmError(null);
+    let status: 'closed' | 'pending' | null = null;
+    const ok = await action.run(async () => {
+      const result = await api.send(
+        'POST',
+        '/v1/account/close',
+        { confirm: true },
+        closeAccountResponseSchema,
+      );
+      status = result.status;
+      return result.status === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending;
+    });
+    if (!ok || status === null) return;
+    // The API's signOut flag: clear this device's session through the normal sign-out path, then
+    // explain on the public page (this page needs a signed-in parent to render).
+    await auth.signOut();
+    void navigate('/account-deletion', { state: { accountClosed: status } });
+  };
+
+  const rule = (error: ApiRequestError): string | null =>
+    error.code === 'CONFLICT' && error.rule === ACCOUNT_CLOSE_RULES.familyDeletionRequired
+      ? ACCOUNT_CLOSE_COPY.familyDeletionRequired
+      : null;
+
+  return (
+    <Section id="account-close-title" title={ACCOUNT_CLOSE_COPY.title}>
+      <p>{ACCOUNT_CLOSE_COPY.intro}</p>
+      <ul>
+        <li>{ACCOUNT_CLOSE_COPY.ownerRule}</li>
+        <li>{ACCOUNT_CLOSE_COPY.guardianRule}</li>
+        <li>{ACCOUNT_CLOSE_COPY.keep}</li>
+      </ul>
+      <div className="notice">
+        <p style={{ margin: 0 }}>
+          <strong>{ACCOUNT_CLOSE_COPY.storeNotice}</strong>
+        </p>
+      </div>
+      <form onSubmit={(e) => void submit(e)} noValidate>
+        <div style={{ marginTop: 12 }}>
+          <input
+            id={confirmId}
+            type="checkbox"
+            checked={confirmed}
+            onChange={(e) => {
+              setConfirmed(e.target.checked);
+              setConfirmError(null);
+            }}
+          />{' '}
+          <label htmlFor={confirmId}>{ACCOUNT_CLOSE_COPY.confirmLabel}</label>
+        </div>
+        {confirmError ? (
+          <p role="alert" style={fieldError}>
+            {confirmError}
+          </p>
+        ) : null}
+        <div style={buttonRow}>
+          <button
+            type="submit"
+            className="btn"
+            style={{ background: 'var(--danger)', borderColor: 'var(--danger)' }}
+            disabled={action.busy}
+          >
+            {action.busy ? 'Deleting…' : ACCOUNT_CLOSE_COPY.action}
+          </button>
+        </div>
+      </form>
+      {action.outcome?.kind === 'error' && rule(action.outcome.error) ? (
+        <p role="alert" style={fieldError}>
+          {rule(action.outcome.error)}
+        </p>
+      ) : (
+        <ActionOutcome outcome={action.outcome} actionLabel={ACCOUNT_CLOSE_COPY.action} />
       )}
     </Section>
   );

@@ -1,6 +1,14 @@
 import { Link } from 'react-router';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
-import { lead, muted, PageTitle, Section, SupportEmail } from './common.tsx';
+import {
+  DraftOnly,
+  draftPrefix,
+  lead,
+  muted,
+  PageTitle,
+  Section,
+  SupportEmail,
+} from './common.tsx';
 
 /**
  * Decision: no contact form. A form needs a monitored backend inbox, spam protection and a data
@@ -18,9 +26,11 @@ export default function ContactPage() {
         <p>
           Email <SupportEmail />.
         </p>
-        <p style={muted}>
-          This address and our response times will be confirmed before PencilLift launches.
-        </p>
+        <DraftOnly>
+          <p style={muted}>
+            This address and our response times will be confirmed before PencilLift launches.
+          </p>
+        </DraftOnly>
       </Section>
 
       <Section title="Before you write">
@@ -43,7 +53,7 @@ export default function ContactPage() {
             <Link to="/account-deletion">How to delete your account or your child’s data</Link>
           </li>
           <li>
-            <Link to="/privacy">Read the draft privacy policy</Link>
+            <Link to="/privacy">Read the {draftPrefix()}privacy policy</Link>
           </li>
           <li>
             <Link to="/pricing">See plans and pricing</Link>

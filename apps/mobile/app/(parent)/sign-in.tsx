@@ -1,13 +1,25 @@
 import { useState } from 'react';
-import { Linking, Text, TextInput } from 'react-native';
+import { Text, TextInput } from 'react-native';
 import { router } from 'expo-router';
 import { colors } from '@pencillift/ui-tokens';
 import { parentAuth, portalUrl } from '../../src/lib/parent-auth.ts';
-import { Body, Button, ErrorBox, Notice, Screen, styles, Title } from '../../src/family/ui.tsx';
+import {
+  Body,
+  Button,
+  ErrorBox,
+  GatedLinkButton,
+  LegalLinks,
+  Notice,
+  Screen,
+  styles,
+  Title,
+} from '../../src/family/ui.tsx';
 
 /**
  * Parent sign-in (spec P3). After signing in, the parent area still needs a fresh PIN unlock.
  * Account creation and password changes happen on the web portal, opened in the system browser.
+ * This screen is reachable without the parent PIN, so every outbound link (sign-up, privacy policy,
+ * terms of use) sits behind the parental gate (APL-02 / PLAY-07; APL-06 / PLAY-20).
  */
 export default function ParentSignIn() {
   const [email, setEmail] = useState('');
@@ -26,6 +38,7 @@ export default function ParentSignIn() {
             device.
           </Body>
         </Notice>
+        <LegalLinks gated />
       </Screen>
     );
   }
@@ -98,12 +111,14 @@ export default function ParentSignIn() {
         />
       )}
       {portalUrl ? (
-        <Button
+        <GatedLinkButton
           label="Create a parent account"
+          purpose="open the parent portal to create an account"
+          url={`${portalUrl}/sign-up`}
           secondary
-          onPress={() => void Linking.openURL(`${portalUrl}/sign-up`)}
         />
       ) : null}
+      <LegalLinks gated />
     </Screen>
   );
 }

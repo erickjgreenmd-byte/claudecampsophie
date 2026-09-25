@@ -47,6 +47,10 @@ export type TierRelation = 'current' | 'upgrade' | 'downgrade';
 export interface TierView {
   readonly paidSlots: number;
   readonly label: string;
+  /** The subscription's title as the store disclosure names it (APL-17). */
+  readonly subscriptionTitle: string;
+  /** Length of one billing period, in words (every PencilLift plan is monthly). */
+  readonly periodText: string;
   readonly approvedCents: number;
   readonly approvedPriceText: string;
   /** The store's own price for this plan on this device: the actual charge. */
@@ -83,6 +87,12 @@ export interface PlanView {
   readonly entitlementLines: readonly EntitlementLine[];
   readonly availability: PlanAvailability;
   readonly tiers: readonly TierView[];
+  /**
+   * Subscription terms shown beside the plans (App Store guideline 3.1.2, Play subscriptions policy;
+   * APL-17): monthly length, automatic renewal until cancelled, where to cancel, when the charge is
+   * made. Prices come from the server's approved tiers, never a hard-coded number.
+   */
+  readonly termsLines: readonly string[];
   /** The product this family pays for on this device's store now, if any. */
   readonly currentProductId: string | null;
   readonly canRestore: boolean;
@@ -95,6 +105,44 @@ export function childrenLabel(count: number): string {
 
 function perMonth(text: string): string {
   return `${text} per month`;
+}
+
+export const PERIOD_TEXT = '1 month';
+
+/** The subscription's title for store disclosures: "PencilLift family plan, 2 children". */
+export function subscriptionTitle(paidSlots: number): string {
+  return `PencilLift family plan, ${childrenLabel(paidSlots)}`;
+}
+
+/**
+ * Store-neutral name for where the parent cancels: the device's store, or "your app store" when
+ * there is none here (web preview), so the terms are still complete.
+ */
+function storeNameForTerms(channel: StoreChannel | null): string {
+  return channel === null ? 'your app store' : STORE_LABEL[channel];
+}
+
+/** Monthly renewal terms (APL-17). Amounts are read from the approved tiers the server sent. */
+export function subscriptionTermsLines(
+  tiers: BillingStatus['tiers'],
+  channel: StoreChannel | null,
+): readonly string[] {
+  const store = storeNameForTerms(channel);
+  const sorted = [...tiers].sort((a, b) => a.paidSlots - b.paidSlots);
+  const first = sorted[0];
+  const second = sorted[1];
+  const maxChildren = sorted.at(-1)?.paidSlots ?? 0;
+  const pricing =
+    first === undefined
+      ? 'Every PencilLift plan is a monthly subscription.'
+      : second === undefined
+        ? `Every PencilLift plan is a monthly subscription: ${formatUsd(first.approvedMonthlyCents)} per month for ${childrenLabel(first.paidSlots)}.`
+        : `Every PencilLift plan is a monthly subscription: ${formatUsd(first.approvedMonthlyCents)} per month for the first child and ${formatUsd(second.approvedMonthlyCents - first.approvedMonthlyCents)} per month for each additional child, up to ${maxChildren} children.`;
+  return [
+    pricing,
+    `It renews automatically each month until you cancel. Cancel in ${store} at least 24 hours before the current month ends to avoid the next charge.`,
+    `Payment is charged to your store account when you confirm a purchase in ${store}. Manage or cancel the subscription in ${store}.`,
+  ];
 }
 
 function longDate(iso: string, timeZone: string | undefined): string {
@@ -314,6 +362,8 @@ function tierView(
   return {
     paidSlots: tier.paidSlots,
     label,
+    subscriptionTitle: subscriptionTitle(tier.paidSlots),
+    periodText: PERIOD_TEXT,
     approvedCents: tier.approvedMonthlyCents,
     approvedPriceText: perMonth(approvedPriceText),
     storePriceText: offered ? perMonth(offered.priceText) : null,
@@ -428,6 +478,7 @@ export function buildPlanView(input: PlanViewInput): PlanView {
     })),
     availability,
     tiers,
+    termsLines: subscriptionTermsLines(status.tiers, input.deviceChannel),
     currentProductId: currentProductOn(status, input.deviceChannel),
     canRestore: input.storeAvailable && input.deviceChannel !== null,
     // Managing an existing subscription opens the store's own page; it needs no SDK key. A

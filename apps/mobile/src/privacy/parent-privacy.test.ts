@@ -8,9 +8,11 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
+  closeAccountAction,
   confirmationPhrase,
   deletableChildren,
   deletionStatusText,
+  exportDownloadAction,
   exportLine,
   familyDeletion,
   loadPrivacyOverview,
@@ -244,6 +246,85 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     expect(overview.reports).toEqual([]);
     expect(familyDeletion(overview.deletions)).toEqual(familyRequest);
     expect(deletionStatusText(familyRequest)).toMatch(/processing has stopped/i);
+  });
+
+  it('[APL-20] a ready export opens through a one-minute signed link and never says the service is off', async () => {
+    const line = exportLine({
+      id: EXPORT,
+      kind: 'progress_csv',
+      childId: null,
+      status: 'ready',
+      createdAt: '2026-09-24T15:00:00.000Z',
+      expiresAt: '2026-10-01T15:00:00.000Z',
+    });
+    expect(line).toBe('Progress data (CSV) · Ready to download');
+    expect(line).not.toMatch(/isn.t available|switched on/i);
+
+    const opened: string[] = [];
+    const open = (url: string) => {
+      opened.push(url);
+      return Promise.resolve();
+    };
+    const ok = fakeApi({
+      get: (path) =>
+        path === `/v1/exports/${EXPORT}/download`
+          ? {
+              url: 'https://storage.example.test/signed/x.csv?t=1',
+              expiresAt: '2026-09-24T15:01:00.000Z',
+            }
+          : new Error(`unexpected ${path}`),
+    });
+    expect(await exportDownloadAction(ok.api, EXPORT, open)).toMatchObject({ status: 'done' });
+    expect(opened).toEqual(['https://storage.example.test/signed/x.csv?t=1']);
+
+    const stepUp = fakeApi({
+      get: () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403),
+    });
+    expect(await exportDownloadAction(stepUp.api, EXPORT, open)).toEqual({ status: 'step_up' });
+    expect(opened).toHaveLength(1);
+  });
+
+  it('[APL-07 / PLAY-10] deletes the parent’s own sign-in only once confirmed, and maps the owner rule and step-up', async () => {
+    const closed = fakeApi({ send: () => ({ status: 'closed', signOut: true }) });
+    expect(await closeAccountAction(closed.api, false)).toMatchObject({ status: 'error' });
+    expect(closed.calls).toHaveLength(0);
+    expect(await closeAccountAction(closed.api, true)).toEqual({
+      status: 'closed',
+      message: expect.stringMatching(/account is closed and this device is signed out/i) as string,
+    });
+    expect(closed.calls).toEqual([
+      { method: 'POST', path: '/v1/account/close', body: { confirm: true } },
+    ]);
+
+    const pending = fakeApi({ send: () => ({ status: 'pending', signOut: true }) });
+    expect(await closeAccountAction(pending.api, true)).toMatchObject({
+      status: 'pending',
+      message: expect.stringMatching(/closes automatically once your family account/i) as string,
+    });
+
+    const owner = fakeApi({
+      send: () =>
+        new ApiRequestError(
+          'CONFLICT',
+          'Delete your whole family account first',
+          409,
+          'FAMILY_DELETION_REQUIRED',
+        ),
+    });
+    const refused = await closeAccountAction(owner.api, true);
+    expect(refused.status).toBe('error');
+    expect(refused.status === 'error' && refused.message).toMatch(
+      /delete your whole family account first, then delete your account/i,
+    );
+
+    const stepUp = fakeApi({
+      send: () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403),
+    });
+    expect(await closeAccountAction(stepUp.api, true)).toEqual({ status: 'step_up' });
+
+    const offline = fakeApi({ send: () => new ApiRequestError('NETWORK', 'offline', 0) });
+    const down = await closeAccountAction(offline.api, true);
+    expect(down.status === 'error' && down.message).toMatch(/offline/i);
   });
 
   it('labels a lapsed or withdrawn export as expired, never as ready', () => {

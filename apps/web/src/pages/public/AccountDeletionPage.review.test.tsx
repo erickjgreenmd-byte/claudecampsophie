@@ -1,5 +1,6 @@
-import { cleanup, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import type { ComponentType } from 'react';
+import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderPage } from '../../test/render.tsx';
 import AccountDeletionPage from './AccountDeletionPage.tsx';
@@ -27,19 +28,61 @@ afterEach(() => {
 });
 
 describe('AccountDeletionPage review', () => {
-  it('[RV-public-site-2] does not advise requesting an export before deleting while export files are never produced', async () => {
-    // Implemented design: POST /v1/exports only queues an `export_build` job; no handler for that
-    // job kind exists (apps/api/src/jobs/dispatcher.ts DEFAULT_HANDLERS has only deletion_purge),
-    // the in-app page says "there is nothing to download until the export service is switched
-    // on", and app.purge_family_data deletes public.data_exports. A parent who follows the
-    // public advice gets no copy and then loses the data.
+  it('[RV-public-site-2, resolved] tells parents to export before deleting now that the export job builds files', async () => {
+    // Implemented design: `export_build` is registered in DEFAULT_HANDLERS (apps/api/src/jobs/
+    // dispatcher.ts) and GET /v1/exports/:id/download signs the file, so the page may (and must)
+    // point at exports as the way to keep a copy, and may no longer call them unavailable.
     const { container } = await renderPublic(AccountDeletionPage, '/account-deletion');
     const text = container.textContent;
-    if (/export/i.test(text)) {
-      expect(text).toMatch(
-        /export (files )?(are|is)n.t (available|ready|prepared)|export(s)? (are|is) not (yet )?available|nothing to download/i,
+    expect(text).toMatch(/request an export .* before you delete/i);
+    expect(text).not.toMatch(/nothing to download|switched on|export files aren.t available/i);
+  });
+
+  it('[APL-07 / PLAY-10] describes in-app deletion of the sign-in itself, in both apps and the portal, with email as the fallback', async () => {
+    // Apple 5.1.1(v) and Google Play require an in-app path that deletes the account, not only
+    // the family's data, and the store-listed page must describe it; email stays for people who
+    // can no longer sign in.
+    const { container } = await renderPublic(AccountDeletionPage, '/account-deletion');
+    const inApp = screen.getByRole('region', { name: /in the app or the parent portal/i });
+    expect(inApp.textContent).toMatch(/iPhone, iPad, Android/i);
+    expect(inApp.textContent).toMatch(/Fire tablet/i);
+    expect(inApp.textContent).toMatch(/Delete my account/);
+    expect(inApp.textContent).toMatch(/closes your email and password sign-in/i);
+    expect(inApp.textContent).toMatch(/family owner deletes the family account first/i);
+    expect(inApp.textContent).toMatch(/guardian is removed from the family and closed at once/i);
+    const email = screen.getByRole('region', { name: /email us/i });
+    expect(email.textContent).toMatch(/if you can.t sign in/i);
+    expect(email.textContent).toMatch(/your own sign-in/i);
+    // The old wording that sent every sign-in closure to support is gone.
+    expect(container.textContent).not.toMatch(/to have the sign-in closed as well, email us/i);
+    const keep = screen.getByRole('region', { name: /what happens after you ask/i });
+    expect(keep.textContent).toMatch(/pseudonymous account id/i);
+    expect(keep.textContent).toMatch(/email address, phone number and password are removed/i);
+  });
+
+  it('shows what happened after an in-app closure (router state only, never a URL parameter)', async () => {
+    const renderWithState = (state: unknown) => {
+      const router = createMemoryRouter(
+        [{ path: '/account-deletion', element: <AccountDeletionPage /> }],
+        { initialEntries: [{ pathname: '/account-deletion', state }] },
       );
-    }
+      return render(<RouterProvider router={router} />);
+    };
+    renderWithState({ accountClosed: 'pending' });
+    await screen.findByRole('heading', { level: 1 });
+    expect(screen.getByRole('status').textContent).toMatch(
+      /closes automatically once your family account/i,
+    );
+    cleanup();
+    renderWithState({ accountClosed: 'closed' });
+    await screen.findByRole('heading', { level: 1 });
+    expect(screen.getByRole('status').textContent).toMatch(
+      /account is closed and this device is signed out/i,
+    );
+    cleanup();
+    renderWithState({ accountClosed: 'anything-else' });
+    await screen.findByRole('heading', { level: 1 });
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('names the Amazon Appstore subscription on Fire tablets next to the App Store and Google Play', async () => {

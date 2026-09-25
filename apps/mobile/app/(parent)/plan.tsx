@@ -32,6 +32,7 @@ import {
   Card,
   ErrorBox,
   Heading,
+  LegalLinks,
   Loading,
   Notice,
   ParentAccessState,
@@ -273,6 +274,11 @@ function Plans({
           ) : null}
         </View>
       ))}
+      <Heading>Subscription terms</Heading>
+      {plan.termsLines.map((line) => (
+        <Body key={line}>{line}</Body>
+      ))}
+      <LegalLinks />
       <FlowPanel
         api={api}
         flow={flow}
@@ -377,12 +383,18 @@ function ConfirmPanel({
       accessibilityLabel="Confirm your plan change"
     >
       <Heading>{confirmation.heading}</Heading>
+      <Body>{confirmation.titleLine}</Body>
+      <Body>{confirmation.periodLine}</Body>
       <Body>{confirmation.childCountLine}</Body>
       <Text style={[styles.body, { fontWeight: '800' }]}>{confirmation.recurringLine}</Text>
       {confirmation.priceNotice ? <Body>{confirmation.priceNotice}</Body> : null}
+      <Body>{confirmation.renewalLine}</Body>
+      <Body>{confirmation.chargeLine}</Body>
       <Body>{confirmation.dueNowLine}</Body>
       <Body>{confirmation.activationLine}</Body>
       <Body>{confirmation.storeConfirmationLine}</Body>
+      <Body>{confirmation.legalLine}</Body>
+      <LegalLinks />
       {confirmation.needsKeepSelection ? (
         <KeepSelector
           api={api}

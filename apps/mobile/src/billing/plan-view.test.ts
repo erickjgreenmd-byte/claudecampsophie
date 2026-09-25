@@ -7,6 +7,7 @@ import {
   waitingSubscription,
   type PlanViewInput,
 } from './plan-view.ts';
+import type { StoreChannel } from './store.ts';
 import { APP_STORE_PRODUCTS, APPROVED_PRICE_PRODUCTS, billingStatus } from './testing.ts';
 
 const TZ = 'America/Chicago';
@@ -319,6 +320,47 @@ describe('honest availability states', () => {
     const loading = view({ storeProducts: null });
     expect(loading.availability.kind).toBe('store_loading');
     expect(loading.tiers.some((t) => t.purchasable)).toBe(false);
+  });
+});
+
+describe('subscription terms shown beside the plans (APL-17)', () => {
+  it('states monthly length, automatic renewal and where to cancel, per store', () => {
+    const cases: readonly [StoreChannel, string][] = [
+      ['app_store', 'the App Store'],
+      ['play_store', 'Google Play'],
+      ['amazon_appstore', 'the Amazon Appstore'],
+    ];
+    for (const [channel, storeName] of cases) {
+      const plan = buildPlanView({
+        status: billingStatus(),
+        deviceChannel: channel,
+        storeAvailable: true,
+        storeProducts: APPROVED_PRICE_PRODUCTS,
+        timeZone: 'UTC',
+      });
+      expect(plan.termsLines).toEqual([
+        'Every PencilLift plan is a monthly subscription: $39.99 per month for the first child and $9.99 per month for each additional child, up to 4 children.',
+        `It renews automatically each month until you cancel. Cancel in ${storeName} at least 24 hours before the current month ends to avoid the next charge.`,
+        `Payment is charged to your store account when you confirm a purchase in ${storeName}. Manage or cancel the subscription in ${storeName}.`,
+      ]);
+      for (const tier of plan.tiers) {
+        expect(tier.subscriptionTitle).toBe(`PencilLift family plan, ${tier.label}`);
+        expect(tier.periodText).toBe('1 month');
+      }
+    }
+  });
+
+  it('without a store on this device the terms still name the monthly renewal, without a store', () => {
+    const plan = buildPlanView({
+      status: billingStatus(),
+      deviceChannel: null,
+      storeAvailable: false,
+      storeProducts: null,
+      timeZone: 'UTC',
+    });
+    expect(plan.termsLines[0]).toMatch(/monthly subscription/);
+    expect(plan.termsLines.join(' ')).toMatch(/renews automatically/);
+    expect(plan.termsLines.join(' ')).toMatch(/your app store/);
   });
 });
 

@@ -162,6 +162,48 @@ describe('confirmation shows what the parent is agreeing to (AC_CAPACITY_06)', (
     expect(text).not.toMatch(/charged (today|now|immediately)/i);
   });
 
+  it('states the subscription title, monthly length, renewal and charge terms per store (APL-17)', () => {
+    const cases: readonly [StoreChannel, string, string][] = [
+      ['app_store', 'the App Store', 'Apple Account'],
+      ['play_store', 'Google Play', 'Google Play account'],
+      ['amazon_appstore', 'the Amazon Appstore', 'Amazon account'],
+    ];
+    for (const [channel, storeName, account] of cases) {
+      const base = billingStatus();
+      // The fixture catalog covers the App Store and Google Play; add the Amazon Appstore's entry.
+      const status = billingStatus({
+        products: [
+          ...base.products,
+          ...base.tiers.map((t) => ({
+            channel: 'amazon_appstore' as const,
+            productId: `pl_family_${t.paidSlots}`,
+            paidSlots: t.paidSlots,
+            storePriceCents: null,
+            priceCheck: 'not_verified' as const,
+          })),
+        ],
+      });
+      const state = select(status, 2, PARENT, channel);
+      expect(state.kind).toBe('confirming');
+      if (state.kind !== 'confirming') return;
+      const c = state.confirmation;
+      expect(c.titleLine).toBe('Subscription: PencilLift family plan, 2 children.');
+      expect(c.periodLine).toBe('Length: 1 month, billed monthly.');
+      expect(c.recurringLine).toContain('$49.98 per month');
+      expect(c.renewalLine).toBe(
+        `It renews automatically every month at $49.98 per month until you cancel. To stop the next charge, cancel in ${storeName} at least 24 hours before the current month ends.`,
+      );
+      expect(c.chargeLine).toBe(
+        `Payment is charged to your ${account} when you confirm the purchase in ${storeName}.`,
+      );
+      expect(c.legalLine).toBe(
+        'By continuing you agree to the PencilLift Terms of use and Privacy policy (links below).',
+      );
+      // Approved prices are never restated as a different number.
+      expect(Object.values(c).join(' ')).not.toMatch(/\$9\.99|\$49\.99/);
+    }
+  });
+
   it('a plan whose store price isn’t the approved price can’t be selected (AC_CAPACITY_02)', () => {
     const status = billingStatus({ paidSlots: 1, assignedSlots: 1 });
     const plan = buildPlanView({

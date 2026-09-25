@@ -3,11 +3,13 @@ import {
   ActivityIndicator,
   AppState,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView, type Edge } from 'react-native-safe-area-context';
@@ -15,8 +17,11 @@ import { router } from 'expo-router';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../brand/BrandMark.tsx';
+import { legalLinks } from '../lib/legal-links.ts';
 import { currentMode } from '../lib/mode.ts';
+import { portalUrl } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
+import { answerGate, gateLock, openGate, type GateState } from './parental-gate.ts';
 import { parentApi } from './runtime.ts';
 import { lockParentArea } from './unlock.ts';
 
@@ -279,6 +284,207 @@ export function useLoad<T>(load: (() => Promise<T>) | null) {
     void run();
   }, [run]);
   return { state, reload: run };
+}
+
+/** Opens a link in the system browser; a failure to open is not an error the parent can act on. */
+export function openExternalUrl(url: string): Promise<void> {
+  return Linking.openURL(url).catch(() => undefined);
+}
+
+/**
+ * The gate's lock outlives one open gate (module state, never persisted): cancelling and reopening
+ * the gate does not reset the lockout after three misses.
+ */
+let lastGate: GateState | null = null;
+
+/**
+ * Parental gate (Apple guideline 1.3 / Play Families; APL-02 / PLAY-07): a random multiplication a
+ * grown-up answers before anything leaves the app from a screen a child can reach. Three misses lock
+ * it for a short while. The right answer is never shown or spoken.
+ */
+export function ParentalGate({
+  purpose,
+  onPassed,
+  onCancel,
+}: {
+  /** What passing the gate does, e.g. "open the privacy policy". */
+  purpose: string;
+  onPassed: () => void;
+  onCancel: () => void;
+}) {
+  const [state, setState] = useState<GateState>(() => openGate(Date.now(), Math.random, lastGate));
+  const [answer, setAnswer] = useState('');
+  const [message, setMessage] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const lock = gateLock(state, now);
+
+  useEffect(() => {
+    lastGate = state;
+  }, [state]);
+
+  // While locked, count the seconds down and draw a fresh challenge once the lock ends.
+  useEffect(() => {
+    if (!lock.locked) return;
+    const timer = setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (!gateLock(state, t).locked) {
+        setState(openGate(t, Math.random, state));
+        setMessage(null);
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [lock.locked, state]);
+
+  const check = () => {
+    const outcome = answerGate(state, answer, Date.now());
+    setAnswer('');
+    setNow(Date.now());
+    if (outcome.kind === 'passed') {
+      setState(outcome.state);
+      setMessage(null);
+      onPassed();
+      return;
+    }
+    setState(outcome.state);
+    setMessage(outcome.message);
+  };
+
+  return (
+    <View
+      style={[styles.card, styles.notice]}
+      accessibilityLabel={`Grown-ups only: ${purpose}`}
+      accessibilityLiveRegion="polite"
+    >
+      <Text style={styles.label}>Grown-ups only</Text>
+      <Body>
+        To {purpose}, a grown-up answers this first. {state.challenge.prompt}
+      </Body>
+      {lock.locked ? (
+        <Body>
+          Too many tries. Please wait {lock.retryInSeconds}{' '}
+          {lock.retryInSeconds === 1 ? 'second' : 'seconds'}, then ask a grown-up to try again.
+        </Body>
+      ) : (
+        <>
+          <Text nativeID="gateAnswerLabel" style={styles.label}>
+            Answer
+          </Text>
+          <TextInput
+            accessibilityLabel="Answer"
+            accessibilityLabelledBy="gateAnswerLabel"
+            style={styles.input}
+            value={answer}
+            onChangeText={setAnswer}
+            keyboardType="number-pad"
+            maxLength={4}
+            autoComplete="off"
+            autoCorrect={false}
+            onSubmitEditing={check}
+          />
+          {message ? <Body>{message}</Body> : null}
+          <Button label="Check" onPress={check} disabled={answer.trim().length === 0} />
+        </>
+      )}
+      <Button label="Cancel" secondary onPress={onCancel} />
+    </View>
+  );
+}
+
+/** A button whose action runs only after the parental gate is passed. */
+export function GatedButton({
+  label,
+  purpose,
+  onPassed,
+  secondary,
+  disabled,
+  accessibilityLabel,
+}: {
+  label: string;
+  /** What the action does, in the gate's words; defaults to the button label. */
+  purpose?: string | undefined;
+  onPassed: () => void;
+  secondary?: boolean | undefined;
+  disabled?: boolean | undefined;
+  accessibilityLabel?: string | undefined;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button
+        label={label}
+        secondary={secondary}
+        disabled={disabled}
+        accessibilityLabel={accessibilityLabel ?? `${label} (grown-ups only)`}
+        onPress={() => setOpen(true)}
+      />
+      {open ? (
+        <ParentalGate
+          purpose={purpose ?? label.toLowerCase()}
+          onPassed={() => {
+            setOpen(false);
+            onPassed();
+          }}
+          onCancel={() => setOpen(false)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/** Gated-link helper: an outbound link that opens in the system browser only past the gate. */
+export function GatedLinkButton({
+  label,
+  url,
+  purpose,
+  secondary,
+}: {
+  label: string;
+  url: string;
+  purpose?: string | undefined;
+  secondary?: boolean | undefined;
+}) {
+  return (
+    <GatedButton
+      label={label}
+      purpose={purpose ?? `open ${label.toLowerCase()}`}
+      secondary={secondary}
+      onPassed={() => void openExternalUrl(url)}
+    />
+  );
+}
+
+/**
+ * Privacy policy and Terms of use links (APL-06 / PLAY-20), on the public parent portal. `gated`
+ * puts them behind the parental gate for screens reachable without the parent PIN; screens already
+ * behind the PIN open them directly. Without a configured portal the links are named, not invented.
+ */
+export function LegalLinks({ gated }: { gated?: boolean | undefined }) {
+  const links = legalLinks(portalUrl);
+  if (links.length === 0) {
+    return (
+      <Body muted>
+        The Privacy policy and Terms of use are on the PencilLift parent portal (not configured in
+        this build).
+      </Body>
+    );
+  }
+  return (
+    <View style={styles.row}>
+      {links.map((link) =>
+        gated ? (
+          <GatedLinkButton key={link.key} label={link.label} url={link.url} secondary />
+        ) : (
+          <Button
+            key={link.key}
+            label={link.label}
+            secondary
+            onPress={() => void openExternalUrl(link.url)}
+          />
+        ),
+      )}
+    </View>
+  );
 }
 
 export function formatDateTime(iso: string): string {

@@ -18,7 +18,7 @@ Spec: `PencilLift_Claude_Code_Master_Prompt.md` **Revision 8** (authoritative, p
 | Pre-commit gate (fail-fast, no filters) | `scripts/verify.sh` (whole repo) or `scripts/verify.sh --only api,db` |
 | Secret scan (tracked files) | `node scripts/scan-secrets.mjs` |
 | Worker bundle dry run | `cd apps/api && npx wrangler deploy --dry-run --outdir <dir>` |
-| Web build / Expo web smoke | `pnpm --filter @pencillift/web build` / `cd apps/mobile && npx expo export --platform web` |
+| Web build / Expo web smoke | `VITE_API_BASE_URL=https://api.example.invalid VITE_SUPABASE_URL=https://x.supabase.invalid VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_smoke pnpm --filter @pencillift/web build` (a production build fails at build time without the three; `scripts/scan-release-artifacts.sh` sets fake ones) / `cd apps/mobile && npx expo export --platform web` |
 
 ## Rules
 

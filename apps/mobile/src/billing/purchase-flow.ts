@@ -62,8 +62,14 @@ export interface Confirmation {
    */
   readonly keepCount: number;
   readonly heading: string;
+  /** Store disclosures (App Store guideline 3.1.2, Play subscriptions policy; APL-17). */
+  readonly titleLine: string;
+  readonly periodLine: string;
   readonly childCountLine: string;
   readonly recurringLine: string;
+  readonly renewalLine: string;
+  readonly chargeLine: string;
+  readonly legalLine: string;
   readonly priceNotice: string | null;
   readonly dueNowLine: string;
   readonly storeConfirmationLine: string;
@@ -129,6 +135,13 @@ function capitalize(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+/** The store account the charge goes to, as each store names it. */
+const STORE_ACCOUNT: Record<StoreChannel, string> = {
+  app_store: 'Apple Account',
+  play_store: 'Google Play account',
+  amazon_appstore: 'Amazon account',
+};
+
 function buildConfirmation(
   tier: TierView,
   plan: PlanView,
@@ -144,6 +157,7 @@ function buildConfirmation(
       ? { productId: plan.currentProductId, direction }
       : null;
   const needsKeepSelection = direction === 'downgrade' && status.assignedSlots > tier.paidSlots;
+  const price = tier.storePriceText ?? tier.approvedPriceText;
   return {
     direction,
     channel,
@@ -159,11 +173,17 @@ function buildConfirmation(
       status.paidSlots === 0
         ? `Subscribe for ${childrenLabel(tier.paidSlots)}`
         : `Change your plan to ${childrenLabel(tier.paidSlots)}`,
+    titleLine: `Subscription: ${tier.subscriptionTitle}.`,
+    periodLine: `Length: ${tier.periodText}, billed monthly.`,
     childCountLine:
       direction === 'upgrade'
         ? `Your plan will cover ${childrenLabel(tier.paidSlots)}${today}.`
         : `After the change your plan will cover ${childrenLabel(tier.paidSlots)}${today}.`,
-    recurringLine: `New monthly total: ${tier.storePriceText ?? tier.approvedPriceText}, as charged by ${store}.`,
+    recurringLine: `New monthly total: ${price}, as charged by ${store}.`,
+    renewalLine: `It renews automatically every month at ${price} until you cancel. To stop the next charge, cancel in ${store} at least 24 hours before the current month ends.`,
+    chargeLine: `Payment is charged to your ${STORE_ACCOUNT[channel]} when you confirm the purchase in ${store}.`,
+    legalLine:
+      'By continuing you agree to the PencilLift Terms of use and Privacy policy (links below).',
     priceNotice: tier.priceNotice,
     // AC_CAPACITY_06: the store supplies due-now and proration; we never promise a fixed charge today.
     dueNowLine:

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   RefreshControl,
@@ -12,15 +13,19 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
+import { router } from 'expo-router';
+import { ACCOUNT_CLOSE_COPY, PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
 import type { ParentReportOutcome, StandardExportKind } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
+import { parentAuth } from '../../src/lib/parent-auth.ts';
 import {
+  closeAccountAction,
   confirmationPhrase,
   deletableChildren,
   deletionStatusText,
+  exportDownloadAction,
   exportLine,
   familyDeletion,
   loadPrivacyOverview,
@@ -43,17 +48,20 @@ type ScreenState =
   | { status: 'not_connected' }
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ready'; data: PrivacyOverview };
+  | { status: 'ready'; data: PrivacyOverview }
+  /** The parent deleted their own sign-in: the device is signed out; only the outcome remains. */
+  | { status: 'account_closed'; message: string };
 
 type Feedback =
-  | { area: 'export' | 'delete'; result: ActionResult; id: number }
+  | { area: 'export' | 'delete' | 'account'; result: ActionResult; id: number }
   | { area: 'report'; reportId: string; result: ActionResult; id: number }
   | null;
 
 /**
- * Parent privacy screen (spec P4, P10, P14 "export/delete"; AC_ACCESS_10, AC_SECURITY_05). Request
- * a private export, delete a child's data or the whole family (typed confirmation + server-enforced
- * PIN step-up), read how long information is kept, and follow the family's safety reports: every
+ * Parent privacy screen (spec P4, P10, P14 "export/delete"; AC_ACCESS_10, AC_SECURITY_05; Apple
+ * 5.1.1(v) / Google Play account deletion). Request a private export and open a ready one, delete a
+ * child's data or the whole family (typed confirmation + server-enforced PIN step-up), delete the
+ * parent's own sign-in, read how long information is kept, and follow the family's safety reports: every
  * flag is listed with the recorded state of the guardian email, and a guardian can mark it looked
  * into or a false alarm (owner decision, 2026-09-25; same wording as the web portal). Logic lives
  * in src/privacy (unit-tested).
@@ -70,6 +78,7 @@ export default function ParentPrivacyScreen() {
   const [feedbackCount, setFeedbackCount] = useState(0);
   const [target, setTarget] = useState<DeletionTarget | null>(null);
   const [typed, setTyped] = useState('');
+  const [closeConfirmed, setCloseConfirmed] = useState(false);
 
   const load = useCallback(async () => {
     if (!api) {
@@ -102,6 +111,33 @@ export default function ParentPrivacyScreen() {
     setFeedback({ area: 'export', result, id: feedbackCount + 1 });
     setBusy(null);
     if (result.status === 'done') await load();
+  };
+
+  const downloadExport = async (exportId: string) => {
+    if (!api || busy !== null) return;
+    setBusy(`download:${exportId}`);
+    setFeedback(null);
+    const result = await exportDownloadAction(api, exportId, (url) => Linking.openURL(url));
+    setFeedbackCount((n) => n + 1);
+    setFeedback({ area: 'export', result, id: feedbackCount + 1 });
+    setBusy(null);
+  };
+
+  const closeAccount = async () => {
+    if (!api || busy !== null) return;
+    setBusy('account');
+    setFeedback(null);
+    const result = await closeAccountAction(api, closeConfirmed);
+    setBusy(null);
+    if (result.status === 'step_up' || result.status === 'error') {
+      setFeedbackCount((n) => n + 1);
+      setFeedback({ area: 'account', result, id: feedbackCount + 1 });
+      return;
+    }
+    // The API's signOut flag: the app's normal sign-out path clears the parent session; the
+    // outcome stays on screen until the parent leaves.
+    setState({ status: 'account_closed', message: result.message });
+    await parentAuth.signOut().catch(() => undefined);
   };
 
   const requestDeletion = async () => {
@@ -168,6 +204,15 @@ export default function ParentPrivacyScreen() {
             />
           ) : null}
 
+          {state.status === 'account_closed' ? (
+            <Section title="Account deleted">
+              <Text accessibilityLiveRegion="polite" style={styles.body}>
+                {state.message}
+              </Text>
+              <Button label="Done" onPress={() => router.replace('/')} />
+            </Section>
+          ) : null}
+
           {state.status === 'error' ? (
             <View accessibilityRole="alert" style={styles.card}>
               <Text style={styles.body}>{state.message}</Text>
@@ -181,13 +226,15 @@ export default function ParentPrivacyScreen() {
             </View>
           ) : null}
 
-          <Section title="How long we keep information">
-            {PRIVACY_RETENTION_LINES.map((line) => (
-              <Text key={line} style={[styles.body, styles.bullet]}>
-                {`• ${line}`}
-              </Text>
-            ))}
-          </Section>
+          {state.status !== 'account_closed' ? (
+            <Section title="How long we keep information">
+              {PRIVACY_RETENTION_LINES.map((line) => (
+                <Text key={line} style={[styles.body, styles.bullet]}>
+                  {`• ${line}`}
+                </Text>
+              ))}
+            </Section>
+          ) : null}
 
           {data && deleted ? (
             <Section
@@ -214,9 +261,10 @@ export default function ParentPrivacyScreen() {
             <>
               <Section title="Export your data">
                 <Text style={styles.body}>
-                  Each request needs a recent parent PIN unlock. Export files aren’t prepared
-                  automatically yet: your request is saved and its status is shown here, and there
-                  is nothing to download until the export service is switched on.
+                  Each request and each download needs a recent parent PIN unlock. Files are
+                  prepared in the background, usually within a few minutes: pull down to refresh. A
+                  ready file can be opened for a limited time, then it expires and you can request a
+                  new copy.
                 </Text>
                 {MOBILE_EXPORT_OPTIONS.map((option) => (
                   <Button
@@ -239,9 +287,17 @@ export default function ParentPrivacyScreen() {
                   <Text style={styles.body}>No exports requested yet.</Text>
                 ) : (
                   data.exports.map((item) => (
-                    <Text key={item.id} style={[styles.body, styles.bullet]}>
-                      {`• ${exportLine(item)}`}
-                    </Text>
+                    <View key={item.id}>
+                      <Text style={[styles.body, styles.bullet]}>{`• ${exportLine(item)}`}</Text>
+                      {item.status === 'ready' ? (
+                        <Button
+                          label={busy === `download:${item.id}` ? 'Opening…' : 'Download'}
+                          secondary
+                          disabled={busy !== null}
+                          onPress={() => void downloadExport(item.id)}
+                        />
+                      ) : null}
+                    </View>
                   ))
                 )}
               </Section>
@@ -371,6 +427,45 @@ export default function ParentPrivacyScreen() {
                 )}
               </Section>
             </>
+          ) : null}
+
+          {data ? (
+            <Section title={ACCOUNT_CLOSE_COPY.title}>
+              <Text style={styles.body}>{ACCOUNT_CLOSE_COPY.intro}</Text>
+              <Text
+                style={[styles.body, styles.bullet]}
+              >{`• ${ACCOUNT_CLOSE_COPY.ownerRule}`}</Text>
+              <Text style={[styles.body, styles.bullet]}>
+                {`• ${ACCOUNT_CLOSE_COPY.guardianRule}`}
+              </Text>
+              <Text style={[styles.body, styles.bullet]}>{`• ${ACCOUNT_CLOSE_COPY.keep}`}</Text>
+              <View style={styles.warning}>
+                <Text style={[styles.body, styles.bold]}>{ACCOUNT_CLOSE_COPY.storeNotice}</Text>
+              </View>
+              <Pressable
+                accessibilityRole="checkbox"
+                accessibilityLabel={ACCOUNT_CLOSE_COPY.confirmLabel}
+                accessibilityState={{ checked: closeConfirmed }}
+                onPress={() => {
+                  setCloseConfirmed((v) => !v);
+                  setFeedback(null);
+                }}
+                style={[styles.choice, closeConfirmed && styles.choiceSelected]}
+              >
+                <Text style={styles.body}>
+                  {`${closeConfirmed ? '☑' : '☐'}  ${ACCOUNT_CLOSE_COPY.confirmLabel}`}
+                </Text>
+              </Pressable>
+              <Button
+                label={busy === 'account' ? 'Deleting…' : ACCOUNT_CLOSE_COPY.action}
+                danger
+                disabled={busy !== null}
+                onPress={() => void closeAccount()}
+              />
+              {feedback?.area === 'account' ? (
+                <ResultView key={feedback.id} result={feedback.result} api={api} />
+              ) : null}
+            </Section>
           ) : null}
         </ScrollView>
       </KeyboardAvoidingView>

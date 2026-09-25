@@ -1,8 +1,12 @@
 import { Link } from 'react-router';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
-import { lead, PageTitle, Section, SupportEmail } from './common.tsx';
+import { draftPrefix, lead, PageTitle, PAYMENT_STORES, Section, SupportEmail } from './common.tsx';
 
-/** Common questions, answered to match the product's actual design (spec P3, P5, P6, P11). */
+/**
+ * Common questions, answered to match the product's actual design (spec P3, P5, P6, P11).
+ * Subscriptions are sold by Apple's App Store, Google Play and the Amazon Appstore (Fire tablets),
+ * named together wherever any of them is named (AMZ-17).
+ */
 const questions: { question: string; answer: string }[] = [
   {
     question: 'How do I connect my child’s device?',
@@ -26,8 +30,7 @@ const questions: { question: string; answer: string }[] = [
   },
   {
     question: 'How do I change or cancel my subscription?',
-    answer:
-      'Subscriptions are billed and managed by the App Store or Google Play, so you change or cancel them there. Deleting your PencilLift account doesn’t cancel a store subscription.',
+    answer: `Subscriptions are billed and managed by ${PAYMENT_STORES}, so you change or cancel them there. Deleting your PencilLift account doesn’t cancel a store subscription.`,
   },
   {
     question: 'How do I report something that looks wrong or unsafe?',
@@ -70,10 +73,10 @@ export default function SupportPage() {
             <Link to="/account-deletion">How to delete your account or your child’s data</Link>
           </li>
           <li>
-            <Link to="/privacy">Read the draft privacy policy</Link>
+            <Link to="/privacy">Read the {draftPrefix()}privacy policy</Link>
           </li>
           <li>
-            <Link to="/terms">Read the draft terms of use</Link>
+            <Link to="/terms">Read the {draftPrefix()}terms of use</Link>
           </li>
           <li>
             <Link to="/contact">Other ways to contact us</Link>

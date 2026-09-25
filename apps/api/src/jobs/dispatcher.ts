@@ -8,6 +8,7 @@ import {
   reverifyFormerHolders,
   syncFamilyFromProvider,
 } from '../services/billing-sync.ts';
+import { createExportBuildHandler, storageUploader, type ExportUploader } from './export-build.ts';
 import { enqueueDueLearningJobs } from './learning-jobs.ts';
 import { purgeExpiredServes } from '../services/monetization-retention.ts';
 import { runDonationAccrual, runGeneration } from '../services/p17-jobs.ts';
@@ -269,9 +270,105 @@ export const safetyFlagEmailHandler: JobHandler = Object.assign(
   },
 );
 
+// ---------------------------------------------------------------------------------------------
+// Private exports (spec P8, P10; AC_LEARNING_10): the builder job, registered for every tick
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The in-memory storage double stores bytes directly: its signed URLs point nowhere, so uploading
+ * through them would fail every export in development. Only the labeled mock has `put`; the real
+ * adapter uploads through its signed URL (export-build.ts storageUploader).
+ */
+function isMemoryStorageMock(
+  storage: JobDeps['providers']['storage'],
+): storage is JobDeps['providers']['storage'] & { put(path: string, bytes: Uint8Array): void } {
+  return storage.isMock && typeof (storage as { put?: unknown }).put === 'function';
+}
+
+/** `export_build`: one job per data_exports row (payload: export id, optional set id). */
+export const exportBuildHandler: JobHandler = (deps, job) => {
+  const storage = deps.providers.storage;
+  const upload: ExportUploader = isMemoryStorageMock(storage)
+    ? (path, bytes) => {
+        storage.put(path, bytes);
+        return Promise.resolve();
+      }
+    : storageUploader(storage);
+  return createExportBuildHandler({ upload })(deps, job);
+};
+
+// ---------------------------------------------------------------------------------------------
+// Account closure (Apple 5.1.1(v), Google Play account deletion; migration 0830)
+// ---------------------------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** How long a family owner's closure waits between checks while the family purge is pending. */
+export const ACCOUNT_CLOSE_RECHECK_MS = 5 * 60_000;
+
+/**
+ * `account_close` (payload: the auth user id only; no family, so the job outlives the family
+ * tombstone): closes the parent's Supabase sign-in through the auth-admin provider once nothing
+ * still needs it. Queued by POST /v1/account/close for every closure; for a family owner it is the
+ * only path (their sign-in closes after the family purge has completed), for a guardian or an adult
+ * without a family it is the durable backstop behind the inline close.
+ *
+ * Idempotent: a user already closed ends the job. While the user still holds an active membership
+ * of a tombstoned family (purge pending) the job pauses without spending an attempt; a membership
+ * of a LIVE family (the deletion was cancelled or never asked for) fails the job, so it retries and
+ * dead-letters like every other job, visible in the ledger. Nothing here is ever a mock outside
+ * development and test (L-016): the refusing provider fails the job. Logs and the audit row carry
+ * the user id and provider name only.
+ */
+export const accountCloseHandler: JobHandler = async (deps, job) => {
+  const userId = typeof job.payload.userId === 'string' ? job.payload.userId : '';
+  if (!UUID_RE.test(userId)) throw new Error('account_close job without user');
+  const authAdmin = deps.providers.authAdmin;
+  if (!authAdmin) throw new Error('AUTH_ADMIN_NOT_CONFIGURED');
+  if (authAdmin.isMock && !MOCK_ENVIRONMENTS.has(deps.config.environment)) {
+    deps.log({ level: 'error', event: 'account_close_blocked', code: 'AUTH_ADMIN_MOCK' });
+    throw new Error('AUTH_ADMIN_MOCK');
+  }
+  const [state] = await deps.db.asService(
+    (tx) => tx<{ closed: boolean; live_family: boolean; purge_pending: boolean }[]>`
+      select app.auth_user_closed(${userId}::uuid) as closed,
+             exists (
+               select 1 from public.family_memberships m
+                 join public.families f on f.id = m.family_id
+                where m.user_id = ${userId}::uuid and m.status = 'active' and f.deleted_at is null
+             ) as live_family,
+             exists (
+               select 1 from public.family_memberships m
+                 join public.families f on f.id = m.family_id
+                where m.user_id = ${userId}::uuid and m.status = 'active' and f.deleted_at is not null
+             ) as purge_pending`,
+  );
+  if (state?.closed) return;
+  if (state?.live_family) {
+    deps.log({ level: 'error', event: 'account_close_blocked', code: 'FAMILY_ACTIVE' });
+    throw new Error('FAMILY_ACTIVE');
+  }
+  if (state?.purge_pending) {
+    return {
+      kind: 'defer',
+      runAfter: new Date(deps.clock().getTime() + ACCOUNT_CLOSE_RECHECK_MS),
+      code: 'PURGE_PENDING',
+    };
+  }
+  const { outcome } = await authAdmin.closeUser(userId);
+  await deps.db.asService(
+    (tx) => tx`
+      insert into public.audit_events (actor_kind, action, target_type, target_id, metadata)
+      values ('system', 'account.closed', 'auth_user', ${userId},
+              ${JSON.stringify({ provider: authAdmin.name, outcome })}::text::jsonb)`,
+  );
+  deps.log({ level: 'info', event: 'account_closed', code: outcome });
+};
+
 export const DEFAULT_HANDLERS: Readonly<Record<string, JobHandler>> = {
   deletion_purge: deletionPurgeHandler,
   safety_flag_email: safetyFlagEmailHandler,
+  export_build: exportBuildHandler,
+  account_close: accountCloseHandler,
 };
 
 export interface TickReport {

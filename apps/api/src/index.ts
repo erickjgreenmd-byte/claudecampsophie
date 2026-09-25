@@ -3,7 +3,7 @@ import { createPostgresClient } from './pg-client.ts';
 import { createApp } from './app.ts';
 import { createParentVerifier } from './auth/parent.ts';
 import { loadConfig, MOCK_ENVIRONMENTS, type ApiConfig } from './config.ts';
-import { createDb } from './db.ts';
+import { createDb, type Db } from './db.ts';
 import {
   createMockModerationClient,
   createOpenAiModerationClient,
@@ -12,17 +12,19 @@ import {
   type ModerationClient,
 } from '@pencillift/ai';
 import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/dispatcher.ts';
-import { createExportBuildHandler } from './jobs/export-build.ts';
 import { createLearningHandlers } from './jobs/learning-jobs.ts';
 import { createScanProcessHandler, storageReader } from './jobs/scan-process.ts';
 import type { AppDeps } from './middleware/context.ts';
 import { createDbRateLimiter } from './middleware/rate-limit.ts';
 import { createSupabaseStorage } from './providers/supabase-storage.ts';
 import { createResendEmail } from './providers/email-resend.ts';
+import { createRefusingAuthAdmin, createSupabaseAuthAdmin } from './providers/auth-admin.ts';
 import {
   createDevelopmentConsentMock,
+  createLocalAuthAdminDouble,
   createMemoryStorageMock,
   createOutboxEmailMock,
+  type AuthAdminProvider,
   type ConsentProvider,
   type EmailProvider,
   type StorageProvider,
@@ -301,6 +303,49 @@ export function selectStorageAndEmail(
 }
 
 /**
+ * Explicit auth-admin selection (account closure, Apple 5.1.1(v) / Google Play), failing closed
+ * like storage and email: the Supabase Auth Admin adapter with SUPABASE_URL and the service key, the
+ * labeled local double only in development/test, and a provider that refuses every closure in
+ * staging/production without the key (never a double there, whatever the configuration says). The
+ * double takes the database lazily: providers are selected before a client is opened.
+ */
+export function selectAuthAdmin(
+  config: ApiConfig,
+  env: WorkerEnv,
+  db: () => Db,
+): { ok: true; provider: AuthAdminProvider } | RuntimeFailure {
+  let provider: AuthAdminProvider;
+  switch (config.providers.authAdmin) {
+    case 'development_mock':
+      provider = createLocalAuthAdminDouble(db);
+      break;
+    case 'unavailable':
+      provider = createRefusingAuthAdmin();
+      break;
+    case 'supabase':
+      if (
+        typeof env.SUPABASE_URL !== 'string' ||
+        typeof env.SUPABASE_SERVICE_ROLE_KEY !== 'string'
+      ) {
+        return NOT_CONFIGURED;
+      }
+      try {
+        provider = createSupabaseAuthAdmin({
+          supabaseUrl: env.SUPABASE_URL,
+          serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+        });
+      } catch {
+        return NOT_CONFIGURED;
+      }
+      break;
+    default:
+      return NOT_CONFIGURED;
+  }
+  if (provider.isMock && !MOCK_ENVIRONMENTS.has(config.environment)) return NOT_READY;
+  return { ok: true, provider };
+}
+
+/**
  * Builds the per-invocation dependencies shared by HTTP requests and Cron Triggers. A provider
  * constructor that refuses a configured value answers NOT_CONFIGURED like any other configuration
  * error (LRD-4): fetch() then serves the structured 503 and scheduled() logs
@@ -342,10 +387,16 @@ function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
   if (!storageAndEmail.ok) return storageAndEmail;
   const moderation = selectModerationClient(config, env);
   if (!moderation.ok) return moderation;
+  let db: Db | null = null;
+  const authAdmin = selectAuthAdmin(config, env, () => {
+    if (!db) throw new Error('database client not ready');
+    return db;
+  });
+  if (!authAdmin.ok) return authAdmin;
   // Last, so a refused configuration never opens a client. One client configuration for the
   // Worker and the tests (BUG-063: array parameters need types).
   const sql = createPostgresClient(env.HYPERDRIVE.connectionString);
-  const db = createDb(sql);
+  db = createDb(sql);
   const deps: AppDeps = {
     config,
     db,
@@ -359,6 +410,7 @@ function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
       email: storageAndEmail.email,
       subscriptions: billing.subscriptions,
       stripe: billing.stripe,
+      authAdmin: authAdmin.provider,
     },
     log: (event) => console.log(JSON.stringify(event)),
   };
@@ -407,7 +459,6 @@ export default {
       // consent and the child-data gate allow it, so these run with or without a key. Every
       // re-themed story and intro passes provider moderation before a child sees it.
       ...createLearningHandlers(ai ? { ai, moderation } : {}),
-      export_build: createExportBuildHandler(),
     };
     if (ai) {
       // Without a real key scans stay queued and readiness reports AI as blocked; they are never

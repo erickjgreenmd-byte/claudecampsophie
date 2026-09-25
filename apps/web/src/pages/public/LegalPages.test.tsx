@@ -127,7 +127,7 @@ describe('PrivacyPage states the limits of the implemented design (RV-public-sit
     );
     expect(text).not.toMatch(/does not collect precise location/i);
     // No deployed job builds export files yet (dispatcher DEFAULT_HANDLERS).
-    expect(text).toMatch(/export files aren.t available yet/i);
+    expect(text).toMatch(/files are prepared within minutes/i);
     // POST /v1/deletion scope "family" is owner-only (privacy.ts ownerOnlyFamilyDeletion).
     expect(text).toMatch(/only the family owner can delete the whole family account/i);
   });

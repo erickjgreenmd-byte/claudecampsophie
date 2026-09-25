@@ -80,6 +80,13 @@ export interface ApiConfig {
      * RESEND_API_KEY, `resend` with the key and EMAIL_FROM (docs/Owner_Actions.md #14).
      */
     readonly email: 'development_mock' | 'unavailable' | 'resend';
+    /**
+     * Supabase Auth Admin (closes a parent's sign-in on account deletion; Apple 5.1.1(v), Google
+     * Play), selected like storage: `supabase` with SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, the
+     * labeled local double only in development/test, `unavailable` (every close refused, the
+     * account_close job retries then dead-letters) in staging/production without the key.
+     */
+    readonly authAdmin: 'development_mock' | 'unavailable' | 'supabase';
   };
   readonly flags: {
     /** Optional adult web billing (spec P11) — disabled until the owner decides launch policy. */
@@ -219,6 +226,10 @@ export function loadConfig(
       moderation: env.OPENAI_API_KEY ? 'openai' : mockOrUnavailable(environment),
       storage: env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY ? 'supabase' : 'development_mock',
       email: env.RESEND_API_KEY ? 'resend' : mockOrUnavailable(environment),
+      authAdmin:
+        env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY
+          ? 'supabase'
+          : mockOrUnavailable(environment),
     },
     flags: {
       stripeWebBillingEnabled: env.OPTIONAL_STRIPE_WEB_BILLING_ENABLED === 'true',
@@ -415,6 +426,11 @@ export function productionReadiness(
       'email_provider',
       config.providers.email === 'resend',
       `Transactional email (${config.providers.email}): guardian invitations, safety flags and notices need RESEND_API_KEY and EMAIL_FROM on a domain verified in Resend; without them every send is refused outside development/test`,
+    ),
+    item(
+      'auth_admin',
+      config.providers.authAdmin === 'supabase',
+      `Account closure (${config.providers.authAdmin}): deleting a parent's own sign-in in the app (Apple 5.1.1(v), Google Play) needs the Supabase Auth Admin API, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY; the local double is development-only and without the key staging/production refuse every closure (account_close jobs dead-letter)`,
     ),
     item(
       'safety_templates',

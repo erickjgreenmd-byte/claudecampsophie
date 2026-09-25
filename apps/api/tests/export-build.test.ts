@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { cryptoRandom } from '@pencillift/domain';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
-import { runJobs, type JobDeps } from '../src/jobs/dispatcher.ts';
+import { DEFAULT_HANDLERS, runJobs, type JobDeps } from '../src/jobs/dispatcher.ts';
 import {
   createExportBuildHandler,
   csvCell,
@@ -370,5 +370,34 @@ describe('progress and family data exports', () => {
         type: 'application/pdf',
       },
     ]);
+  });
+});
+
+describe('the export builder is a registered job (APL-20)', () => {
+  it('DEFAULT_HANDLERS carries export_build, and with the labeled memory mock the file lands where the download route signs it', async () => {
+    // Before: export-build.ts existed but DEFAULT_HANDLERS had no export_build, so a tick built
+    // nothing and the apps said exports were "not switched on".
+    expect(Object.keys(DEFAULT_HANDLERS)).toContain('export_build');
+    const res = await api.request('/v1/exports', {
+      method: 'POST',
+      token,
+      body: { kind: 'progress_csv' },
+    });
+    expect(res.status).toBe(202);
+    const { export: created } = await json<{ export: { id: string } }>(res);
+    const report = await runJobs(deps, DEFAULT_HANDLERS);
+    expect(report.succeeded).toBeGreaterThanOrEqual(1);
+    const [row] = await api.db.sql<{ status: string; storage_path: string | null }[]>`
+      select status, storage_path from public.data_exports where id = ${created.id}`;
+    expect(row).toEqual({
+      status: 'ready',
+      storage_path: `exports/${fam.familyId}/${created.id}.csv`,
+    });
+    // The bytes are in the mock store (measured, so a stat answers), not behind a dead signed URL.
+    expect(await api.providers.storage.stat(row!.storage_path!)).toMatchObject({
+      byteSize: expect.any(Number) as number,
+    });
+    const download = await api.request(`/v1/exports/${created.id}/download`, { token });
+    expect(download.status).toBe(200);
   });
 });

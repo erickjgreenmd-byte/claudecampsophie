@@ -22,6 +22,7 @@ import { billingRoutes } from './routes/billing.ts';
 import { exportDownloadRoutes } from './routes/export-download.ts';
 import { adminMonetizationRoutes } from './routes/admin-monetization.ts';
 import { supportRoutes } from './routes/support.ts';
+import { accountRoutes } from './routes/account.ts';
 import { adminOpsRoutes } from './routes/admin-ops.ts';
 
 /** Max JSON body accepted by any route (uploads use signed storage URLs, never the API body). */
@@ -162,6 +163,7 @@ export function createApp(appDeps: AppDeps): Hono<AppEnv> {
   app.route('/v1', supportRoutes()); // /v1/support/*
   app.route('/v1/admin', adminOpsRoutes()); // /v1/admin/overview, /v1/admin/support/*, /v1/admin/revenue/*
   app.route('/webhooks', webhooksRoutes()); // /webhooks/revenuecat, /webhooks/stripe
+  app.route('/v1', accountRoutes());
   return app;
 }
 

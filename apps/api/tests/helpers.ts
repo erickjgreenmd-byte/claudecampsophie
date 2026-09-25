@@ -13,6 +13,7 @@ import {
   createDevelopmentConsentMock,
   createMemoryStorageMock,
   createOutboxEmailMock,
+  createLocalAuthAdminDouble,
 } from '../src/providers/index.ts';
 
 export const TEST_JWT_SECRET = 'test-supabase-jwt-secret-with-at-least-32-chars!!';
@@ -40,6 +41,7 @@ export interface TestApi {
     email: ReturnType<typeof createOutboxEmailMock>;
     subscriptions: ReturnType<typeof createSubscriberStateMock>;
     stripe: ReturnType<typeof createStripeClientMock>;
+    authAdmin: ReturnType<typeof createLocalAuthAdminDouble>;
   };
   request(
     path: string,
@@ -65,6 +67,8 @@ export async function createTestApi(overrides: Record<string, string> = {}): Pro
     email: createOutboxEmailMock(),
     subscriptions: createSubscriberStateMock(),
     stripe: createStripeClientMock(),
+    // Labeled local double of the Supabase Auth Admin soft delete (migration 0830); never outside test.
+    authAdmin: createLocalAuthAdminDouble(() => apiDb),
   };
   const app = createApp({
     config,

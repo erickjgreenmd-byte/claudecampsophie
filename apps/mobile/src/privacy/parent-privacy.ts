@@ -1,14 +1,19 @@
 /**
- * Parent privacy screen logic (spec P4, P10, P14 "export/delete"; AC_ACCESS_10, AC_SECURITY_05).
- * Request a private export, request deletion of a child or the whole family with typed
- * confirmation, and handle the server-enforced PIN step-up. Pure: no react-native imports.
+ * Parent privacy screen logic (spec P4, P10, P14 "export/delete"; AC_ACCESS_10, AC_SECURITY_05;
+ * Apple 5.1.1(v) / Google Play account deletion). Request a private export and open a ready one,
+ * request deletion of a child or the whole family with typed confirmation, delete the parent's own
+ * sign-in, and handle the server-enforced PIN step-up. Pure: no react-native imports.
  */
 import {
+  ACCOUNT_CLOSE_COPY,
+  ACCOUNT_CLOSE_RULES,
   adultUnlockResponseSchema,
+  closeAccountResponseSchema,
   dataExportResponseSchema,
   dataExportsResponseSchema,
   deletionRequestResponseSchema,
   deletionRequestsResponseSchema,
+  exportDownloadResponseSchema,
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
   PRIVACY_RETENTION,
@@ -58,7 +63,7 @@ const EXPORT_KIND_LABELS: Record<DataExport['kind'], string> = {
 
 const EXPORT_STATUS_LABELS: Record<DataExport['status'], string> = {
   queued: 'Requested — waiting to be prepared',
-  ready: 'Ready — downloading in the app isn’t available yet',
+  ready: 'Ready to download',
   failed: 'Couldn’t be prepared — please request it again',
   expired: 'Expired — request a new copy',
 };
@@ -129,6 +134,67 @@ export async function requestExportAction(
     return { status: 'done', message: 'Export requested. Its status is shown below.' };
   } catch (error) {
     return toResult(error);
+  }
+}
+
+/**
+ * Opens a ready export: the API answers a one-minute signed link (family and step-up checked
+ * server-side; never a durable URL), which `open` hands to the system browser. The link is never
+ * shown or stored.
+ */
+export async function exportDownloadAction(
+  api: ApiClient,
+  exportId: string,
+  open: (url: string) => Promise<void>,
+): Promise<ActionResult> {
+  try {
+    const link = await api.get(`/v1/exports/${exportId}/download`, exportDownloadResponseSchema);
+    await open(link.url);
+    return { status: 'done', message: 'Opening your download. The link works for one minute.' };
+  } catch (error) {
+    return toResult(error);
+  }
+}
+
+export type CloseAccountResult =
+  | { readonly status: 'closed' | 'pending'; readonly message: string }
+  | { readonly status: 'step_up' }
+  | { readonly status: 'error'; readonly message: string };
+
+/**
+ * Deletes the parent's own sign-in (POST /v1/account/close). Nothing is sent until the parent has
+ * ticked the confirmation; the server needs a recent PIN unlock. A family owner is told to delete
+ * the family account first (the server's FAMILY_DELETION_REQUIRED rule); `closed` and `pending`
+ * both mean the device must sign out now (the API's signOut flag).
+ */
+export async function closeAccountAction(
+  api: ApiClient,
+  confirmed: boolean,
+): Promise<CloseAccountResult> {
+  if (!confirmed) return { status: 'error', message: 'Tick the box to confirm.' };
+  try {
+    const result = await api.send(
+      'POST',
+      '/v1/account/close',
+      { confirm: true },
+      closeAccountResponseSchema,
+    );
+    return {
+      status: result.status,
+      message: result.status === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending,
+    };
+  } catch (error) {
+    if (
+      error instanceof ApiRequestError &&
+      error.code === 'CONFLICT' &&
+      error.rule === ACCOUNT_CLOSE_RULES.familyDeletionRequired
+    ) {
+      return { status: 'error', message: ACCOUNT_CLOSE_COPY.familyDeletionRequired };
+    }
+    const fallback = toResult(error);
+    return fallback.status === 'step_up'
+      ? fallback
+      : { status: 'error', message: parentErrorMessage(error) };
   }
 }
 

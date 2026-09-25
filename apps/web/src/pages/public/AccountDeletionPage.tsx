@@ -1,60 +1,107 @@
-import { Link } from 'react-router';
+import { Link, useLocation } from 'react-router';
+import { ACCOUNT_CLOSE_COPY } from '@pencillift/contracts';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
-import { lead, PageTitle, Section, SupportEmail } from './common.tsx';
+import { DraftOnly, draftPrefix, lead, PageTitle, Section, SupportEmail } from './common.tsx';
 
 /**
- * Public account-deletion page (spec P4, P15 deletion URL, AC_DEPLOY_04). Mirrors the implemented
- * flow: public.request_deletion requires a recent PIN unlock, tombstones the family, signs child
- * devices out and cancels queued jobs at once; purge of active data completes within 30 days.
+ * Public account-deletion page (spec P4, P15 deletion URL, AC_DEPLOY_04; Apple 5.1.1(v), Google
+ * Play account deletion). Mirrors the implemented flow: in the PencilLift app (iPhone, iPad,
+ * Android and Fire tablets) or the parent portal, with a recent PIN unlock, a parent deletes one
+ * child's data, the family owner deletes the whole family account, and any parent deletes their
+ * own sign-in (POST /v1/account/close: an owner's sign-in closes once the family purge has
+ * finished, an invited guardian is removed and closed at once). Email remains the fallback for
+ * someone who can no longer sign in.
  *
- * It also states the flow's limits (AC_UX_02, RV-public-site-2..4): whole-family deletion is
- * owner-only (privacy.ts ownerOnlyFamilyDeletion); export files are not built by any deployed job,
- * so no "export first" advice; and the retention list matches app.purge_family_data (billing,
- * consent records, audit log, family tombstone; the adult's sign-in is not removed).
+ * It also states the flow's limits (AC_UX_02, RV-public-site-3/4): whole-family deletion is
+ * owner-only (privacy.ts ownerOnlyFamilyDeletion) and the retention list matches
+ * app.purge_family_data (billing, consent records, audit log, family tombstone) plus the auth
+ * user's pseudonymous id after a soft delete (migration 0830). Exports are built by the
+ * export_build job and can be downloaded before deleting (RV-public-site-2 resolved).
  */
+
+/** Set by the parent area after an in-app closure (router state, never a URL parameter). */
+type ClosedState = 'closed' | 'pending';
+
+function closedFromState(state: unknown): ClosedState | null {
+  const value = (state as { accountClosed?: unknown } | null)?.accountClosed;
+  return value === 'closed' || value === 'pending' ? value : null;
+}
+
 export default function AccountDeletionPage() {
+  const closed = closedFromState(useLocation().state);
   return (
     <>
       <DraftBanner />
       <PageTitle title="Delete your account" />
       <h1>Delete your PencilLift account</h1>
+      {closed ? (
+        <div className="notice" role="status" style={{ marginBottom: 16 }}>
+          <p style={{ margin: 0 }}>
+            <strong>
+              {closed === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending}
+            </strong>
+          </p>
+        </div>
+      ) : null}
       <p style={lead}>
-        Any parent or guardian in your family can delete one child’s data at any time. Only the
-        family owner, the parent who created the account, can delete the whole family account.
-        Here’s how, and what happens next.
+        You can delete one child’s data, your whole family account (family owner only) and your own
+        parent sign-in from inside the PencilLift app or the parent portal. Here’s how, and what
+        happens next.
       </p>
 
-      <Section title="Option 1: In the parent area">
+      <Section title="Option 1: In the app or the parent portal">
         <ol>
-          <li>Sign in to PencilLift as a parent or guardian in your family.</li>
-          <li>Unlock the parent area with your six-digit PIN.</li>
           <li>
-            Open <Link to="/app/privacy">privacy controls in the parent area</Link>.
+            Open the PencilLift app on your iPhone, iPad, Android phone or tablet or Fire tablet, or
+            sign in to the parent portal at <Link to="/sign-in">this website</Link>.
           </li>
           <li>
-            Choose to delete one child’s data or, if you are the family owner, the whole family
-            account, and confirm.
+            Sign in as a parent or guardian and unlock the parent area with your six-digit PIN.
+          </li>
+          <li>
+            Open <strong>Privacy, export and deletion</strong> (in the portal:{' '}
+            <Link to="/app/privacy">privacy controls in the parent area</Link>).
+          </li>
+          <li>
+            Choose what to delete and confirm:
+            <ul>
+              <li>
+                <strong>One child’s data.</strong> Any parent or guardian in the family can do this.
+              </li>
+              <li>
+                <strong>The whole family account.</strong> Only the family owner, the parent who
+                created the account, can do this. It removes every child’s data and every guardian’s
+                access.
+              </li>
+              <li>
+                <strong>Your own account (sign-in).</strong> “Delete my account” closes your email
+                and password sign-in. The family owner deletes the family account first; their
+                sign-in then closes automatically once that deletion has finished. An invited
+                guardian is removed from the family and closed at once. Either way the device is
+                signed out right away.
+              </li>
+            </ul>
           </li>
         </ol>
         <p>
-          <strong>If you joined by invitation as a guardian:</strong> you can delete a child’s data,
-          but only the family owner can delete the whole family account. Ask the family owner to do
-          it. The family owner can also remove you from the family.
+          <strong>If you joined by invitation as a guardian:</strong> you can delete a child’s data
+          and your own account, but only the family owner can delete the whole family account. The
+          family owner can also remove you from the family.
         </p>
         <p>
-          <strong>Copies of your information:</strong> export files aren’t available yet. You can
-          request an export in privacy controls, but there is nothing to download until the export
-          service is switched on, and deleting the data also removes its export requests.
+          <strong>Copies of your information:</strong> request an export in privacy controls before
+          you delete. Files are prepared within minutes and can be downloaded from the parent portal
+          for a limited time. Deleting the data also removes its exports.
         </p>
       </Section>
 
       <Section title="Option 2: Email us">
         <p>
-          Email <SupportEmail /> from the email address on your parent account and say whether you
-          want to delete one child’s data or the whole family account. We will confirm you are a
-          parent or guardian in the family before deleting anything, and only the family owner can
-          ask us to delete the whole family account. Please don’t include homework photos or your
-          child’s full name.
+          If you can’t sign in, email <SupportEmail /> from the email address on your parent account
+          and say whether you want to delete one child’s data, the whole family account or your own
+          sign-in. We will confirm you are a parent or guardian in the family before deleting
+          anything, and only the family owner can ask us to delete the whole family account. Please
+          don’t include homework photos or your child’s full name.
         </p>
       </Section>
 
@@ -65,6 +112,10 @@ export default function AccountDeletionPage() {
           <li>Your child’s paired devices are signed out.</li>
           <li>Pending homework checks and other queued work are cancelled.</li>
           <li>The deleted family or child data can no longer be opened from any device.</li>
+          <li>
+            When you delete your own account, your sign-in stops working everywhere as soon as it is
+            closed (at once for a guardian; after the family deletion for the family owner).
+          </li>
         </ul>
         <h3>Within 30 days</h3>
         <ul>
@@ -72,7 +123,10 @@ export default function AccountDeletionPage() {
             Homework photos, results, practice and review history, points and rewards are deleted
             from our active systems.
           </li>
-          <li>Backups expire on a documented schedule (length to be confirmed).</li>
+          <li>
+            Backups expire on a documented schedule
+            <DraftOnly> (length to be confirmed)</DraftOnly>.
+          </li>
         </ul>
         <h3>What we keep</h3>
         <ul>
@@ -89,14 +143,13 @@ export default function AccountDeletionPage() {
             When the whole family account is deleted, a minimal record that the family was deleted,
             so late store notices can’t bring any data back.
           </li>
+          <li>
+            When your sign-in is closed, a pseudonymous account id that those records point to. Your
+            email address, phone number and password are removed from it.
+          </li>
         </ul>
         <p>
-          Deleting the whole family account does not close your parent sign-in (your email address
-          and password), but that sign-in no longer opens any of the family’s information. To have
-          the sign-in closed as well, email us.
-        </p>
-        <p>
-          Read the <Link to="/privacy">draft privacy policy</Link> for more detail.
+          Read the <Link to="/privacy">{draftPrefix()}privacy policy</Link> for more detail.
         </p>
       </Section>
 

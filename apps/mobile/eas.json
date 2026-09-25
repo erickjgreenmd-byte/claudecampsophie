@@ -7,7 +7,6 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "channel": "development",
       "env": {
         "EXPO_PUBLIC_API_BASE_URL": "https://api-staging.pencillift.com",
         "EXPO_PUBLIC_APP_ENV": "development"
@@ -15,14 +14,12 @@
     },
     "preview": {
       "distribution": "internal",
-      "channel": "preview",
       "env": {
         "EXPO_PUBLIC_API_BASE_URL": "https://api-staging.pencillift.com",
         "EXPO_PUBLIC_APP_ENV": "staging"
       }
     },
     "production": {
-      "channel": "production",
       "autoIncrement": true,
       "env": {
         "EXPO_PUBLIC_API_BASE_URL": "https://api.pencillift.com",
@@ -31,7 +28,6 @@
     },
     "preview-amazon": {
       "distribution": "internal",
-      "channel": "preview-amazon",
       "android": {
         "buildType": "apk"
       },
@@ -42,7 +38,6 @@
       }
     },
     "production-amazon": {
-      "channel": "production-amazon",
       "autoIncrement": true,
       "android": {
         "buildType": "apk"
