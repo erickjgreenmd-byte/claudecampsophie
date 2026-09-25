@@ -184,6 +184,27 @@ in any of the seven catalogs fails (a draft creative or campaign may be stored, 
   `Stripe test secret` and `service-role JWT` (2 files, 4 findings); in the app config, `Supabase secret key`
   and `database URL with password` (1 finding each).
 
+### 3.3 Amazon Appstore builds (Fire tablets; channel `amazon_appstore`)
+
+Fire OS has no Google services, so an Amazon build is a separate EAS profile, never the Google Play build with
+a different key (Owner action #29; `docs/Provider_Capability_Matrix.md` §2a):
+
+1. RevenueCat: create the Amazon app and copy its public `amzn_…` key into `EXPO_PUBLIC_REVENUECAT_AMAZON_KEY`
+   for the `preview-amazon` / `production-amazon` profiles (`apps/mobile/eas.json`). Those profiles also set
+   `EXPO_PUBLIC_ANDROID_STORE=amazon`; `app.config.ts` refuses any other value and any key that is not `amzn_…`,
+   and a `goog_` key on an Amazon build (or `amzn_` on a Play build) leaves purchases switched off.
+2. Build an APK with the Amazon profile (`eas build --platform android --profile production-amazon`) and scan the
+   public config as in §3.2. EAS Submit has no Amazon target: upload the APK by hand in the Amazon developer
+   console and test purchases with Amazon App Tester before submission.
+3. Create the four subscription items (1–4 children at the approved totals) in the Amazon console and record them
+   as `store_product_mappings` rows with channel `amazon_appstore`; readiness blocks a tier whose store price is
+   not the approved price, exactly as for the other stores.
+4. Expect no promo-code redemption on this channel: the P17 generation job records every Amazon mapping as
+   `unsupported` ("The Amazon Appstore has no offer codes") and the parent screen says so. Push notifications on
+   Fire tablets need Amazon Device Messaging, which is not built.
+5. The first sandbox webhook from an Amazon purchase must arrive with store `AMAZON` and produce a billing period
+   (BUG-113); record it in `docs/Connections.md`.
+
 ## 4. Scheduled work and durable jobs
 
 One Cron Trigger calls `runScheduledTick` (`apps/api/src/jobs/dispatcher.ts`): monthly promo generation
