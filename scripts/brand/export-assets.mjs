@@ -31,6 +31,8 @@ const SOURCES = path.join(root, 'brand/assets');
 const MOBILE = path.join(root, 'apps/mobile/assets/brand');
 const WEB = path.join(root, 'apps/web/public');
 const REVIEW = path.join(root, 'brand/assets/review');
+/** Store listing graphics (Play feature graphic, Amazon icons); not shipped in any app bundle. */
+const STORE = path.join(root, 'brand/store');
 const REFERENCE = path.join(root, 'brand/approved_logo_reference.png');
 
 const NAVY = '#17324D';
@@ -118,6 +120,13 @@ function adaptiveLayer(size, symbol) {
   const w = size * ADAPTIVE_SYMBOL_WIDTH;
   const h = (w * SYMBOL.h) / SYMBOL.w;
   return page(size, size, null, img(symbol, (size - w) / 2, (size - h) / 2, w, h));
+}
+
+/** Store feature graphic: the full lockup centred on an opaque off-white banner (Play 1024x500). */
+function feature(w, h, lockup) {
+  const lw = w * 0.72;
+  const lh = (lw * 430) / 1620;
+  return page(w, h, OFF_WHITE, img(lockup, (w - lw) / 2, (h - lh) / 2, lw, lh));
 }
 
 /** Splash art: symbol above the wordmark on a transparent square (expo-splash-screen image). */
@@ -230,6 +239,37 @@ const PNG_EXPORTS = [
     html: () => tile(256, TEAL, symbolOnTeal()),
     purpose: 'In-app teal tile mark (opaque; round the corners in the app if wanted)',
     from: 'symbol-on-teal.svg',
+  },
+  {
+    file: path.join(STORE, 'amazon-icon-114.png'),
+    size: 114,
+    opaque: true,
+    ground: TEAL,
+    safe: MASKABLE_SAFE_RADIUS,
+    html: () => tile(114, TEAL, symbolOnTeal()),
+    purpose: 'Amazon Appstore small icon (opaque teal tile)',
+    from: 'symbol-on-teal.svg',
+  },
+  {
+    file: path.join(STORE, 'amazon-icon-512.png'),
+    size: 512,
+    opaque: true,
+    ground: TEAL,
+    safe: MASKABLE_SAFE_RADIUS,
+    html: () => tile(512, TEAL, symbolOnTeal()),
+    purpose: 'Amazon Appstore large icon (opaque teal tile)',
+    from: 'symbol-on-teal.svg',
+  },
+  {
+    file: path.join(STORE, 'feature-graphic-1024x500.png'),
+    size: 1024,
+    width: 1024,
+    height: 500,
+    opaque: true,
+    ground: OFF_WHITE,
+    html: () => feature(1024, 500, svgSource('lockup')),
+    purpose: 'Google Play feature graphic (opaque off-white banner with the full lockup)',
+    from: 'lockup.svg',
   },
   {
     file: path.join(WEB, 'favicon-32.png'),
@@ -482,7 +522,7 @@ async function renderAll() {
       writeFileSync(file, png);
       console.log(`  wrote ${path.relative(root, file)} (${png.length} bytes)`);
     };
-    for (const e of PNG_EXPORTS) await shoot(e.html(), e.size, e.size, !e.opaque, e.file);
+    for (const e of PNG_EXPORTS) await shoot(e.html(), e.width ?? e.size, e.height ?? e.size, !e.opaque, e.file);
     for (const c of SVG_COPIES) {
       mkdirSync(path.dirname(c.file), { recursive: true });
       writeFileSync(c.file, svgSource(c.from));
@@ -605,7 +645,8 @@ function verifyPng(e) {
   if (!existsSync(e.file)) return [`missing`];
   const buffer = readFileSync(e.file);
   const image = decodePng(buffer);
-  if (image.width !== e.size || image.height !== e.size) problems.push(`is ${image.width}x${image.height}, expected ${e.size}x${e.size}`);
+  const [ew, eh] = [e.width ?? e.size, e.height ?? e.size];
+  if (image.width !== ew || image.height !== eh) problems.push(`is ${image.width}x${image.height}, expected ${ew}x${eh}`);
   const corners = [0, (image.width - 1) * 4, (image.height - 1) * image.width * 4, (image.width * image.height - 1) * 4];
   if (e.opaque) {
     let translucent = 0;
@@ -642,7 +683,7 @@ function verifyAll() {
     }
     total += result.bytes;
     const extra = result.radius === null ? '' : `, content radius ${(result.radius * 100).toFixed(1)} % (limit ${(e.safe * 100).toFixed(1)} %)`;
-    report(e.file, result.problems.length === 0, `${e.size}x${e.size}, ${e.opaque ? 'opaque' : 'transparent'}, ${result.bytes} bytes${extra}${result.problems.length ? '; ' + result.problems.join('; ') : ''}`);
+    report(e.file, result.problems.length === 0, `${e.width ?? e.size}x${e.height ?? e.size}, ${e.opaque ? 'opaque' : 'transparent'}, ${result.bytes} bytes${extra}${result.problems.length ? '; ' + result.problems.join('; ') : ''}`);
   }
   for (const c of SVG_COPIES) {
     const ok = existsSync(c.file) && readFileSync(c.file, 'utf8') === svgSource(c.from);

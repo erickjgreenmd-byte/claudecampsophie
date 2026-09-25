@@ -127,3 +127,15 @@ plugins: [['expo-splash-screen', { image: './assets/brand/splash-1200.png', imag
   (Playwright) and BSD-3-Clause (Chromium). Build-time only; not bundled.
 - No typeface is bundled or claimed: the wordmark and tagline are outlined paths traced from the
   reference (the brand guide's rule that the generated wordmark is not attributed to a specific font).
+
+## Store listing graphics (`brand/store/`, not shipped in any bundle)
+
+| File | Purpose | Size | Background | Derived from |
+| --- | --- | --- | --- | --- |
+| `amazon-icon-114.png` | Amazon Appstore small icon | 114 x 114, opaque | teal | `symbol-on-teal.svg` |
+| `amazon-icon-512.png` | Amazon Appstore large icon | 512 x 512, opaque | teal | `symbol-on-teal.svg` |
+| `feature-graphic-1024x500.png` | Google Play feature graphic (listing header) | 1024 x 500, opaque | off-white | `lockup.svg` at 72 % width |
+
+Screenshots for the listings are captured by the owner from real builds (Owner actions #33, #36): iPhone 6.9-inch
+and iPad 13-inch (App Store), phone plus 7-inch and 10-inch tablets (Google Play), Fire HD 8/10 (Amazon); synthetic
+names only (Riley, Sam, Jordan), never a real child's homework.
