@@ -3,7 +3,12 @@
 // deliberately no request shape that awards points for ads, sponsor/affiliate clicks, purchases or
 // referrals (AC_MON_13).
 import { z } from 'zod';
-import { isoDateTimeSchema, uuidSchema } from './common.ts';
+import {
+  CONTROL_CHARACTER_MESSAGE,
+  isoDateTimeSchema,
+  textHasControlCharacter,
+  uuidSchema,
+} from './common.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Limits (mirror migration 0400 and @pencillift/domain/rewards)
@@ -59,18 +64,15 @@ export function rewardTextContainsLink(text: string): boolean {
 
 /**
  * Decision: free text (reward title, instructions, adjustment reason) refuses control characters
- * other than tab, line feed and carriage return. Postgres cannot store U+0000 in text at all, so a
+ * other than tab, line feed and carriage return (`textHasControlCharacter` in common.ts, shared by
+ * every free-text field since API-AUTH-R1-01). Postgres cannot store U+0000 in text at all, so a
  * NUL used to surface as a 500 (RV-rewards-2), and the other controls have no place in
  * child-visible text or an audit reason.
  */
-export function textHasControlCharacter(text: string): boolean {
-  return /\p{Cc}/u.test(text.replace(/[\t\n\r]/g, ''));
-}
-
 const noLinks = (text: string) => !rewardTextContainsLink(text);
 const noControls = (text: string) => !textHasControlCharacter(text);
 const LINK_MESSAGE = 'Links are not allowed in rewards';
-const CONTROL_MESSAGE = 'Remove the hidden control characters';
+const CONTROL_MESSAGE = CONTROL_CHARACTER_MESSAGE;
 
 // ---------------------------------------------------------------------------------------------
 // Shared fields
@@ -235,6 +237,10 @@ export const pointsAdjustmentResponseSchema = z.strictObject({
 });
 export type PointsAdjustmentResponse = z.infer<typeof pointsAdjustmentResponseSchema>;
 
+export const POINTS_HISTORY_PAGE_SIZE = 100;
+/** A ledger sequence number (bigint as a decimal string), as GET /v1/points/history?before= takes it. */
+export const pointsLedgerCursorSchema = z.string().regex(/^[0-9]{1,19}$/);
+
 export const pointsHistoryEntrySchema = z.strictObject({
   /** Ledger sequence number (bigint as a decimal string). */
   id: z.string().regex(/^\d+$/),
@@ -251,9 +257,14 @@ export type PointsHistoryEntry = z.infer<typeof pointsHistoryEntrySchema>;
 export const pointsHistoryResponseSchema = z.strictObject({
   childId: uuidSchema,
   balance: balanceSchema,
-  /** Newest first; at most 100 entries. */
-  entries: z.array(pointsHistoryEntrySchema),
+  /** Newest first; at most 100 entries per page (`?before=<nextCursor>` for the older ones). */
+  entries: z.array(pointsHistoryEntrySchema).max(POINTS_HISTORY_PAGE_SIZE),
   hasMore: z.boolean(),
+  /**
+   * Ledger id to pass as `before` for the next older page; null on the last page (API-AUTH-R1-02).
+   * The API always sends it; optional so payloads from before it existed still parse.
+   */
+  nextCursor: pointsLedgerCursorSchema.nullable().optional(),
   /** Sums over the child's whole ledger; `net` always equals `balance` (P9 reconciliation). */
   totals: z.strictObject({
     awarded: z.number().int(),

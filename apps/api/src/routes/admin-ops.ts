@@ -168,6 +168,24 @@ const PROBLEM_MESSAGES: Readonly<Record<CaseUpdateProblem, string>> = {
 /** `<created_at in epoch microseconds>_<id>` of the last case on the previous page. */
 const CURSOR_RE = /^([0-9]{1,19})_([0-9a-f-]{36})$/;
 
+/** Largest epoch-microsecond value Postgres can hold in a bigint. */
+const INT64_MAX = 9223372036854775807n;
+/** No stored row is timestamped this far past the request clock; anything beyond is a bad cursor. */
+const CURSOR_AHEAD_MICROS = 10n * 366n * 24n * 3600n * 1_000_000n;
+
+/**
+ * Parses the epoch-microseconds half of a keyset cursor with BigInt (API-AUTH-R1-03): a 19-digit
+ * value past int64, or one far in the future, would fail the bigint cast or overflow the interval
+ * in SQL and surface as a 500; here it is a 400 like any other malformed cursor.
+ */
+function cursorMicros(digits: string, now: Date): string {
+  const micros = BigInt(digits);
+  if (micros > INT64_MAX || micros > BigInt(now.getTime()) * 1000n + CURSOR_AHEAD_MICROS) {
+    throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+  }
+  return micros.toString();
+}
+
 export function adminOpsRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
   for (const path of ['/overview', '/revenue', '/subscriptions', '/support/*', '/settings/*']) {
@@ -216,7 +234,10 @@ export function adminOpsRoutes(): Hono<AppEnv> {
     }
     const { scope, status, kind, age, after } = query.data;
     const now = deps.clock();
-    const cursor = after === undefined ? null : CURSOR_RE.exec(after);
+    const match = after === undefined ? null : CURSOR_RE.exec(after);
+    if (after !== undefined && !match)
+      throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+    const cursor = match === null ? null : { micros: cursorMicros(match[1]!, now), id: match[2]! };
     const openedBefore = age === undefined ? null : caseOpenedAtOrBefore(now, age);
     // Keyset pages, oldest first, like the safety queue: no fixed first page hides an old case.
     const rows = await deps.db.asService((tx) =>
@@ -237,8 +258,8 @@ export function adminOpsRoutes(): Hono<AppEnv> {
           [...OPEN_CASE_STATUSES],
           kind ?? null,
           openedBefore,
-          cursor?.[1] ?? null,
-          cursor?.[2] ?? null,
+          cursor?.micros ?? null,
+          cursor?.id ?? null,
         ],
       ),
     );

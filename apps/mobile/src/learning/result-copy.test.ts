@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { PracticeAnswerResponse } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, NETWORK_RULES } from '@pencillift/contracts/client';
 import {
   ASK_GROWN_UP_COPY,
   answerFeedback,
@@ -166,6 +166,11 @@ describe('child practice feedback copy (spec P6)', () => {
 
   it('error copy is calm and never shows raw server text', () => {
     expect(childLearningError(new ApiRequestError('NETWORK', 'raw', 0))).toMatch(/offline/);
+    const slow = childLearningError(
+      new ApiRequestError('NETWORK', 'raw', 0, NETWORK_RULES.timeout),
+    );
+    expect(slow).toMatch(/taking longer than usual/);
+    expect(slow).not.toMatch(/offline/);
     expect(childLearningError(new ApiRequestError('RATE_LIMITED', 'raw', 429))).toMatch(
       /little break/,
     );

@@ -991,4 +991,35 @@ describe('rubric feedback for written work (AC_GRADING_03)', () => {
     ).toBeTruthy();
     expect(within(article).queryByRole('region', { name: 'Rubric feedback' })).toBeNull();
   });
+
+  it('offers "Show older scans" while older pages exist and appends them (API-AUTH-R1-02)', async () => {
+    const OLDER = 'e0c1d2e3-f4a5-4b6c-8d7e-9f0a1b2c3d4e';
+    const cursor = `1758380400000000_${QUEUED}`;
+    const { api, gets } = fakeApi({
+      get: (path) => {
+        if (path === `/v1/assignments?childId=${RILEY}`) return { ...list(), nextCursor: cursor };
+        if (path === `/v1/assignments?childId=${RILEY}&after=${encodeURIComponent(cursor)}`) {
+          return { assignments: [summary(OLDER, 'ready')], allowance: null, nextCursor: null };
+        }
+        return undefined;
+      },
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(6);
+    await userEvent.click(within(scans).getByRole('button', { name: 'Show older scans' }));
+    await waitFor(() =>
+      expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(7),
+    );
+    expect(gets).toContain(`/v1/assignments?childId=${RILEY}&after=${encodeURIComponent(cursor)}`);
+    // The last page: nothing older is offered.
+    expect(within(scans).queryByRole('button', { name: /Show older/ })).toBeNull();
+  });
+
+  it('shows no "Show older" control when the first page is the whole history', async () => {
+    const { api } = fakeApi();
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).queryByRole('button', { name: /Show older/ })).toBeNull();
+  });
 });

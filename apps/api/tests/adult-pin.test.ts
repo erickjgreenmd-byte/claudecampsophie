@@ -105,6 +105,48 @@ describe('PIN reset budget (RV-lead-identity-access-2)', () => {
   });
 });
 
+describe('PIN set/change budget (API-AUTH-R1-04 follow-up)', () => {
+  it('an adult can replace their PIN ten times an hour; the eleventh call is refused', async () => {
+    const { fam, session } = await adultWithPin('739164');
+    await grantAdultUnlock(api.db, fam.ownerId, session, 3600);
+    const token = await parentToken(fam.ownerId, { sessionId: session });
+    const pins = [
+      '842957',
+      '953168',
+      '164379',
+      '275481',
+      '386592',
+      '497613',
+      '518724',
+      '629835',
+      '740916',
+      '851027',
+    ];
+    const statuses: number[] = [];
+    for (const pin of pins) {
+      statuses.push(
+        (await api.request('/v1/adult/pin', { method: 'PUT', token, body: { pin } })).status,
+      );
+    }
+    // The first set counted as one of the ten; nine changes follow, then 429 with retry-after.
+    expect(statuses).toEqual([200, 200, 200, 200, 200, 200, 200, 200, 200, 429]);
+    const refused = await api.request('/v1/adult/pin', {
+      method: 'PUT',
+      token,
+      body: { pin: '962138' },
+    });
+    expect(refused.status).toBe(429);
+    expect(Number(refused.headers.get('retry-after'))).toBeGreaterThan(0);
+    // A weak PIN is refused before the budget is touched, so it never counts against the parent.
+    const weak = await api.request('/v1/adult/pin', {
+      method: 'PUT',
+      token,
+      body: { pin: '111111' },
+    });
+    expect(weak.status).toBe(400);
+  });
+});
+
 describe('changing the PIN ends other sessions’ step-ups (review note c)', () => {
   it('other sessions must unlock again with the new PIN; this session keeps its step-up', async () => {
     const { fam, session } = await adultWithPin('739164');

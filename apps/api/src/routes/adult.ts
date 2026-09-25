@@ -46,6 +46,12 @@ export function adultRoutes(): Hono<AppEnv> {
     // Changing an existing PIN needs the current step-up; first-time setup only needs the session.
     const changing = existing.length > 0;
     if (changing) await assertRecentUnlock(c);
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `pin-set:${parent.userId}`,
+      RATE_RULES.pinSetPerUser,
+      deps.clock(),
+    );
     const hash = await hashPin(pin, deps.config.hashPepper);
     await deps.db.asService(async (tx) => {
       await tx`

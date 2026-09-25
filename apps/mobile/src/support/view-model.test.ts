@@ -14,7 +14,7 @@ import {
   type SupportCase,
   type SupportCaseDetail,
 } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, NETWORK_RULES } from '@pencillift/contracts/client';
 import {
   ageLabel,
   billingPeriodOptions,
@@ -414,6 +414,12 @@ describe('supportProblem', () => {
     expect(supportProblem(new ApiRequestError('NETWORK', 'offline', 0), 'load').message).toMatch(
       /offline/,
     );
+    const slow = supportProblem(
+      new ApiRequestError('NETWORK', 'raw', 0, NETWORK_RULES.timeout),
+      'load',
+    ).message;
+    expect(slow).toMatch(/taking longer than usual/);
+    expect(slow).not.toMatch(/offline/);
     expect(
       supportProblem(new ApiRequestError('UNAUTHENTICATED', 'x', 401), 'load').message,
     ).toMatch(/sign in again/);

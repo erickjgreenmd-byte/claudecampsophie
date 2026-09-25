@@ -8,7 +8,7 @@ import {
   SUPPORT_REFERENCE_MAX_LENGTH,
   SUPPORT_SUBJECT_MAX_LENGTH,
 } from '@pencillift/domain/ops';
-import { channelSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
+import { channelSchema, freeTextSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 // Support cases between a family and the owner's staff (parent-facing routes under /v1/support).
 // A case is about the family's account, plan or the app, never about a child: the intake copy
@@ -74,8 +74,8 @@ export const SUPPORT_CASE_RESOLUTION_LABELS: Readonly<Record<SupportCaseResoluti
   duplicate: 'Duplicate of another case',
 };
 
-const subjectSchema = z.string().trim().min(1).max(SUPPORT_SUBJECT_MAX_LENGTH);
-const messageBodySchema = z.string().trim().min(1).max(SUPPORT_MESSAGE_MAX_LENGTH);
+const subjectSchema = freeTextSchema({ max: SUPPORT_SUBJECT_MAX_LENGTH });
+const messageBodySchema = freeTextSchema({ max: SUPPORT_MESSAGE_MAX_LENGTH });
 
 /** Natural key of a provider billing period (public.billing_periods unique (channel, provider_period_id)). */
 export const supportBillingPeriodRefSchema = z.strictObject({

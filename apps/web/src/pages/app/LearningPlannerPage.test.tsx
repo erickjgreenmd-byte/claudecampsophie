@@ -505,13 +505,12 @@ describe('LearningPlannerPage (spec P7, P8, P10; AC_LEARNING_01/02/07/10, AC_UX_
     fireEvent.change(within(form).getByLabelText('Review time (America/New_York)'), {
       target: { value: '17:15' },
     });
-    await userEvent.click(within(form).getByRole('checkbox', { name: /Set quiet hours/ }));
-    fireEvent.change(within(form).getByLabelText('Quiet hours start (America/New_York)'), {
-      target: { value: '20:00' },
-    });
-    fireEvent.change(within(form).getByLabelText('Quiet hours end (America/New_York)'), {
-      target: { value: '07:00' },
-    });
+    // Honest reminder copy (MOB-R1-05, web twin): no reminder or quiet-hours toggle is offered
+    // while nothing sends notifications; the stored values round-trip unchanged.
+    expect(within(form).queryByRole('checkbox', { name: /practice reminders/ })).toBeNull();
+    expect(within(form).queryByRole('checkbox', { name: /quiet hours/ })).toBeNull();
+    expect(within(form).getByText(/aren’t available yet/)).toBeTruthy();
+    expect(within(form).getByText(/doesn’t send notifications to Riley’s device/)).toBeTruthy();
     await userEvent.click(within(form).getByRole('button', { name: 'Save schedule' }));
     await waitFor(() => expect(sends).toHaveLength(1));
     expect(sends[0]).toEqual({
@@ -524,7 +523,7 @@ describe('LearningPlannerPage (spec P7, P8, P10; AC_LEARNING_01/02/07/10, AC_UX_
         dailyLocalTime: '15:30',
         dailyQuestionCount: 7,
         pause: { from: '2026-12-31', to: '2027-01-02' },
-        quietHours: { start: '20:00', end: '07:00' },
+        quietHours: null,
         childRemindersPermitted: false,
       },
     });

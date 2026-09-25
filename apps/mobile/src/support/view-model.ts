@@ -17,7 +17,7 @@ import {
   type SupportCaseKind,
   type SupportCaseStatus,
 } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, isRequestTimeout } from '@pencillift/contracts/client';
 import { formatUsd } from '@pencillift/domain';
 
 /**
@@ -474,8 +474,13 @@ export function supportProblem(error: unknown, context: SupportContext): Support
   if (code === 'VALIDATION_FAILED') {
     return problem('Please check the subject and message, then try again.');
   }
-  if (code === 'NETWORK')
-    return problem('You appear to be offline. Try again when you’re connected.');
+  if (code === 'NETWORK') {
+    return problem(
+      isRequestTimeout(error)
+        ? 'This is taking longer than usual. Check your connection and try again.'
+        : 'You appear to be offline. Try again when you’re connected.',
+    );
+  }
   if (code === 'UNAUTHENTICATED') return problem('Please sign in again to use support.');
   if (code === 'CHILD_MODE_FORBIDDEN') {
     return problem('Support cases can only be opened by a grown-up.');

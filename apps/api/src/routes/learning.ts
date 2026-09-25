@@ -76,7 +76,7 @@ import {
   requireParent,
 } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
-import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
+import { enforceRateLimit, RATE_RULES, type RateRule } from '../middleware/rate-limit.ts';
 
 /**
  * Learning API (spec P6-P9, P13; AC_LEARNING_01..10, AC_REWARDS_01/02, AC_GRADING_06/09).
@@ -158,6 +158,19 @@ function archivedChild(): ApiError {
  * plan before activation; no new practice work starts for it, since practice jobs are only created
  * for active profiles (loadChildContext).
  */
+/**
+ * Per-family abuse bound on a parent write route (API-AUTH-R1-04): a stuck button or a script
+ * cannot flood a child's subjects, test dates, materials or schedule; real use is far below.
+ */
+async function familyWriteLimit(
+  c: Context<AppEnv>,
+  familyId: string,
+  action: string,
+  rule: RateRule,
+): Promise<void> {
+  await enforceRateLimit(c.var.deps.rateLimiter, `${action}:${familyId}`, rule, c.var.deps.clock());
+}
+
 async function ownedChild(c: Context<AppEnv>, access: ChildAccess): Promise<OwnedChild> {
   const childId = paramUuid(c, 'childId', 'Child not found');
   const familyId = await currentFamilyId(c);
@@ -601,6 +614,7 @@ export function learningRoutes(): Hono<AppEnv> {
 
   r.post('/children/:childId/subjects', requireParent, async (c) => {
     const owned = await ownedChild(c, 'write');
+    await familyWriteLimit(c, owned.familyId, 'subject-create', RATE_RULES.subjectCreatePerFamily);
     const body = await readJson(c, createChildSubjectRequestSchema);
     const displayName =
       body.displayName ??
@@ -666,6 +680,12 @@ export function learningRoutes(): Hono<AppEnv> {
 
   r.put('/children/:childId/learning-schedule', requireParent, async (c) => {
     const owned = await ownedChild(c, 'write');
+    await familyWriteLimit(
+      c,
+      owned.familyId,
+      'schedule-update',
+      RATE_RULES.scheduleUpdatePerFamily,
+    );
     const body = await readJson(c, updateLearningScheduleRequestSchema);
     await parentContext(c, owned); // creates defaults
     await c.var.deps.db.asParent(
@@ -738,6 +758,12 @@ export function learningRoutes(): Hono<AppEnv> {
 
   r.post('/children/:childId/test-dates', requireParent, async (c) => {
     const owned = await ownedChild(c, 'write');
+    await familyWriteLimit(
+      c,
+      owned.familyId,
+      'test-date-create',
+      RATE_RULES.testDateCreatePerFamily,
+    );
     const body = await readJson(c, createTestDateRequestSchema);
     const scope =
       body.scopeNotes !== undefined && body.scopeNotes.length > 0 ? body.scopeNotes : null;
@@ -795,6 +821,12 @@ export function learningRoutes(): Hono<AppEnv> {
 
   r.post('/children/:childId/study-materials', requireParent, async (c) => {
     const owned = await ownedChild(c, 'write');
+    await familyWriteLimit(
+      c,
+      owned.familyId,
+      'study-material-create',
+      RATE_RULES.studyMaterialCreatePerFamily,
+    );
     const body = await readJson(c, createStudyMaterialRequestSchema);
     if (body.text.length > STUDY_MATERIAL_MAX_CHARS[body.kind]) {
       throw new ApiError('PAYLOAD_TOO_LARGE', 'That is too long for this kind of material');

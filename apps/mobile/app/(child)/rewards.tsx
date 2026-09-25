@@ -13,6 +13,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ChildRewards } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { ChildNav } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
   askForRewardAction,
@@ -104,6 +105,7 @@ export default function ChildRewardsScreen() {
         }
       >
         <BrandRow />
+        <ChildNav />
         <Text accessibilityRole="header" style={styles.title}>
           My rewards
         </Text>

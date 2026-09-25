@@ -27,6 +27,7 @@ export default function ParentSignIn() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resetSent, setResetSent] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
 
   if (!parentAuth.configured) {
     return (
@@ -99,14 +100,24 @@ export default function ParentSignIn() {
         </Notice>
       ) : (
         <Button
-          label="Forgot password"
+          label={resetBusy ? 'Sending…' : 'Forgot password'}
           secondary
+          busy={resetBusy}
           onPress={() => {
             if (!email.trim()) {
               setError('Enter your email first, then tap Forgot password.');
               return;
             }
-            void parentAuth.sendPasswordReset(email).finally(() => setResetSent(true));
+            setResetBusy(true);
+            setError(null);
+            // Only a request the server accepted shows the "on its way" notice (MOB-R1-02).
+            void parentAuth
+              .sendPasswordReset(email)
+              .then((result) => {
+                if (result.ok) setResetSent(true);
+                else setError(`We couldn’t send a reset link. ${result.message}`);
+              })
+              .finally(() => setResetBusy(false));
           }}
         />
       )}

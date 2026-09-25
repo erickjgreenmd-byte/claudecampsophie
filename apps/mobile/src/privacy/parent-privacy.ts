@@ -39,7 +39,7 @@ export const PRIVACY_RETENTION_LINES: readonly string[] = [
   `When you ask for deletion, processing stops at once and devices are signed out. Deletion from our active systems completes within ${PRIVACY_RETENTION.deletionTargetDays} days.`,
   'Backups expire on a documented schedule (length to be confirmed).',
   'We may keep limited billing records where the law requires it, plus consent records and a security log with pseudonymous ids only.',
-  'Deleting your PencilLift account does not cancel an App Store or Google Play subscription. Cancel it in the store.',
+  'Deleting your PencilLift account does not cancel an App Store, Google Play or Amazon Appstore subscription. Cancel it in the store.',
 ];
 
 /**

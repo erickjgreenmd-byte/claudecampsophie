@@ -2,7 +2,12 @@ import { cleanup, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
-import type { PointsHistory, RewardRulesResponse, RewardsOverview } from '@pencillift/contracts';
+import type {
+  PointsHistory,
+  PointsHistoryEntry,
+  RewardRulesResponse,
+  RewardsOverview,
+} from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { unconfiguredAuth } from '../../lib/auth.ts';
 import { renderPage } from '../../test/render.tsx';
@@ -488,5 +493,51 @@ describe('RewardsPage (spec P9, P14; AC_UX_02)', () => {
     renderPage(<RewardsPage />, { api: { get }, auth: unconfiguredAuth });
     expect(await screen.findByText(/sign-in isn’t available yet/i)).toBeTruthy();
     expect(get).not.toHaveBeenCalled();
+  });
+
+  it('offers "Show older entries" while older ledger pages exist and appends them (API-AUTH-R1-02)', async () => {
+    const olderEntry: PointsHistoryEntry = {
+      id: '1',
+      kind: 'award',
+      points: 3,
+      reason: null,
+      actor: 'system',
+      redemptionId: null,
+      rewardTitle: null,
+      createdAt: AT,
+    };
+    const { api, gets } = fakeApi({
+      get: (path) => {
+        if (path === `/v1/points/history?childId=${RILEY}`) {
+          return { ...history, hasMore: true, nextCursor: '2' };
+        }
+        if (path === `/v1/points/history?childId=${RILEY}&before=2`) {
+          return { ...history, entries: [olderEntry], hasMore: false, nextCursor: null };
+        }
+        return overview();
+      },
+    });
+    renderPage(<RewardsPage />, { api });
+    await userEvent.click(await screen.findByRole('button', { name: 'View Riley’s history' }));
+    const section = await screen.findByRole('region', { name: 'Riley’s points history' });
+    expect(await within(section).findByText('Duplicate award reversed')).toBeTruthy();
+    expect(within(section).getAllByRole('row')).toHaveLength(1 + history.entries.length);
+    await userEvent.click(within(section).getByRole('button', { name: 'Show older entries' }));
+    await waitFor(() =>
+      expect(within(section).getAllByRole('row')).toHaveLength(2 + history.entries.length),
+    );
+    expect(gets).toContain(`/v1/points/history?childId=${RILEY}&before=2`);
+    expect(within(section).queryByRole('button', { name: /Show older/ })).toBeNull();
+  });
+
+  it('shows no "Show older" control when the history fits on one page', async () => {
+    const { api } = fakeApi({
+      get: (path) => (path.startsWith('/v1/points/history') ? history : overview()),
+    });
+    renderPage(<RewardsPage />, { api });
+    await userEvent.click(await screen.findByRole('button', { name: 'View Riley’s history' }));
+    const section = await screen.findByRole('region', { name: 'Riley’s points history' });
+    await within(section).findByText('Duplicate award reversed');
+    expect(within(section).queryByRole('button', { name: /Show older/ })).toBeNull();
   });
 });

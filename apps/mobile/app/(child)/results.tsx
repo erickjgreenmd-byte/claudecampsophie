@@ -9,6 +9,7 @@ import {
 } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { ChildNav } from '../../src/family/ui.tsx';
 import { childApi } from '../../src/homework/child-api.ts';
 import {
   buildResultView,
@@ -73,6 +74,7 @@ function ScanList() {
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <BrandRow />
+      <ChildNav />
       <Text style={styles.title} accessibilityRole="header">
         My scans
       </Text>
@@ -121,6 +123,7 @@ function ResultDetail({ id }: { id: string }) {
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <BrandRow />
+      <ChildNav />
       {state.kind === 'loading' ? <Loading /> : null}
       {state.kind === 'error' ? <LoadError message={state.message} onRetry={state.reload} /> : null}
       {state.kind === 'ready' ? (
@@ -183,7 +186,8 @@ function ResultDetail({ id }: { id: string }) {
               ))}
             </View>
           ))}
-          <Button label="All my scans" secondary onPress={() => router.push('/results')} />
+          {/* Back to the list already underneath, rather than stacking another one (MOB-R1-07). */}
+          <Button label="All my scans" secondary onPress={() => router.dismissTo('/results')} />
         </>
       ) : null}
     </ScrollView>

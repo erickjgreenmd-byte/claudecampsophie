@@ -5,6 +5,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ChildReportCategory } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { ChildNav } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
   CHILD_HELP_COPY,
@@ -43,6 +44,7 @@ export default function ChildHelpScreen() {
     <SafeAreaView style={styles.screen} edges={['top', 'left', 'right', 'bottom']}>
       <ScrollView contentContainerStyle={styles.content}>
         <BrandRow />
+        <ChildNav back={false} />
         <Text accessibilityRole="header" style={styles.title}>
           {CHILD_HELP_COPY.title}
         </Text>

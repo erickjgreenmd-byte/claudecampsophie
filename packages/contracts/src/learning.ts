@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import {
   calendarDateSchema,
+  freeTextSchema,
   idempotencyKeySchema,
   isoDateTimeSchema,
   uuidSchema,
@@ -52,7 +53,7 @@ export const childSubjectsResponseSchema = z.strictObject({
 });
 export type ChildSubjects = z.infer<typeof childSubjectsResponseSchema>;
 
-const displayNameSchema = z.string().trim().min(1).max(60);
+const displayNameSchema = freeTextSchema({ max: 60 });
 
 /** POST /v1/children/:childId/subjects. A custom subject needs a display name. */
 export const createChildSubjectRequestSchema = z
@@ -176,7 +177,7 @@ export const testDatesResponseSchema = z.strictObject({ testDates: z.array(testD
 export const createTestDateRequestSchema = z.strictObject({
   subjectId: uuidSchema,
   testDate: calendarDateSchema,
-  scopeNotes: z.string().trim().max(2000).optional(),
+  scopeNotes: freeTextSchema({ min: 0, max: 2000 }).optional(),
 });
 export type CreateTestDateRequest = z.infer<typeof createTestDateRequestSchema>;
 
@@ -198,7 +199,7 @@ export const createStudyMaterialRequestSchema = z
   .strictObject({
     kind: studyMaterialKindSchema,
     subjectId: uuidSchema.optional(),
-    text: z.string().trim().min(1).max(4000),
+    text: freeTextSchema({ max: 4000 }),
   })
   .refine((v) => v.text.length <= STUDY_MATERIAL_MAX_CHARS[v.kind], {
     message: 'That is too long for this kind of material',
@@ -332,7 +333,7 @@ export type ChildReviews = z.infer<typeof childReviewsResponseSchema>;
 
 /** POST /v1/child/practice/items/:itemId/answer */
 export const practiceAnswerRequestSchema = z.strictObject({
-  answer: z.string().min(1).max(200),
+  answer: freeTextSchema({ max: 200, trim: false }),
   idempotencyKey: idempotencyKeySchema,
 });
 export type PracticeAnswerRequest = z.infer<typeof practiceAnswerRequestSchema>;

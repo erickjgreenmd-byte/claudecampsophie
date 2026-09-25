@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { isoDateTimeSchema, uuidSchema } from './common.ts';
+import { freeTextSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 /**
  * Family vertical contracts (spec P1 guardians, P3 identity/consent/authorization, P14 parent
@@ -16,15 +16,21 @@ export const CHILD_PROFILE_STATUSES = ['draft', 'active', 'archived'] as const;
 export const childProfileStatusSchema = z.enum(CHILD_PROFILE_STATUSES);
 export type ChildProfileStatus = z.infer<typeof childProfileStatusSchema>;
 
-export const AGE_BANDS = ['5-7', '8-10', '11-13', '14-18'] as const;
+/**
+ * Launch scope is K-8, children under 13 (API-AUTH-R1-05, docs/Threat_Model.md T38): no band for
+ * 14-18 is offered, so a profile can never be declared outside the under-13 consent and
+ * child-mode flows. Widening it is a product decision (the database check already allows more).
+ */
+export const AGE_BANDS = ['5-7', '8-10', '11-13'] as const;
 export const ageBandSchema = z.enum(AGE_BANDS);
 export type AgeBand = z.infer<typeof ageBandSchema>;
 
-/** 0 = kindergarten. Launch scope is K-8; the API accepts up to 12 for later expansion. */
-export const gradeLevelSchema = z.number().int().min(0).max(12);
+/** 0 = kindergarten … 8 = grade 8 (launch scope K-8; the database check allows up to 12). */
+export const GRADE_LEVEL_MAX = 8;
+export const gradeLevelSchema = z.number().int().min(0).max(GRADE_LEVEL_MAX);
 
 export const createFamilyRequestSchema = z.strictObject({
-  displayName: z.string().trim().min(1).max(80),
+  displayName: freeTextSchema({ max: 80 }),
   timezone: z.string().min(1).max(64),
 });
 export type CreateFamilyRequest = z.infer<typeof createFamilyRequestSchema>;
@@ -54,7 +60,7 @@ export type FamilyOverview = z.infer<typeof familyOverviewResponseSchema>;
 
 /** POST /v1/children (parent + step-up). Always creates an uncharged draft. */
 export const createChildProfileRequestSchema = z.strictObject({
-  nickname: z.string().trim().min(1).max(40),
+  nickname: freeTextSchema({ max: 40 }),
   gradeLevel: gradeLevelSchema,
   ageBand: ageBandSchema,
 });

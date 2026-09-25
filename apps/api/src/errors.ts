@@ -66,9 +66,17 @@ const KNOWN_CONSTRAINTS: Readonly<Record<string, () => ApiError>> = {
     businessRule('CHILD_NOT_ACTIVE', 'Assign a paid slot to this child before pairing a device'),
 };
 
-/** Maps a violation of a known schema invariant to its API error; undefined for anything else. */
+/**
+ * Maps a violation of a known schema invariant to its API error; undefined for anything else.
+ * Text Postgres cannot store (22021 invalid byte sequence, e.g. U+0000; 22P05 untranslatable
+ * character) is an input problem too: the contracts refuse control characters first
+ * (API-AUTH-R1-01) and this keeps any other unstorable text a 400 instead of an unhandled 500.
+ */
 export function knownConstraintError(error: unknown): ApiError | undefined {
   const code = pgErrorCode(error);
+  if (code === '22021' || code === '22P05') {
+    return new ApiError('VALIDATION_FAILED', 'Some text contains characters that can’t be saved');
+  }
   if (code !== '23505' && code !== '23514') return undefined;
   const constraint = pgConstraint(error);
   const make = constraint === undefined ? undefined : KNOWN_CONSTRAINTS[constraint];

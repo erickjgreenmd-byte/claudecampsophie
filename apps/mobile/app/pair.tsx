@@ -62,6 +62,21 @@ export default function PairScreen() {
     await enterChildMode(secureStorage, modeEffects);
   };
 
+  // A device the parent disconnected (or wants to pair to a sibling) still holds its old
+  // refresh token until the next refresh fails (MOB-R1-06), so a different code is always offered:
+  // the child session's own logout forgets the stale pairing before the form shows.
+  const useDifferentCode = async () => {
+    setBusy(true);
+    try {
+      await childSession.logout();
+    } finally {
+      setBusy(false);
+      setPairedName(null);
+      setCode('');
+      setError(null);
+    }
+  };
+
   if (pairedName) {
     return (
       <Screen edges={ROOT_EDGES}>
@@ -69,7 +84,18 @@ export default function PairScreen() {
         <Body>This device is connected to {pairedName}’s space.</Body>
         <Button
           label="Go to my space"
+          disabled={busy}
           onPress={() => void enterChildMode(secureStorage, modeEffects)}
+        />
+        <Body muted>
+          Got a new connect code from a grown-up? Using it disconnects this device from {pairedName}
+          ’s space first.
+        </Body>
+        <Button
+          label={busy ? 'Disconnecting…' : 'Use a different code'}
+          secondary
+          busy={busy}
+          onPress={() => void useDifferentCode()}
         />
       </Screen>
     );

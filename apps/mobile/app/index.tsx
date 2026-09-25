@@ -3,9 +3,9 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import { colors, minTouchTarget, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandHero } from '../src/brand/BrandMark.tsx';
-import { childSession } from '../src/family/runtime.ts';
+import { childSession, modeEffects } from '../src/family/runtime.ts';
 import { entryRoute } from '../src/lib/entry.ts';
-import { currentMode } from '../src/lib/mode.ts';
+import { currentMode, enterChildMode } from '../src/lib/mode.ts';
 import { parentAuth } from '../src/lib/parent-auth.ts';
 import { secureStorage } from '../src/lib/secure-storage.ts';
 
@@ -35,6 +35,12 @@ export default function Welcome() {
       parentAuth.email(),
     ]);
     const route = entryRoute(mode, paired, email !== null, choice);
+    if (route === '/(child)/home') {
+      // Handing a paired device to the child switches modes explicitly: adult caches cleared,
+      // parent area relocked and the stack reset, never a push that leaves parent mode behind.
+      await enterChildMode(secureStorage, modeEffects);
+      return;
+    }
     if (route) router.push(route);
   }
 

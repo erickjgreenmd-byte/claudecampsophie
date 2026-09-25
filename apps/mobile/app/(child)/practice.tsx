@@ -41,7 +41,7 @@ export default function PracticeScreen() {
     setState((s) => (s.status === 'ready' ? { status: 'ready', today: { ...s.today, set } } : s));
 
   return (
-    <Screen>
+    <Screen childNav="home_and_back">
       <Title>Today’s practice</Title>
       {state.status === 'loading' ? <Loading label="Getting your practice" /> : null}
       {state.status === 'error' ? (

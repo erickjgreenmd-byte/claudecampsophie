@@ -1,7 +1,10 @@
 import { Hono } from 'hono';
-import { z } from 'zod';
 import { isValidIanaZone } from '@pencillift/domain';
-import { uuidSchema } from '@pencillift/contracts';
+import {
+  createChildProfileRequestSchema,
+  createFamilyRequestSchema,
+  uuidSchema,
+} from '@pencillift/contracts';
 import { readJson } from '../app.ts';
 import { generatePairingCode, pairingCodeHash } from '../auth/pairing.ts';
 import { acceptsTestProviderConsent } from '../config.ts';
@@ -13,16 +16,12 @@ import type { AppEnv } from '../middleware/context.ts';
 import { enforceRateLimit, RATE_RULES } from '../middleware/rate-limit.ts';
 import { toHex } from '../security/crypto.ts';
 
-const createFamilySchema = z.strictObject({
-  displayName: z.string().trim().min(1).max(80),
-  timezone: z.string().min(1).max(64),
-});
-
-const createChildSchema = z.strictObject({
-  nickname: z.string().trim().min(1).max(40),
-  gradeLevel: z.number().int().min(0).max(12),
-  ageBand: z.enum(['5-7', '8-10', '11-13', '14-18']),
-});
+/**
+ * Draft, active and archived profiles a family may hold at once, counting every profile that is
+ * not archived (API-AUTH-R1-04). Well above the 4 paid slots: a bound on runaway clients, not a
+ * product limit (archiving keeps history and frees room, spec P11).
+ */
+export const CHILD_PROFILE_LIMIT = 12;
 
 /** Family, child profile and device management for signed-in parents. */
 export function familyRoutes(): Hono<AppEnv> {
@@ -35,7 +34,7 @@ export function familyRoutes(): Hono<AppEnv> {
 
   r.post('/families', async (c) => {
     const { deps, parent } = c.var;
-    const body = await readJson(c, createFamilySchema);
+    const body = await readJson(c, createFamilyRequestSchema);
     if (!isValidIanaZone(body.timezone))
       throw new ApiError('VALIDATION_FAILED', 'Invalid time zone');
     try {
@@ -93,18 +92,37 @@ export function familyRoutes(): Hono<AppEnv> {
 
   // Adding a child creates an uncharged draft; activation requires a verified paid slot (spec P11).
   r.post('/children', async (c) => {
-    const { deps, parent } = c.var;
+    const { deps } = c.var;
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
-    const body = await readJson(c, createChildSchema);
-    const [row] = await deps.db.asParent(
-      parent,
-      (tx) => tx<{ id: string }[]>`
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `child-create:${familyId}`,
+      RATE_RULES.childCreatePerFamily,
+      deps.clock(),
+    );
+    // The contract is the K-8, under-13 launch scope (API-AUTH-R1-05) and refuses control text.
+    const body = await readJson(c, createChildProfileRequestSchema);
+    const row = await deps.db.asService(async (tx) => {
+      // Serialize with other profile changes for this family so the cap holds under a race.
+      await tx`select 1 from public.families where id = ${familyId} for update`;
+      const [count] = await tx<{ n: number }[]>`
+        select count(*)::int as n from public.child_profiles
+         where family_id = ${familyId} and status <> 'archived'`;
+      if (count!.n >= CHILD_PROFILE_LIMIT) {
+        throw businessRule(
+          'CHILD_PROFILE_LIMIT',
+          `A family can have up to ${CHILD_PROFILE_LIMIT} child profiles. Archive one you no longer use first.`,
+        );
+      }
+      // Service role: the family id comes from the caller's verified membership (spec E4).
+      const [inserted] = await tx<{ id: string }[]>`
         insert into public.child_profiles (family_id, nickname, grade_level, age_band)
         values (${familyId}, ${body.nickname}, ${body.gradeLevel}, ${body.ageBand}) returning id
-      `,
-    );
-    return c.json({ childId: row!.id, status: 'draft' }, 201);
+      `;
+      return inserted!;
+    });
+    return c.json({ childId: row.id, status: 'draft' }, 201);
   });
 
   r.post('/children/:childId/pairing-code', async (c) => {

@@ -154,6 +154,14 @@ export function childAuthRoutes(): Hono<AppEnv> {
   r.post('/refresh', async (c) => {
     const { deps } = c.var;
     const now = deps.clock();
+    // Per client network before any token lookup (API-AUTH-R1-04); the per-session rule below
+    // still bounds one paired device.
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `child-refresh:${clientNetworkKey(c.req.header('cf-connecting-ip'))}`,
+      RATE_RULES.childRefreshPerNetwork,
+      now,
+    );
     const { refreshToken } = await readJson(c, childRefreshRequestSchema);
     const refreshHashHex = await sha256Hex(refreshToken);
     const outcome = await deps.db.asService(async (tx) => {

@@ -3,8 +3,10 @@ import { router } from 'expo-router';
 import * as ScreenCapture from 'expo-screen-capture';
 import * as SecureStore from 'expo-secure-store';
 import type { ApiClient } from '@pencillift/contracts/client';
+import { forgetStoreIdentity } from '../billing/revenuecat.ts';
 import { createMobileApi } from '../lib/api.ts';
-import type { ModeEffects } from '../lib/mode.ts';
+import { signOutParent, type ModeEffects } from '../lib/mode.ts';
+import { parentAuth } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { createChildSession } from './child-session.ts';
 import { clearAdultCaches, parentTokenSource, stepUpTokenSource } from './parent-session.ts';
@@ -97,6 +99,10 @@ export const modeEffects: ModeEffects = {
     if (router.canDismiss()) router.dismissAll();
     router.replace('/(child)/home');
   },
+  resetNavigationToWelcome() {
+    if (router.canDismiss()) router.dismissAll();
+    router.replace('/');
+  },
   async relockOnServer() {
     const api = stepUpApi();
     if (api) await lockParentArea(api);
@@ -116,3 +122,14 @@ export const modeEffects: ModeEffects = {
     }
   },
 };
+
+/**
+ * Parent sign-out on this device (MOB-R1-01): server relock, Supabase session ended, adult caches
+ * cleared, store SDK identity forgotten, mode reset and navigation back to the welcome screen. The
+ * session watcher in src/lib/app-session.ts also reacts to the sign-out; this covers the device
+ * being offline, when that watcher may see no change.
+ */
+export async function signOutParentOnDevice(): Promise<void> {
+  await signOutParent(secureStorage, modeEffects, parentAuth);
+  await forgetStoreIdentity().catch(() => undefined);
+}

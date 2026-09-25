@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { BackHandler, Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { randomUUID } from 'expo-crypto';
@@ -13,7 +13,7 @@ import {
 } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
-import { GatedButton } from '../../src/family/ui.tsx';
+import { ChildNav, GatedButton } from '../../src/family/ui.tsx';
 import { childApi } from '../../src/homework/child-api.ts';
 import { nativeUploadIo, normalizePhoto } from '../../src/homework/native-io.ts';
 import {
@@ -108,6 +108,17 @@ export default function ScanScreen() {
   }, []);
 
   const running = upload.kind === 'running';
+
+  // Android/Fire hardware Back while the camera is open closes only the camera (MOB-R1-07); the
+  // pages already added stay. On iOS this listener is a no-op.
+  useEffect(() => {
+    if (!cameraOpen) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setCameraOpen(false);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [cameraOpen]);
 
   /** Any change to the pages starts a fresh scan; an earlier unfinished one is stopped. */
   const changePages = useCallback((next: ScanSession) => {
@@ -315,6 +326,7 @@ export default function ScanScreen() {
       <SafeAreaView style={styles.screen}>
         <View style={styles.content}>
           <BrandRow />
+          <ChildNav />
         </View>
         <View style={styles.center}>
           <Text style={styles.title} accessibilityRole="header">
@@ -339,6 +351,7 @@ export default function ScanScreen() {
     <SafeAreaView style={styles.screen}>
       <ScrollView contentContainerStyle={styles.content}>
         <BrandRow />
+        <ChildNav />
         <Text style={styles.title} accessibilityRole="header">
           Scan your homework
         </Text>

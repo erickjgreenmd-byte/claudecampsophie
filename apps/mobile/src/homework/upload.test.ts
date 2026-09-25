@@ -367,3 +367,151 @@ describe('picture size and server capture rules (AC_CAPTURE_02)', () => {
     );
   });
 });
+
+describe('stalled requests and memory (MOB-R1-03, MOB-R1-04)', () => {
+  it('passes the scan’s AbortSignal to every API call so “Stop sending” can stop a stalled one', async () => {
+    const controller = new AbortController();
+    const signals: (AbortSignal | undefined)[] = [];
+    const { api } = fakeApi();
+    const send: ApiClient['send'] = (method, path, body, schema, options) => {
+      signals.push(options?.signal);
+      return api.send(method, path, body, schema, options);
+    };
+    const { io } = fakeIo();
+    await uploadScan({
+      api: { ...api, send },
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: newAttempt(newKey),
+      signal: controller.signal,
+      onProgress: () => undefined,
+    });
+    expect(signals).toHaveLength(3);
+    expect(signals.every((s) => s === controller.signal)).toBe(true);
+  });
+
+  it('an API call that fails because the scan was stopped is reported as cancelled', async () => {
+    const controller = new AbortController();
+    const { api } = fakeApi({
+      fail: (call) => {
+        if (call.path !== '/v1/assignments') return null;
+        controller.abort();
+        return new ApiRequestError('NETWORK', 'The request was stopped.', 0, 'ABORTED');
+      },
+    });
+    const { io } = fakeIo();
+    const error = await uploadScan({
+      api,
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: newAttempt(newKey),
+      signal: controller.signal,
+      onProgress: () => undefined,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ScanCancelledError);
+  });
+
+  it('never holds every page’s bytes at once: fingerprints first, then re-reads each page just before its PUT', async () => {
+    // Each read hands out a fresh buffer; a page's bytes are "live" from the read until the PUT
+    // (or the fingerprint) that consumes them. More than one live page means the whole scan was
+    // being pinned in memory (10 × 15 MB on a Fire tablet).
+    const { api } = fakeApi();
+    const live = new Set<Uint8Array>();
+    let maxLive = 0;
+    const order: string[] = [];
+    const putBuffers: Uint8Array[] = [];
+    const firstPass = new Map<string, Uint8Array>();
+    const io: UploadIo = {
+      readBytes: (uri) => {
+        const bytes = new TextEncoder().encode(`bytes of ${uri}`);
+        live.add(bytes);
+        maxLive = Math.max(maxLive, live.size);
+        order.push(`read ${uri}`);
+        if (!firstPass.has(uri)) firstPass.set(uri, bytes);
+        return Promise.resolve(bytes);
+      },
+      sha256Hex: (bytes) => {
+        live.delete(bytes);
+        order.push('hash');
+        return Promise.resolve(toHex(bytes.slice(0, 32)).padEnd(64, '0'));
+      },
+      putBytes: (url, bytes) => {
+        live.delete(bytes);
+        putBuffers.push(bytes);
+        order.push(`put ${url.replace(/\?.*$/, '')}`);
+        return Promise.resolve();
+      },
+    };
+    await uploadScan({
+      api,
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: newAttempt(newKey),
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    });
+    expect(maxLive).toBe(1);
+    expect(order).toEqual([
+      'read file:///p1.jpg',
+      'hash',
+      'read file:///p2.png',
+      'hash',
+      'read file:///p1.jpg',
+      'put https://storage.example.test/upload/1',
+      'read file:///p2.png',
+      'put https://storage.example.test/upload/2',
+    ]);
+    // The PUT sends the freshly read buffer, not one kept from the fingerprint pass.
+    expect(putBuffers[0]).not.toBe(firstPass.get('file:///p1.jpg'));
+  });
+
+  it('a page already stored is not read again on resume', async () => {
+    const reads: string[] = [];
+    const { api } = fakeApi({ alreadyUploaded: [true, false] });
+    const { io } = fakeIo({
+      readBytes: (uri) => {
+        reads.push(uri);
+        return Promise.resolve(new TextEncoder().encode(`bytes of ${uri}`));
+      },
+    });
+    await uploadScan({
+      api,
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: { ...newAttempt(newKey), assignmentId: ASSIGNMENT },
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    });
+    expect(reads.filter((u) => u === 'file:///p1.jpg')).toHaveLength(1);
+    expect(reads.filter((u) => u === 'file:///p2.png')).toHaveLength(2);
+  });
+
+  it('a page whose file changed between fingerprint and send is refused before the PUT', async () => {
+    let reads = 0;
+    const { api } = fakeApi();
+    const { io, puts } = fakeIo({
+      readBytes: (uri) => {
+        reads += 1;
+        // Second pass: the photo was replaced by a larger file.
+        return Promise.resolve(
+          new TextEncoder().encode(reads > 2 ? `changed bytes of ${uri}` : `bytes of ${uri}`),
+        );
+      },
+    });
+    const error = await uploadScan({
+      api,
+      io,
+      pages: twoPages(),
+      limits,
+      attempt: newAttempt(newKey),
+      signal: new AbortController().signal,
+      onProgress: () => undefined,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(UploadTransferError);
+    expect(puts).toHaveLength(0);
+  });
+});

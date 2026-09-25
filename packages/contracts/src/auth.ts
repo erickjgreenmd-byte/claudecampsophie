@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { isoDateTimeSchema, uuidSchema } from './common.ts';
+import { freeTextSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 /** Six-digit parent PIN. The raw PIN is only ever sent over TLS to the API and never stored. */
 export const parentPinSchema = z.string().regex(/^\d{6}$/, 'PIN must be 6 digits');
@@ -23,7 +23,7 @@ export const createPairingCodeResponseSchema = z.strictObject({
 
 export const childPairRequestSchema = z.strictObject({
   code: z.string().min(6).max(20),
-  deviceLabel: z.string().min(1).max(60),
+  deviceLabel: freeTextSchema({ max: 60, trim: false }),
   platform: z.enum(['ios', 'android', 'web']),
 });
 

@@ -2,7 +2,9 @@ import { Hono, type Context } from 'hono';
 import {
   childRewardRequestBodySchema,
   createRewardRequestSchema,
+  POINTS_HISTORY_PAGE_SIZE,
   pointsAdjustmentRequestSchema,
+  pointsLedgerCursorSchema,
   rewardDecisionRequestSchema,
   updateRewardRequestSchema,
   updateRewardRulesRequestSchema,
@@ -39,7 +41,7 @@ import {
   requireParent,
 } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
-import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
+import { RATE_RULES, enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
 
 /**
  * Rewards and points (spec P9, P16.4; AC_REWARDS_01..05, AC_MON_13, AC_ACCESS_05).
@@ -61,7 +63,9 @@ import { enforceRateLimit, type RateRule } from '../middleware/rate-limit.ts';
  * damage; the limit stops a stuck button or a script from flooding the parent's request list.
  */
 const CHILD_REWARD_ACTION_RULE: RateRule = { limit: 30, windowSeconds: 3600 };
-const HISTORY_PAGE_SIZE = 100;
+const HISTORY_PAGE_SIZE = POINTS_HISTORY_PAGE_SIZE;
+/** Largest ledger id Postgres can compare (bigint). */
+const INT64_MAX = 9223372036854775807n;
 const RECENT_REQUESTS_LIMIT = 20;
 const CHILD_REQUESTS_LIMIT = 50;
 
@@ -427,6 +431,12 @@ export function rewardsRoutes(): Hono<AppEnv> {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `reward-create:${familyId}`,
+      RATE_RULES.rewardCreatePerFamily,
+      deps.clock(),
+    );
     const body = await readJson(c, createRewardRequestSchema);
     const instructions =
       body.instructions !== undefined && body.instructions.length > 0 ? body.instructions : null;
@@ -557,6 +567,16 @@ export function rewardsRoutes(): Hono<AppEnv> {
     const parsed = uuidSchema.safeParse(c.req.query('childId'));
     if (!parsed.success) throw new ApiError('VALIDATION_FAILED', 'Choose a child');
     const childId = parsed.data;
+    // Keyset page (API-AUTH-R1-02): `before` is the previous page's `nextCursor`, a ledger id.
+    // Parsed with BigInt so a 19-digit value past int64 is a 400, never a failed cast (500).
+    const rawBefore = c.req.query('before');
+    let before: string | null = null;
+    if (rawBefore !== undefined) {
+      const cursor = pointsLedgerCursorSchema.safeParse(rawBefore);
+      if (!cursor.success || BigInt(cursor.data) > INT64_MAX)
+        throw new ApiError('VALIDATION_FAILED', 'Invalid request: before');
+      before = cursor.data;
+    }
     const familyId = await currentFamilyId(c);
     const data = await deps.db.asParent(parent, async (tx) => {
       // Archived and draft profiles keep their history; only a child under deletion is hidden.
@@ -582,6 +602,7 @@ export function rewardsRoutes(): Hono<AppEnv> {
           left join public.reward_redemptions rr on rr.id = l.redemption_id
           left join public.rewards w on w.id = rr.reward_id
          where l.child_id = ${childId} and l.family_id = ${familyId}
+           and (${before}::bigint is null or l.id < ${before}::bigint)
          order by l.id desc
          limit ${HISTORY_PAGE_SIZE + 1}`;
       const [totals] = await tx<
@@ -597,10 +618,13 @@ export function rewardsRoutes(): Hono<AppEnv> {
       return { entries, totals: totals!, balance: await readBalance(tx, childId) };
     });
     if (!data) throw new ApiError('NOT_FOUND', 'Child not found');
+    const page = data.entries.slice(0, HISTORY_PAGE_SIZE);
+    const hasMore = data.entries.length > HISTORY_PAGE_SIZE;
+    const last = page.at(-1);
     const body: PointsHistory = {
       childId,
       balance: data.balance,
-      entries: data.entries.slice(0, HISTORY_PAGE_SIZE).map((e) => ({
+      entries: page.map((e) => ({
         id: String(e.id),
         kind: e.kind,
         points: e.points,
@@ -610,7 +634,8 @@ export function rewardsRoutes(): Hono<AppEnv> {
         rewardTitle: e.reward_title,
         createdAt: iso(e.created_at),
       })),
-      hasMore: data.entries.length > HISTORY_PAGE_SIZE,
+      hasMore,
+      nextCursor: hasMore && last !== undefined ? String(last.id) : null,
       totals: data.totals,
     };
     return c.json(body);

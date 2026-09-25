@@ -428,16 +428,58 @@ function historyDescription(entry: PointsHistoryEntry): string {
   return entry.rewardTitle ? `${base}: ${entry.rewardTitle}` : base;
 }
 
+/**
+ * Older pages of the newest-first history (API-AUTH-R1-02). They stay attached only while the
+ * first page still ends at the entry they were fetched before (`from`); a reload that moves that
+ * entry drops them and offers "Show older" again, so no entry is skipped.
+ */
+interface OlderHistory {
+  from: string;
+  entries: PointsHistoryEntry[];
+  nextCursor: string | null;
+}
+
 function HistorySection({ child, version }: { child: RewardChildBalance; version: number }) {
   const headingId = useId();
+  const { api } = useSession();
+  const historyPath = `/v1/points/history?childId=${encodeURIComponent(child.childId)}`;
   const history = useApiQuery(
-    (api) =>
-      api.get(
-        `/v1/points/history?childId=${encodeURIComponent(child.childId)}`,
-        pointsHistoryResponseSchema,
-      ),
+    (client) => client.get(historyPath, pointsHistoryResponseSchema),
     [child.childId, version],
   );
+  const [older, setOlder] = useState<OlderHistory | null>(null);
+  const [olderBusy, setOlderBusy] = useState(false);
+  const [olderError, setOlderError] = useState<string | null>(null);
+  const firstCursor = history.status === 'ready' ? (history.data.nextCursor ?? null) : null;
+  const attached = older !== null && older.from === firstCursor ? older : null;
+  const nextCursor = attached ? attached.nextCursor : firstCursor;
+  const seen = new Set<string>();
+  const entries = (
+    history.status === 'ready' ? [...history.data.entries, ...(attached?.entries ?? [])] : []
+  ).filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true)));
+
+  const showOlder = (from: string, cursor: string) =>
+    void (async () => {
+      setOlderBusy(true);
+      setOlderError(null);
+      try {
+        const page = await api.get(
+          `${historyPath}&before=${encodeURIComponent(cursor)}`,
+          pointsHistoryResponseSchema,
+        );
+        setOlder((prev) => ({
+          from,
+          entries: [...(prev?.from === from ? prev.entries : []), ...page.entries],
+          nextCursor: page.nextCursor ?? null,
+        }));
+      } catch (error) {
+        setOlderError(
+          error instanceof ApiRequestError ? error.message : 'Could not load older entries.',
+        );
+      } finally {
+        setOlderBusy(false);
+      }
+    })();
   return (
     <section className="card" style={sectionStyle} aria-labelledby={headingId}>
       <h2 id={headingId}>{child.nickname}’s points history</h2>
@@ -454,13 +496,13 @@ function HistorySection({ child, version }: { child: RewardChildBalance; version
             Earned {history.data.totals.awarded}, adjusted {history.data.totals.adjustments}, set
             aside {history.data.totals.reserved}, returned {history.data.totals.released}.
           </p>
-          {history.data.entries.length === 0 ? (
+          {entries.length === 0 ? (
             <p>No points activity yet.</p>
           ) : (
             <div style={{ overflowX: 'auto' }}>
               <table style={{ borderCollapse: 'collapse', width: '100%' }}>
                 <caption style={{ textAlign: 'left', fontWeight: 700 }}>
-                  Newest first{history.data.hasMore ? ' (latest 100 entries)' : ''}
+                  Newest first{nextCursor !== null ? ` (latest ${entries.length} entries)` : ''}
                 </caption>
                 <thead>
                   <tr>
@@ -479,7 +521,7 @@ function HistorySection({ child, version }: { child: RewardChildBalance; version
                   </tr>
                 </thead>
                 <tbody>
-                  {history.data.entries.map((entry) => (
+                  {entries.map((entry) => (
                     <tr key={entry.id} style={{ borderTop: '1px solid #e3e8ee' }}>
                       <td>{formatDate(entry.createdAt)}</td>
                       <td>{historyDescription(entry)}</td>
@@ -493,6 +535,19 @@ function HistorySection({ child, version }: { child: RewardChildBalance; version
               </table>
             </div>
           )}
+          {nextCursor !== null && firstCursor !== null ? (
+            <p>
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={olderBusy}
+                onClick={() => showOlder(firstCursor, nextCursor)}
+              >
+                {olderBusy ? 'Loading older entries…' : 'Show older entries'}
+              </button>
+            </p>
+          ) : null}
+          {olderError ? <p role="alert">{olderError}</p> : null}
         </>
       ) : null}
     </section>

@@ -31,3 +31,16 @@ describe('child scan screen offers only what the scan job can read (AC_CAPTURE_0
     expect(scanScreen).toMatch(/\{limitsSummary\(limits\)\}/);
   });
 });
+
+describe('the camera and the hardware Back button (MOB-R1-07)', () => {
+  it('Back while the camera is open closes only the camera; the pages already added stay', () => {
+    expect(scanScreen).toMatch(
+      /BackHandler\.addEventListener\('hardwareBackPress', \(\) => \{\s*setCameraOpen\(false\);\s*return true;/,
+    );
+    expect(scanScreen).toMatch(/\}, \[cameraOpen\]\);/);
+  });
+
+  it('the scan screen carries the child nav (a way home without the native header)', () => {
+    expect(scanScreen).toMatch(/<ChildNav \/>/);
+  });
+});

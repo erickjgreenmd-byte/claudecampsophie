@@ -124,7 +124,9 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     expect(text).toMatch(/within 30 days/i);
     expect(text).toMatch(/backups expire on a documented schedule/i);
     expect(text).toMatch(/billing records/i);
-    expect(text).toMatch(/does not cancel an app store or google play subscription/i);
+    expect(text).toMatch(
+      /does not cancel an app store, google play or amazon appstore subscription/i,
+    );
   });
 
   it('offers family exports only; the answer key is never offered on mobile', () => {

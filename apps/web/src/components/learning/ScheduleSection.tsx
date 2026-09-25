@@ -304,46 +304,14 @@ function ScheduleEditor({
 
       <fieldset style={{ border: 'none', padding: 0, margin: '16px 0 0' }}>
         <legend style={{ fontWeight: 800 }}>Reminders</legend>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.childRemindersPermitted}
-            onChange={(e) => set('childRemindersPermitted', e.target.checked)}
-            style={{ width: 24, minHeight: 24 }}
-          />
-          Allow gentle practice reminders on {childName}’s device
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.quietEnabled}
-            onChange={(e) => set('quietEnabled', e.target.checked)}
-            style={{ width: 24, minHeight: 24 }}
-          />
-          Set quiet hours (no reminders between these times)
-        </label>
-        {form.quietEnabled ? (
-          <div role="group" aria-label="Quiet hours">
-            <label htmlFor={id('quietStart')}>Quiet hours start ({zone})</label>
-            <input
-              id={id('quietStart')}
-              type="time"
-              value={form.quietStart}
-              onChange={(e) => set('quietStart', e.target.value)}
-              aria-invalid={errors.quietHours ? true : undefined}
-              aria-describedby={errors.quietHours ? id('quiet-error') : undefined}
-            />
-            <label htmlFor={id('quietEnd')}>Quiet hours end ({zone})</label>
-            <input
-              id={id('quietEnd')}
-              type="time"
-              value={form.quietEnd}
-              onChange={(e) => set('quietEnd', e.target.value)}
-              aria-invalid={errors.quietHours ? true : undefined}
-              aria-describedby={errors.quietHours ? id('quiet-error') : undefined}
-            />
-          </div>
-        ) : null}
+        {/* Honest copy (MOB-R1-05, web twin): nothing sends a notification to a child's device in
+            this version, so no toggle promises one. The schedule's stored reminder and quiet-hours
+            values round-trip unchanged through the form. */}
+        <p style={hintStyle}>
+          Practice reminders and quiet hours aren’t available yet. PencilLift doesn’t send
+          notifications to {childName}’s device in this version; when reminders arrive, you’ll
+          choose here whether to allow them and when to keep things quiet.
+        </p>
         <FieldError id={id('quiet-error')} message={errors.quietHours} />
       </fieldset>
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ChildRewards } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, NETWORK_RULES } from '@pencillift/contracts/client';
 import {
   buildChildRewardsView,
   CHILD_COPY_FORBIDDEN,
@@ -170,6 +170,7 @@ describe('child rewards view model (spec P9, P14)', () => {
     const cases: [ApiRequestError, RegExp][] = [
       [new ApiRequestError('UNAUTHENTICATED', 'raw', 401), /connect/i],
       [new ApiRequestError('NETWORK', 'raw', 0), /offline/i],
+      [new ApiRequestError('NETWORK', 'raw', 0, NETWORK_RULES.timeout), /taking longer than usual/],
       [new ApiRequestError('BUSINESS_RULE', 'raw', 422, 'INSUFFICIENT_POINTS'), /few more points/i],
       [new ApiRequestError('BUSINESS_RULE', 'raw', 422, 'INVALID_TRANSITION'), /grown-up/i],
       [new ApiRequestError('NOT_FOUND', 'raw', 404), /isn’t available/i],

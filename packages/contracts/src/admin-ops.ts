@@ -14,7 +14,13 @@ import {
   RESPONSE_TARGET_HOURS_MIN,
   type CaseAgeFilter,
 } from '@pencillift/domain/ops';
-import { calendarMonthSchema, channelSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
+import {
+  calendarMonthSchema,
+  channelSchema,
+  freeTextSchema,
+  isoDateTimeSchema,
+  uuidSchema,
+} from './common.ts';
 import {
   billingSettlementSchema,
   supportAuthorKindSchema,
@@ -379,7 +385,7 @@ export type AdminSupportCaseDetailResponse = z.infer<typeof adminSupportCaseDeta
 
 /** POST /v1/admin/support/cases/:id/messages. An internal note never reaches the family. */
 export const adminCaseMessageRequestSchema = z.strictObject({
-  message: z.string().trim().min(1).max(SUPPORT_MESSAGE_MAX_LENGTH),
+  message: freeTextSchema({ max: SUPPORT_MESSAGE_MAX_LENGTH }),
   internal: z.boolean(),
 });
 export type AdminCaseMessageRequest = z.infer<typeof adminCaseMessageRequestSchema>;
@@ -395,11 +401,7 @@ export const adminCaseUpdateRequestSchema = z
     assigneeUserId: uuidSchema.nullable().optional(),
     priority: supportCasePrioritySchema.optional(),
     resolution: supportCaseResolutionSchema.nullable().optional(),
-    resolutionReference: z
-      .string()
-      .trim()
-      .min(1)
-      .max(SUPPORT_REFERENCE_MAX_LENGTH)
+    resolutionReference: freeTextSchema({ max: SUPPORT_REFERENCE_MAX_LENGTH })
       .nullable()
       .optional(),
   })

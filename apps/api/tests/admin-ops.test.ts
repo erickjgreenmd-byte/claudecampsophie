@@ -739,6 +739,9 @@ describe('support queue', () => {
       { message: 'x' },
       { message: 'x', internal: 'yes' },
       { message: '', internal: true },
+      // Staff free text refuses control characters like every other field (API-AUTH-R1-01).
+      { message: 'checked\u0000 twice', internal: true },
+      { message: 'see \u001b[31mred', internal: false },
     ]) {
       expect((await admin(`/support/cases/${refundCaseId}/messages`, 'POST', bad)).status).toBe(
         400,

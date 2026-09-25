@@ -146,6 +146,14 @@ Marking `production` is refused while any live fake row exists. Once marked, ins
 in any of the seven catalogs fails (a draft creative or campaign may be stored, but cannot go to review). Staging stays `staging`, so labeled fixtures keep working there and its
 `database_environment` check stays blocked (correct: it must not serve real families).
 
+Before the first production release (and after any hand edit of `public.child_profiles`), confirm no profile
+sits outside the launch scope the contracts enforce (K-8, bands 5-7/8-10/11-13; Threat_Model T38): the
+database check is wider so widening later needs no data rewrite, but the portal's response schema is not.
+
+```sql
+select count(*) from public.child_profiles where grade_level > 8 or age_band = '14-18';  -- must be 0
+```
+
 ### 3.2 Secret scanning (AC_SECURITY_04)
 
 - **Tracked files**: `node scripts/scan-secrets.mjs` (CI) and `--staged` (pre-commit gate, `scripts/verify.sh`).

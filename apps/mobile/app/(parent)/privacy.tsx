@@ -17,7 +17,10 @@ import { router } from 'expo-router';
 import { ACCOUNT_CLOSE_COPY, PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
 import type { ParentReportOutcome, StandardExportKind } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
+import { storeChannelForBuild } from '../../src/billing/revenuecat.ts';
+import { STORE_LABEL } from '../../src/billing/store.ts';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { ParentAccessState, useParentAccess } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import { parentAuth } from '../../src/lib/parent-auth.ts';
 import {
@@ -67,6 +70,9 @@ type Feedback =
  * in src/privacy (unit-tested).
  */
 export default function ParentPrivacyScreen() {
+  // Same gate as every parent screen (MOB-R1-09): child mode, a signed-out parent and a device
+  // that has not entered the PIN since the app started all stop here, deep link or not.
+  const access = useParentAccess();
   const tokenSource = parentPrivacyTokenSource();
   const api = useMemo(() => (tokenSource ? createMobileApi(tokenSource) : null), [tokenSource]);
   const [state, setState] = useState<ScreenState>(
@@ -93,8 +99,8 @@ export default function ParentPrivacyScreen() {
   }, [api]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (access.status === 'ready') void load();
+  }, [load, access.status]);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -168,6 +174,20 @@ export default function ParentPrivacyScreen() {
 
   const data = state.status === 'ready' ? state.data : null;
   const deleted = data && !data.family ? familyDeletion(data.deletions) : null;
+
+  if (access.status !== 'ready') {
+    return (
+      <SafeAreaView style={styles.screen} edges={['left', 'right', 'bottom']}>
+        <ScrollView contentContainerStyle={styles.content}>
+          <BrandRow />
+          <Text accessibilityRole="header" style={styles.title}>
+            Privacy, export and deletion
+          </Text>
+          <ParentAccessState access={access} />
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.screen} edges={['left', 'right', 'bottom']}>
@@ -354,10 +374,7 @@ export default function ParentPrivacyScreen() {
 
               <Section title="Delete data">
                 <View style={styles.warning}>
-                  <Text style={[styles.body, styles.bold]}>
-                    Deleting your PencilLift account does not cancel an App Store or Google Play
-                    subscription. Cancel it in the store first.
-                  </Text>
+                  <Text style={[styles.body, styles.bold]}>{deletionStoreWarning()}</Text>
                 </View>
                 <Text style={[styles.body, styles.spaced]}>
                   Deleting stops processing immediately and signs out the affected devices. This
@@ -697,3 +714,15 @@ const styles = StyleSheet.create({
   success: { color: colors.success, fontWeight: '800', marginTop: spacing.sm },
   problem: { color: colors.danger, marginTop: spacing.sm },
 });
+
+/**
+ * The store this build sells through (App Store, Google Play or, on Fire tablets, the Amazon
+ * Appstore) is the one to cancel in; a build for no store (web) names all three (MOB-R1-10).
+ */
+function deletionStoreWarning(): string {
+  const channel = storeChannelForBuild();
+  const store = channel
+    ? `your ${STORE_LABEL[channel]} subscription`
+    : 'an App Store, Google Play or Amazon Appstore subscription';
+  return `Deleting your PencilLift account does not cancel ${store}. Cancel it in the store first.`;
+}

@@ -22,7 +22,7 @@ import {
   type ChildAssignmentDetailResponse,
   type GradedVerdict,
 } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, isRequestTimeout } from '@pencillift/contracts/client';
 
 export type VerdictTone = 'success' | 'retry' | 'help' | 'info' | 'pending';
 
@@ -276,7 +276,11 @@ export function findForbiddenKeys(value: unknown): string[] {
 /** Calm copy when results cannot be loaded (offline, unpaired, missing); never raw server text. */
 export function childLoadMessage(error: unknown): string {
   if (error instanceof ApiRequestError) {
-    if (error.code === 'NETWORK') return 'You seem to be offline. Try again when you’re connected.';
+    if (error.code === 'NETWORK') {
+      return isRequestTimeout(error)
+        ? 'This is taking longer than usual. Let’s try again.'
+        : 'You seem to be offline. Try again when you’re connected.';
+    }
     if (error.code === 'UNAUTHENTICATED') return 'Ask a grown-up to connect this device again.';
     if (error.code === 'NOT_FOUND') return 'We couldn’t find that scan.';
     if (error.code === 'RATE_LIMITED') return 'Let’s take a little break and try again soon.';

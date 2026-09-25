@@ -431,6 +431,24 @@ async function queueClearanceRecheck(
 // Routes
 // ---------------------------------------------------------------------------------------------
 
+/** Largest epoch-microsecond value Postgres can hold in a bigint. */
+const INT64_MAX = 9223372036854775807n;
+/** No stored row is timestamped this far past the request clock; anything beyond is a bad cursor. */
+const CURSOR_AHEAD_MICROS = 10n * 366n * 24n * 3600n * 1_000_000n;
+
+/**
+ * Parses the epoch-microseconds half of a keyset cursor with BigInt (API-AUTH-R1-03): a 19-digit
+ * value past int64, or one far in the future, would fail the bigint cast or overflow the interval
+ * in SQL and surface as a 500; here it is a 400 like any other malformed cursor.
+ */
+function cursorMicros(digits: string, now: Date): string {
+  const micros = BigInt(digits);
+  if (micros > INT64_MAX || micros > BigInt(now.getTime()) * 1000n + CURSOR_AHEAD_MICROS) {
+    throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+  }
+  return micros.toString();
+}
+
 export function privacyRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
 
@@ -865,7 +883,7 @@ export function privacyRoutes(): Hono<AppEnv> {
     if (after !== undefined) {
       const m = ADMIN_CURSOR.exec(after);
       if (!m) throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
-      cursor = { micros: m[1]!, id: m[2]! };
+      cursor = { micros: cursorMicros(m[1]!, deps.clock()), id: m[2]! };
     }
     // Service role after the aal2 owner check above (RLS no longer grants admins family reports,
     // migration 0670). Selects ids, category, status and timestamps only — never homework text,

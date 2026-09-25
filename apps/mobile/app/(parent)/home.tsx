@@ -23,6 +23,7 @@ import {
   Notice,
   ParentAccessState,
   Screen,
+  SignOutButton,
   Title,
   useLoad,
   useParentAccess,
@@ -142,6 +143,11 @@ function FamilyHome({ api }: { api: ApiClient }) {
       </Body>
       <Button label="Connect as a child device" secondary onPress={() => router.push('/pair')} />
       <LockButton api={api} />
+      <Body muted>
+        Signing out ends your parent session on this device. You’ll need your email and password to
+        come back.
+      </Body>
+      <SignOutButton />
     </>
   );
 }

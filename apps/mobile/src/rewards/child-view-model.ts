@@ -1,5 +1,5 @@
 import type { ChildEarningRules, ChildRewards, RewardRequestState } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, isRequestTimeout } from '@pencillift/contracts/client';
 
 /**
  * Child rewards screen logic (spec P9, P14 "progress/rewards"). Pure: no react-native imports.
@@ -143,7 +143,11 @@ export function childRewardsErrorMessage(error: unknown): string {
   const { code, rule } = error;
   if (code === 'UNAUTHENTICATED')
     return 'This device needs to be connected again. Ask a grown-up to help.';
-  if (code === 'NETWORK') return 'Looks like we’re offline. Your points are safe – try again soon.';
+  if (code === 'NETWORK') {
+    return isRequestTimeout(error)
+      ? 'This is taking longer than usual. Your points are safe – try again soon.'
+      : 'Looks like we’re offline. Your points are safe – try again soon.';
+  }
   if (code === 'BUSINESS_RULE' && rule === 'INSUFFICIENT_POINTS')
     return 'You need a few more points for this one. Keep practicing!';
   if (code === 'BUSINESS_RULE' && rule === 'INVALID_TRANSITION')

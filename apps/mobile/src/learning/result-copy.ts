@@ -4,7 +4,7 @@ import type {
   ChildReviews,
   PracticeAnswerResponse,
 } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, isRequestTimeout } from '@pencillift/contracts/client';
 
 /**
  * Child-facing copy for practice and review (spec P6, P7, P9, P14). Pure and unit-tested.
@@ -265,6 +265,7 @@ const ERROR_COPY: Readonly<Partial<Record<ApiRequestError['code'], string>>> = {
 
 /** Calm copy for load and submit failures; never raw server text. */
 export function childLearningError(error: unknown): string {
+  if (isRequestTimeout(error)) return 'This is taking longer than usual. Let’s try again.';
   const known = error instanceof ApiRequestError ? ERROR_COPY[error.code] : undefined;
   return known ?? 'Something went wrong. Let’s try again.';
 }

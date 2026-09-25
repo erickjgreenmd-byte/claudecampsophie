@@ -5,7 +5,7 @@ import {
   childAssignmentDetailResponseSchema,
   type ChildAssignmentDetailResponse,
 } from '@pencillift/contracts';
-import { ApiRequestError } from '@pencillift/contracts/client';
+import { ApiRequestError, NETWORK_RULES } from '@pencillift/contracts/client';
 import { childSafetyMessage } from '@pencillift/domain/safety';
 import {
   buildResultView,
@@ -322,6 +322,9 @@ describe('safety template (spec P4; AC_SECURITY_02)', () => {
 describe('load errors', () => {
   it('explains offline, unpaired and missing states calmly', () => {
     expect(childLoadMessage(new ApiRequestError('NETWORK', 'raw', 0))).toMatch(/offline/);
+    const slow = childLoadMessage(new ApiRequestError('NETWORK', 'raw', 0, NETWORK_RULES.timeout));
+    expect(slow).toMatch(/taking longer than usual/);
+    expect(slow).not.toMatch(/offline/);
     expect(childLoadMessage(new ApiRequestError('UNAUTHENTICATED', 'raw', 401))).toMatch(
       /grown-up/,
     );

@@ -5,7 +5,7 @@
 // carry an answer key, worked solution, rubric, confidence, grading route or disagreement flag, so a
 // server change that adds one fails client validation instead of rendering it (AC_GRADING_06).
 import { z } from 'zod';
-import { idempotencyKeySchema, isoDateTimeSchema, uuidSchema } from './common.ts';
+import { freeTextSchema, idempotencyKeySchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Limits (spec P5: configurable, visible before upload) and allowance (spec P11 prototype)
@@ -272,16 +272,16 @@ export type FinalizeAssignmentRequest = z.infer<typeof finalizeAssignmentRequest
 export const OVERRIDE_REASON_MAX_LENGTH = 300;
 export const overrideResultRequestSchema = z.strictObject({
   verdict: overrideVerdictSchema,
-  reason: z.string().trim().min(1).max(OVERRIDE_REASON_MAX_LENGTH),
+  reason: freeTextSchema({ max: OVERRIDE_REASON_MAX_LENGTH }),
 });
 export type OverrideResultRequest = z.infer<typeof overrideResultRequestSchema>;
 
 export const TRANSCRIPTION_TEXT_MAX_LENGTH = 4000;
 export const correctTranscriptionRequestSchema = z
   .strictObject({
-    promptText: z.string().trim().min(1).max(TRANSCRIPTION_TEXT_MAX_LENGTH).optional(),
+    promptText: freeTextSchema({ max: TRANSCRIPTION_TEXT_MAX_LENGTH }).optional(),
     /** An empty string records that the student left the question blank. */
-    studentAnswerText: z.string().trim().max(TRANSCRIPTION_TEXT_MAX_LENGTH).optional(),
+    studentAnswerText: freeTextSchema({ min: 0, max: TRANSCRIPTION_TEXT_MAX_LENGTH }).optional(),
   })
   .refine(
     (v) => v.promptText !== undefined || v.studentAnswerText !== undefined,
@@ -366,10 +366,23 @@ export const assignmentSummarySchema = z.strictObject({
 });
 export type AssignmentSummary = z.infer<typeof assignmentSummarySchema>;
 
+/** `<created_at in epoch microseconds>_<id>` of the last scan on a page (GET /v1/assignments?after=). */
+export const assignmentCursorSchema = z
+  .string()
+  .regex(/^[0-9]{1,19}_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+export const ASSIGNMENT_LIST_PAGE_SIZE = 100;
+
+/**
+ * GET /v1/assignments[?childId=…][&after=<nextCursor>]. Newest first, at most 100 per page;
+ * `nextCursor` is set while older scans exist (API-AUTH-R1-02: history is kept and reachable).
+ * The API always sends it; optional so payloads from before it existed still parse.
+ */
 export const assignmentListResponseSchema = z.strictObject({
-  assignments: z.array(assignmentSummarySchema),
+  assignments: z.array(assignmentSummarySchema).max(ASSIGNMENT_LIST_PAGE_SIZE),
   /** Present when the list is filtered to one child. */
   allowance: pageAllowanceSchema.nullable(),
+  nextCursor: assignmentCursorSchema.nullable().optional(),
 });
 export type AssignmentListResponse = z.infer<typeof assignmentListResponseSchema>;
 

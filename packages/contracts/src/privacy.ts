@@ -5,7 +5,7 @@
 // or "include answers" switch can ride along). Responses are strict so a server change that adds a
 // private field fails loudly in the client instead of being rendered.
 import { z } from 'zod';
-import { isoDateTimeSchema, uuidSchema } from './common.ts';
+import { freeTextSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Documented retention (mirrors migrations 0600/0620 and the public privacy page)
@@ -317,7 +317,7 @@ export const RESOLUTION_NOTE_MAX_LENGTH = 1000;
 export const createSafetyReportRequestSchema = z.strictObject({
   category: safetyReportCategorySchema,
   questionId: uuidSchema.optional(),
-  note: z.string().trim().min(1).max(SAFETY_NOTE_MAX_LENGTH).optional(),
+  note: freeTextSchema({ max: SAFETY_NOTE_MAX_LENGTH }).optional(),
 });
 export type CreateSafetyReportRequest = z.infer<typeof createSafetyReportRequestSchema>;
 
@@ -451,7 +451,7 @@ export const adminSafetyReportResponseSchema = z.strictObject({
 export const updateSafetyReportRequestSchema = z
   .strictObject({
     status: z.enum(['triaged', 'escalated', 'resolved']).optional(),
-    resolutionNote: z.string().trim().min(1).max(RESOLUTION_NOTE_MAX_LENGTH).optional(),
+    resolutionNote: freeTextSchema({ max: RESOLUTION_NOTE_MAX_LENGTH }).optional(),
     familyVisible: z.literal(true).optional(),
     /** The reviewer's clearing only; `addressed` is the guardian's outcome (PATCH /v1/safety-reports/:id). */
     resolution: z.literal('false_match').optional(),

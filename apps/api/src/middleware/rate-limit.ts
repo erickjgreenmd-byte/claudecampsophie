@@ -98,6 +98,13 @@ export const RATE_RULES = {
   /** Across all of an adult's sessions (a lockout still engages after 5 wrong PINs). */
   pinAttemptPerUser: { limit: 20, windowSeconds: 15 * 60 },
   pinResetPerUser: { limit: 5, windowSeconds: 24 * 3600 },
+  /**
+   * Setting or changing the PIN, per adult (API-AUTH-R1-04 follow-up): each call hashes with PBKDF2
+   * and the first-time set needs only a session, so a stolen session cannot burn CPU or churn the
+   * PIN at will. Counted only for calls that would replace the PIN (after the weak-PIN and step-up
+   * checks), so refused calls cannot use up the parent's own budget.
+   */
+  pinSetPerUser: { limit: 10, windowSeconds: 3600 },
   /** Per client network: an IPv4 address or an IPv6 /64 (one subscriber's allocation). */
   pairingRedeemPerNetwork: { limit: 20, windowSeconds: 15 * 60 },
   /**
@@ -110,6 +117,21 @@ export const RATE_RULES = {
   pairingRedeemFailuresGlobal: { limit: 200, windowSeconds: 3600 },
   pairingCreatePerFamily: { limit: 20, windowSeconds: 3600 },
   childRefreshPerSession: { limit: 60, windowSeconds: 3600 },
+  /**
+   * Refreshes per client network before the token lookup (API-AUTH-R1-04): a script cannot use the
+   * database to test tokens at will. A family's four paired devices refresh ~4 times an hour each.
+   */
+  childRefreshPerNetwork: { limit: 240, windowSeconds: 3600 },
+  /**
+   * Parent create routes, per family (API-AUTH-R1-04; spec: every endpoint defines a limit). Abuse
+   * bounds well above real use, so a stuck button or a script cannot bloat the family's views.
+   */
+  childCreatePerFamily: { limit: 12, windowSeconds: 24 * 3600 },
+  rewardCreatePerFamily: { limit: 40, windowSeconds: 3600 },
+  subjectCreatePerFamily: { limit: 20, windowSeconds: 3600 },
+  testDateCreatePerFamily: { limit: 30, windowSeconds: 3600 },
+  studyMaterialCreatePerFamily: { limit: 30, windowSeconds: 3600 },
+  scheduleUpdatePerFamily: { limit: 30, windowSeconds: 3600 },
   promoQuotePerUser: { limit: 20, windowSeconds: 3600 },
   promoRedeemPerFamily: { limit: 10, windowSeconds: 3600 },
   promoInvalidCodePerFamily: { limit: 8, windowSeconds: 24 * 3600 },

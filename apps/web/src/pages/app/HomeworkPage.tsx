@@ -303,19 +303,53 @@ function HomeworkManager() {
   );
 }
 
+/**
+ * Older pages of a newest-first list (API-AUTH-R1-02). They stay attached only while the first
+ * page still ends at the row they were fetched after (`from`); a refresh that moves that row (a
+ * new scan arrived) drops them and offers "Show older" again, so nothing is ever skipped.
+ */
+interface OlderPages<T> {
+  from: string;
+  items: T[];
+  nextCursor: string | null;
+}
+
 function ChildHomework({ child }: { child: FamilyChild }) {
+  const listPath = `/v1/assignments?childId=${encodeURIComponent(child.id)}`;
   const query = useRefreshingQuery(
-    (api) =>
-      api.get(
-        `/v1/assignments?childId=${encodeURIComponent(child.id)}`,
-        assignmentListResponseSchema,
-      ),
+    (api) => api.get(listPath, assignmentListResponseSchema),
     [child.id],
   );
   const [openId, setOpenId] = useState<string | null>(null);
+  const [older, setOlder] = useState<OlderPages<AssignmentSummary> | null>(null);
+  const [olderBusy, setOlderBusy] = useState(false);
+  const [olderError, setOlderError] = useState<string | null>(null);
   const { api } = useSession();
   const action = useAction();
   const { reload } = query;
+
+  const showOlder = (firstCursor: string, cursor: string) =>
+    void (async () => {
+      setOlderBusy(true);
+      setOlderError(null);
+      try {
+        const page = await api.get(
+          `${listPath}&after=${encodeURIComponent(cursor)}`,
+          assignmentListResponseSchema,
+        );
+        setOlder((prev) => ({
+          from: firstCursor,
+          items: [...(prev?.from === firstCursor ? prev.items : []), ...page.assignments],
+          nextCursor: page.nextCursor ?? null,
+        }));
+      } catch (error) {
+        setOlderError(
+          error instanceof ApiRequestError ? error.message : 'Could not load older scans.',
+        );
+      } finally {
+        setOlderBusy(false);
+      }
+    })();
 
   const cancel = (assignment: AssignmentSummary) =>
     void action
@@ -336,7 +370,14 @@ function ChildHomework({ child }: { child: FamilyChild }) {
   if (query.status === 'error') {
     return <ErrorState message={query.error.message} onRetry={reload} />;
   }
-  const { assignments, allowance } = query.data;
+  const { allowance } = query.data;
+  const firstCursor = query.data.nextCursor ?? null;
+  const attached = older !== null && older.from === firstCursor ? older : null;
+  const nextCursor = attached ? attached.nextCursor : firstCursor;
+  const seen = new Set<string>();
+  const assignments = [...query.data.assignments, ...(attached?.items ?? [])].filter((a) =>
+    seen.has(a.id) ? false : (seen.add(a.id), true),
+  );
   return (
     <>
       {allowance ? <AllowanceCard allowance={allowance} name={child.nickname} /> : null}
@@ -390,6 +431,19 @@ function ChildHomework({ child }: { child: FamilyChild }) {
             ))}
           </ul>
         )}
+        {nextCursor !== null && firstCursor !== null ? (
+          <div style={buttonRow}>
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={olderBusy}
+              onClick={() => showOlder(firstCursor, nextCursor)}
+            >
+              {olderBusy ? 'Loading older scans…' : 'Show older scans'}
+            </button>
+          </div>
+        ) : null}
+        {olderError ? <p role="alert">{olderError}</p> : null}
       </section>
       {openId !== null ? (
         <AssignmentDetail

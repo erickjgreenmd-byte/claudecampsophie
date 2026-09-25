@@ -448,34 +448,14 @@ function ScheduleEditor({
 
       <Card>
         <Heading>Reminders</Heading>
-        <ToggleRow
-          label={`Allow gentle practice reminders on ${childName}’s device`}
-          value={form.childRemindersPermitted}
-          onChange={(v) => set('childRemindersPermitted', v)}
-        />
-        <ToggleRow
-          label="Quiet hours (no reminders)"
-          value={form.quietEnabled}
-          onChange={(v) => set('quietEnabled', v)}
-        />
-        {form.quietEnabled ? (
-          <>
-            <Field
-              label={`Quiet hours start (${zone})`}
-              value={form.quietStart}
-              onChange={(v) => set('quietStart', v)}
-              placeholder="24-hour time, like 20:00"
-              error={undefined}
-            />
-            <Field
-              label={`Quiet hours end (${zone})`}
-              value={form.quietEnd}
-              onChange={(v) => set('quietEnd', v)}
-              placeholder="24-hour time, like 07:00"
-              error={errors.quietHours}
-            />
-          </>
-        ) : null}
+        {/* The app sends no notifications (no push stack in this build), so the reminder and
+            quiet-hours controls are not offered: the copy must match what is delivered
+            (AC_SECURITY_02; MOB-R1-05). The schedule keeps its stored reminder fields unchanged. */}
+        <Body muted>
+          Practice reminders and quiet hours aren’t available yet. PencilLift doesn’t send
+          notifications to {childName}’s device in this version; when reminders arrive, you’ll
+          choose here whether to allow them and when to keep things quiet.
+        </Body>
       </Card>
 
       {result ? (

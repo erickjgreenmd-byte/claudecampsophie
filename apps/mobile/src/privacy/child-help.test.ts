@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
+import { ApiRequestError, NETWORK_RULES, type ApiClient } from '@pencillift/contracts/client';
 import {
   CHILD_HELP_COPY,
   CHILD_REPORT_CHOICES,
@@ -103,6 +103,11 @@ describe('child help and report choices (spec P4, AC_SECURITY_01)', () => {
     const result = await sendChildReport(offline.api, 'upsetting', {});
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/tell a grown-up/i);
+    const slow = childReportErrorMessage(
+      new ApiRequestError('NETWORK', 'raw', 0, NETWORK_RULES.timeout),
+    );
+    expect(slow).toMatch(/taking longer than usual/);
+    expect(slow).toMatch(/tell a grown-up/i);
 
     const missing = fakeApi(() => new ApiRequestError('NOT_FOUND', 'nope', 404));
     const notFound = await sendChildReport(missing.api, 'wrong_or_confusing', {

@@ -18,11 +18,11 @@ import type { ApiClient } from '@pencillift/contracts/client';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../brand/BrandMark.tsx';
 import { legalLinks } from '../lib/legal-links.ts';
-import { currentMode } from '../lib/mode.ts';
-import { portalUrl } from '../lib/parent-auth.ts';
+import { currentMode, parentUnlockActive } from '../lib/mode.ts';
+import { parentAuth, portalUrl } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { answerGate, gateLock, openGate, type GateState } from './parental-gate.ts';
-import { parentApi } from './runtime.ts';
+import { parentApi, signOutParentOnDevice } from './runtime.ts';
 import { lockParentArea } from './unlock.ts';
 
 /**
@@ -39,12 +39,24 @@ const DEFAULT_EDGES: readonly Edge[] = ['left', 'right', 'bottom'];
  * without a header (/pair) passes `edges` including 'top'.
  */
 export function Screen({
-  children,
+  children: content,
   edges = DEFAULT_EDGES,
+  childNav,
 }: {
   children: ReactNode;
   edges?: readonly Edge[] | undefined;
+  /** Child screens have no native header: show the Home (and Back) controls under the brand row. */
+  childNav?: 'home' | 'home_and_back' | undefined;
 }) {
+  // The brand row always comes first; a child screen's nav is the first thing under it.
+  const children = childNav ? (
+    <>
+      <ChildNav back={childNav === 'home_and_back'} />
+      {content}
+    </>
+  ) : (
+    content
+  );
   return (
     <SafeAreaView style={styles.screen} edges={edges}>
       <KeyboardAvoidingView
@@ -59,6 +71,38 @@ export function Screen({
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
+  );
+}
+
+/** Returns to the child home with no child screens left underneath it. */
+export function goToChildHome(): void {
+  if (router.canDismiss()) router.dismissAll();
+  router.replace('/(child)/home');
+}
+
+/** One screen back; from the bottom of the stack, the child home. */
+export function goBackOrChildHome(): void {
+  if (router.canGoBack()) router.back();
+  else goToChildHome();
+}
+
+/**
+ * Persistent way out of every child screen (MOB-R1-07): the child space hides the native header,
+ * so a child on a tablet without a reliable edge-swipe still has an on-screen Home (and Back).
+ */
+export function ChildNav({ back = true }: { back?: boolean | undefined }) {
+  return (
+    <View style={styles.childNav} accessibilityRole="toolbar" accessibilityLabel="Navigation">
+      {back ? (
+        <Button
+          label="Back"
+          secondary
+          accessibilityLabel="Back to the previous screen"
+          onPress={goBackOrChildHome}
+        />
+      ) : null}
+      <Button label="Home" secondary accessibilityLabel="Go to my home" onPress={goToChildHome} />
+    </View>
   );
 }
 
@@ -196,13 +240,20 @@ export function ErrorBox({
 export type ParentAccess =
   | { readonly status: 'checking' }
   | { readonly status: 'child_mode' }
+  /** Parent sign-in is configured in this build, but nobody is signed in on this device. */
   | { readonly status: 'no_session' }
+  /** This build has no parent sign-in at all (no Supabase project configured). */
+  | { readonly status: 'not_configured' }
+  /** Signed in, but the PIN unlock has not happened since the app started (or has lapsed). */
+  | { readonly status: 'locked' }
   | { readonly status: 'ready'; readonly api: ApiClient };
 
 /**
  * Gate for parent screens (AC_ACCESS_07): a device in child mode never shows parent data, even via
  * a deep link. Returning to the parent area requires a fresh server-verified PIN on the unlock
- * screen. Without a parent sign-in on this device, screens show an honest "not connected" state.
+ * screen, and so does a cold start or a lapsed unlock (MOB-R1-09): the client-side unlock is held
+ * in memory only, so a deep link into a parent screen after a restart goes to the unlock screen.
+ * Without a parent sign-in on this device, screens offer the sign-in (MOB-R1-08).
  */
 export function useParentAccess(): ParentAccess {
   const [access, setAccess] = useState<ParentAccess>({ status: 'checking' });
@@ -215,7 +266,16 @@ export function useParentAccess(): ParentAccess {
         return;
       }
       const api = parentApi();
-      setAccess(api ? { status: 'ready', api } : { status: 'no_session' });
+      if (!api) {
+        setAccess({ status: parentAuth.configured ? 'no_session' : 'not_configured' });
+        return;
+      }
+      if (!parentUnlockActive(new Date())) {
+        setAccess({ status: 'locked' });
+        router.replace('/(parent)/unlock');
+        return;
+      }
+      setAccess({ status: 'ready', api });
     });
     return () => {
       active = false;
@@ -250,17 +310,59 @@ export function ParentAccessState({ access }: { access: ParentAccess }) {
       </Notice>
     );
   }
-  if (access.status === 'no_session') {
+  if (access.status === 'locked') {
+    return (
+      <Notice>
+        <Body>Enter your parent PIN to open the parent area.</Body>
+        <Button label="Unlock parent area" onPress={() => router.replace('/(parent)/unlock')} />
+      </Notice>
+    );
+  }
+  if (access.status === 'no_session') return <SignInPrompt />;
+  if (access.status === 'not_configured') {
     return (
       <Notice>
         <Body>
-          Parent sign-in isn’t connected on this device yet, so family details can’t be shown here.
+          Parent sign-in isn’t connected in this build yet, so family details can’t be shown here.
           You can manage your family in the parent portal.
         </Body>
       </Notice>
     );
   }
   return null;
+}
+
+/**
+ * A signed-out parent on a configured build is offered the sign-in (MOB-R1-08); the sign-in screen
+ * replaces this one and continues to the PIN unlock, so no dead end and no doubled screens.
+ */
+export function SignInPrompt() {
+  return (
+    <Notice>
+      <Body>Sign in as a parent to see and manage your family on this device.</Body>
+      <Button label="Sign in as a parent" onPress={() => router.replace('/(parent)/sign-in')} />
+    </Notice>
+  );
+}
+
+/**
+ * Ends the parent session on this device (MOB-R1-01): server relock, Supabase sign-out, adult
+ * caches and store identity cleared, then the welcome screen. A paired child stays paired.
+ */
+export function SignOutButton() {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Button
+      label={busy ? 'Signing out…' : 'Sign out'}
+      secondary
+      busy={busy}
+      accessibilityLabel="Sign out of the parent account on this device"
+      onPress={() => {
+        setBusy(true);
+        void signOutParentOnDevice().finally(() => setBusy(false));
+      }}
+    />
+  );
 }
 
 /** Load helper with explicit loading/error/ready states and a reload. */
@@ -558,6 +660,7 @@ export const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   row: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+  childNav: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm, marginBottom: spacing.sm },
   chip: {
     minHeight: minTouchTarget,
     minWidth: minTouchTarget,

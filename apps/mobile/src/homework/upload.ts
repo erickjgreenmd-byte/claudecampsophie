@@ -7,6 +7,12 @@
  * scan and the server marks pages already stored; only missing pages are sent again. When the create
  * shows the scan was already finalized (a lost finalize response), the retry reports it as sent
  * without touching pages again. Pure logic with injected I/O so it is unit-testable without a device.
+ *
+ * Memory (MOB-R1-04): a page's bytes live in the JS heap only while they are being fingerprinted or
+ * sent. The first pass reads, measures and hashes each page and drops the bytes; each page is read
+ * again just before its PUT. A ten-page scan therefore holds one page at a time, not ~150 MB.
+ * Cancellation (MOB-R1-03): the scan's AbortSignal reaches every API call, not only the storage PUT,
+ * so "Stop sending" also stops a stalled create/register/finalize request.
  */
 import {
   FINALIZED_ASSIGNMENT_STATUSES,
@@ -103,6 +109,33 @@ function checkCancelled(signal: AbortSignal): void {
   if (signal.aborted) throw new ScanCancelledError();
 }
 
+/** An API call that failed because the child stopped the scan is a cancellation, not a network fault. */
+async function cancellable<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
+  checkCancelled(signal);
+  try {
+    return await work();
+  } catch (error) {
+    if (signal.aborted) throw new ScanCancelledError();
+    throw error;
+  }
+}
+
+/**
+ * Reads one page's bytes just before its PUT; the buffer goes out of scope as soon as the PUT
+ * returns. A file that changed since it was fingerprinted is refused here rather than sent, since
+ * the server would remove it as a mismatch anyway.
+ */
+async function sendPage(
+  io: UploadIo,
+  uploadUrl: string,
+  page: { uri: string; mimeType: string; byteSize: number },
+  signal: AbortSignal,
+): Promise<void> {
+  const bytes = await io.readBytes(page.uri);
+  if (bytes.length !== page.byteSize) throw new UploadTransferError(0);
+  await io.putBytes(uploadUrl, bytes, page.mimeType, signal);
+}
+
 export async function uploadScan(args: {
   api: ApiClient;
   io: UploadIo;
@@ -117,8 +150,17 @@ export async function uploadScan(args: {
   const { api, io, pages, limits, signal, onProgress } = args;
   const total = pages.length;
 
-  // 1. Measure and fingerprint every page before contacting the API.
-  const prepared: { pageNumber: number; mimeType: string; bytes: PageBytes; sha256: string }[] = [];
+  const request = { signal };
+
+  // 1. Measure and fingerprint every page before contacting the API. Only the size and the hash
+  // are kept; the bytes are read again, one page at a time, when they are sent.
+  const prepared: {
+    pageNumber: number;
+    uri: string;
+    mimeType: string;
+    byteSize: number;
+    sha256: string;
+  }[] = [];
   for (const [i, page] of pages.entries()) {
     checkCancelled(signal);
     onProgress({ phase: 'preparing', pagesDone: i, pagesTotal: total });
@@ -131,19 +173,23 @@ export async function uploadScan(args: {
     }
     prepared.push({
       pageNumber: i + 1,
+      uri: page.uri,
       mimeType: page.mimeType,
-      bytes,
+      byteSize: bytes.length,
       sha256: await io.sha256Hex(bytes),
     });
   }
   checkCancelled(signal);
 
   // 2. Create (or, with the same key, find) the scan. A child never names a child id.
-  const created = await api.send(
-    'POST',
-    '/v1/assignments',
-    { pageCount: total, idempotencyKey: args.attempt.createKey },
-    assignmentStateResponseSchema,
+  const created = await cancellable(signal, () =>
+    api.send(
+      'POST',
+      '/v1/assignments',
+      { pageCount: total, idempotencyKey: args.attempt.createKey },
+      assignmentStateResponseSchema,
+      request,
+    ),
   );
   const attempt: UploadAttempt = { ...args.attempt, assignmentId: created.assignment.id };
   args.onAttempt?.(attempt);
@@ -160,21 +206,25 @@ export async function uploadScan(args: {
 
   // 3. Register pages (or resume) and receive single-object signed upload URLs.
   checkCancelled(signal);
-  const registered = await api.send(
-    'POST',
-    `${base}/uploads`,
-    {
-      pages: prepared.map((p) => ({
-        pageNumber: p.pageNumber,
-        mimeType: p.mimeType,
-        byteSize: p.bytes.length,
-        sha256: p.sha256,
-      })),
-    },
-    uploadPagesResponseSchema,
+  const registered = await cancellable(signal, () =>
+    api.send(
+      'POST',
+      `${base}/uploads`,
+      {
+        pages: prepared.map((p) => ({
+          pageNumber: p.pageNumber,
+          mimeType: p.mimeType,
+          byteSize: p.byteSize,
+          sha256: p.sha256,
+        })),
+      },
+      uploadPagesResponseSchema,
+      request,
+    ),
   );
 
-  // 4. Send bytes straight to storage; pages already stored are skipped (resume).
+  // 4. Send bytes straight to storage, one page in memory at a time; pages already stored are
+  // skipped (resume).
   let done = registered.uploads.filter((u) => u.alreadyUploaded).length;
   onProgress({ phase: 'uploading', pagesDone: done, pagesTotal: total });
   for (const target of registered.uploads) {
@@ -182,7 +232,7 @@ export async function uploadScan(args: {
     checkCancelled(signal);
     const page = prepared.find((p) => p.pageNumber === target.pageNumber);
     if (!page) throw new UploadTransferError(0);
-    await io.putBytes(target.uploadUrl, page.bytes, page.mimeType, signal);
+    await sendPage(io, target.uploadUrl, page, signal);
     done += 1;
     onProgress({ phase: 'uploading', pagesDone: done, pagesTotal: total });
   }
@@ -190,11 +240,14 @@ export async function uploadScan(args: {
 
   // 5. Finalize (idempotent: repeating it never double-charges or double-queues).
   onProgress({ phase: 'sending', pagesDone: total, pagesTotal: total });
-  const finalized = await api.send(
-    'POST',
-    `${base}/finalize`,
-    { idempotencyKey: attempt.finalizeKey },
-    assignmentStateResponseSchema,
+  const finalized = await cancellable(signal, () =>
+    api.send(
+      'POST',
+      `${base}/finalize`,
+      { idempotencyKey: attempt.finalizeKey },
+      assignmentStateResponseSchema,
+      request,
+    ),
   );
   onProgress({ phase: 'done', pagesDone: total, pagesTotal: total });
   return { assignment: finalized.assignment, attempt };

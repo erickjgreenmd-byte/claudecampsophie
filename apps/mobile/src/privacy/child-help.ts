@@ -11,7 +11,7 @@ import {
   type ChildReportCategory,
   type ChildReportRequest,
 } from '@pencillift/contracts';
-import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
+import { ApiRequestError, isRequestTimeout, type ApiClient } from '@pencillift/contracts/client';
 
 export interface ChildReportChoice {
   readonly category: ChildReportCategory;
@@ -91,6 +91,9 @@ const CHILD_REPORT_ERRORS: Readonly<Record<string, string>> = {
 };
 
 export function childReportErrorMessage(error: unknown): string {
+  if (isRequestTimeout(error)) {
+    return 'This is taking longer than usual. Please try again, or tell a grown-up.';
+  }
   const code = error instanceof ApiRequestError ? error.code : 'INTERNAL';
   return CHILD_REPORT_ERRORS[code] ?? 'Something went wrong sending this. Please tell a grown-up.';
 }

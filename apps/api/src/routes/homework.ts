@@ -1,14 +1,16 @@
 import { Hono, type Context } from 'hono';
 import {
+  ASSIGNMENT_LIST_PAGE_SIZE,
+  assignmentCursorSchema,
   CANCELLABLE_ASSIGNMENT_STATUSES,
   CORRECTABLE_ASSIGNMENT_STATUSES,
-  DEFAULT_HOMEWORK_PAGE_ALLOWANCE_PER_CHILD,
-  DEFAULT_HOMEWORK_UPLOAD_LIMITS,
-  FINALIZED_ASSIGNMENT_STATUSES,
-  HOMEWORK_READABLE_MIME_TYPES,
   correctTranscriptionRequestSchema,
   createAssignmentRequestSchema,
+  DEFAULT_HOMEWORK_PAGE_ALLOWANCE_PER_CHILD,
+  DEFAULT_HOMEWORK_UPLOAD_LIMITS,
   finalizeAssignmentRequestSchema,
+  FINALIZED_ASSIGNMENT_STATUSES,
+  HOMEWORK_READABLE_MIME_TYPES,
   overrideResultRequestSchema,
   uploadPagesRequestSchema,
   uuidSchema,
@@ -114,7 +116,26 @@ const CHILD_CREATE_RULE: RateRule = { limit: 30, windowSeconds: 3600 };
 const PARENT_CREATE_RULE: RateRule = { limit: 120, windowSeconds: 3600 };
 const CORRECTION_RULE: RateRule = { limit: 120, windowSeconds: 3600 };
 
-const LIST_LIMIT = 100;
+const LIST_LIMIT = ASSIGNMENT_LIST_PAGE_SIZE;
+
+/** Largest epoch-microsecond value Postgres can hold in a bigint. */
+const INT64_MAX = 9223372036854775807n;
+/** No stored row is timestamped this far past the request clock; anything beyond is a bad cursor. */
+const CURSOR_AHEAD_MICROS = 10n * 366n * 24n * 3600n * 1_000_000n;
+
+/**
+ * Parses the epoch-microseconds half of a keyset cursor with BigInt (API-AUTH-R1-03): a 19-digit
+ * value past int64, or one far in the future, would fail the bigint cast or overflow the interval
+ * in SQL and surface as a 500; here it is a 400 like any other malformed cursor.
+ */
+function cursorMicros(digits: string, now: Date): string {
+  const micros = BigInt(digits);
+  if (micros > INT64_MAX || micros > BigInt(now.getTime()) * 1000n + CURSOR_AHEAD_MICROS) {
+    throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+  }
+  return micros.toString();
+}
+
 const CHILD_LIST_LIMIT = 50;
 
 const EXTENSIONS: Record<HomeworkMimeType, string> = {
@@ -1092,6 +1113,15 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
       childId = parsed.data;
     }
     const now = deps.clock();
+    // Keyset page, newest first (API-AUTH-R1-02): `after` is the previous page's `nextCursor`.
+    const rawAfter = c.req.query('after');
+    let cursor: { micros: string; id: string } | null = null;
+    if (rawAfter !== undefined) {
+      const parsed = assignmentCursorSchema.safeParse(rawAfter);
+      if (!parsed.success) throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+      const [micros, id] = parsed.data.split('_') as [string, string];
+      cursor = { micros: cursorMicros(micros, now), id };
+    }
     const data = await deps.db.asParent(parent, async (tx) => {
       let childHasPaidSlot = false;
       if (childId !== null) {
@@ -1107,12 +1137,17 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
         if (!profile) return null;
         childHasPaidSlot = profile.entitled;
       }
-      const rows = await tx<AssignmentRow[]>`
-        select ${tx(ASSIGNMENT_COLUMNS)} from public.assignments
+      const rows = await tx<(AssignmentRow & { cursor_micros: string })[]>`
+        select ${tx(ASSIGNMENT_COLUMNS)},
+               ((extract(epoch from created_at) * 1000000)::bigint)::text as cursor_micros
+          from public.assignments
          where family_id = ${familyId} and status <> 'deleted'
            and (${childId}::uuid is null or child_id = ${childId}::uuid)
-         order by created_at desc
-         limit ${LIST_LIMIT}`;
+           and (${cursor?.micros ?? null}::bigint is null
+                or (created_at, id) < (timestamptz 'epoch' + ${cursor?.micros ?? null}::bigint * interval '1 microsecond',
+                                       ${cursor?.id ?? null}::uuid))
+         order by created_at desc, id desc
+         limit ${LIST_LIMIT + 1}`;
       let allowance: PageAllowance | null = null;
       if (childId !== null) {
         const periodKey = await pagePeriodKey(tx, familyId, now);
@@ -1122,9 +1157,15 @@ export function homeworkRoutes(overrides: Partial<HomeworkConfig> = {}): Hono<Ap
       return { rows, allowance };
     });
     if (!data) throw new ApiError('NOT_FOUND', 'Child not found');
+    const page = data.rows.slice(0, LIST_LIMIT);
+    const last = page.at(-1);
     const response: AssignmentListResponse = {
-      assignments: data.rows.map(toSummary),
+      assignments: page.map(toSummary),
       allowance: data.allowance,
+      nextCursor:
+        data.rows.length > LIST_LIMIT && last !== undefined
+          ? `${last.cursor_micros}_${last.id}`
+          : null,
     };
     return c.json(response);
   });

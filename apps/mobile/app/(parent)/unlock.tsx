@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Switch, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
 import { colors } from '@pencillift/ui-tokens';
 import { enterParentMode } from '../../src/lib/mode.ts';
-import { portalUrl } from '../../src/lib/parent-auth.ts';
+import { parentAuth, portalUrl } from '../../src/lib/parent-auth.ts';
 import { secureStorage } from '../../src/lib/secure-storage.ts';
 import {
   biometricPinStore,
@@ -19,6 +19,8 @@ import {
   Heading,
   Notice,
   Screen,
+  SignInPrompt,
+  SignOutButton,
   styles,
   Title,
   useRelockOnBackground,
@@ -37,9 +39,13 @@ import {
  * Parent-area unlock (spec P3; AC_ACCESS_07/08). Every unlock is a fresh, server-verified PIN
  * (rate-limited, with lockout). Biometric unlock is an opt-in convenience that reads the PIN from
  * the keychain behind the OS prompt; the server still verifies it. The unlock is short-lived.
+ * Without a signed-in parent, a configured build offers the sign-in here (MOB-R1-08); only a build
+ * with no parent sign-in at all says so.
  */
 export default function UnlockScreen() {
-  const api = useMemo(() => stepUpApi(), []);
+  const [api, setApi] = useState(() => stepUpApi());
+  // The step-up client appears once the session layer registers a signed-in parent.
+  useEffect(() => parentAuth.watch(() => setApi(stepUpApi())), []);
   const [pin, setPin] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -57,12 +63,16 @@ export default function UnlockScreen() {
     return (
       <Screen>
         <Title>Parent area</Title>
-        <Notice>
-          <Body>
-            Parent sign-in isn’t connected on this device yet, so the parent area can’t be unlocked
-            here. You can manage your family in the parent portal.
-          </Body>
-        </Notice>
+        {parentAuth.configured ? (
+          <SignInPrompt />
+        ) : (
+          <Notice>
+            <Body>
+              Parent sign-in isn’t connected in this build yet, so the parent area can’t be unlocked
+              here. You can manage your family in the parent portal.
+            </Body>
+          </Notice>
+        )}
       </Screen>
     );
   }
@@ -77,7 +87,10 @@ export default function UnlockScreen() {
           setInfo('Biometric unlock couldn’t be turned on. You can keep using your PIN.');
         }
       }
-      const mode = await enterParentMode(secureStorage, modeEffects, { unlocked: true });
+      const mode = await enterParentMode(secureStorage, modeEffects, {
+        unlocked: true,
+        unlockedUntil: outcome.unlockedUntil,
+      });
       if (mode === 'parent') router.replace('/(parent)/home');
       return;
     }
@@ -186,6 +199,7 @@ export default function UnlockScreen() {
           )
         }
       />
+      <SignOutButton />
       <PinResetHelp />
     </Screen>
   );

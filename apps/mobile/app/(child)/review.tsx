@@ -62,7 +62,7 @@ export default function ReviewScreen() {
 
   if (openSet) {
     return (
-      <Screen>
+      <Screen childNav="home">
         <Title>{openSection ? `${openSection.displayName} review` : 'Weekly review'}</Title>
         <PracticePlayer
           key={openSet.id}
@@ -90,7 +90,7 @@ export default function ReviewScreen() {
   const stateCopy = state.status === 'ready' ? reviewStateCopy(state.data.state) : null;
 
   return (
-    <Screen>
+    <Screen childNav="home_and_back">
       <Title>My weekly review</Title>
       {state.status === 'loading' ? <Loading label="Getting your review" /> : null}
       {state.status === 'error' ? (
