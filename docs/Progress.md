@@ -4,7 +4,7 @@ Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on 
 Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
 (1–4 paid slots) — unchanged.
 
-## Current state (2026-09-25; code at `54ca934`)
+## Current state (2026-09-25; code at `77c13b1`)
 
 Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
 approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
@@ -28,14 +28,19 @@ characters refused in every free-text field, keyset paging for scans and points,
 budget, the K-8 under-13 scope in the contracts (T38), parent sign-out on the device, honest sign-in and reset
 errors, request timeouts with a stoppable upload, one page in memory at a time, honest reminder copy on both
 planners, pairing recovery, a way home from every child screen, the sign-in offered to a signed-out parent, the
-client-side unlock in memory only (privacy screen included) and store names per build. MCP connectors for Supabase, Stripe and Expo are attached to
+client-side unlock in memory only (privacy screen included) and store names per build. Then hardening round 2a
+(`77c13b1`, BUG-131..142): chargebacks and won disputes settle the right amount, a re-enabled subscription is
+observed, the stale-entitlement sweep rotates, the RevenueCat TRANSFER shape is accepted, non-USD charges stay out of
+USD revenue and the donation rule, consent withdrawal ends the child's access and keeps a pending safety-flag email,
+the privacy page names the real photo-removal paths, and migration 0840 adds job and safety-report indexes, 90-day
+job retention, membership release at deletion request time and pseudo-zone refusal. MCP connectors for Supabase, Stripe and Expo are attached to
 the build session but no project, account or EAS project of PencilLift's exists yet (Connections).
 Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with its gap): integration_tested 33,
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `54ca934`:
-api 952, domain 3,656, db 341, web 530, mobile 591, ai 49, contracts 20, ui-tokens 4 (6,143 tests, 0 failed,
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `77c13b1`:
+api 982, domain 3,656, db 355, web 530, mobile 592, ai 49, contracts 20, ui-tokens 4 (6,188 tests, 0 failed,
 0 skipped), gate audit, finance, release-artifact scan with negative control. Earlier gates caught BUG-114 (a
 stale function re-creation, L-026) and BUG-115 (a pinned-clock time bomb, L-027) before their commits. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
 there is the source of truth; a records-only commit may still have its run in progress).
@@ -64,19 +69,21 @@ moderation built but never run live (no key).
 
 ## In flight
 
-- Adversarial bug hunt across every area (read-only, workflow `wf_2a9a8aa6-7c4`, two finder rounds with three-lens
-  verification, still verifying its round-1 findings for billing, safety-privacy, database, jobs-AI and web). Its
-  first fifteen confirmed findings (API auth/validation and mobile runtime) are fixed in `54ca934`
-  (`wf_8b66cd30-e71`, BUG-116..130); the remaining confirmed findings go to a second fix workflow (failing test
-  first, checkers, isolated gate). The four store audits of the same workflow are done and their code gaps are
-  closed (`wf_b0de02d8-ca2`; store checklist in `docs/Release_Readiness.md`); the owner-side rows are Owner
-  actions #33–#37.
+- Hardening round 2b (workflow `wf_90c8faf6-975`): the remaining seventeen confirmed findings of the bug hunt, in
+  three areas with disjoint files — web portal (WEB-R1-01..04, 06..11: invitation token through sign-in, route
+  error boundary, button contrast, Amazon channel, promo-code honesty, PKCE link errors, FAQ and layout fixes, a
+  launch switch for pre-launch copy), database (DB-R1-05..07, migration 0850: child-bound subject links, dead
+  ON DELETE actions, session-table indexes and housekeeping) and jobs (JOBS-R1-01..04: a purge that never stops for
+  good, bounded scan request size, metered timeouts, pipeline codes in the job ledger). Failing test first,
+  checkers with mutation checks, isolated gate.
+- The bug hunt (`wf_2a9a8aa6-7c4`) verified 48 first-round findings (44 confirmed, 4 refuted); its second finder
+  round did not run (session limit) and is owed on a stable tree after round 2b.
 
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. When the bug hunt finishes: verify its remaining confirmed findings, run the second fix workflow, gate, commit,
-   record (`docs/ECC_Runs.md`, `docs/Bug_Ledger.md`).
+2. Integrate round 2b (lead actions, gate, commit, records), then run the bug hunt's second finder round on the
+   stable tree and fix what it confirms.
 3. Owner actions in `docs/Owner_Actions.md` (#1–#37) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
