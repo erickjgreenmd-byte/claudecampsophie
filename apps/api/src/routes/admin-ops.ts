@@ -14,6 +14,7 @@ import {
   type AdminSupportCaseDetailResponse,
   type AdminSupportCaseMessage,
   type StoreFeeRatesResponse,
+  supportPolicyUpdateRequestSchema,
 } from '@pencillift/contracts';
 import {
   OPEN_CASE_STATUSES,
@@ -25,6 +26,7 @@ import {
   nextResolvedAt,
   type CaseUpdateProblem,
   type SupportCaseStatus,
+  supportPolicyProblems,
 } from '@pencillift/domain/ops';
 import { readJson } from '../app.ts';
 import { loadReadinessFacts, productionReadiness } from '../config.ts';
@@ -39,6 +41,8 @@ import {
   loadStoreFeeRates,
   loadSubscriptions,
   saveStoreFeeRates,
+  loadSupportPolicy,
+  saveSupportPolicy,
 } from '../services/ops-metrics.ts';
 
 type Ctx = Context<AppEnv>;
@@ -484,6 +488,34 @@ export function adminOpsRoutes(): Hono<AppEnv> {
       return saved;
     });
     return c.json(ratesBody(row));
+  });
+
+  r.get('/settings/support-policy', async (c) => {
+    const row = await c.var.deps.db.asService((tx) => loadSupportPolicy(tx));
+    return c.json(row);
+  });
+
+  r.put('/settings/support-policy', async (c) => {
+    const { deps } = c.var;
+    const input = await readJson(c, supportPolicyUpdateRequestSchema);
+    // The schema bounds each field; the domain check is the same rule set the console applies.
+    const problems = supportPolicyProblems(input.policy);
+    if (problems.length > 0) {
+      throw businessRule(
+        'SUPPORT_POLICY_INVALID',
+        problems.map((p) => `${p.field} ${p.problem}`).join('; '),
+      );
+    }
+    const row = await deps.db.asService(async (tx) => {
+      const before = await loadSupportPolicy(tx);
+      const saved = await saveSupportPolicy(tx, input.policy, c.var.parent.userId);
+      await audit(tx, c, 'ops.support_policy_updated', 'ops_setting', 'support_policy', null, {
+        from: before.policy,
+        to: saved.policy,
+      });
+      return saved;
+    });
+    return c.json(row);
   });
 
   return r;

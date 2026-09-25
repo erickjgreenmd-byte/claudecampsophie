@@ -4,6 +4,7 @@ import {
   supportBillingPeriodsResponseSchema,
   supportCaseResponseSchema,
   supportCasesResponseSchema,
+  parentSupportPolicyResponseSchema,
 } from '@pencillift/contracts';
 import { seedFamily, seedOwnerAdmin, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { issueChildAccessToken } from '../src/auth/child.ts';
@@ -327,5 +328,19 @@ describe('parent flow', () => {
       }
     }
     expect(last).toBe(429);
+  });
+});
+
+describe('policy view', () => {
+  it('a parent reads the refund window and response targets; a child cannot', async () => {
+    const view = parentSupportPolicyResponseSchema.parse(
+      await ok(api.request('/v1/support/policy', { token: tokenA })),
+    );
+    expect(view.refundWindowDays).toBe(14);
+    expect(view.responseTargetHours.safety_question).toBe(24);
+    expect(view.refundWindowSentence).toMatch(/last 14 days/);
+    expect(view.refundWindowSentence).not.toMatch(/guarantee/i);
+    expect((await api.request('/v1/support/policy', { token: childToken })).status).toBe(401);
+    expect((await api.request('/v1/support/policy')).status).toBe(401);
   });
 });

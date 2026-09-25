@@ -6,7 +6,12 @@ import {
   MAX_REPORT_MONTHS,
   SUPPORT_MESSAGE_MAX_LENGTH,
   SUPPORT_REFERENCE_MAX_LENGTH,
+  SUPPORT_CASE_KINDS,
   SUPPORT_SUBJECT_MAX_LENGTH,
+  REFUND_WINDOW_DAYS_MAX,
+  REFUND_WINDOW_DAYS_MIN,
+  RESPONSE_TARGET_HOURS_MAX,
+  RESPONSE_TARGET_HOURS_MIN,
   type CaseAgeFilter,
 } from '@pencillift/domain/ops';
 import { calendarMonthSchema, channelSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
@@ -431,3 +436,35 @@ export type StoreFeeRatesResponse = z.infer<typeof storeFeeRatesResponseSchema>;
 
 export const storeFeeRatesUpdateRequestSchema = z.strictObject({ rates: storeFeeRatesSchema });
 export type StoreFeeRatesUpdateRequest = z.infer<typeof storeFeeRatesUpdateRequestSchema>;
+
+/**
+ * The owner's support policy (Owner action #32): refund window in days, a response-time target
+ * per case kind in hours, and whether partial refunds are granted. Edited on /admin/support,
+ * stored in ops_settings under `support_policy`; the parent support page states the window.
+ */
+export const supportPolicySchema = z.strictObject({
+  refundWindowDays: z.number().int().min(REFUND_WINDOW_DAYS_MIN).max(REFUND_WINDOW_DAYS_MAX),
+  responseTargetHours: z.strictObject(
+    Object.fromEntries(
+      SUPPORT_CASE_KINDS.map((kind) => [
+        kind,
+        z.number().int().min(RESPONSE_TARGET_HOURS_MIN).max(RESPONSE_TARGET_HOURS_MAX),
+      ]),
+    ) as Record<(typeof SUPPORT_CASE_KINDS)[number], z.ZodNumber>,
+  ),
+  partialRefunds: z.boolean(),
+});
+export type SupportPolicyContract = z.infer<typeof supportPolicySchema>;
+
+/** GET and PUT /v1/admin/settings/support-policy. */
+export const supportPolicyResponseSchema = z.strictObject({
+  policy: supportPolicySchema,
+  /** True while no policy row exists (the defaults apply) or the stored one no longer validates. */
+  usedDefault: z.boolean(),
+  updatedAt: isoDateTimeSchema.nullable(),
+  updatedBy: uuidSchema.nullable(),
+});
+export type SupportPolicyResponse = z.infer<typeof supportPolicyResponseSchema>;
+
+export const supportPolicyUpdateRequestSchema = z.strictObject({ policy: supportPolicySchema });
+export type SupportPolicyUpdateRequest = z.infer<typeof supportPolicyUpdateRequestSchema>;

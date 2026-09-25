@@ -135,5 +135,11 @@ The parent is the only person PencilLift sends a safety message to, and the pare
   there is no base. The attention list names every rule, zero counts included, and says honestly when no owner
   console exists for a row (failed jobs, deletion requests, safety reports — the last are the parent's under the
   2026-09-25 decision). All owner routes require `requireParent` + `requireOwnerAdmin` (aal2); a `support` staff
-  role cannot reach the queue until the owner decides on `app.is_support_staff()` (Owner action #31).
+  role does not exist: the owner works the queue (Owner action #31, decided 2026-09-25).
+- **Support policy** (Owner action #32): `ops_settings.support_policy` holds the refund window (days), a
+  response-time target per case kind (hours) and whether partial refunds are granted; the domain module
+  `packages/domain/src/ops/policy.ts` validates it and computes hours over target and the refund window with
+  `now` as input; `/v1/admin/settings/support-policy` (owner-only, audited as ids and values, never case text)
+  edits it from `/admin/support`; `/v1/support/policy` gives parents the window and the targets with a fixed
+  sentence that promises no refund. Absent or invalid stored values fall back to the defaults and say so.
 

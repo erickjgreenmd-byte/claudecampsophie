@@ -25,6 +25,7 @@ import {
   loadSupportCases,
   openSupportCase,
   replyToCase,
+  loadSupportPolicy,
 } from '../../src/support/actions.ts';
 import {
   billingPeriodOptions,
@@ -361,9 +362,13 @@ function RefundPeriodPicker({
 }) {
   const load = useCallback(() => loadBillingPeriods(api), [api]);
   const { state, reload } = useLoad(load);
+  // The owner's refund window (Owner action #32): stated when known, silently absent otherwise.
+  const loadPolicy = useCallback(() => loadSupportPolicy(api), [api]);
+  const { state: policy } = useLoad(loadPolicy);
   return (
     <Notice>
       <Body>{SUPPORT_REFUND_NOTICE}</Body>
+      {policy.status === 'ready' ? <Body muted>{policy.data.refundWindowSentence}</Body> : null}
       {state.status === 'idle' || state.status === 'loading' ? (
         <Loading label="Loading your billing periods" />
       ) : null}

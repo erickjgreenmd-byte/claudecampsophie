@@ -158,6 +158,23 @@ function fakeApi(routes: Record<string, unknown> = {}) {
     [`GET ${BASE}`]: { cases: [adminCase(), secondCase], nextCursor: null },
     [`GET ${BASE}/${CASE_A}`]: detail(),
     [`GET ${BASE}/${CASE_B}`]: detail({ case: secondCase, messages: [], refundPath: null }),
+    'GET /v1/admin/settings/support-policy': {
+      policy: {
+        refundWindowDays: 14,
+        responseTargetHours: {
+          refund_request: 48,
+          complaint: 48,
+          billing_issue: 48,
+          bug: 72,
+          safety_question: 24,
+          other: 72,
+        },
+        partialRefunds: true,
+      },
+      usedDefault: true,
+      updatedAt: null,
+      updatedBy: null,
+    },
   };
   const table = { ...defaults, ...routes };
   const respond = (call: Call): unknown => {

@@ -7,6 +7,7 @@ import {
   loadSupportCases,
   openSupportCase,
   replyToCase,
+  loadSupportPolicy,
 } from './actions.ts';
 import { EMPTY_DRAFT, NO_PERIOD_VALUE } from './view-model.ts';
 
@@ -212,5 +213,35 @@ describe('replyToCase', () => {
     );
     const result = await replyToCase(api, CASE_ID, 'Hello again', 'closed');
     expect(!result.ok && result.problem.message).toMatch(/closed, so it takes no more replies/);
+  });
+});
+
+describe('loadSupportPolicy', () => {
+  it('reads the parent view of the policy through the contract schema', async () => {
+    const { api, calls } = fakeApi(() => ({
+      refundWindowDays: 14,
+      responseTargetHours: {
+        refund_request: 48,
+        complaint: 48,
+        billing_issue: 48,
+        bug: 72,
+        safety_question: 24,
+        other: 72,
+      },
+      refundWindowSentence: 'Refund requests are reviewed for charges from the last 14 days; …',
+    }));
+    const policy = await loadSupportPolicy(api);
+    expect(policy.refundWindowDays).toBe(14);
+    expect(calls).toEqual([{ method: 'GET', path: '/v1/support/policy', body: undefined }]);
+  });
+
+  it('a malformed answer is rejected by the schema, never rendered', async () => {
+    const { api } = fakeApi(() => ({
+      refundWindowDays: 0,
+      responseTargetHours: {},
+      refundWindowSentence: '',
+    }));
+    // The double parses synchronously; the real client rejects. Either way nothing is rendered.
+    await expect(Promise.resolve().then(() => loadSupportPolicy(api))).rejects.toThrow();
   });
 });

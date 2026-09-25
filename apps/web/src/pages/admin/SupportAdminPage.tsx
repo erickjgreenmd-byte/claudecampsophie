@@ -26,6 +26,8 @@ import {
   type SupportCasePriority,
   type SupportCaseResolution,
   type SupportCaseStatus,
+  supportPolicyResponseSchema,
+  type SupportPolicyContract,
 } from '@pencillift/contracts';
 import { formatUsd } from '@pencillift/domain';
 import {
@@ -37,6 +39,11 @@ import {
   SUPPORT_CASE_STATUSES,
   type CaseAgeFilter,
   type CaseUpdateProblem,
+  REFUND_WINDOW_DAYS_MAX,
+  REFUND_WINDOW_DAYS_MIN,
+  RESPONSE_TARGET_HOURS_MAX,
+  RESPONSE_TARGET_HOURS_MIN,
+  supportPolicyProblems,
 } from '@pencillift/domain/ops';
 import { ErrorState, Loading } from '../../components/states.tsx';
 import { useApiQuery, useSession } from '../../lib/session.tsx';
@@ -156,7 +163,161 @@ function SupportConsole() {
         }}
       />
       <Queue filters={filters} version={version} caseHref={(id) => hrefFor(filters, id)} />
+      <PolicyForm />
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Support policy (PUT /v1/admin/settings/support-policy; Owner action #32)
+// ---------------------------------------------------------------------------------------------
+
+/** "48" -> 48; null unless a whole number. */
+function parseWhole(text: string): number | null {
+  const trimmed = text.trim();
+  if (!/^\d{1,4}$/.test(trimmed)) return null;
+  return Number(trimmed);
+}
+
+function PolicyForm() {
+  const { api } = useSession();
+  const headingId = useId();
+  const fieldBase = useId();
+  const [saved, setSaved] = useState(0);
+  const query = useApiQuery(
+    (a) => a.get('/v1/admin/settings/support-policy', supportPolicyResponseSchema),
+    [saved],
+  );
+  const data = useLastGood(query);
+  const [edits, setEdits] = useState<Record<string, string>>({});
+  const [partial, setPartial] = useState<boolean | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const { busy, feedback, run } = useAdminAction();
+
+  const valueFor = (field: string, current: number): string => edits[field] ?? String(current);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!data) return;
+    const problems: Record<string, string> = {};
+    const window = parseWhole(valueFor('refundWindowDays', data.policy.refundWindowDays));
+    if (window === null) problems['refundWindowDays'] = 'Enter a whole number of days.';
+    const targets: Record<string, number> = {};
+    for (const kind of SUPPORT_CASE_KINDS) {
+      const hours = parseWhole(valueFor(kind, data.policy.responseTargetHours[kind]));
+      if (hours === null) problems[kind] = 'Enter a whole number of hours.';
+      else targets[kind] = hours;
+    }
+    const candidate = {
+      refundWindowDays: window ?? 0,
+      responseTargetHours: targets,
+      partialRefunds: partial ?? data.policy.partialRefunds,
+    };
+    if (Object.keys(problems).length === 0) {
+      // Same rule set as the API (domain), so a refusal is explained before the request.
+      for (const p of supportPolicyProblems(candidate)) {
+        const field = p.field.replace('responseTargetHours.', '');
+        problems[field] = `This ${p.problem}.`;
+      }
+    }
+    setErrors(problems);
+    if (Object.keys(problems).length > 0) return;
+    await run('save-policy', async () => {
+      await api.send(
+        'PUT',
+        '/v1/admin/settings/support-policy',
+        { policy: candidate as SupportPolicyContract },
+        supportPolicyResponseSchema,
+      );
+      setEdits({});
+      setPartial(null);
+      setSaved((v) => v + 1);
+      return 'Support policy saved. Parents see the refund window on their support page.';
+    });
+  };
+
+  const numberField = (field: string, label: string, current: number, hint: string) => {
+    const id = `${fieldBase}-${field}`;
+    return (
+      <div key={field} style={{ display: 'grid', gap: 4 }}>
+        <label htmlFor={id}>{label}</label>
+        <input
+          id={id}
+          inputMode="numeric"
+          value={valueFor(field, current)}
+          onChange={(e) => setEdits((prev) => ({ ...prev, [field]: e.target.value }))}
+          aria-describedby={`${id}-hint`}
+          aria-invalid={errors[field] ? true : undefined}
+          style={{ maxWidth: 120 }}
+        />
+        <span id={`${id}-hint`} style={smallMutedStyle}>
+          {hint}
+        </span>
+        <FieldError id={`${id}-error`} message={errors[field]} />
+      </div>
+    );
+  };
+
+  return (
+    <section className="card" style={sectionStyle} aria-labelledby={headingId}>
+      <h2 id={headingId}>Support policy</h2>
+      <p>
+        The refund window parents see on their support page and your response-time target per case
+        kind (measured from when a case is opened). Store refunds are still issued by the stores; a
+        Stripe refund is issued in the Stripe dashboard and recorded on the case.
+      </p>
+      {data === null && query.status === 'loading' ? <Loading label="Loading the policy…" /> : null}
+      {query.status === 'error' && data === null ? (
+        <ErrorState message={adminErrorMessage(query.error)} onRetry={query.reload} />
+      ) : null}
+      {data !== null ? (
+        <form onSubmit={(e) => void submit(e)} noValidate aria-labelledby={headingId}>
+          {data.usedDefault ? (
+            <p style={smallMutedStyle}>No policy has been saved yet; the defaults below apply.</p>
+          ) : (
+            <p style={smallMutedStyle}>
+              Last saved {data.updatedAt ? formatUtc(data.updatedAt) : '—'}
+              {data.updatedBy ? ` by ${shortId(data.updatedBy)}` : ''}.
+            </p>
+          )}
+          <div style={{ display: 'grid', gap: 12 }}>
+            {numberField(
+              'refundWindowDays',
+              'Refund window (days)',
+              data.policy.refundWindowDays,
+              `${REFUND_WINDOW_DAYS_MIN} to ${REFUND_WINDOW_DAYS_MAX} days after a charge.`,
+            )}
+            <fieldset style={{ border: 0, padding: 0, margin: 0 }}>
+              <legend style={{ fontWeight: 700 }}>Response target (hours) per case kind</legend>
+              <div style={{ display: 'grid', gap: 12 }}>
+                {SUPPORT_CASE_KINDS.map((kind) =>
+                  numberField(
+                    kind,
+                    SUPPORT_CASE_KIND_LABELS[kind],
+                    data.policy.responseTargetHours[kind],
+                    `${RESPONSE_TARGET_HOURS_MIN} to ${RESPONSE_TARGET_HOURS_MAX} hours.`,
+                  ),
+                )}
+              </div>
+            </fieldset>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={partial ?? data.policy.partialRefunds}
+                onChange={(e) => setPartial(e.target.checked)}
+              />
+              Partial refunds may be granted
+            </label>
+          </div>
+          <div style={buttonRow}>
+            <button type="submit" className="primary" disabled={busy !== null}>
+              {busy === 'save-policy' ? 'Saving…' : 'Save policy'}
+            </button>
+          </div>
+          <AdminFeedback feedback={feedback} rules={SUPPORT_RULE_MESSAGES} />
+        </form>
+      ) : null}
+    </section>
   );
 }
 

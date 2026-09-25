@@ -18,6 +18,8 @@ import {
   type SupportCase,
   type SupportCaseKind,
   type SupportCaseStatus,
+  parentSupportPolicyResponseSchema,
+  type ParentSupportPolicyResponse,
 } from '@pencillift/contracts';
 import { formatUsd } from '@pencillift/domain';
 import { SUPPORT_CASE_KINDS } from '@pencillift/domain/ops';
@@ -138,6 +140,11 @@ function Support() {
     (api) => api.get('/v1/support/billing-periods', supportBillingPeriodsResponseSchema),
     [],
   );
+  // The owner's refund window (Owner action #32); shown on refund requests, never a promise.
+  const policy = useApiQuery(
+    (api) => api.get('/v1/support/policy', parentSupportPolicyResponseSchema),
+    [],
+  );
   const list = useLastGood(cases);
   return (
     <>
@@ -146,7 +153,7 @@ function Support() {
         Questions about your account, your plan, a charge or the app? Open a case below and we’ll
         reply on this page. Common answers are on the <Link to="/support">help page</Link>.
       </p>
-      <NewCaseForm periods={periods} onCreated={changed} />
+      <NewCaseForm periods={periods} policy={policy} onCreated={changed} />
       {list === null && cases.status === 'loading' ? <Loading label="Loading your cases…" /> : null}
       {cases.status === 'error' && list === null ? (
         <ErrorState message={cases.error.message} onRetry={cases.reload} />
@@ -169,9 +176,11 @@ function Support() {
 
 function NewCaseForm({
   periods,
+  policy,
   onCreated,
 }: {
   periods: QueryState<{ periods: SupportBillingPeriod[] }>;
+  policy: QueryState<ParentSupportPolicyResponse>;
   onCreated: (id: string) => void;
 }) {
   const { api } = useSession();
@@ -250,6 +259,7 @@ function NewCaseForm({
           <>
             <p className="notice" style={{ marginTop: 12 }}>
               {SUPPORT_REFUND_NOTICE}
+              {policy.status === 'ready' ? ` ${policy.data.refundWindowSentence}` : null}
             </p>
             <label htmlFor={periodId}>Which charge? (optional)</label>
             {periods.status === 'loading' ? (

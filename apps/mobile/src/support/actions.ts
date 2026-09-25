@@ -5,6 +5,8 @@ import {
   type SupportBillingPeriod,
   type SupportCase,
   type SupportCaseDetail,
+  parentSupportPolicyResponseSchema,
+  type ParentSupportPolicyResponse,
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
 import {
@@ -31,6 +33,11 @@ export function loadBillingPeriods(api: ApiClient): Promise<SupportBillingPeriod
   return api
     .get('/v1/support/billing-periods', supportBillingPeriodsResponseSchema)
     .then((r) => r.periods);
+}
+
+/** The owner's refund window and response targets (Owner action #32); wording comes from the API. */
+export function loadSupportPolicy(api: ApiClient): Promise<ParentSupportPolicyResponse> {
+  return api.get('/v1/support/policy', parentSupportPolicyResponseSchema);
 }
 
 export function loadSupportCase(api: ApiClient, id: string): Promise<SupportCaseDetail> {

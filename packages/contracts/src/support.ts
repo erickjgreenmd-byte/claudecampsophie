@@ -161,6 +161,17 @@ export const supportCaseDetailSchema = z.strictObject({
 export type SupportCaseDetail = z.infer<typeof supportCaseDetailSchema>;
 
 /** GET /v1/support/cases: the family's cases, newest first. */
+/**
+ * GET /v1/support/policy: what a parent may know of the owner's support policy — the refund window
+ * and the response-time targets; nothing about how the owner decides.
+ */
+export const parentSupportPolicyResponseSchema = z.strictObject({
+  refundWindowDays: z.number().int().min(1).max(90),
+  responseTargetHours: z.record(supportCaseKindSchema, z.number().int().min(1).max(336)),
+  refundWindowSentence: z.string().min(1).max(400),
+});
+export type ParentSupportPolicyResponse = z.infer<typeof parentSupportPolicyResponseSchema>;
+
 export const supportCasesResponseSchema = z.strictObject({ cases: z.array(supportCaseSchema) });
 export type SupportCasesResponse = z.infer<typeof supportCasesResponseSchema>;
 

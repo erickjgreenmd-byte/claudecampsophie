@@ -12,6 +12,7 @@ import {
   storeFeeRatesResponseSchema,
   subscriptionsSummarySchema,
   type OverviewResponse,
+  supportPolicyResponseSchema,
 } from '@pencillift/contracts';
 import { seedFamily, seedOwnerAdmin, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { cryptoRandom } from '@pencillift/domain';
@@ -304,6 +305,25 @@ describe('owner-admin isolation', () => {
       'PUT',
       '/settings/store-fee-rates',
       { rates: { app_store: 0, play_store: 0, stripe: 0, amazon_appstore: 0 } },
+    ],
+    ['GET', '/settings/support-policy'],
+    [
+      'PUT',
+      '/settings/support-policy',
+      {
+        policy: {
+          refundWindowDays: 14,
+          responseTargetHours: {
+            refund_request: 48,
+            complaint: 48,
+            billing_issue: 48,
+            bug: 72,
+            safety_question: 24,
+            other: 72,
+          },
+          partialRefunds: true,
+        },
+      },
     ],
   ];
 
@@ -893,5 +913,96 @@ describe('store fee rates', () => {
     expect(audits.map((a) => [a.metadata.from.app_store, a.metadata.to.app_store])).toEqual([
       [0.3, 0.15],
     ]);
+  });
+});
+
+describe('support policy (Owner action #32)', () => {
+  const targets = {
+    refund_request: 48,
+    complaint: 48,
+    billing_issue: 48,
+    bug: 72,
+    safety_question: 24,
+    other: 72,
+  };
+
+  it('reads the defaults while no row exists, refuses bad values, saves and audits a new policy', async () => {
+    const before = supportPolicyResponseSchema.parse(await ok(admin('/settings/support-policy')));
+    expect(before).toMatchObject({
+      usedDefault: true,
+      updatedAt: null,
+      updatedBy: null,
+      policy: { refundWindowDays: 14, partialRefunds: true, responseTargetHours: targets },
+    });
+
+    for (const bad of [
+      { policy: { refundWindowDays: 0, responseTargetHours: targets, partialRefunds: true } },
+      { policy: { refundWindowDays: 91, responseTargetHours: targets, partialRefunds: true } },
+      { policy: { refundWindowDays: 7.5, responseTargetHours: targets, partialRefunds: true } },
+      {
+        policy: {
+          refundWindowDays: 7,
+          responseTargetHours: { ...targets, bug: 0 },
+          partialRefunds: true,
+        },
+      },
+      {
+        policy: {
+          refundWindowDays: 7,
+          responseTargetHours: { complaint: 48 },
+          partialRefunds: true,
+        },
+      },
+      { policy: { refundWindowDays: 7, responseTargetHours: targets, partialRefunds: 'yes' } },
+      {
+        policy: {
+          refundWindowDays: 7,
+          responseTargetHours: targets,
+          partialRefunds: true,
+          extra: 1,
+        },
+      },
+      { rates: {} },
+    ]) {
+      expect(
+        (await admin('/settings/support-policy', 'PUT', bad)).status,
+        JSON.stringify(bad),
+      ).toBe(400);
+    }
+
+    const saved = supportPolicyResponseSchema.parse(
+      await ok(
+        admin('/settings/support-policy', 'PUT', {
+          policy: {
+            refundWindowDays: 30,
+            responseTargetHours: { ...targets, safety_question: 12 },
+            partialRefunds: false,
+          },
+        }),
+      ),
+    );
+    expect(saved).toMatchObject({
+      usedDefault: false,
+      updatedBy: adminId,
+      policy: { refundWindowDays: 30, partialRefunds: false },
+    });
+    expect(saved.policy.responseTargetHours.safety_question).toBe(12);
+    expect(saved.updatedAt).not.toBeNull();
+    const again = supportPolicyResponseSchema.parse(await ok(admin('/settings/support-policy')));
+    expect(again.policy.refundWindowDays).toBe(30);
+
+    const audits = await api.db.sql<
+      { metadata: { from: { refundWindowDays: number }; to: { refundWindowDays: number } } }[]
+    >`
+      select metadata from public.audit_events where action = 'ops.support_policy_updated'`;
+    expect(
+      audits.map((a) => [a.metadata.from.refundWindowDays, a.metadata.to.refundWindowDays]),
+    ).toEqual([[14, 30]]);
+    // The parent-facing view follows the saved policy at once.
+    const parentView = await ok<{ refundWindowDays: number; refundWindowSentence: string }>(
+      api.request('/v1/support/policy', { token: tokenA }),
+    );
+    expect(parentView.refundWindowDays).toBe(30);
+    expect(parentView.refundWindowSentence).toMatch(/last 30 days/);
   });
 });

@@ -15,9 +15,11 @@ import {
   type SupportCaseKind,
   type SupportCaseResolution,
   type SupportCaseStatus,
+  refundWindowSentence,
 } from '@pencillift/domain/ops';
 import { readJson } from '../app.ts';
 import type { Tx } from '../db.ts';
+import { loadSupportPolicy } from '../services/ops-metrics.ts';
 import { ApiError, businessRule } from '../errors.ts';
 import { currentFamilyId, requireParent } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
@@ -162,6 +164,16 @@ export function supportRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
 
   // The family's provider billing periods, for the refund-request picker (empty without a purchase).
+  // What a parent may know of the owner's policy: the refund window and the response targets.
+  r.get('/support/policy', requireParent, async (c) => {
+    const { policy } = await c.var.deps.db.asService((tx) => loadSupportPolicy(tx));
+    return c.json({
+      refundWindowDays: policy.refundWindowDays,
+      responseTargetHours: policy.responseTargetHours,
+      refundWindowSentence: refundWindowSentence(policy),
+    });
+  });
+
   r.get('/support/billing-periods', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);

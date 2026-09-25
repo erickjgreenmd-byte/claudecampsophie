@@ -68,3 +68,17 @@ export {
   type SupportCaseResolution,
   type SupportCaseStatus,
 } from './cases.ts';
+export {
+  DEFAULT_SUPPORT_POLICY,
+  REFUND_WINDOW_DAYS_MAX,
+  REFUND_WINDOW_DAYS_MIN,
+  RESPONSE_TARGET_HOURS_MAX,
+  RESPONSE_TARGET_HOURS_MIN,
+  hoursOverTarget,
+  refundWindowSentence,
+  supportPolicyFromStored,
+  supportPolicyProblems,
+  withinRefundWindow,
+  type PolicyProblem,
+  type SupportPolicy,
+} from './policy.ts';

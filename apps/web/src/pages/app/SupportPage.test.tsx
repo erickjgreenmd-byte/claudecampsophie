@@ -72,6 +72,19 @@ function fakeApi(routes: Record<string, unknown> = {}) {
   const defaults: Record<string, unknown> = {
     'GET /v1/support/cases': { cases: [supportCase()] },
     'GET /v1/support/billing-periods': { periods: [period] },
+    'GET /v1/support/policy': {
+      refundWindowDays: 14,
+      responseTargetHours: {
+        refund_request: 48,
+        complaint: 48,
+        billing_issue: 48,
+        bug: 72,
+        safety_question: 24,
+        other: 72,
+      },
+      refundWindowSentence:
+        'Refund requests are reviewed for charges from the last 14 days; the store or Stripe issues any refund, and PencilLift records the outcome on your case.',
+    },
     [`GET /v1/support/cases/${CASE_A}`]: { case: detail() },
   };
   const table = { ...defaults, ...routes };

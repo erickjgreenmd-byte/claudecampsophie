@@ -7,6 +7,7 @@ import {
   type RevenueResponse,
   type StoreFeeRates,
   type SubscriptionsSummary,
+  type SupportPolicyResponse,
 } from '@pencillift/contracts';
 import { MAX_ACCESS_AFTER_PERIOD_END_MS } from '@pencillift/domain/entitlements';
 import {
@@ -31,6 +32,8 @@ import {
   utcMonthBounds,
   utcMonthKey,
   type AttentionKind,
+  supportPolicyFromStored,
+  type SupportPolicy,
 } from '@pencillift/domain/ops';
 import type { Tx } from '../db.ts';
 
@@ -96,6 +99,40 @@ export async function saveStoreFeeRates(
       set value = excluded.value, updated_at = now(), updated_by = excluded.updated_by
   `;
   return loadStoreFeeRates(tx);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Support policy (public.ops_settings key support_policy; Owner action #32)
+// ---------------------------------------------------------------------------------------------
+
+const SUPPORT_POLICY_KEY = 'support_policy';
+
+/** Absent or invalid stored value → the default policy, reported as such. */
+export async function loadSupportPolicy(tx: Tx): Promise<SupportPolicyResponse> {
+  const [row] = await tx<{ value: unknown; updated_at: Date; updated_by: string | null }[]>`
+    select value, updated_at, updated_by from public.ops_settings where key = ${SUPPORT_POLICY_KEY}
+  `;
+  const { policy, usedDefault } = supportPolicyFromStored(row?.value ?? null);
+  return {
+    policy,
+    usedDefault,
+    updatedAt: row && !usedDefault ? row.updated_at.toISOString() : null,
+    updatedBy: row && !usedDefault ? row.updated_by : null,
+  };
+}
+
+export async function saveSupportPolicy(
+  tx: Tx,
+  policy: SupportPolicy,
+  userId: string,
+): Promise<SupportPolicyResponse> {
+  await tx`
+    insert into public.ops_settings (key, value, updated_by)
+    values (${SUPPORT_POLICY_KEY}, ${JSON.stringify(policy)}::text::jsonb, ${userId})
+    on conflict (key) do update
+      set value = excluded.value, updated_at = now(), updated_by = excluded.updated_by
+  `;
+  return loadSupportPolicy(tx);
 }
 
 export const STORE_FEE_RATES_NOTES: readonly string[] = [
