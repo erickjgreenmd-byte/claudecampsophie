@@ -4,7 +4,7 @@ Branch: `claude/new-session-vil6cz` (pushed after every lead commit; CI runs on 
 Spec: `PencilLift_Claude_Code_Master_Prompt.md` Revision 8. Pricing: $39.99 first child + $9.99 each additional
 (1–4 paid slots) — unchanged.
 
-## Current state (2026-09-25; code at `6728bea`)
+## Current state (2026-09-25; code at `110ff0f`)
 
 Software for every spec area is built and integrated on the branch; nothing is deployed, signed, submitted or
 approved, and no live provider has been exercised (`docs/Connections.md`, `docs/Release_Readiness.md`).
@@ -38,14 +38,17 @@ BUG-143..159): invitation links survive sign-in, a branded route error boundary,
 the Amazon Appstore across the portal, honest promo-code copy, auth-link failure notices, a `VITE_STORE_LIVE` launch
 switch, child-bound subject links and session housekeeping (migration 0850), a deletion purge and account closure
 that re-queue after a dead letter, a 15 MiB per-scan bound with mobile downscaling, timeouts metered at their upper
-bound and pipeline codes in the job ledger. MCP connectors for Supabase, Stripe and Expo are attached to
+bound and pipeline codes in the job ledger. Then round 2c (`110ff0f`, BUG-160..164): web homework photos shrunk in
+the browser and pre-checked against the per-scan bound, Amazon Appstore promo templates that keep their channel, a
+password reset requested in the mobile app that finishes on the web, AA contrast on every mobile screen, and child
+copy for an oversize scan. MCP connectors for Supabase, Stripe and Expo are attached to
 the build session but no project, account or EAS project of PencilLift's exists yet (Connections).
 Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with its gap): integration_tested 33,
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `6728bea`:
-api 997, domain 3,656, db 366, web 574, mobile 596, ai 59, contracts 20, ui-tokens 4 (6,272 tests, 0 failed,
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `110ff0f`:
+api 997, domain 3,656, db 366, web 603, mobile 658, ai 59, contracts 20, ui-tokens 4 (6,363 tests, 0 failed,
 0 skipped), gate audit, finance, release-artifact scan with negative control. Earlier gates caught BUG-114 (a
 stale function re-creation, L-026) and BUG-115 (a pinned-clock time bomb, L-027) before their commits. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
 there is the source of truth; a records-only commit may still have its run in progress).
@@ -74,18 +77,13 @@ moderation built but never run live (no key).
 
 ## In flight
 
-- Round 2c (workflow `wf_1eaa94df-496`): follow-ups the round-2b fixers reported — web homework uploads downscaled
-  in the browser and pre-checked against the per-scan bound, Amazon in owner promo campaigns, a password reset
-  started in the mobile app that finishes on the web, AA contrast for mobile buttons, and child copy for an
-  oversize scan.
-- The bug hunt (`wf_2a9a8aa6-7c4`) verified 48 first-round findings (44 confirmed, 4 refuted); its second finder
-  round did not run (session limit) and is owed on a stable tree after round 2b.
+- The bug hunt's second finder round (`wf_2a9a8aa6-7c4` resumed on `110ff0f`): seven area finders told the
+  first-round titles, three-lens verification of anything new; its confirmed findings go to a fix round.
 
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Integrate round 2c (gate, commit, records), then run the bug hunt's second finder round on the stable tree and
-   fix what it confirms.
+2. Fix what the second finder round confirms (failing test first, checkers, isolated gate), then record it.
 3. Owner actions in `docs/Owner_Actions.md` (#1–#37) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
