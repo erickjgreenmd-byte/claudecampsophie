@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { entryRoute } from './entry.ts';
 import {
   currentMode,
   enterParentMode,
   forgetParentUnlock,
   lockParentAreaOnDevice,
   parentUnlockActive,
+  signOutClosedAccount,
   signOutParent,
   storePurchaseInFlight,
   STORAGE_KEYS,
@@ -77,7 +79,7 @@ describe('one lock action for backgrounding and both Lock buttons (MOB-R2-01)', 
     expect(parentUnlockActive(SERVER_NOW)).toBe(true);
 
     const fx = effects();
-    await lockParentAreaOnDevice(fx);
+    await lockParentAreaOnDevice(storage, fx);
     // The next parent screen needs a fresh PIN, whatever the server's window still says.
     expect(parentUnlockActive(SERVER_NOW)).toBe(false);
     expect(fx.calls).toContain('clear');
@@ -96,7 +98,7 @@ describe('one lock action for backgrounding and both Lock buttons (MOB-R2-01)', 
       SERVER_NOW,
     );
     const fx = effects({ relockOnServer: vi.fn(() => Promise.reject(new Error('offline'))) });
-    await lockParentAreaOnDevice(fx);
+    await lockParentAreaOnDevice(storage, fx);
     expect(parentUnlockActive(SERVER_NOW)).toBe(false);
     expect(fx.calls).toContain('reset-unlock');
   });
@@ -151,6 +153,73 @@ describe('one lock action for backgrounding and both Lock buttons (MOB-R2-01)', 
       },
       started + 6 * 60_000,
     );
+  });
+});
+
+/**
+ * MOB-R4-LOCK-01. Locking the parent area was the one way out of it that ignored the child pairing:
+ * it left pl.mode 'parent' and replaced the whole stack with the PIN screen. On a paired family
+ * tablet that stranded the child on a PIN field with no way back to their space (the unlock screen
+ * is the only route in the stack, so there is no back arrow), and the next cold start showed the
+ * parent/child chooser instead of the child home, because entryRoute only sends mode 'child'
+ * straight there. Signing out already handled this (MOB-R2-04); locking now does the same.
+ */
+describe('locking a paired family tablet returns it to the child space (MOB-R4-LOCK-01)', () => {
+  it('[repro] writes mode child and goes to the child home instead of the PIN screen', async () => {
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-4-abcdefghijkl');
+    await enterParentMode(
+      storage,
+      effects(),
+      { unlocked: true, unlockedUntil: SERVER_UNTIL, unlockSeconds: UNLOCK_SECONDS },
+      SERVER_NOW,
+    );
+    expect(await currentMode(storage)).toBe('parent');
+
+    const fx = effects();
+    await lockParentAreaOnDevice(storage, fx);
+
+    // The parent area is still locked: the PIN is what opens it again, from the child's Grown-ups.
+    expect(parentUnlockActive(SERVER_NOW)).toBe(false);
+    expect(fx.calls).toContain('clear');
+    expect(fx.calls).toContain('relock');
+    // ... but the device is the child's again, not a PIN field with no exit.
+    expect(fx.calls).toContain('reset-nav');
+    expect(fx.calls).not.toContain('reset-unlock');
+    expect(await currentMode(storage)).toBe('child');
+    // And the next cold start opens the child space rather than the parent/child chooser.
+    expect(entryRoute(await currentMode(storage), true, true, null)).toBe('/(child)/home');
+    // The pairing itself is untouched: locking is not unpairing.
+    expect(storage.data.get(STORAGE_KEYS.childRefreshToken)).toBe(
+      'refresh-token-number-4-abcdefghijkl',
+    );
+  });
+
+  it('a parent-only device still lands on the unlock screen and stays in parent mode', async () => {
+    const storage = memoryStorage();
+    await enterParentMode(
+      storage,
+      effects(),
+      { unlocked: true, unlockedUntil: SERVER_UNTIL, unlockSeconds: UNLOCK_SECONDS },
+      SERVER_NOW,
+    );
+    const fx = effects();
+    await lockParentAreaOnDevice(storage, fx);
+    expect(fx.calls).toContain('reset-unlock');
+    expect(fx.calls).not.toContain('reset-nav');
+    expect(await currentMode(storage)).toBe('parent');
+  });
+
+  it('a keychain that cannot be read falls back to the unlock screen', async () => {
+    const storage: SecureStorage = {
+      getItem: () => Promise.reject(new Error('keychain unavailable')),
+      setItem: () => Promise.resolve(),
+      deleteItem: () => Promise.resolve(),
+    };
+    const fx = effects();
+    await lockParentAreaOnDevice(storage, fx);
+    expect(fx.calls).toContain('reset-unlock');
+    expect(fx.calls).not.toContain('reset-nav');
   });
 });
 
@@ -275,5 +344,54 @@ describe('signing out on a paired child device keeps the child space (MOB-R2-04)
     expect(parentUnlockActive(SERVER_NOW)).toBe(false);
     expect(fx.calls).toContain('clear');
     expect(fx.calls).toContain('privacy:false');
+  });
+});
+
+/**
+ * MOB-R4-LOCK-05, re-fix round. An account closure is not a sign-out: the adult who set this device
+ * up is gone. The first attempt put the forget behind a `familyDeleted` flag that no caller passed,
+ * so on the finding's own repro — the family owner deletes the whole family, then closes their
+ * sign-in on the paired tablet — the device still came out in child mode with the deleted child's
+ * refresh token and nickname in the keychain. The device cannot tell an owner's closure from a
+ * guardian's, so the closure forgets the child either way and nothing is revoked on the wire.
+ */
+describe('closing an account leaves no child pairing on the device (MOB-R4-LOCK-05)', () => {
+  it('[repro] the paired tablet ends signed out, with no child token and no cached nickname', async () => {
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.mode, 'parent');
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-5-abcdefghijkl');
+    await storage.setItem(STORAGE_KEYS.childProfile, '{"id":"child-1","nickname":"Robin"}');
+    const fx = effects();
+    await signOutClosedAccount(storage, fx, { signOut: () => Promise.resolve() });
+    expect(await currentMode(storage)).toBe('signed_out');
+    expect(storage.data.has(STORAGE_KEYS.childRefreshToken)).toBe(false);
+    expect(storage.data.has(STORAGE_KEYS.childProfile)).toBe(false);
+    // Nothing sends the relaunch into the child space of a family that no longer exists: the
+    // welcome screen asks again (null) instead of opening the deleted child's home.
+    expect(entryRoute(await currentMode(storage), false, true, null)).toBeNull();
+  });
+
+  it('a parent-only device closes exactly as the plain sign-out did', async () => {
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.mode, 'parent');
+    const fx = effects();
+    await signOutClosedAccount(storage, fx, { signOut: () => Promise.resolve() });
+    expect(await currentMode(storage)).toBe('signed_out');
+    expect(fx.calls).toContain('clear');
+    expect(fx.calls).toContain('relock');
+  });
+
+  it('the closure still forgets the client-side unlock', async () => {
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-6-abcdefghijkl');
+    await enterParentMode(
+      storage,
+      effects(),
+      { unlocked: true, unlockedUntil: SERVER_UNTIL, unlockSeconds: UNLOCK_SECONDS },
+      SERVER_NOW,
+    );
+    expect(parentUnlockActive(SERVER_NOW)).toBe(true);
+    await signOutClosedAccount(storage, effects(), { signOut: () => Promise.resolve() });
+    expect(parentUnlockActive(SERVER_NOW)).toBe(false);
   });
 });

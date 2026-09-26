@@ -9,6 +9,7 @@ import {
   updateFamilyResponseSchema,
   type ConsentStatus,
   type FamilyOverview,
+  type UpdateFamilyRequest,
 } from '@pencillift/contracts';
 import { ErrorState, Loading } from '../../components/states.tsx';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
@@ -87,6 +88,12 @@ function Dashboard() {
 function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: () => void }) {
   const active = data.children.filter((c) => c.status === 'active').length;
   const [editing, setEditing] = useState(false);
+  // WEBR4-04: the action state lives here, not in the collapsible form, and its feedback is rendered
+  // outside the form — the pattern ChildCard already follows. The form used to own its own
+  // useAction(), so closing it on success unmounted the only place "Saved. Your family is …" could
+  // appear; and when the reload that followed failed, useLastGood kept the OLD name and zone on
+  // screen beside an ErrorState, so the parent read a failure and retried a save that had worked.
+  const { busy, feedback, run } = useAction();
   return (
     <section className="card" aria-labelledby="family-title">
       <h2 id="family-title">{data.displayName}</h2>
@@ -107,12 +114,15 @@ function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: (
       {editing ? (
         <EditFamilyForm
           data={data}
+          busy={busy === 'save-family'}
+          run={run}
           onSaved={() => {
             setEditing(false);
             onChanged();
           }}
         />
       ) : null}
+      <ActionFeedback feedback={feedback} stepUpAction="Saving your family details" />
       {data.billingConflict ? (
         <div className="notice" role="note" style={{ marginTop: 8 }}>
           Your subscription needs attention: more than one store reports a plan for this family.
@@ -144,15 +154,35 @@ function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: (
  * weekly review and school report is planned in it. The server validates the zone as IANA, requires
  * a recent PIN unlock and audits the change.
  */
-function EditFamilyForm({ data, onSaved }: { data: FamilyOverview; onSaved: () => void }) {
+function EditFamilyForm({
+  data,
+  busy,
+  run,
+  onSaved,
+}: {
+  data: FamilyOverview;
+  busy: boolean;
+  run: (key: string, action: () => Promise<string>) => Promise<boolean>;
+  onSaved: () => void;
+}) {
   const { api } = useSession();
-  const { busy, feedback, run } = useAction();
   const [name, setName] = useState(data.displayName);
   const [timezone, setTimezone] = useState(data.timezone);
   const [fieldError, setFieldError] = useState<string | null>(null);
   const nameId = useId();
   const zoneId = useId();
   const errorId = useId();
+
+  /**
+   * Only what differs from the family this form was opened on (WEBR4-03). Sending both fields every
+   * time reverted the other guardian's time-zone change when a parent corrected only the name, and
+   * the zone is what every daily release, weekly review and school report is planned in.
+   */
+  const changes = (displayName: string, zone: string): UpdateFamilyRequest => ({
+    ...(displayName === data.displayName ? {} : { displayName }),
+    ...(zone === data.timezone ? {} : { timezone: zone }),
+  });
+  const nothingChanged = Object.keys(changes(name.trim(), timezone.trim())).length === 0;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -167,13 +197,10 @@ function EditFamilyForm({ data, onSaved }: { data: FamilyOverview; onSaved: () =
       return;
     }
     setFieldError(null);
+    const body = changes(displayName, zone);
+    if (Object.keys(body).length === 0) return;
     const ok = await run('save-family', async () => {
-      const result = await api.send(
-        'PATCH',
-        '/v1/family',
-        { displayName, timezone: zone },
-        updateFamilyResponseSchema,
-      );
+      const result = await api.send('PATCH', '/v1/family', body, updateFamilyResponseSchema);
       return `Saved. Your family is “${result.family.displayName}” in ${result.family.timezone}.`;
     });
     if (ok) onSaved();
@@ -216,11 +243,10 @@ function EditFamilyForm({ data, onSaved }: { data: FamilyOverview; onSaved: () =
         not move practice already released.
       </p>
       <div style={buttonRow}>
-        <button type="submit" className="btn" disabled={busy !== null}>
-          {busy === 'save-family' ? 'Saving…' : 'Save family details'}
+        <button type="submit" className="btn" disabled={busy || nothingChanged}>
+          {busy ? 'Saving…' : 'Save family details'}
         </button>
       </div>
-      <ActionFeedback feedback={feedback} stepUpAction="Saving your family details" />
     </form>
   );
 }

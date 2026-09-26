@@ -29,12 +29,20 @@ afterEach(cleanup);
 const RECOVERY_HASH =
   '#access_token=synthetic-access&expires_at=1790000000&expires_in=3600&refresh_token=synthetic-refresh&token_type=bearer&type=recovery';
 
-/** Labeled fake account: the recovery-link capability is a vi.fn the tests control. */
+/**
+ * Labeled fake account: the recovery-link capability is a vi.fn the tests control.
+ *
+ * WEB-R4-AUTH-1: it also carries `recoveryActive`, as the real adapter does, and an accepted link
+ * opens that grant exactly where `acceptRecoveryLink` opens it in production (supabase-auth.ts). The
+ * page reads the grant from the adapter alone now, so a fake without it would not be this flow.
+ */
 function fakeAccount(
   accept: RecoveryLinkAuth['acceptRecoveryLink'],
   updatePassword = vi.fn(() => Promise.resolve<AuthOutcome>({ ok: true, next: 'done' })),
-): AccountAuth & RecoveryLinkAuth {
+): AccountAuth & RecoveryLinkAuth & { recoveryActive(): boolean } {
+  let grantOpen = false;
   return {
+    recoveryActive: () => grantOpen,
     signInWithPassword: () => Promise.resolve({ ok: true, next: 'signed_in' }),
     signUp: () => Promise.resolve({ ok: true, next: 'check_email' }),
     sendMagicLink: () => Promise.resolve({ ok: true, next: 'check_email' }),
@@ -44,7 +52,11 @@ function fakeAccount(
     enrollTotp: () => Promise.resolve({ error: 'not used here' }),
     verifyTotp: () => Promise.resolve({ ok: true, next: 'done' }),
     verifiedTotpFactorId: () => Promise.resolve(null),
-    acceptRecoveryLink: accept,
+    acceptRecoveryLink: async (tokens) => {
+      const outcome = await accept(tokens);
+      if (outcome.ok) grantOpen = true;
+      return outcome;
+    },
   };
 }
 

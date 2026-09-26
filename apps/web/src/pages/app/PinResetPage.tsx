@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { okResponseSchema } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
@@ -18,7 +18,19 @@ import { AccountForm, Field } from '../auth/forms.tsx';
  * every /admin page refusing with "Owner administration requires an MFA session". The owner is now
  * told before it happens and re-verifies the authenticator code in this same flow, so aal2 is back
  * before the new PIN is even chosen.
+ *
+ * WEBR4-05: that protection has to be a resolved precondition of the password grant, not a piece of
+ * state an effect happens to fill in time. `verifiedTotpFactorId()` is a network call
+ * (auth.mfa.listFactors()), so an autofilled password submitted first — or a lookup that fails —
+ * used to send an owner straight to the PIN step on a fresh aal1 session with no re-verification.
+ * The grant now waits for the lookup to settle, and a failed lookup refuses the submit instead of
+ * being read as "this account has no two-step".
  */
+type TwoStepLookup =
+  | { readonly state: 'required'; readonly factorId: string }
+  | { readonly state: 'not_needed' }
+  | { readonly state: 'unavailable' };
+
 function PinReset() {
   const { auth, api } = useSession();
   const state = useParentSession();
@@ -27,24 +39,46 @@ function PinReset() {
   const [code, setCode] = useState('');
   const [pin, setPin] = useState('');
   const [confirm, setConfirm] = useState('');
-  /** The verified TOTP factor to re-prove, set only when this session is currently at aal2. */
-  const [twoStepFactorId, setTwoStepFactorId] = useState<string | null>(null);
+  /**
+   * Whether this session must re-prove a two-step factor, once the lookup has settled. `null` means
+   * it is still in flight, so nothing on screen may claim either way and no grant may proceed.
+   */
+  const [lookup, setLookup] = useState<TwoStepLookup | null>(null);
+  /** The single in-flight lookup, shared by the display effect and the submit that awaits it. */
+  const inFlight = useRef<Promise<TwoStepLookup> | null>(null);
   const account = auth.account;
   const email = state.status === 'signed_in' ? state.session.email : null;
+
+  const readTwoStep = useCallback((): Promise<TwoStepLookup> => {
+    if (!account) return Promise.resolve<TwoStepLookup>({ state: 'not_needed' });
+    inFlight.current ??= Promise.all([
+      account.assuranceLevel(),
+      account.verifiedTotpFactorId(),
+    ]).then(
+      ([level, factorId]): TwoStepLookup =>
+        level === 'aal2' && factorId ? { state: 'required', factorId } : { state: 'not_needed' },
+      (): TwoStepLookup => {
+        // A failed lookup is not proof that there is no two-step factor, so it is never treated as
+        // one. Forgetting it here also makes the parent's next attempt ask again.
+        inFlight.current = null;
+        return { state: 'unavailable' };
+      },
+    );
+    return inFlight.current;
+  }, [account]);
 
   useEffect(() => {
     if (!account) return;
     let active = true;
-    void Promise.all([account.assuranceLevel(), account.verifiedTotpFactorId()]).then(
-      ([level, factorId]) => {
-        if (active && level === 'aal2' && factorId) setTwoStepFactorId(factorId);
-      },
-      () => undefined,
-    );
+    void readTwoStep().then((result) => {
+      if (active) setLookup(result);
+    });
     return () => {
       active = false;
     };
-  }, [account]);
+  }, [account, readTwoStep]);
+
+  const twoStepFactorId = lookup?.state === 'required' ? lookup.factorId : null;
 
   if (!account || !email)
     return <Notice>PIN reset needs parent sign-in, which isn’t available here.</Notice>;
@@ -56,8 +90,19 @@ function PinReset() {
         title="Reset your parent PIN"
         submitLabel="Confirm it’s you"
         onSubmit={async () => {
+          // The grant replaces this browser's session with a fresh aal1 one, so whether an owner has
+          // to re-verify is settled BEFORE it happens rather than read off state an effect may not
+          // have filled yet (the form shows "Please wait…" while the lookup finishes).
+          const twoStep = await readTwoStep();
+          setLookup(twoStep);
+          if (twoStep.state === 'unavailable')
+            return {
+              ok: false,
+              message:
+                'We could not check whether your account uses two-step verification, and your PIN reset would sign you in again. Check your connection and press “Confirm it’s you” again.',
+            };
           const outcome = await account.signInWithPassword(email, password);
-          if (outcome.ok) setStep(twoStepFactorId ? 'two_step' : 'pin');
+          if (outcome.ok) setStep(twoStep.state === 'required' ? 'two_step' : 'pin');
           return outcome;
         }}
       >

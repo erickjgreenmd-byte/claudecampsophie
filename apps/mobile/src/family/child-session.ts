@@ -57,6 +57,12 @@ export interface ChildSession {
    * token the server refused from a call that had no token at all.
    */
   invalidateAccessToken(): boolean;
+  /**
+   * Counts every change to the cached access token (a refresh that stored one, a drop, a forget).
+   * A caller that read it before making a call can tell "the token I presented is still the current
+   * one" from "the token has already moved on since" without holding the token itself (HUNT4-MOB-3).
+   */
+  accessTokenGeneration(): number;
   /** Ends the session on the server (best effort) and forgets the child on this device. */
   logout(): Promise<void>;
 }
@@ -69,17 +75,29 @@ export interface ChildSession {
  * before a clock change) instead of telling the child the device is not connected. A refusal with no
  * cached token, or a second refusal after a fresh one, is passed on unchanged: only the refresh
  * itself being refused forgets the pairing.
+ *
+ * The one retry belongs to the CALL, not to the session (HUNT4-MOB-3). Deciding by "is a token
+ * cached right now" gave the whole session a single slot: of two calls that presented the same stale
+ * token, the first refusal to land dropped the token and retried, and the second found nothing
+ * cached and was told the device is not connected — while the refresh it needed was already in
+ * flight. So each call notes the token generation it started on: a refusal after the generation
+ * moved on is retried against the newer token without dropping it, which keeps the single-flight
+ * refresher to one rotation however many calls were refused together.
  */
 export function withChildTokenRetry(
   api: ApiClient,
-  session: Pick<ChildSession, 'invalidateAccessToken'>,
+  session: Pick<ChildSession, 'invalidateAccessToken' | 'accessTokenGeneration'>,
 ): ApiClient {
   const once = async <T>(run: () => Promise<T>): Promise<T> => {
+    const generation = session.accessTokenGeneration();
     try {
       return await run();
     } catch (error) {
       const refused = error instanceof ApiRequestError && error.code === 'UNAUTHENTICATED';
-      if (!refused || !session.invalidateAccessToken()) throw error;
+      if (!refused) throw error;
+      // Another call already dropped or replaced the token this one presented: retry on the new one.
+      if (session.accessTokenGeneration() !== generation) return run();
+      if (!session.invalidateAccessToken()) throw error;
       return run();
     }
   };
@@ -93,6 +111,8 @@ export function withChildTokenRetry(
 export function createChildSession(deps: ChildSessionDeps): ChildSession {
   let access: { token: string; expiresAtMs: number } | null = null;
   let inflight: Promise<string | null> | null = null;
+  /** Bumped on every change to `access`, so a caller can tell a token apart from its successor. */
+  let generation = 0;
 
   async function persist(response: ChildTokenResponse, receivedAt: Date): Promise<void> {
     // Store the rotated refresh token before anything else uses the new access token.
@@ -107,10 +127,12 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
       token: response.accessToken,
       expiresAtMs: receivedAt.getTime() + response.accessTokenExpiresInSeconds * 1000,
     };
+    generation += 1;
   }
 
   async function forget(): Promise<void> {
     access = null;
+    generation += 1;
     await unpairChildDevice(deps.storage);
   }
 
@@ -189,7 +211,12 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
     invalidateAccessToken() {
       if (access === null) return false;
       access = null;
+      generation += 1;
       return true;
+    },
+
+    accessTokenGeneration() {
+      return generation;
     },
 
     async logout() {

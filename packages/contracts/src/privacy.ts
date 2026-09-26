@@ -263,6 +263,23 @@ export const PARENT_SAFETY_FLAG_COPY = {
 } as const;
 
 /**
+ * Parent-facing wording for a scan that consent withdrawal stopped (CS-R4-03). Withdrawing consent
+ * cancels the scan_process jobs of the family's pending scans and settles each one
+ * (guardians.ts settleScansAfterConsentWithdrawal): a queued or running initial scan ends
+ * `failed_final` with `error_code = 'CONSENT_REQUIRED'` and its page allowance is released.
+ *
+ * The portal's `failed_final` state copy — "This scan could not be processed after several tries.
+ * Please start a new scan with clear photos." — is untrue of this scan twice over (it was stopped
+ * once, by the family's own withdrawal, and the photos were fine) and the advice cannot work: a new
+ * upload re-checks consent and is refused 422 CONSENT_REQUIRED
+ * (HOMEWORK_BUSINESS_RULES). So this outcome gets its own line, here rather than in a page, so the
+ * portal and the app say the same thing. It also states the one good fact the settlement delivers,
+ * that the pages were given back.
+ */
+export const CONSENT_WITHDRAWN_SCAN_COPY =
+  'Checking stopped because parental consent for this child’s learning data was withdrawn, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Give consent again on the privacy page before scanning this worksheet once more.';
+
+/**
  * The two actions a guardian can take on an unresolved flag (portal and app; both need a recent PIN
  * unlock, and the report must be the family's own). Same wording on every surface. DRAFT with the
  * copy above.

@@ -848,6 +848,7 @@ describe('honest follow-up states (RV-homework-6, 7, 8)', () => {
   it.each([
     ['SCAN_TOO_MANY_QUESTIONS', /more questions than one check can handle/],
     ['AI_PAUSED_TOO_LONG', /could not check this scan in time/],
+    ['CONSENT_REQUIRED', /consent .* was withdrawn|parental consent/i],
   ])('a %s scan says what to do instead of the generic failure line', async (code, copy) => {
     const { api } = fakeApi({
       get: (path) =>

@@ -41,6 +41,26 @@ async function issueRefreshToken(
 
 const PAIR_FAILURES_KEY = 'pair-fail:global';
 
+/**
+ * A device with no live session left is not connected any more (HUNT4-MOB-4). The parent's device
+ * list derives "Connected" from `child_devices.revoked_at` alone, so a session that ended any way
+ * except logout or a parent action left the tablet listed as connected for good — with a live
+ * "Disconnect" button — while the child was being told to ask a grown-up to connect it again. Only
+ * stamped when this device has no other live session, so a second session on a shared tablet keeps
+ * it connected.
+ */
+async function stampDeviceWhenNoLiveSession(tx: Tx, sessionId: string): Promise<void> {
+  await tx`
+    update public.child_devices d set revoked_at = now()
+     where d.id = (select device_id from public.child_sessions where id = ${sessionId})
+       and d.revoked_at is null
+       and not exists (
+         select 1 from public.child_sessions s
+          where s.device_id = d.id and s.revoked_at is null and s.expires_at > now()
+       )
+  `;
+}
+
 async function tokenResponse(
   deps: AppDeps,
   principal: ChildPrincipal,
@@ -202,25 +222,49 @@ export function childAuthRoutes(): Hono<AppEnv> {
          for update of t
       `;
       if (!row) return { kind: 'invalid' as const };
+      /**
+       * Withdrawal revokes the session, so this only matters for a session that outlived a consent
+       * change made another way; the child sees the same "connect again" answer.
+       */
+      const consented = async () =>
+        consentAllowsChildAccess(tx, row.family_id, {
+          allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
+        });
       if (row.used_at) {
-        // Reuse of a rotated token signals theft: revoke the whole session (spec P3).
+        // Reuse of a rotated token signals theft: revoke the whole session (spec P3), at once and
+        // without any grace window.
+        //
+        // HUNT4-MOB-1 (round 4) is a CONFIRMED and still-open defect here, kept open deliberately:
+        // this also fires when a rotation's response is lost on the way back to the tablet, so one
+        // dropped HTTP response unpairs a child's device and the parent has to mint a new pairing
+        // code. A 60-second "the response never arrived" grace was written and then withdrawn in the
+        // same round, and the lead's decision is NOT to take it: a time window cannot tell the
+        // rightful holder's retry from a blind replay of a stolen token, so it would hand a replayer
+        // a live child session in exactly the case it is meant to help.
+        //
+        // The remedy that does distinguish them is an IDEMPOTENT refresh keyed on a client-supplied
+        // request id the tablet keeps across its own retries: the same id is the rightful holder
+        // finishing an attempt, any other presentation of a rotated token stays theft. That needs a
+        // contract field, a column, and mobile changes, so it is a designed change for its own round
+        // (docs/Bug_Ledger.md BUG-2xx HUNT4-MOB-1, docs/Progress.md), not a late edit to this one.
+        // Until then this gate stays closed and the unpairing is the accepted cost.
         await tx`update public.child_sessions set revoked_at = ${now}, revoke_reason = 'refresh_token_reuse' where id = ${row.session_id} and revoked_at is null`;
         await tx`
           insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
           values (${row.family_id}, 'system', 'child_session.revoked_token_reuse', 'child_session', ${row.session_id})
         `;
+        // The session is over, so the parent's list must stop calling the device connected
+        // (HUNT4-MOB-4).
+        await stampDeviceWhenNoLiveSession(tx, row.session_id);
         return { kind: 'reused' as const };
       }
-      if (!row.live) return { kind: 'invalid' as const };
-      // Withdrawal revokes the session, so this only matters for a session that outlived a
-      // consent change made another way; the child sees the same "connect again" answer.
-      if (
-        !(await consentAllowsChildAccess(tx, row.family_id, {
-          allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
-        }))
-      ) {
+      if (!row.live) {
+        // The session is over (revoked, or simply expired on an unused tablet): the device stops
+        // being listed as connected, so the parent sees that a new pairing code is what is needed.
+        await stampDeviceWhenNoLiveSession(tx, row.session_id);
         return { kind: 'invalid' as const };
       }
+      if (!(await consented())) return { kind: 'invalid' as const };
       await enforceRateLimit(
         deps.rateLimiter,
         `refresh:${row.session_id}`,
@@ -252,19 +296,8 @@ export function childAuthRoutes(): Hono<AppEnv> {
     const { deps, child } = c.var;
     await deps.db.asService(async (tx) => {
       await tx`update public.child_sessions set revoked_at = now(), revoke_reason = 'logout' where id = ${child.sessionId} and revoked_at is null`;
-      // A device that signed itself out is no longer connected (API-AUTH-R2-05). The parent's
-      // device list reads child_devices.revoked_at, so a logout that only revoked the session left
-      // the tablet listed as "Connected" for good. Only stamped when this device has no other live
-      // session, so a second session on a shared tablet keeps it connected.
-      await tx`
-        update public.child_devices d set revoked_at = now()
-         where d.id = (select device_id from public.child_sessions where id = ${child.sessionId})
-           and d.revoked_at is null
-           and not exists (
-             select 1 from public.child_sessions s
-              where s.device_id = d.id and s.revoked_at is null and s.expires_at > now()
-           )
-      `;
+      // A device that signed itself out is no longer connected (API-AUTH-R2-05).
+      await stampDeviceWhenNoLiveSession(tx, child.sessionId);
     });
     return c.json({ ok: true });
   });

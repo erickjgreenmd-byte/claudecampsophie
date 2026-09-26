@@ -49,19 +49,68 @@ export type RunStageErrorCode =
   /**
    * The provider cut the answer off at `max_output_tokens` (JOBS-R2-02). Not an outage: the same
    * request would be cut off again, so the caller must not treat it as retryable work. The loop
-   * already tried once with a raised output budget (see OUTPUT_TRUNCATED_BUDGET_MULTIPLE) where the
-   * stage's cost cap admitted it; this code means the work does not fit this stage at all.
+   * already tried once with a raised output budget (see raisedOutputBudget) unless the stage's cost
+   * cap had no room for any raise at all; this code means the work does not fit this stage.
    */
   | 'OUTPUT_TRUNCATED'
   | 'OUTPUT_INVALID'
   | 'UNKNOWN_MODEL';
 
 /**
- * How much of the stage's output budget a truncated answer is retried with (JOBS-R2-02): once, at
- * this multiple of the configured `maxOutputTokens`, and only while the stage's cost cap still
- * admits the raised estimate — the owner's ceiling is never exceeded to fit a longer answer.
+ * The MOST of the stage's output budget a truncated answer is retried with (JOBS-R2-02): once, at up
+ * to this multiple of the configured `maxOutputTokens`, and never past what the stage's cost cap
+ * still admits — the owner's ceiling is never exceeded to fit a longer answer.
  */
 export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE = 2;
+
+/**
+ * The output budget the one truncation retry is sent with: the largest budget the stage's cost cap
+ * still admits, up to OUTPUT_TRUNCATED_BUDGET_MULTIPLE x the configured one. Null when not even one
+ * token more fits, and the stage settles with OUTPUT_TRUNCATED at once.
+ *
+ * R4-JOBS-1: raising straight to the full multiple made the retry UNREACHABLE for extraction and
+ * grading — 2 x 4,000 output tokens is estimated at ~102,000 micros on top of the ~53,000 the first
+ * cut-off answer already cost, past their 150,000-micro cap, at every input size a real scan sends
+ * (the floor for extraction is 2,478 input tokens). A worksheet a few hundred tokens too long was
+ * abandoned although the retry the comments promised had never been made. The raise is now sized to
+ * the headroom that exists, so the single retry is always really attempted when there is room for a
+ * bigger answer at all. Monotone in the budget, so a binary search finds the largest admissible one.
+ */
+function raisedOutputBudget(args: {
+  readonly limits: StageLimits;
+  readonly rates: Parameters<typeof computeOperationCostMicros>[0];
+  readonly modelId: string;
+  readonly inputTokens: number;
+  readonly attemptsSoFar: number;
+  readonly spentMicros: number;
+}): number | null {
+  const admits = (maxOutputTokens: number): boolean => {
+    const estimate = estimateUpperBoundCostMicros(args.rates, {
+      modelId: args.modelId,
+      inputTokens: args.inputTokens,
+      maxOutputTokens,
+    });
+    if (!estimate.ok) return false;
+    return canAttempt(args.limits, {
+      attemptsSoFar: args.attemptsSoFar,
+      spentMicrosSoFar: args.spentMicros,
+      nextEstimateMicros: estimate.value,
+    }).allow;
+  };
+  let low = args.limits.maxOutputTokens + 1;
+  let high = args.limits.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE;
+  let best: number | null = null;
+  while (low <= high) {
+    const mid = low + Math.floor((high - low) / 2);
+    if (admits(mid)) {
+      best = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best;
+}
 
 /** Statuses by which the provider refuses the request body itself (size, image, schema). */
 const REJECTED_REQUEST_STATUSES: ReadonlySet<number> = new Set([400, 413, 415, 422]);
@@ -113,8 +162,8 @@ export async function runStage<S extends z.ZodType>(
   let spent = 0;
   let lastError: RunStageErrorCode = 'PROVIDER_FAILED';
   // JOBS-R2-02: the output budget this attempt is sent with. A `max_output_tokens` incomplete raises
-  // it once (never twice, and never past the stage's cost cap), so the identical request is never
-  // sent again.
+  // it once (never twice, and never past what the stage's cost cap admits, R4-JOBS-1), so the
+  // identical request is never sent again.
   let maxOutputTokens = limits.maxOutputTokens;
   let budgetRaised = false;
 
@@ -204,11 +253,22 @@ export async function runStage<S extends z.ZodType>(
       attempts.push(record('failed'));
       if (response.reason === 'max_output_tokens') {
         // JOBS-R2-02: the answer did not fit the budget. Re-sending the identical request would be
-        // cut off at the same place, so the stage raises the budget once and, if that answer is cut
-        // off too (or the cost cap refuses the raise), ends with its own code. The caller turns that
-        // into a parent-facing outcome instead of spending every job attempt on truncated answers.
+        // cut off at the same place, so the stage raises the budget once — as far as the stage's
+        // cost cap has room for (R4-JOBS-1) — and, if that answer is cut off too (or there is no
+        // room for any raise), ends with its own code. The caller turns that into a parent-facing
+        // outcome instead of spending every job attempt on truncated answers.
         lastError = 'OUTPUT_TRUNCATED';
-        if (budgetRaised) {
+        const raised = budgetRaised
+          ? null
+          : raisedOutputBudget({
+              limits,
+              rates,
+              modelId,
+              inputTokens: options.estimatedInputTokens,
+              attemptsSoFar: attempt,
+              spentMicros: spent,
+            });
+        if (raised === null) {
           return {
             result: err(
               'OUTPUT_TRUNCATED',
@@ -221,7 +281,7 @@ export async function runStage<S extends z.ZodType>(
           };
         }
         budgetRaised = true;
-        maxOutputTokens = limits.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE;
+        maxOutputTokens = raised;
       } else {
         lastError = 'PROVIDER_FAILED';
       }

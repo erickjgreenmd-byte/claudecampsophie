@@ -113,14 +113,47 @@ export interface ClientAuthOptions {
 
 export type ClientFactory = (url: string, key: string, options: ClientAuthOptions) => Client;
 
-const PORTAL_CLIENT: ClientAuthOptions = {
-  auth: {
-    flowType: 'pkce',
-    persistSession: true,
-    detectSessionInUrl: true,
-    autoRefreshToken: true,
-  },
-};
+/**
+ * The key supabase-js stores this project's session under. It is exactly the default supabase-js
+ * derives from the project URL (`sb-<ref>-auth-token`), spelled out and handed back so a refused
+ * sign-out can clear that session itself (WEB-R4-AUTH-2). A URL this cannot parse keeps the SDK's
+ * own default and gives up the clearing rather than removing the wrong key.
+ */
+function sessionStorageKey(supabaseUrl: string): string | null {
+  try {
+    return `sb-${new URL(supabaseUrl).hostname.split('.')[0]}-auth-token`;
+  } catch {
+    return null;
+  }
+}
+
+function portalClient(storageKey: string | null): ClientAuthOptions {
+  return {
+    auth: {
+      flowType: 'pkce',
+      persistSession: true,
+      detectSessionInUrl: true,
+      autoRefreshToken: true,
+      ...(storageKey ? { storageKey } : {}),
+    },
+  };
+}
+
+/**
+ * WEB-R4-AUTH-2: removes this origin's stored session. Used only when supabase-js has refused a
+ * sign-out *without* clearing it — with an expired access token it tries a refresh first, and when
+ * that fails at the fetch level (offline, captive portal, auth outage) it returns the error before
+ * removeCurrentSession(), leaving a still-valid refresh token in localStorage. On a shared family,
+ * school or library computer the next person would sign straight back in with it.
+ */
+function forgetStoredSession(storageKey: string | null): void {
+  if (!storageKey) return;
+  try {
+    globalThis.localStorage?.removeItem(storageKey);
+  } catch {
+    // Storage blocked (private mode, a locked-down browser): nothing was stored to remove.
+  }
+}
 
 /**
  * The password-proof client: nothing persisted, nothing refreshed and no URL handling, so it can
@@ -151,7 +184,8 @@ export function createSupabaseAuth(
   }
   const url = config.supabaseUrl;
   const key = config.supabasePublishableKey;
-  const client = factory(url, key, PORTAL_CLIENT);
+  const storageKey = sessionStorageKey(url);
+  const client = factory(url, key, portalClient(storageKey));
   const auth = client.auth;
   // Opened by the auth server's own PASSWORD_RECOVERY event (a PKCE reset link exchanged by
   // detectSessionInUrl) and by acceptRecoveryLink (a link started in the mobile app). Never opened
@@ -309,7 +343,20 @@ export function createSupabaseAuth(
       // Closed before the call: whatever the server answers, this page is no longer holding a
       // recovery grant (WEB-R2-04).
       closeRecovery();
-      await auth.signOut({ scope });
+      // WEB-R4-AUTH-2: the outcome is no longer thrown away. supabase-js resolves with `{ error }`
+      // instead of rejecting, and on one path it returns that error before it clears storage (see
+      // forgetStoredSession), so a caller that ignored this showed the sign-in page over a session
+      // whose refresh token was still in this browser. The session is cleared here and the failure
+      // is reported, so no caller can present a refused sign-out as a finished one.
+      //
+      // ACC-WEB-AUTH-A: reported by returning, not by throwing. The account-closure flow awaits this
+      // with no catch and must still reach the page that explains the closure, so a rejection here
+      // lost that page and left an unhandled promise. Callers that would show a signed-out screen
+      // read the report instead (SignOutControl).
+      const { error } = await auth.signOut({ scope });
+      if (!error) return;
+      forgetStoredSession(storageKey);
+      return { serverNotTold: true };
     },
     onChange(listener) {
       const { data } = auth.onAuthStateChange(() => listener());

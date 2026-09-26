@@ -89,8 +89,14 @@ export default function UpdatePasswordPage() {
   // nothing else. In any other signed-in session the current password is proved first, so an
   // unattended signed-in browser is no longer enough to take over the account (and the weaker
   // secret, the 6-digit PIN, is no longer the better-protected one).
-  const fromRecoveryLink =
-    recovery.status === 'ready' || recoverySession?.recoveryActive() === true;
+  //
+  // WEB-R4-AUTH-1: the adapter's grant is the ONE source of that permission, on the mobile-link path
+  // too. `recovery.status` is written once, when the implicit-flow hash was adopted, and nothing ever
+  // resets it, so reading it here was a second grant with no bound at all: an /update-password tab
+  // left open on a shared family, school or library computer still changed the account password with
+  // no current password hours later. `acceptRecoveryLink` opens the bounded, single-use grant
+  // (supabase-auth.ts), and RECOVERY_GRANT_MS, the one change and a sign-out all close it.
+  const fromRecoveryLink = recoverySession?.recoveryActive() === true;
   const currentEmail = state.status === 'signed_in' ? state.session.email : null;
   const mustProve = !fromRecoveryLink;
   if (mustProve && (!proof || !currentEmail)) {

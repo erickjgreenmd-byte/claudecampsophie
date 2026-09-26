@@ -146,6 +146,8 @@ export async function saveSupportPolicy(
 export const STORE_FEE_RATES_NOTES: readonly string[] = [
   'Store fees are an estimate at the configured rate on charged minus refunded amounts, rounded half up to the cent; the store statements are the truth.',
   STRIPE_FEE_NOTE,
+  // BILL-R4-3 / BILL-R4-4: what "gross" means, stated where the owner reads the figure.
+  "Gross is the money collected for the subscription itself: US sales tax (a state's money), a mid-cycle proration item and any amount settled from a Stripe customer credit balance are never revenue, and a refund is recorded in that same pre-tax unit, capped at the charge.",
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -153,7 +155,7 @@ export const STORE_FEE_RATES_NOTES: readonly string[] = [
 // ---------------------------------------------------------------------------------------------
 
 const REVENUE_SOURCE = 'public.billing_periods';
-const REVENUE_DEFINITION = `Charged periods in ${REVENUE_CURRENCY} (settlement settled, refunded, partially_refunded or chargeback) bucketed by the UTC month of settled_at (period_start when unsettled); gross = charged_amount_cents, refunds = refunded_cents attributed to the month of the charge they reverse (a chargeback counts as a refund of the disputed amount, or of the whole charge when the store reports none), fee = estimate at the channel rate, net = gross − refunds − fee. A period charged in another currency is counted in the notes, never in these sums.`;
+const REVENUE_DEFINITION = `Charged periods in ${REVENUE_CURRENCY} (settlement settled, refunded, partially_refunded or chargeback) bucketed by the UTC month of settled_at (period_start when unsettled); gross = charged_amount_cents (the pre-tax subscription money collected), refunds = refunded_cents in that same unit, attributed to the month of the charge they reverse (a chargeback counts as a refund of the disputed amount, or of the whole charge when the store reports none), fee = estimate at the channel rate, net = gross − refunds − fee. A period charged in another currency is counted in the notes, never in these sums.`;
 
 /** The revenue note listing periods left out because they were not charged in USD (BILL-R1-5). */
 export function foreignCurrencyNote(counts: ReadonlyMap<string, number>): string | null {
@@ -270,27 +272,60 @@ export async function loadSubscriptions(tx: Tx, now: Date): Promise<Subscription
   // the subset of those whose access ENDED during the month, so the rate can never exceed 100% and
   // a family that left once is counted once, in the month it left (BILL-R2-1-a: a family whose
   // access ended in an earlier month must not re-enter this month's numerator).
-  const newFamilies = await tx<{ family_id: string }[]>`
-    select e.family_id
-      from public.family_entitlements e
-     group by e.family_id
-    having min(e.created_at) >= ${start} and min(e.created_at) < ${end}
+  //
+  // BILL-R4-5: both movement figures are counted in SQL. Returning one row per family and counting
+  // in JS made a single Worker invocation (128 MB) decode an array the size of the whole customer
+  // base twice, beside six months of revenue rows, and it grew linearly with the business instead of
+  // failing at a threshold a test would catch.
+  const [newFamilies] = await tx<{ count: number }[]>`
+    select count(*)::int as count
+      from (
+        select e.family_id
+          from public.family_entitlements e
+         group by e.family_id
+        having min(e.created_at) >= ${start} and min(e.created_at) < ${end}
+      ) first_subscription
   `;
   // BILL-R2-1-a: each ledger row carries the instant its paid access ends (`ended_at`), because
   // `status` alone says only that a row grants nothing NOW, not when it stopped. RevenueCat leaves
   // `expires_date` untouched on a refund (providers/billing.ts), so a row refunded on 20 August can
   // still carry period_end 1 December: keyed on status alone that family re-entered the base and the
   // lapsed set every month until December, and the owner saw a fresh 100% churn month after month
-  // for one family that left once. Per row:
+  // for one family that left once.
+  //
+  // BILL-R4-1: the ending is derived the way the domain grant rule derives access, NEVER from
+  // `provider_updated_at` alone. That column is not an observation instant: mapRevenueCatSubscription
+  // takes the latest of purchase_date, refunded_at, grace_period_expires_date,
+  // billing_issues_detected_at and unsubscribe_detected_at, and deliberately EXCLUDES expires_date.
+  // For a subscription that simply ran out it is therefore the cancellation (or purchase) date,
+  // always BEFORE period_end, and for a transfer-away vanishedSnapshots keeps the stored (purchase)
+  // instant on purpose. Dating those endings by it put a family that was paying at the month start
+  // into NEITHER activeAtMonthStart nor lapsedThisMonth, so a subscription that ran out or was
+  // transferred away disappeared from churn altogether. Per row:
   //   active / grace_period  -> period_end + the access bound (the domain grant rule)
-  //   cancelled_active       -> period_end (exclusive)
-  //   expired / revoked / refunded / billing_retry -> least(period_end, provider_updated_at): an
-  //     expiry is observed at or after the nominal period end, while a refund or revocation mid
-  //     period is dated by the provider's own update instant.
+  //   cancelled_active       -> period_end (exclusive, as grantsAccess bounds it)
+  //   expired                -> period_end: an expiry IS the paid period running out (the mapper
+  //                             only reports it once period_end has passed), so paid access ended
+  //                             there whatever the provider's marker instants say
+  //   revoked                -> least(period_end, fetched_at): the provider instant is deliberately
+  //                             stale on a transfer/removal, so the ending is when we observed it,
+  //                             never later than the paid period. Terminal rows are skipped by the
+  //                             re-verification sweep (BILL-R1-3) and by vanishedSnapshots, so
+  //                             fetched_at is frozen at that observation and cannot drift forward.
+  //   refunded / billing_retry -> least(period_end, provider_updated_at): these ARE dated by a
+  //                             provider action inside the period (refunded_at,
+  //                             billing_issues_detected_at), which that column does carry.
   // `pending` never granted and rows without a period_end cannot be dated, so both are left out.
   // A family's access ends when its last row ends, or at its tombstone if that comes first
   // (BILL-R2-2: deletion is the end of the service).
-  const baseFamilies = await tx<{ family_id: string; ended_at: Date | null }[]>`
+  //
+  // A base family that grants nothing any more has lapsed, whatever ended it: an expired, revoked or
+  // refunded subscription, or the account deletion (BILL-R2-2) that takes it out of `active`. The
+  // ending must fall inside the reported month (BILL-R2-1-a), so a family that left in an earlier
+  // month is counted in that month only and never again. "Grants access now" is the same domain rule
+  // the `active` query above applies, computed in the CTE so both figures come back as scalars
+  // (BILL-R4-5).
+  const [baseFamilies] = await tx<{ base: number; lapsed: number }[]>`
     with ledger as (
       select e.family_id,
              e.created_at,
@@ -298,17 +333,33 @@ export async function loadSubscriptions(tx: Tx, now: Date): Promise<Subscription
                when e.status in ('active', 'grace_period')
                  then e.period_end + make_interval(secs => ${accessBoundSeconds})
                when e.status = 'cancelled_active' then e.period_end
+               when e.status = 'expired' then e.period_end
+               when e.status = 'revoked' then least(e.period_end, e.fetched_at)
                else least(e.period_end, e.provider_updated_at)
-             end as ended_at
+             end as ended_at,
+             case
+               when e.status in ('active', 'grace_period')
+                 then e.period_end + make_interval(secs => ${accessBoundSeconds}) > ${now}
+               when e.status = 'cancelled_active' then e.period_end > ${now}
+               else false
+             end as granting_now
         from public.family_entitlements e
        where e.status <> 'pending' and e.period_end is not null
+    ),
+    base_families as (
+      select l.family_id,
+             least(f.deleted_at, max(l.ended_at)) as ended_at,
+             f.deleted_at is null and bool_or(l.granting_now) as granting_now
+        from ledger l
+        join public.families f on f.id = l.family_id
+       where f.deleted_at is null or f.deleted_at >= ${start}
+       group by l.family_id, f.deleted_at
+      having bool_or(l.created_at < ${start} and l.ended_at >= ${start})
     )
-    select l.family_id, least(f.deleted_at, max(l.ended_at)) as ended_at
-      from ledger l
-      join public.families f on f.id = l.family_id
-     where f.deleted_at is null or f.deleted_at >= ${start}
-     group by l.family_id, f.deleted_at
-    having bool_or(l.created_at < ${start} and l.ended_at >= ${start})
+    select count(*)::int as base,
+           count(*) filter (where not granting_now and ended_at is not null
+                              and ended_at >= ${start} and ended_at <= ${now})::int as lapsed
+      from base_families
   `;
   const channelCounts = new Map<string, number>(CHANNELS.map((c) => [c, 0]));
   const slotCounts = new Map<number, number>();
@@ -318,19 +369,8 @@ export async function loadSubscriptions(tx: Tx, now: Date): Promise<Subscription
     slotCounts.set(row.paid_slots, (slotCounts.get(row.paid_slots) ?? 0) + 1);
     families.add(row.family_id);
   }
-  // A base family that grants nothing any more has lapsed, whatever ended it: an expired, revoked
-  // or refunded subscription, or the account deletion (BILL-R2-2) that takes it out of `active`.
-  // The ending must fall inside the reported month (BILL-R2-1-a), so a family that left in an
-  // earlier month is counted in that month only and never again.
-  const startMs = start.getTime();
-  const nowMs = now.getTime();
-  const lapsed = baseFamilies.filter((r) => {
-    if (families.has(r.family_id)) return false;
-    if (r.ended_at === null) return false;
-    const endedMs = r.ended_at.getTime();
-    return endedMs >= startMs && endedMs <= nowMs;
-  }).length;
-  const activeAtStart = baseFamilies.length;
+  const lapsed = baseFamilies?.lapsed ?? 0;
+  const activeAtStart = baseFamilies?.base ?? 0;
   return {
     asOf: now.toISOString(),
     month,
@@ -352,7 +392,7 @@ export async function loadSubscriptions(tx: Tx, now: Date): Promise<Subscription
       count: r.count,
     })),
     newThisMonth: {
-      value: newFamilies.length,
+      value: newFamilies?.count ?? 0,
       source: ENTITLEMENTS,
       definition: `Families whose FIRST subscription row was recorded (created_at) in ${month} UTC; a tier change of a family that already subscribed is not a new subscription. A family that has since deleted its account still counts: it did subscribe this month.`,
     },
@@ -483,9 +523,16 @@ export async function loadOverview(
     select count(*)::int as count, min(updated_at) as oldest from public.jobs
      where status = any(${[...FAILED_JOB_STATUSES]}) and updated_at >= ${failedJobsWindowStart(now)}
   `;
+  // BILL-R4-2: the rule is windowed, exactly as jobs_failed is. A failed provider event can only be
+  // cleared by the provider redelivering the SAME event id (recordEvent's re-open clause), and no
+  // provider retries for ever (Stripe stops after about three days); the raw body is deliberately
+  // never stored (migration 0200), so a refused shape whose retries have run out is work the owner
+  // cannot do and an event whose content cannot be recovered. All-time it stayed in the attention
+  // list for good with an ever-growing age, hiding genuinely new failures behind a count that could
+  // never return to zero. The same window as failed jobs: past it the provider has given up too.
   const [billingEvents] = await tx<CountRow[]>`
     select count(*)::int as count, min(received_at) as oldest from public.billing_provider_events
-     where status = 'failed'
+     where status = 'failed' and received_at >= ${failedJobsWindowStart(now)}
   `;
   const [safety] = await tx<CountRow[]>`
     select count(*)::int as count, min(created_at) as oldest from public.safety_reports
@@ -602,7 +649,7 @@ export async function loadOverview(
         'billing_events_failed',
         billingEvents,
         'public.billing_provider_events',
-        'Provider events (RevenueCat, Stripe) whose processing failed, all time, including bodies the request schema refused (error_code UNEXPECTED_SHAPE): the provider retries them, and a retry after a fix is reprocessed (BILL-R2-6).',
+        `Provider events (RevenueCat, Stripe) whose processing failed and were received within ${FAILED_JOBS_WINDOW_DAYS} days, including bodies the request schema refused (error_code UNEXPECTED_SHAPE): the provider retries them, and a retry after a fix is reprocessed (BILL-R2-6). Older failures are not counted (BILL-R4-2): a provider stops retrying, the raw body is never stored, so there is nothing left to act on — they stay in public.billing_provider_events for the record.`,
       ),
       item(
         'safety_reports_open',

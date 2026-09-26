@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Link, useLocation } from 'react-router';
 import { adultUnlockResponseSchema } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
@@ -50,6 +50,12 @@ export function StepUpPrompt({
   const [message, setMessage] = useState<string | null>(null);
   const [unlockedUntil, setUnlockedUntil] = useState<string | null>(null);
   const pinId = useId();
+  const pinRef = useRef<HTMLInputElement | null>(null);
+  // WEBR4-06: the prompt can appear far from the control that was refused, so it takes the focus
+  // once, when it mounts. It is never re-focused afterwards, so typing elsewhere is not interrupted.
+  useEffect(() => {
+    pinRef.current?.focus();
+  }, []);
 
   const submit = async () => {
     if (!PIN_PATTERN.test(pin)) {
@@ -100,7 +106,17 @@ export function StepUpPrompt({
       style={{ borderColor: 'var(--gold)', border: '1px solid var(--gold)', borderRadius: 8 }}
     >
       <legend style={{ fontWeight: 700 }}>Enter your parent PIN to continue</legend>
-      <p style={{ marginTop: 0 }}>
+      {/*
+        WEBR4-06: the explanation is a live region, and the PIN field takes the focus on mount. Every
+        notice this component replaced was `<div className="notice" role="alert">`, and every other
+        refusal on the same screens still speaks through ErrorState (also role="alert"). Without
+        them a refusal was announced nowhere: on the learning planner this prompt sits ~150 lines of
+        fields above the submit button, so a parent who pressed "Save schedule" with a lapsed unlock
+        saw no change near the control they used and heard nothing. The role goes here rather than on
+        the fieldset so the fieldset keeps its group role, which the privacy screen's tests use to
+        scope their queries to this prompt.
+      */}
+      <p role="alert" style={{ marginTop: 0 }}>
         {`${explanation} PencilLift’s servers check it, not this browser. `}
         <Link
           to="/app/security"
@@ -125,6 +141,7 @@ export function StepUpPrompt({
         <label htmlFor={pinId}>Parent PIN</label>
         <input
           id={pinId}
+          ref={pinRef}
           type="password"
           inputMode="numeric"
           autoComplete="off"

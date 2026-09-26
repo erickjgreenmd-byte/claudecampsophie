@@ -74,8 +74,15 @@ export function childRows(family: FamilyOverview): ChildRow[] {
         : child.status === 'archived'
           ? 'Archived profiles can’t be paired.'
           : null,
-      canActivate: draft && unused > 0,
-      activationNote: draft && unused === 0 ? draftActivationNote(family, child.nickname) : null,
+      // WEBR4-01: an archived child can take a free slot too, the way the portal offers it. The
+      // activate route clears archived_at for any profile that is not already active, and the archive
+      // confirmation on this screen promises it. The screen still withholds the control while a
+      // deletion request covers the child.
+      canActivate: (draft || child.status === 'archived') && unused > 0,
+      activationNote:
+        (draft || child.status === 'archived') && unused === 0
+          ? draftActivationNote(family, child.nickname)
+          : null,
     };
   });
 }

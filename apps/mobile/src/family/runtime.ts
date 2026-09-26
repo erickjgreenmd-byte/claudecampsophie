@@ -5,7 +5,7 @@ import * as SecureStore from 'expo-secure-store';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { forgetStoreIdentity } from '../billing/revenuecat.ts';
 import { createMobileApi } from '../lib/api.ts';
-import { signOutParent, type ModeEffects } from '../lib/mode.ts';
+import { signOutClosedAccount, signOutParent, type ModeEffects } from '../lib/mode.ts';
 import { parentAuth } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { createChildSession, withChildTokenRetry } from './child-session.ts';
@@ -79,6 +79,10 @@ export const biometricPinStore: BiometricPinStore = {
    * after a deletion, is never offered a Face ID unlock that would submit the previous parent's PIN
    * (a failed attempt counted toward the lockout and read as "Your PIN has changed"). A PIN that
    * belongs to someone else is removed here rather than left on the device.
+   *
+   * Only 'other_user' removes it. A user id that cannot be read ('unknown', MOB-R4-LOCK-02) means
+   * nothing about who the PIN belongs to — an offline device past its access-token expiry reports
+   * exactly that — so the offer is withheld and the enrolment is left alone.
    */
   async isEnabled() {
     const [enabled, ownerUserId, signedInUserId] = await Promise.all([
@@ -170,9 +174,7 @@ export const modeEffects: ModeEffects = {
  */
 export async function signOutParentOnDevice(effects: ModeEffects = modeEffects): Promise<void> {
   await signOutParent(secureStorage, effects, parentAuth);
-  // The parent's PIN must not stay on the device for the next adult to unlock with (MOB-R2-06).
-  await biometricPinStore.clear().catch(() => undefined);
-  await forgetStoreIdentity().catch(() => undefined);
+  await clearDeviceAdultSecrets();
 }
 
 /**
@@ -180,11 +182,31 @@ export async function signOutParentOnDevice(effects: ModeEffects = modeEffects):
  * closure path used to call parentAuth.signOut() directly, which left mode 'parent', the in-memory
  * unlock and the biometric PIN of a deleted account on the device. Navigation is the only part left
  * out, so the parent still reads what happened to their account before leaving the screen.
+ *
+ * The child pairing goes too (MOB-R4-LOCK-05): signOutClosedAccount in src/lib/mode.ts carries that
+ * rule and its reasoning, and is unit-tested there. It takes no argument, so the one call site
+ * (app/(parent)/privacy.tsx) cannot leave the forget switched off — which is exactly what the first
+ * round-4 attempt did with a `familyDeleted` flag no caller passed.
  */
-export function signOutClosedAccountOnDevice(): Promise<void> {
-  return signOutParentOnDevice({
-    ...modeEffects,
-    resetNavigationToWelcome: () => undefined,
-    resetNavigationToChildHome: () => undefined,
-  });
+export async function signOutClosedAccountOnDevice(): Promise<void> {
+  await signOutClosedAccount(
+    secureStorage,
+    {
+      ...modeEffects,
+      resetNavigationToWelcome: () => undefined,
+      resetNavigationToChildHome: () => undefined,
+    },
+    parentAuth,
+  );
+  await clearDeviceAdultSecrets();
+}
+
+/**
+ * What a signed-out device must not keep whichever way the adult left: the parent's PIN must not stay
+ * for the next adult to unlock with (MOB-R2-06), and the store SDK must forget the identity it was
+ * bound to. Both are best effort; neither may stop the sign-out.
+ */
+async function clearDeviceAdultSecrets(): Promise<void> {
+  await biometricPinStore.clear().catch(() => undefined);
+  await forgetStoreIdentity().catch(() => undefined);
 }

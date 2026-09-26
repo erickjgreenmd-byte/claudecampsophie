@@ -44,3 +44,28 @@ describe('the camera and the hardware Back button (MOB-R1-07)', () => {
     expect(scanScreen).toMatch(/<ChildNav \/>/);
   });
 });
+
+/**
+ * HUNT4-MOB-5. The abort path used to ignore what cancelScan answered: it always told the child
+ * "Stopped." and rotated the idempotency keys, so a scan the server had already taken was reported
+ * as stopped and "Try again" created a second assignment for the same homework (two jobs, two page
+ * charges against AC_CAPTURE_06). The screen must branch on the answer; the decision itself lives in
+ * src/homework/upload.ts `stoppedScanOutcome` and is unit-tested there.
+ */
+describe('stopping a scan the server already took (HUNT4-MOB-5)', () => {
+  it('branches on what the cancel answered instead of assuming it stopped', () => {
+    expect(scanScreen).toMatch(/stoppedScanOutcome\(/);
+    expect(scanScreen).toMatch(/await cancelScan\(childApi, attemptRef\.current\)/);
+    // The fresh attempt is conditional now: keeping it is what makes "Try again" report the scan
+    // that is already on its way rather than sending it a second time.
+    expect(scanScreen).toMatch(
+      /if \(!outcome\.keepAttempt\) attemptRef\.current = newAttempt\(newKey\);/,
+    );
+  });
+
+  it('no longer hard-codes the "Stopped" message on the abort path', () => {
+    expect(scanScreen).not.toMatch(
+      /ScanCancelledError\) \{[\s\S]{0,400}?setUpload\(\{ kind: 'error', message: childUploadMessage\(new ScanCancelledError\(\)\) \}\)/,
+    );
+  });
+});

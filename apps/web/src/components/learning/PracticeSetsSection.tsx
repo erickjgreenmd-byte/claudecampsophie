@@ -37,6 +37,21 @@ import {
 type KindFilter = 'all' | ParentPracticeSet['kind'];
 
 /**
+ * What one row is called, per filter, so a count can name the list it counted (WEBR4-11). Singular;
+ * the plural is this plus "s".
+ */
+const FILTER_NOUN: Record<KindFilter, string> = {
+  all: 'set',
+  daily: 'daily practice set',
+  thursday_review: 'weekly review',
+  top_up: 'extra practice set',
+};
+
+function filterNoun(filter: KindFilter): string {
+  return FILTER_NOUN[filter];
+}
+
+/**
  * Older pages of the newest-first list (API-AUTH-R2-04). They stay attached only while the first
  * page still ends at the set they were fetched after (`from`); a refresh that moves that set (a new
  * daily set arrived) drops them and offers "Show older sets" again, so nothing is ever skipped.
@@ -214,9 +229,15 @@ function SetList({
           </button>
         </div>
       ) : (
+        // WEBR4-11: the count belongs to the FILTERED list, so the sentence has to name the filter.
+        // "All 3 sets are shown for Riley" claimed the whole history while "Show" was set to Daily
+        // practice and forty weekly reviews were hidden; the copy it replaced ("Showing the 30 most
+        // recent sets") made no completeness claim at all.
         <p style={hintStyle}>
-          {sets.length === 1 ? 'This is the only set' : `All ${sets.length} sets are shown`} for{' '}
-          {childName}.
+          {sets.length === 1
+            ? `This is the only ${filterNoun(filter)}`
+            : `All ${sets.length} ${filterNoun(filter)}s are shown`}{' '}
+          for {childName}.
         </p>
       )}
       {olderError ? (

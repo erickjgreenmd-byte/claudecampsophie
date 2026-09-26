@@ -90,11 +90,16 @@ describe('[WEB-R2-03] a child profile can be corrected from the portal', () => {
     await user.click(within(riley).getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(sends).toHaveLength(1));
+    // WEBR4-03: this used to expect `ageBand: '8-10'` as well, although the age band was never
+    // touched here. That assertion was wrong: sending an untouched field overwrites whatever the
+    // other guardian saved into it in the meantime, which is exactly what the form's own doc comment
+    // promises not to do. The body now carries only the two fields this test changes.
     expect(sends[0]).toMatchObject({
       method: 'PATCH',
       path: `/v1/children/${RILEY}`,
-      body: { nickname: 'Riley R.', gradeLevel: 4, ageBand: '8-10' },
+      body: { nickname: 'Riley R.', gradeLevel: 4 },
     });
+    expect(sends[0]!.body).not.toHaveProperty('ageBand');
   });
 
   it('offers every age band the contract allows, from the schema', async () => {

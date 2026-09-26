@@ -934,5 +934,193 @@ describe('[DB-R2-08] pairing codes and expired spend holds are pruned', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// HR4-0860-01: the revoke sweep reaches the append-only ledgers' identity sequences (migration 0870)
+// ---------------------------------------------------------------------------------------------
+
+describe("[HR4-0860-01] the append-only ledgers' identity sequences are not client-writable", () => {
+  it('a statement running as authenticated cannot setval an append-only ledger sequence', async () => {
+    // 0860 section 2 stopped at TABLES. UPDATE on a sequence is all setval() needs and it needs no
+    // privilege on the owning table, so app.prevent_mutation() and the revoked INSERT/UPDATE/DELETE
+    // grants never saw it: one statement as `authenticated` could reset audit_events_id_seq to 1 and
+    // every later append would then fail on audit_events_pkey until an operator repaired it, taking
+    // create_family, request_deletion, activation and consent with it — and, on
+    // ai_usage_events_id_seq, settleSpend's cost insert, whose spend hold then never settles.
+    const fam = await seedFamily(db, { childCount: 1 });
+    for (const sequence of [
+      'public.audit_events_id_seq',
+      'public.ai_usage_events_id_seq',
+      'public.points_ledger_id_seq',
+      'public.aggregate_ad_events_id_seq',
+    ]) {
+      expect(
+        await pgMessage(
+          db.asParent(fam.ownerId, (tx) => tx.unsafe(`select setval('${sequence}', 1, false)`)),
+        ),
+        sequence,
+      ).toMatch(/permission denied/);
+      expect(
+        await pgMessage(db.asAnon((tx) => tx.unsafe(`select setval('${sequence}', 1, false)`))),
+        sequence,
+      ).toMatch(/permission denied/);
+    }
+
+    // Proof that the sequence really was the damage: the append that failed on audit_events_pkey in
+    // the report — the 'deletion.requested' row request_deletion writes (spec P4) — still succeeds.
+    await grantAdultUnlock(db, fam.ownerId, undefined, 3600);
+    expect(
+      await pgMessage(
+        db.asParent(fam.ownerId, (tx) => tx`select public.request_deletion(${fam.familyId})`),
+      ),
+    ).toBeUndefined();
+    const [appended] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.audit_events
+       where family_id = ${fam.familyId} and action = 'deletion.requested'`;
+    expect(appended!.n).toBe(1);
+  });
+
+  it('every sequence in public belongs to an identity column, so no client insert needs USAGE', async () => {
+    // Why revoking USAGE as well as UPDATE is safe: a `generated always as identity` sequence is
+    // advanced internally and authorized on the table, never through a client's USAGE on the
+    // sequence. A future `serial` column in public would break this and must be reviewed here.
+    const rows = await db.sql<{ seq: string; deptype: string }[]>`
+      select s.relname as seq, d.deptype
+        from pg_class s
+        join pg_depend d on d.objid = s.oid and d.classid = 'pg_class'::regclass
+                        and d.refclassid = 'pg_class'::regclass
+        join pg_class t on t.oid = d.refobjid
+       where s.relkind = 'S' and s.relnamespace = 'public'::regnamespace
+       order by s.relname`;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.filter((r) => r.deptype !== 'i')).toEqual([]);
+  });
+
+  it('the ledger insert path is untouched: an identity column needs no sequence privilege', async () => {
+    const fam = await seedFamily(db, { childCount: 1 });
+    expect(
+      await pgMessage(
+        db.asService(
+          (tx) => tx`
+            insert into public.points_ledger (family_id, child_id, kind, points, idempotency_key,
+                                              actor_kind)
+            values (${fam.familyId}, ${fam.children[0]!.id}, 'award', 10, 'hr4-0860-01', 'system')`,
+        ),
+      ),
+    ).toBeUndefined();
+    const [row] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.points_ledger where family_id = ${fam.familyId}`;
+    expect(row!.n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HR4-0860-02: the one client DELETE in the guarded set is guarded too (migration 0870)
+// ---------------------------------------------------------------------------------------------
+
+describe('[HR4-0860-02] a Data-API delete of a test date obeys the archived-child rule', () => {
+  // 0860 created test_dates_data_api_guard `before insert` only, and public.test_dates is the one
+  // table in the guarded set where `authenticated` holds DELETE (0100_learning.sql:499) under a
+  // `for all` policy. So the invariant 0860 set out to enforce — an archived profile is history only,
+  // and a child under deletion has stopped (spec P4) — was skippable with the parent's own JWT, while
+  // the API's own DELETE /children/:childId/test-dates/:testDateId answers CHILD_ARCHIVED. 0870 adds
+  // the `before delete` branch, so the rule holds for whatever grant the table carries.
+  it("an archived child's test date cannot be deleted through the Data API", async () => {
+    const s = await familyWithArchivedChild();
+    const [row] = await db.sql<{ id: string }[]>`
+      insert into public.test_dates (family_id, child_id, subject_id, test_date)
+      values (${s.fam.familyId}, ${s.archivedChild}, ${s.subjectOfArchived}, '2030-05-05')
+      returning id`;
+    expect(
+      await pgMessage(
+        db.asParent(s.fam.ownerId, (tx) => tx`delete from public.test_dates where id = ${row!.id}`),
+      ),
+    ).toMatch(/the child profile is archived/);
+    const [left] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.test_dates where id = ${row!.id}`;
+    expect(left!.n).toBe(1);
+  });
+
+  it('a test date of a child under deletion cannot be deleted through the Data API either', async () => {
+    const s = await familyWithArchivedChild();
+    const [row] = await db.sql<{ id: string }[]>`
+      insert into public.test_dates (family_id, child_id, subject_id, test_date)
+      values (${s.fam.familyId}, ${s.activeChild}, ${s.subjectOfActive}, '2030-07-07')
+      returning id`;
+    await db.sql`
+      insert into public.deletion_requests (family_id, scope, child_id, target_child_id, requested_by)
+      values (${s.fam.familyId}, 'child', ${s.activeChild}, ${s.activeChild}, ${s.fam.ownerId})`;
+    expect(
+      await pgMessage(
+        db.asParent(s.fam.ownerId, (tx) => tx`delete from public.test_dates where id = ${row!.id}`),
+      ),
+    ).toMatch(/deletion covering this child/);
+    const [left] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.test_dates where id = ${row!.id}`;
+    expect(left!.n).toBe(1);
+  });
+
+  it("a live child's test date is still deletable by its parent and still reschedules", async () => {
+    // The guard must refuse the archived child only: removing a test date of a live child is an
+    // ordinary parent action (routes/learning.ts, and supabase/tests/learning_runtime.test.ts).
+    const s = await familyWithArchivedChild();
+    await db.sql`insert into public.learning_schedules (child_id, family_id)
+                 values (${s.activeChild}, ${s.fam.familyId})`;
+    const [row] = await db.sql<{ id: string }[]>`
+      insert into public.test_dates (family_id, child_id, subject_id, test_date)
+      values (${s.fam.familyId}, ${s.activeChild}, ${s.subjectOfActive}, '2030-06-06')
+      returning id`;
+    const [before] = await db.sql<{ v: number }[]>`
+      select schedule_version as v from public.learning_schedules where child_id = ${s.activeChild}`;
+    await db.asParent(
+      s.fam.ownerId,
+      (tx) => tx`delete from public.test_dates where id = ${row!.id}`,
+    );
+    const [left] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.test_dates where id = ${row!.id}`;
+    expect(left!.n).toBe(0);
+    const [after] = await db.sql<{ v: number }[]>`
+      select schedule_version as v from public.learning_schedules where child_id = ${s.activeChild}`;
+    expect(after!.v).toBeGreaterThan(before!.v);
+  });
+
+  it('the service role deletes a test date of an archived child, as the purge must', async () => {
+    // The guard returns early for every role but `authenticated`: the purge (0620), the deletion
+    // worker and the jobs delete rows of archived children and children under deletion on purpose,
+    // and the API route deletes with the service role after its own CHILD_ARCHIVED check.
+    const s = await familyWithArchivedChild();
+    await db.sql`
+      insert into public.deletion_requests (family_id, scope, child_id, target_child_id, requested_by)
+      values (${s.fam.familyId}, 'child', ${s.archivedChild}, ${s.archivedChild}, ${s.fam.ownerId})`;
+    const [row] = await db.sql<{ id: string }[]>`
+      insert into public.test_dates (family_id, child_id, subject_id, test_date)
+      values (${s.fam.familyId}, ${s.archivedChild}, ${s.subjectOfArchived}, '2030-08-08')
+      returning id`;
+    const deleted = await db.asService(
+      (tx) => tx<{ id: string }[]>`
+        delete from public.test_dates
+         where id = ${row!.id} and child_id = ${s.archivedChild} and family_id = ${s.fam.familyId}
+        returning id`,
+    );
+    expect(deleted.map((d) => d.id)).toEqual([row!.id]);
+  });
+
+  it('the delete guard is a row-level BEFORE DELETE trigger no client role can call', async () => {
+    const [trigger] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from pg_trigger t
+       where t.tgrelid = 'public.test_dates'::regclass
+         and t.tgname = 'test_dates_data_api_delete_guard'
+         and not t.tgisinternal
+         and (t.tgtype & 8) = 8   -- DELETE
+         and (t.tgtype & 2) = 2   -- BEFORE
+         and (t.tgtype & 1) = 1`; // FOR EACH ROW
+    expect(trigger!.n).toBe(1);
+    const [priv] = await db.sql<{ anon: boolean; parent: boolean; child: boolean }[]>`
+      select has_function_privilege('anon', 'app.data_api_test_date_delete_guard()', 'EXECUTE') as anon,
+             has_function_privilege('authenticated', 'app.data_api_test_date_delete_guard()', 'EXECUTE') as parent,
+             has_function_privilege('pl_child', 'app.data_api_test_date_delete_guard()', 'EXECUTE') as child`;
+    expect(priv).toEqual({ anon: false, parent: false, child: false });
+  });
+});
+
 // A stable id so a failure message names the finding, not a random uuid.
 export const HARDENING_R2_DB_MARKER = `hardening-r2-db:${randomUUID().slice(0, 8)}`;

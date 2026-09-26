@@ -122,3 +122,43 @@ describe('[API-AUTH-R2-04] older practice sets stay reachable', () => {
     expect(paths.at(-1)).toBe(`/v1/children/${CHILD}/practice-sets?kind=daily`);
   });
 });
+
+/**
+ * WEBR4-11: on the last page of a filtered list the paging button is replaced by "All N sets are
+ * shown for {child}". The sentence named the child, not the filter, while `sets` is the filtered
+ * list — so with Show = "Daily practice" and three daily sets beside forty weekly reviews the page
+ * claimed the whole history was on screen. The copy it replaced ("Showing the 30 most recent sets")
+ * made no completeness claim at all.
+ */
+describe('[WEBR4-11] the completeness hint names the filter that is hiding the rest', () => {
+  function oneFilteredPage(): Partial<ApiClient> {
+    return {
+      get: <S extends z.ZodType>(path: string, schema: S) =>
+        Promise.resolve(
+          schema.parse({
+            sets: path.includes('kind=daily')
+              ? [daily(1), daily(2), daily(3)]
+              : [daily(1), daily(2), daily(3), daily(4)],
+            nextCursor: null,
+          }),
+        ),
+    };
+  }
+
+  it('says which filter the count belongs to while one is applied', async () => {
+    const user = userEvent.setup();
+    render(oneFilteredPage());
+    await waitFor(() => expect(screen.getAllByRole('heading', { level: 3 })).toHaveLength(4));
+    await user.selectOptions(screen.getByLabelText('Show'), 'daily');
+    await waitFor(() => expect(screen.getAllByRole('heading', { level: 3 })).toHaveLength(3));
+    const hint = await screen.findByText(/are shown/i);
+    expect(hint.textContent).toMatch(/daily practice/i);
+    expect(hint.textContent).not.toBe('All 3 sets are shown for Riley.');
+  });
+
+  it('still speaks for the whole history when no filter is applied', async () => {
+    render(oneFilteredPage());
+    const hint = await screen.findByText(/are shown/i);
+    expect(hint.textContent).toBe('All 4 sets are shown for Riley.');
+  });
+});

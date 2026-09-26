@@ -155,6 +155,19 @@ export const childArchiveResponseSchema = z.strictObject({
 });
 export type ChildArchiveResponse = z.infer<typeof childArchiveResponseSchema>;
 
+/**
+ * Stable BUSINESS_RULE codes from PATCH /v1/children/:childId (FL-R4-04). `archived` is the
+ * long-standing code for a history-only profile; `deletionPending` replaced a misleading NOT_FOUND
+ * for a child whose data deletion is still `requested` or `processing` — GET /v1/family names that
+ * child to the same caller and flags it `deletionPending`, so denying its existence on the edit
+ * protected nothing and told the parent a profile they can see is gone. An id that is unknown or
+ * another family's still answers NOT_FOUND.
+ */
+export const CHILD_PROFILE_RULES = {
+  archived: 'CHILD_ARCHIVED',
+  deletionPending: 'CHILD_DELETION_PENDING',
+} as const;
+
 /** Stable BUSINESS_RULE codes from child activation that the parent screens branch on. */
 export const CHILD_ACTIVATION_RULES = {
   needsPaidSlot: 'NEEDS_PAID_SLOT',

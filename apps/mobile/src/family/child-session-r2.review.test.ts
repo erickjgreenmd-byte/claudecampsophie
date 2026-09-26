@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { childMeResponseSchema } from '@pencillift/contracts';
@@ -230,4 +232,78 @@ describe('a refused data call refreshes once through the single-flight refresher
     expect(await t.session.isPaired()).toBe(true);
     expect(await t.session.profile()).toMatchObject({ nickname: 'Riley' });
   });
+});
+
+/**
+ * HUNT4-MOB-3. `once` used to decide whether to retry by "is a token cached right now", which is one
+ * retry slot for the whole session rather than one per call. Two calls that both presented the same
+ * stale token race: the first refusal to land drops the token and retries, the second finds nothing
+ * cached and is told the device is not connected — while the refresh it needed was already in flight.
+ * No explicit Promise.all is needed: the limits GET issued on the scan screen's mount, or a request
+ * left running by a screen the child navigated away from, consumes the slot just as well.
+ */
+describe('the retry is per call, not one slot for the whole session (HUNT4-MOB-3)', () => {
+  it('[repro] two calls refused at the same instant both recover, through a single refresh', async () => {
+    const t = setup(0);
+    await pair(t.session);
+    t.advance(16); // the server-side token is dead
+    t.setSkew(-30); // the device clock moved back, so the device still believes it live
+    const results = await Promise.allSettled([
+      t.childApi.get('/v1/child/me', childMeResponseSchema),
+      t.childApi.get('/v1/child/assignments', childMeResponseSchema),
+    ]);
+    expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled']);
+    // The single-flight refresher still collapses them: one rotation, not one per call.
+    expect(t.server.refreshes).toBe(1);
+    expect(await t.session.isPaired()).toBe(true);
+  });
+
+  it('three concurrent calls still make exactly one refresh', async () => {
+    const t = setup(0);
+    await pair(t.session);
+    t.advance(16);
+    t.setSkew(-30);
+    const paths = ['/v1/child/me', '/v1/child/assignments', '/v1/child/rewards'];
+    const results = await Promise.allSettled(
+      paths.map((p) => t.childApi.get(p, childMeResponseSchema)),
+    );
+    expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
+    expect(t.server.refreshes).toBe(1);
+  });
+
+  it('a call made while the device is not paired at all is still refused, not retried', async () => {
+    const t = setup(0);
+    // Never paired: there is no refresh token, so nothing a retry could do.
+    await expect(t.childApi.get('/v1/child/me', childMeResponseSchema)).rejects.toMatchObject({
+      code: 'UNAUTHENTICATED',
+    });
+    expect(t.server.refreshes).toBe(0);
+    const me = t.server.calls.filter((c) => c.path === '/v1/child/me');
+    expect(me).toHaveLength(1);
+  });
+});
+
+/**
+ * HUNT4-MOB-2. withChildTokenRetry was applied to two of the four child clients. The child's rewards
+ * screen and the child's help/report screen built `createMobileApi(tokenSource)` straight from the
+ * registered source, so after a backwards device-clock jump they got 401 with nothing invalidating
+ * the cached token: every tap presented the same dead token, and help.tsx turned the child's attempt
+ * to report a problem into "not connected" copy while the homework screens recovered on their first
+ * try. These screens import react-native, so this suite reads their source (as
+ * src/homework/scan-screen.test.ts does for the scan screen).
+ */
+describe('every child surface gets the token retry, not only homework (HUNT4-MOB-2)', () => {
+  const screen = (name: string) =>
+    readFileSync(join(import.meta.dirname, '..', '..', 'app', '(child)', name), 'utf8');
+
+  for (const name of ['help.tsx', 'rewards.tsx']) {
+    it(`${name} builds its child client through withChildTokenRetry`, () => {
+      const source = screen(name);
+      expect(source).toMatch(
+        /withChildTokenRetry\(\s*createMobileApi\(tokenSource\),\s*childSession/,
+      );
+      // And never the bare client, which would leave the dead token cached on every tap.
+      expect(source).not.toMatch(/=>\s*\(tokenSource \? createMobileApi\(tokenSource\) : null\)/);
+    });
+  }
 });

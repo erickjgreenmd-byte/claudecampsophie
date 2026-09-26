@@ -185,11 +185,18 @@ export default function UnlockScreen() {
               busy={busy}
               onPress={() => void unlockBiometric()}
             />
-            <Button
+            {/* MOB-R4-LOCK-03: this deletes the keychain PIN and both flags — a parent-only
+                security change — and the child's "Grown-ups" button opens this screen with no PIN
+                at all, so an ungated button let a child undo the parent's enrolment in one tap. It
+                sits behind the same parental gate as the portal link below rather than behind the
+                live unlock that hides Lock and Sign out, because a parent who wants it turned off
+                is by definition on this screen without an unlock. */}
+            <GatedButton
               label="Turn off biometric unlock"
+              purpose="turn off biometric unlock on this device"
               secondary
               disabled={busy}
-              onPress={() =>
+              onPassed={() =>
                 void biometricPinStore.clear().then(() => {
                   setBiometricOn(false);
                   setInfo('Biometric unlock is off.');

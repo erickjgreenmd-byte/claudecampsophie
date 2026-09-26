@@ -18,6 +18,7 @@ import {
   type SeededFamily,
 } from '@pencillift/db/testing/fixtures';
 import { runJobs, type JobDeps, type JobHandler } from '../src/jobs/dispatcher.ts';
+import { createExportBuildHandler } from '../src/jobs/export-build.ts';
 import { createScanProcessHandler } from '../src/jobs/scan-process.ts';
 import { UNRESOLVED_REPORTS_PAGE_SIZE } from '../src/routes/privacy.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
@@ -593,11 +594,22 @@ describe('CS-R2-07 the family’s report list never drops an unresolved flag', (
   /**
    * Lead follow-up (the acceptance checker's residual on this fix): lifting the cap on the
    * unresolved branch left the response unbounded — nothing resolves a report but a grown-up, a
-   * guardian may file 30 an hour, and system flags stay 'escalated'. The bound is on the OLDEST
-   * unresolved rows, so it drains: each report acted on makes room for the next, and no report is
-   * permanently unreachable the way a newest-first cap made it.
+   * guardian may file 30 an hour, and system flags stay 'escalated'. So the unresolved rows are
+   * bounded too.
+   *
+   * ASSERTIONS CHANGED for CS-R4-01. This test used to require the response to be exactly
+   * UNRESOLVED_REPORTS_PAGE_SIZE rows — one page over all unresolved rows, taken from the oldest end
+   * — and proved the "it drains" claim by resolving six of those rows with raw SQL, noting that "the
+   * query is what is under test here, not the action path". Both were wrong, and the lead wrote both
+   * the defect and this too-kind test: the action path is exactly what decides whether the bound
+   * drains, and it REFUSES a parent's own report (422 parentActionNotForReport; migration 0790 allows
+   * a resolution only on 'system' and 'child' reports). A single oldest-end page therefore let 200
+   * open parent reports hide every later flag for good — the failure CS-R2-07 set out to remove,
+   * reintroduced from the other end (see the CS-R4-01 case below, where the flag is NEWER than the
+   * filler rows). The bound is now per reporter kind, so this test keeps what was true — the response
+   * is bounded and the old flag is in it — and proves the drain through the guardian's own action.
    */
-  it('bounds the unresolved rows from the oldest end, so the bound drains', async () => {
+  it('bounds the unresolved rows per reporter kind, and the flag still drains', async () => {
     const { fam, reportId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
     const extra = UNRESOLVED_REPORTS_PAGE_SIZE + 5;
     // `extra` open parent reports, all NEWER than the flag. Timestamps derive from the flag's own
@@ -613,21 +625,187 @@ describe('CS-R2-07 the family’s report list never drops an unresolved flag', (
     const first = safetyReportsResponseSchema.parse(
       await (await api.request('/v1/safety-reports', { token: parent })).json(),
     ).reports;
-    // Bounded, and the oldest report — the flag a grown-up still has to answer — is in the page.
-    expect(first).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE);
+    // Bounded on the family's own branch: 205 open parent reports, 200 listed.
+    expect(
+      first.filter((r) => r.reporterKind === 'parent' && r.status !== 'resolved'),
+    ).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE);
+    // And the oldest report — the flag a grown-up still has to answer — is in the response.
     expect(first.map((r) => r.id)).toContain(reportId);
-    const held = new Set(first.map((r) => r.id));
+    expect(first.filter((r) => r.status !== 'resolved')).toHaveLength(
+      UNRESOLVED_REPORTS_PAGE_SIZE + 1,
+    );
 
-    // Six of the page resolved (the query is what is under test here, not the action path).
-    await api.db.sql`
-      update public.safety_reports set status = 'resolved', resolved_at = created_at
-       where id = any(${api.db.sql.array(first.slice(0, 6).map((r) => r.id))}::uuid[])`;
+    // The drain, through the product's own path and not raw SQL: the guardian acts on the flag while
+    // all 205 of their own reports are still open, and the flag leaves the unresolved set.
+    const patched = await api.request(`/v1/safety-reports/${reportId}`, {
+      method: 'PATCH',
+      token: parent,
+      body: { outcome: 'addressed' },
+    });
+    expect(patched.status).toBe(200);
     const second = safetyReportsResponseSchema.parse(
       await (await api.request('/v1/safety-reports', { token: parent })).json(),
     ).reports;
-    // Still bounded, and six rows that the bound had held back are now in reach.
-    const unresolvedNow = second.filter((r) => r.status !== 'resolved');
-    expect(unresolvedNow).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE - 6 + 6);
-    expect(unresolvedNow.filter((r) => !held.has(r.id))).toHaveLength(6);
+    expect(second.find((r) => r.id === reportId)).toMatchObject({
+      status: 'resolved',
+      parentOutcome: 'addressed',
+    });
+    expect(second.filter((r) => r.status !== 'resolved')).toHaveLength(
+      UNRESOLVED_REPORTS_PAGE_SIZE,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round-4 findings ON the round-3 fixes above (CS-R4-01, CS-R4-02). They live in this file
+// because they reproduce through the same scan harness and the same flagged family.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * CS-R4-01. The oldest-end bound the lead added to the unresolved branch (UNRESOLVED_REPORTS_PAGE_SIZE,
+ * justified above with "the bound drains") does NOT drain for a report the family itself filed: the
+ * guardian action path refuses `reporter_kind = 'parent'` (PRIVACY_RULES.parentActionNotForReport)
+ * and migration 0790 permits a resolution only on 'system' and 'child' reports. So once 200 open
+ * parent reports exist, every LATER system flag and later child report fell outside the single page
+ * and was absent from the response — unreachable and unactionable from the portal, the app and the
+ * flag email's link, which is the exact failure CS-R2-07 set out to remove, reintroduced from the
+ * other end. The bound is now taken PER REPORTER KIND (the lead's decision), so rows the family
+ * cannot act on can never consume the room a flag needs.
+ */
+describe('CS-R4-01 a new flag while the family already filed 200+ reports of its own', () => {
+  it('lists a newer flag and a newer child report behind 200+ older open parent reports', async () => {
+    const { fam, reportId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    const filler = UNRESOLVED_REPORTS_PAGE_SIZE + 5;
+    // `filler` open parent reports, every one OLDER than the flag — what a guardian reaches in under
+    // seven hours at the 30/hour limit, and what an adult who is the subject of a child's disclosure
+    // can pre-fill on purpose. Timestamps derive from the flag's own row, never from a second clock
+    // (L-027). No note is stored.
+    await api.db.sql`
+      insert into public.safety_reports (family_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, 'parent', 'wrong_or_confusing', 'open',
+             flag.created_at - (n * interval '1 minute')
+        from generate_series(1, ${filler}) as n,
+             (select created_at from public.safety_reports where id = ${reportId}) as flag`;
+    // The child's own report, also newer than the filler rows. A guardian may act on this one too.
+    const [childReport] = await api.db.sql<{ id: string }[]>`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, ${fam.children[0]!.id}, 'child', 'upsetting', 'open',
+             flag.created_at - interval '30 seconds'
+        from (select created_at from public.safety_reports where id = ${reportId}) as flag
+      returning id`;
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    // Before the fix: the 200 oldest unresolved rows were all parent reports, so neither the flag
+    // nor the child's report was in the response at all, and nothing the family could do freed a
+    // slot (PATCH on a parent report is 422 parentActionNotForReport).
+    expect(reports.map((r) => r.id)).toContain(reportId);
+    expect(reports.map((r) => r.id)).toContain(childReport!.id);
+    // The flag is still first: unresolved before resolved, newest first inside that.
+    expect(reports[0]).toMatchObject({ id: reportId, status: 'escalated' });
+    // The family's own pending reports stay bounded on their own branch.
+    const pendingParent = reports.filter(
+      (r) => r.reporterKind === 'parent' && r.status !== 'resolved',
+    );
+    expect(pendingParent).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE);
+
+    // Drain proved through the product's own path, not raw SQL: the guardian acts on both rows they
+    // are meant to act on while all 205 parent reports are still open.
+    for (const id of [reportId, childReport!.id]) {
+      const patched = await api.request(`/v1/safety-reports/${id}`, {
+        method: 'PATCH',
+        token: parent,
+        body: { outcome: 'addressed' },
+      });
+      expect(patched.status).toBe(200);
+    }
+  });
+});
+
+/**
+ * CS-R4-02. The `childFeedback` rows CS-R2-05 added to the 'family_data' export were selected with
+ * no filter on `kind`, so a safety notice's BODY was exported verbatim. That body is
+ * childSafetyMessage(categories, ageBand): a self-harm screen adds the 988 line, an abuse-type
+ * screen adds the Childhelp line and drops the anger line, so the wording says WHICH KIND of
+ * concern was flagged — the one thing the family must never learn (owner decision 2026-09-25),
+ * which the same commit's safetyFlags block claimed the export could not say. The export now
+ * carries the FACT and instant of a notice and its template version, never its wording.
+ */
+describe('CS-R4-02 the family_data export and the child’s safety notice', () => {
+  it('exports that a notice exists, its instant and its template version, never its wording', async () => {
+    const { fam, questionId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    const [notice] = await api.db.sql<{ id: string; body: string; guard_version: string }[]>`
+      select id, body, guard_version from public.child_feedback
+       where question_id = ${questionId} and kind = 'safety'`;
+    // The body really is the distinguishing wording (this is what must not travel).
+    expect(notice!.body).toMatch(/988|1-800-422-4453/);
+
+    const parent = await unlockedParent(fam.ownerId);
+    const requested = await api.request('/v1/exports', {
+      method: 'POST',
+      token: parent,
+      body: { kind: 'family_data' },
+    });
+    expect(requested.status).toBe(202);
+    const uploads = new Map<string, Uint8Array>();
+    await runJobs(deps, {
+      export_build: createExportBuildHandler({
+        upload: (path, bytes) => {
+          uploads.set(path, bytes);
+          return Promise.resolve();
+        },
+      }),
+    });
+    const [row] = await api.db.sql<{ status: string; storage_path: string | null }[]>`
+      select status, storage_path from public.data_exports
+       where family_id = ${fam.familyId} and kind = 'family_data'`;
+    expect(row).toMatchObject({ status: 'ready' });
+    const body = new TextDecoder().decode(uploads.get(row!.storage_path!));
+
+    // Before the fix the exported JSON contained the notice body word for word, and safetyFlags'
+    // feedback_id named which flag each notice belonged to. This is the assertion that carries the
+    // finding.
+    expect(body).not.toContain(notice!.body);
+    // The distinguishing sentences, matched as whole phrases. A bare `not.toContain('988')` here
+    // made this test flaky (it failed about one run in three): the document is full of random v4
+    // UUIDs and millisecond timestamps, and any UUID group containing '988' reddened a run with
+    // nothing leaked. A phrase with spaces, or a number grouped `1-800-...`, cannot occur in a UUID
+    // or an ISO instant, so these match only real wording.
+    for (const phrase of ['call or text 988', '1-800-422-4453']) {
+      expect(body).not.toContain(phrase);
+    }
+    const data = JSON.parse(body) as {
+      childFeedback: {
+        id: string;
+        kind: string;
+        body: string | null;
+        created_at: string;
+        safety_template_version: string | null;
+      }[];
+    };
+    const exported = data.childFeedback.find((f) => f.id === notice!.id)!;
+    // The fact, the instant and the template version stay: the family can see that PencilLift put a
+    // notice on that question and when, which the report list already tells them.
+    expect(exported).toMatchObject({
+      kind: 'safety',
+      body: null,
+      safety_template_version: notice!.guard_version,
+    });
+    expect(typeof exported.created_at).toBe('string');
+    // Scoped to the rows that carry the risk: no safety notice in the export has a body at all, and
+    // none of them carries the hotline wording, whatever else the document happens to contain.
+    const safetyRows = data.childFeedback.filter((f) => f.kind === 'safety');
+    expect(safetyRows.length).toBeGreaterThan(0);
+    expect(safetyRows.every((f) => f.body === null)).toBe(true);
+    // The identifiers and the instant are dropped before the hotline check: a v4 UUID group or a
+    // millisecond timestamp can contain '988' by chance, which reddened this run about once in fifty
+    // while nothing had leaked (measured by the round-4 checker over 20 runs). The assertion itself
+    // is unchanged in strength — every field that could carry wording is still searched.
+    const withoutIds = safetyRows.map(({ id: _id, created_at: _at, ...rest }) => rest);
+    expect(JSON.stringify(withoutIds)).not.toMatch(/988|422-4453/);
+    // The coaching feedback CS-R2-05 added is untouched: only the safety notice loses its wording.
+    expect(data.childFeedback.some((f) => f.kind !== 'safety' && f.body !== null)).toBe(true);
   });
 });

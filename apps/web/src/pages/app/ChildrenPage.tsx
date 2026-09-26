@@ -54,6 +54,25 @@ export function gradeLabel(grade: number): string {
 const GRADES: readonly number[] = Array.from({ length: GRADE_LEVEL_MAX + 1 }, (_, g) => g);
 const AGE_BAND_OPTIONS: readonly AgeBand[] = ageBandSchema.options;
 
+/**
+ * How a child's state is spelled beside their name in another screen's picker (WEBR4-10). Both the
+ * Homework and the learning-planner picker used to spell every non-active child " (no paid slot
+ * yet)", which was written when 'draft' was the only non-active state a portal user could reach.
+ * WEB-R2-03 makes 'archived' reachable in one click, and a requested deletion archives a child too:
+ * for those two there is no slot waiting to be bought, so the sentence was false and unactionable.
+ */
+export function childPickerSuffix(child: { status: string; deletionPending?: boolean }): string {
+  if (child.deletionPending === true) return ' (data deletion under way)';
+  switch (child.status) {
+    case 'active':
+      return '';
+    case 'archived':
+      return ' (archived — history only)';
+    default:
+      return ' (no paid slot yet)';
+  }
+}
+
 /** Status is always spelled out in text, never shown by colour alone. */
 export function childStatusLabel(status: FamilyChild['status']): string {
   switch (status) {
@@ -145,6 +164,16 @@ function ChildrenContent({ data, onChanged }: { data: FamilyOverview; onChanged:
   );
 }
 
+/**
+ * Why activation is not on offer, for a draft and for an archived child alike: this portal never
+ * sells capacity, so the only honest answer is where a slot comes from (WEB-R1-04).
+ */
+function noFreeSlotText(nickname: string, paidSlots: number): string {
+  return paidSlots === 0
+    ? `Your family has no paid child slots yet. To activate ${nickname}, subscribe in the PencilLift app.`
+    : `All ${paidSlots} paid ${paidSlots === 1 ? 'slot is' : 'slots are'} in use. To activate ${nickname}, add a child slot to your plan in the PencilLift app.`;
+}
+
 function ChildCard({
   child,
   unusedSlots,
@@ -170,6 +199,12 @@ function ChildCard({
 
   // Spec P11 / AC_CAPACITY_03: an unused paid slot is assigned without buying again. The server
   // re-checks the slot count, consent and a recent PIN unlock; this never purchases anything.
+  //
+  // WEBR4-01: this also brings an ARCHIVED child back. POST /children/:childId/activate assigns a
+  // free slot and clears archived_at for any profile that is not already active, but no client
+  // offered it outside the draft branch, so the archive confirmation's promise ("You can activate
+  // them again later while a paid slot is free") could not be kept and an archived child's devices
+  // stayed signed out for good.
   const activate = async () => {
     setLastAction('activate');
     const ok = await run('activate', async () => {
@@ -212,8 +247,14 @@ function ChildCard({
       );
       return `${child.nickname} is archived. Their history stays available and ${result.assignedSlots} of ${result.paidSlots} paid slots are now in use. ${result.note}`;
     });
-    setConfirmArchive(false);
-    if (ok) onChanged();
+    // WEBR4-12: only a successful archive closes the confirmation. Closing it unconditionally left a
+    // STEP_UP_REQUIRED refusal showing the inline PIN prompt's "Press the same button again to
+    // continue" beside no such button, so the parent had to rediscover Archive → confirm.
+    // `saveProfile` below already worked this way.
+    if (ok) {
+      setConfirmArchive(false);
+      onChanged();
+    }
   };
 
   // WEB-R2-03: the grade drives practice generation, so without this a family stayed on last year's
@@ -260,10 +301,16 @@ function ChildCard({
         // API-AUTH-R2-02: the child stays listed while a deletion is requested or processing, so a
         // parent can still see who it covers, but the server refuses activation, pairing and edits
         // for it, so no control is offered here either.
+        // WEBR4-02: this used to say "Cancel the request on the privacy page if you did not mean
+        // it". There is no cancel: /v1/privacy exposes only POST and GET /deletion, nothing sets
+        // deletion_requests.status = 'cancelled', and the privacy page itself says the deletion
+        // can't be undone. The notice now says what is true and where a mistake is actually handled.
         <p className="notice" style={{ margin: '4px 0' }}>
           <strong>Data deletion under way.</strong> You asked for {child.nickname}’s data to be
-          deleted, so nothing can be changed, paired or activated for them. Cancel the request on
-          the <Link to="/app/privacy">privacy page</Link> if you did not mean it.
+          deleted. Processing has already stopped, so nothing can be changed, paired or activated
+          for them, and they stay listed here until the deletion finishes. You can follow it on the{' '}
+          <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the app: if you
+          did not mean it, <Link to="/app/support">contact support</Link> straight away.
         </p>
       ) : child.status === 'active' ? (
         <div style={buttonRow}>
@@ -294,11 +341,34 @@ function ChildCard({
               </button>
             </div>
           ) : (
-            <p style={{ margin: '4px 0' }}>
-              {paidSlots === 0
-                ? `Your family has no paid child slots yet. To activate ${child.nickname}, subscribe in the PencilLift app.`
-                : `All ${paidSlots} paid ${paidSlots === 1 ? 'slot is' : 'slots are'} in use. To activate ${child.nickname}, add a child slot to your plan in the PencilLift app.`}
-            </p>
+            <p style={{ margin: '4px 0' }}>{noFreeSlotText(child.nickname, paidSlots)}</p>
+          )}
+        </>
+      ) : child.status === 'archived' ? (
+        // WEBR4-01: an archived child is not a dead end. The archive confirmation promises "You can
+        // activate them again later while a paid slot is free", and POST /children/:id/activate does
+        // exactly that for an archived profile, but no surface called it, so a family that archived a
+        // child lost their access (the archive signs their devices out) with no way back in product.
+        <>
+          <p style={{ margin: '4px 0' }}>
+            {child.nickname}’s homework, practice, points and rewards are all kept and stay
+            readable. Activating {child.nickname} again assigns one of your unused paid slots, with
+            no new purchase, and lets you pair a device.
+          </p>
+          {unusedSlots > 0 ? (
+            <div style={buttonRow}>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy !== null}
+                aria-label={`Activate ${child.nickname} again with an unused paid slot`}
+                onClick={() => void activate()}
+              >
+                {busy === 'activate' ? 'Activating…' : `Activate ${child.nickname} again`}
+              </button>
+            </div>
+          ) : (
+            <p style={{ margin: '4px 0' }}>{noFreeSlotText(child.nickname, paidSlots)}</p>
           )}
         </>
       ) : null}
@@ -321,7 +391,14 @@ function ChildCard({
             disabled={busy !== null}
             onClick={() => setConfirmArchive(true)}
           >
-            Archive (keeps history, frees the slot)
+            {/*
+              WEBR4-12: the label was unconditionally "…, frees the slot", but this row is rendered
+              for a draft child too, and a draft holds no slot (slotSummary returns unchanged counts
+              after archiving one). The confirmation body below already branched on the status.
+            */}
+            {child.status === 'active'
+              ? 'Archive (keeps history, frees the slot)'
+              : 'Archive (keeps history)'}
           </button>
         </div>
       )}
@@ -392,6 +469,13 @@ function ChildCard({
  * Correcting one child's nickname, grade and age band (WEB-R2-03). Only the fields the parent
  * changed are sent, so a concurrent edit by the other guardian is not overwritten wholesale. The
  * server re-checks the recent PIN unlock, the contract bounds and the archived rule.
+ *
+ * WEBR4-03: the body used to carry all three fields every time, which made that promise false —
+ * guardian A opening this form while the child was in grade 3, guardian B saving grade 4, then A
+ * correcting only the nickname put the grade back to 3 with no warning, and the grade is what
+ * practice generation is pitched at. The diff below is against the props the form was seeded with,
+ * and the submit button stays disabled while the diff is empty (the contract's refine rejects an
+ * empty body anyway).
  */
 function EditChildForm({
   child,
@@ -411,6 +495,14 @@ function EditChildForm({
   const bandId = useId();
   const errorId = useId();
 
+  /** Only what differs from the profile this form was opened on (WEBR4-03). */
+  const changes = (name: string): UpdateChildProfileRequest => ({
+    ...(name === child.nickname ? {} : { nickname: name }),
+    ...(Number(grade) === child.gradeLevel ? {} : { gradeLevel: Number(grade) }),
+    ...(ageBand === child.ageBand ? {} : { ageBand }),
+  });
+  const nothingChanged = Object.keys(changes(nickname.trim())).length === 0;
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const name = nickname.trim();
@@ -419,11 +511,8 @@ function EditChildForm({
       return;
     }
     setFieldError(null);
-    const body: UpdateChildProfileRequest = {
-      nickname: name,
-      gradeLevel: Number(grade),
-      ageBand,
-    };
+    const body = changes(name);
+    if (Object.keys(body).length === 0) return;
     await onSave(body);
   };
 
@@ -466,7 +555,7 @@ function EditChildForm({
         New practice is built for the grade saved here, so update it when the school year changes.
       </p>
       <div style={buttonRow}>
-        <button type="submit" className="btn" disabled={busy}>
+        <button type="submit" className="btn" disabled={busy || nothingChanged}>
           {busy ? 'Saving…' : `Save ${child.nickname}’s details`}
         </button>
       </div>

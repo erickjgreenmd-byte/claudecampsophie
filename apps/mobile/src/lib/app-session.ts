@@ -7,6 +7,7 @@ import { registerPrivacyTokenSources } from '../privacy/session.ts';
 import { registerRewardsTokenSources } from '../rewards/session.ts';
 import {
   currentMode,
+  forgetParentUnlock,
   lockParentAreaOnDevice,
   storePurchaseInFlight,
   type AppMode,
@@ -59,6 +60,12 @@ export function initAppSession(): () => void {
     registerRewardsTokenSources({ parent: gated });
     registerPrivacyTokenSources({ parent: gated });
     if (!signedIn) {
+      // The client-side unlock belongs to the session that earned it (MOB-R4-LOCK-04). A session
+      // that ends elsewhere (portal "sign out everywhere", a password change) used to leave the
+      // grant running for the rest of its window, so the next parent to sign in on this device
+      // reached the parent screens with no fresh PIN unlock, and a screen still mounted as 'ready'
+      // kept the previous parent's data on show.
+      forgetParentUnlock();
       clearAdultCaches();
       // The store SDK must stop acting for the signed-out family (RV-billing-7).
       void forgetStoreIdentity().catch(() => undefined);
@@ -74,7 +81,9 @@ export function initAppSession(): () => void {
     void readMode().then(async (mode) => {
       if (mode !== 'parent') return;
       // The whole lock, not only the server relock: the open parent screen and its data go too.
-      await lockParentAreaOnDevice(modeEffects);
+      // On a paired family tablet this also returns the device to the child's space
+      // (MOB-R4-LOCK-01), so backgrounding cannot strand a child on the PIN screen.
+      await lockParentAreaOnDevice(secureStorage, modeEffects);
     });
   });
 

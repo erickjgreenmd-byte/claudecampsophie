@@ -82,6 +82,20 @@ const TICK_CLAIM_BUDGET_MS = 10 * 60_000;
  */
 const TICK_WALL_LIMIT_MS = 15 * 60_000;
 /**
+ * Wall time the ledger leaves to the steps that run AFTER it (R4-JOBS-4).
+ *
+ * Decision: a RESERVED SLICE, not a re-ordering. The entitlement sweep must stay behind the ledger —
+ * the work a family is waiting on (a scan, a safety email, an export) comes first, and a store that
+ * answers slowly must delay only itself (JOBS-R2-04) — but the claim arithmetic gave it nothing: a
+ * scan (7-minute worst case) could be claimed at minute 8 of a 15-minute invocation and run to the
+ * wall, so `entitlementsReconciled` was 0 on every tick with a deep scan queue and a family whose
+ * subscription lapsed without a webhook kept paid AI until a lighter tick happened to sweep. Two
+ * minutes is enough for the sweep to reconcile several families per tick (each request is bounded by
+ * BILLING_REQUEST_TIMEOUT_MS and one failure never stops it), and entitlement staleness is measured
+ * in days, so the slice does not have to fit all 25 families.
+ */
+const TICK_TRAILING_RESERVE_MS = 2 * 60_000;
+/**
  * The worst case, in wall time, a job of this kind may need. A job is not claimed unless that much
  * of the invocation is left, so a kill mid-run (which spends an attempt and leaves the job invisible
  * until its 20-minute lease expires) is not how a long job usually ends. A scan is the longest:
@@ -720,8 +734,9 @@ export async function runJobs(
   for (let n = 0; n < limit; n += 1) {
     const elapsed = deps.clock().getTime() - tickStart.getTime();
     if (elapsed > TICK_CLAIM_BUDGET_MS) break;
-    // Only kinds whose worst case still fits the rest of the invocation (JOBS-R2-07).
-    const remaining = TICK_WALL_LIMIT_MS - elapsed;
+    // Only kinds whose worst case still fits the rest of the invocation (JOBS-R2-07), keeping the
+    // trailing steps their reserved slice of it (R4-JOBS-4).
+    const remaining = TICK_WALL_LIMIT_MS - TICK_TRAILING_RESERVE_MS - elapsed;
     const claimable = kinds.filter(
       (kind) => (JOB_WORST_CASE_MS[kind] ?? DEFAULT_JOB_WORST_CASE_MS) <= remaining,
     );
@@ -1299,7 +1314,9 @@ export async function runScheduledTick(
   // BILLING_REQUEST_TIMEOUT_MS, but the sweep makes up to 25 of them one after another, and the work
   // a family is actually waiting on — a scan, a safety email, an export — is in the ledger. A store
   // that answers slowly now delays only itself; entitlement staleness is measured in days, so a sweep
-  // that misses the end of a tick loses nothing.
+  // that misses the end of a tick loses nothing. It is not starvable either: the ledger stops
+  // claiming TICK_TRAILING_RESERVE_MS before the invocation limit, so this step always gets a slice
+  // (R4-JOBS-4).
   const entitlementsReconciled = await step('entitlements', 0, () =>
     reconcileStaleEntitlements(deps),
   );

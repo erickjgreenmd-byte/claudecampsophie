@@ -10,6 +10,7 @@ import { SubjectsSection } from '../../components/learning/SubjectsSection.tsx';
 import { TestDatesSection } from '../../components/learning/TestDatesSection.tsx';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
 import { RequireParent, useApiQuery } from '../../lib/session.tsx';
+import { childPickerSuffix } from './ChildrenPage.tsx';
 
 /**
  * Parent learning planner (spec P7, P8, P10, P14 "learning trends, practice/review planner";
@@ -76,7 +77,7 @@ function LearningPlanner() {
             {children.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.nickname}
-                {c.status === 'active' ? '' : ' (no paid slot yet)'}
+                {childPickerSuffix(c)}
               </option>
             ))}
           </select>
@@ -113,7 +114,21 @@ function ChildPlanner({ child, zone }: { child: PlannerChild; zone: string }) {
   return (
     <div aria-label={`Learning plan for ${child.nickname}`} role="region">
       <h2 style={{ marginTop: 24 }}>{child.nickname}</h2>
-      {child.status === 'active' ? null : (
+      {/*
+        WEBR4-10: an archived child has no slot waiting to be bought — the profile is history only —
+        so "doesn't have a paid slot yet … see Subscription" was both false and unactionable for it.
+        A draft still gets that copy, because a draft really is waiting for a slot.
+      */}
+      {child.status === 'active' ? null : child.status === 'archived' ? (
+        <p className="notice">
+          {child.nickname}’s profile is archived, so no new practice is prepared and nothing here is
+          released to them. What was planned and practised stays readable.{' '}
+          <Link to="/app/children">
+            Activate {child.nickname} again on the Children page while a paid slot is free
+          </Link>
+          .
+        </p>
+      ) : (
         <p className="notice">
           {child.nickname} doesn’t have a paid slot yet, so no practice is prepared. You can still
           set things up; see <Link to="/app/subscription">Subscription</Link>.

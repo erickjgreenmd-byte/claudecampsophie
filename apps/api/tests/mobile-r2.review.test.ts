@@ -202,3 +202,106 @@ describe('a device that signs itself out stops being listed as connected (API-AU
     expect(refreshed.status).toBe(401);
   });
 });
+
+/** Every audit action recorded for this family, newest last. */
+async function auditActions(familyId: string): Promise<string[]> {
+  const rows = await api.db.sql<{ action: string }[]>`
+    select action from public.audit_events where family_id = ${familyId} order by created_at`;
+  return rows.map((r) => r.action);
+}
+
+const refresh = (refreshToken: string) =>
+  api.request('/v1/child/refresh', { method: 'POST', body: { refreshToken } });
+
+/** The session of the one device this test paired (seedFamily seeds its own 'Test tablet' too). */
+async function sessionRow(
+  familyId: string,
+  label: string,
+): Promise<{ revoked_at: Date | null; revoke_reason: string | null }> {
+  const [row] = await api.db.sql<{ revoked_at: Date | null; revoke_reason: string | null }[]>`
+    select s.revoked_at, s.revoke_reason from public.child_sessions s
+      join public.child_devices d on d.id = s.device_id
+     where s.family_id = ${familyId} and d.label = ${label}`;
+  return row!;
+}
+
+/**
+ * HUNT4-MOB-1 — OPEN, not fixed here; these cases pin the behaviour the attempted fix removed.
+ *
+ * The finding is real: POST /v1/child/refresh commits the rotation before the response goes out, so a
+ * response lost on the way back (the client's own 20s timeout, a wifi/cellular switch, a Worker
+ * evicted after commit) leaves the tablet holding a token the server has marked used. Presenting it
+ * again is read as theft, the session is revoked, and the client unpairs — a parent has to mint a new
+ * pairing code over one dropped HTTP response. But the only remedy on this side is to serve some
+ * re-presentations of a rotated token, and the server cannot tell the tablet from a replayer: a 60s
+ * grace (tried and withdrawn in this round) hands whoever replays the older token a live child access
+ * token with no audit event, and retires the rightful holder's unclaimed replacement, so the real
+ * tablet is the one that gets kicked. It also contradicts tests/auth.test.ts:189 ("refresh tokens
+ * rotate and reuse revokes the session"), which requires an immediate replay to revoke, and
+ * docs/Threat_Model.md T20. Weakening either is a lead decision, so reuse stays immediate revocation
+ * and this case keeps it that way.
+ *
+ * So this case is a PIN, not a repro: it passes against src/routes/child-auth.ts unchanged, and no
+ * failing-test-first for HUNT4-MOB-1 exists, because nothing about the reuse gate was changed. If the
+ * lead does accept a bounded "the response never arrived" grace, this case is the one to update (age
+ * the rotation first: update private.child_refresh_tokens set used_at = used_at - interval '5 minutes'
+ * for this family, then replay, and keep the 401 + audit + revoke_reason assertions), never to delete
+ * — an immediate replay would then be served, but a replay outside the window must still be theft.
+ */
+describe('reuse of a rotated refresh token revokes the session at once (HUNT4-MOB-1 open)', () => {
+  it('an immediate replay is revoked and audited, and the rotated replacement dies with it', async () => {
+    const device = await pairedDevice('Replay tablet');
+    const rotated = await json<{ refreshToken: string }>(await refresh(device.refreshToken));
+
+    expect((await refresh(device.refreshToken)).status).toBe(401);
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+    expect((await sessionRow(device.fam.familyId, 'Replay tablet')).revoke_reason).toBe(
+      'refresh_token_reuse',
+    );
+    // No grace window: the token the rotation issued stops working too, however new it is.
+    expect((await refresh(rotated.refreshToken)).status).toBe(401);
+  });
+});
+
+/**
+ * HUNT4-MOB-4. The parent's device list derives "Connected" from child_devices.revoked_at alone
+ * (GET /v1/devices, apps/mobile/src/family/family-view.ts). Round 3 stamped that column in the
+ * logout handler only, so a session that ended any other way left the tablet listed as Connected for
+ * good, with a live "Disconnect" button, while the child was being told to ask a grown-up to connect
+ * the device again. The two remaining paths are the refresh-token-reuse revocation and plain expiry.
+ */
+describe('a session that ends any other way stops being listed as connected (HUNT4-MOB-4)', () => {
+  it('[repro] the refresh-token-reuse revocation stamps the device', async () => {
+    const device = await pairedDevice('Reuse tablet');
+    expect((await refresh(device.refreshToken)).status).toBe(200);
+    // The same token again: theft, so the session is revoked (see the HUNT4-MOB-1 note above).
+    expect((await refresh(device.refreshToken)).status).toBe(401);
+    const after = await devices(device.parentToken, 'Reuse tablet');
+    expect(after).toHaveLength(1);
+    expect(after[0]!.revokedAt).not.toBeNull();
+  });
+
+  it('[repro] a session that simply expired stamps the device on the next refresh', async () => {
+    const device = await pairedDevice('Expired tablet');
+    await api.db.sql`
+      update public.child_sessions s set expires_at = now() - interval '1 day'
+       where s.family_id = ${device.fam.familyId}
+         and exists (select 1 from public.child_devices d
+                      where d.id = s.device_id and d.label = 'Expired tablet')`;
+    expect((await refresh(device.refreshToken)).status).toBe(401);
+    const after = await devices(device.parentToken, 'Expired tablet');
+    expect(after[0]!.revokedAt).not.toBeNull();
+  });
+
+  it('a device that still has a live session stays connected', async () => {
+    const device = await pairedDevice('Shared reuse tablet');
+    const [deviceRow] = await devices(device.parentToken, 'Shared reuse tablet');
+    await api.db.sql`
+      insert into public.child_sessions (family_id, child_id, device_id, created_at, expires_at)
+      values (${device.fam.familyId}, ${device.childId}, ${deviceRow!.id}, ${FIXED_NOW},
+              ${new Date(FIXED_NOW.getTime() + 7 * 24 * 3600 * 1000)})`;
+    expect((await refresh(device.refreshToken)).status).toBe(200);
+    expect((await refresh(device.refreshToken)).status).toBe(401);
+    expect((await devices(device.parentToken, 'Shared reuse tablet'))[0]!.revokedAt).toBeNull();
+  });
+});

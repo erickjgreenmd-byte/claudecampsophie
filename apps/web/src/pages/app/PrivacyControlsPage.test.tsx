@@ -743,11 +743,19 @@ describe('PrivacyControlsPage', () => {
     expect(text(section)).toMatch(
       /pencillift also adds a report here[^.]*flags one of your child’s answers/i,
     );
-    // Owner decision (2026-09-25): no flag is held from this list, every flag is emailed to the
-    // guardians (each row says whether that email was sent), and the parent addresses it. The
-    // page no longer speaks of held flags, and still does not promise a staffed review of every
-    // flag (triage targets and the reviewer are not approved yet, Owner action #24).
-    expect(text(section)).toMatch(/emails the guardians on this account/i);
+    // Owner decision (2026-09-25): no flag is held from this list, every flag is emailed to a
+    // verified guardian address (each row says whether that email was sent), and the parent
+    // addresses it. The page no longer speaks of held flags, and still does not promise a staffed
+    // review of every flag (triage targets and the reviewer are not approved yet, Owner action #24).
+    //
+    // WEBR4-07: the previous assertion here pinned "emails the guardians on this account", the exact
+    // overclaim CS-R2-06 removed from PARENT_SAFETY_FLAG_COPY.emailSent and that
+    // apps/api/tests/jobs-r2.review.test.ts:467 asserts the contract copy must NOT make. The job
+    // emails only VERIFIED addresses (jobs/dispatcher.ts) and records `sent` as soon as one accepts,
+    // so an unverified co-guardian, or one whose address bounced, read on this page that they had
+    // been emailed. The assertion was wrong, not the product; the intro must not claim it either.
+    expect(text(section)).not.toMatch(/emails the guardians on this account/i);
+    expect(text(section)).toMatch(/verified/i);
     expect(text(section)).toMatch(/says whether that email was sent/i);
     expect(text(section)).not.toMatch(/kept off this list|reviewer releases/i);
     expect(text(section)).not.toMatch(/sends no automatic alert/i);
@@ -953,6 +961,35 @@ describe('PrivacyControlsPage', () => {
     expect(await screen.findByText('deletion page: closed')).toBeTruthy();
     expect(count()).toBe(1);
     expect(sends).toEqual([{ method: 'POST', path: '/v1/account/close', body: { confirm: true } }]);
+  });
+
+  /**
+   * Lead follow-up to WEB-R4-AUTH-2 (round 4): a sign-out the auth server refuses now rejects
+   * instead of reporting success. This handler awaited it bare, so a refused sign-out swallowed the
+   * navigation and left the parent on a page that needs a signed-in parent — with their account
+   * already closed on the server. The close is done by then, so the page moves on either way.
+   */
+  it('lands on the public page even when the device sign-out is refused', async () => {
+    let attempted = 0;
+    const auth: AuthAdapter = {
+      configured: true,
+      currentSession: () =>
+        Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
+      signOut: () => {
+        attempted += 1;
+        return Promise.reject(new Error('auth server refused the sign-out'));
+      },
+    };
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close' ? { status: 'closed', signOut: true } : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('deletion page: closed')).toBeTruthy();
+    expect(attempted).toBe(1);
   });
 
   it('a family owner is told to delete the family account first (409 rule), and nothing signs out', async () => {

@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { isValidIanaZone } from '@pencillift/domain';
 import {
+  CHILD_PROFILE_RULES,
   createChildProfileRequestSchema,
   createFamilyRequestSchema,
   updateChildProfileRequestSchema,
@@ -15,7 +16,7 @@ import { ApiError, businessRule } from '../errors.ts';
 import { consentAllowsChildAccess, hasVerifiedConsent } from '../services/consent.ts';
 import { assertRecentUnlock, currentFamilyId, requireParent } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
-import { enforceRateLimit, RATE_RULES } from '../middleware/rate-limit.ts';
+import { enforceRateLimit, RATE_RULES, type RateRule } from '../middleware/rate-limit.ts';
 import { toHex } from '../security/crypto.ts';
 
 /**
@@ -24,6 +25,55 @@ import { toHex } from '../security/crypto.ts';
  * product limit (archiving keeps history and frees room, spec P11).
  */
 export const CHILD_PROFILE_LIMIT = 12;
+
+/**
+ * Profile edits per family (FL-R4-03). Local to this vertical, as privacy.ts keeps its own rules,
+ * because the shared table in rate-limit.ts is not this area's to change; move it there when that
+ * file is next edited.
+ *
+ * Every other parent write here reserves a per-family bound before doing work (POST /children,
+ * POST /children/:id/pairing-code), and the spec asks every endpoint for a limit. The two PATCH
+ * edits had none and app.ts installs no global per-user limiter, so one stuck client could append
+ * audit_events rows without end — nothing prunes that table — and each call takes the family row
+ * FOR UPDATE, serialising the family's other writes behind it. One bucket covers both edits: a
+ * family fixing a name, a time zone and a grade makes a handful of these an hour, so thirty is well
+ * above real use and far below a stuck button.
+ */
+const PROFILE_UPDATE_PER_FAMILY: RateRule = { limit: 30, windowSeconds: 3600 };
+
+/**
+ * Takes the family row's write lock: the FIRST lock of every family write, and the whole of the
+ * canonical lock order for these rows (FL-R4-02) —
+ *
+ *     public.families  →  public.child_profiles  →  any child-scoped row
+ *
+ * POST /children, PATCH /children/:childId, activate and archive already ordered their locks this
+ * way. POST /children/:childId/pairing-code did the reverse: it took the child row first (BUG-106,
+ * L-021: a code row must never be locked before the child row) and the family row only implicitly
+ * afterwards, through the `private.child_pairing_codes` FK, which takes FOR KEY SHARE on
+ * `public.families` — and FOR UPDATE blocks that. The two orders were an ABBA cycle, so Postgres
+ * killed one side with 40P01 and app.ts answered it 503 ("The service is busy"); in the repro the
+ * victim was the parent's profile edit, activation or archive. Routing every family write through
+ * this helper first keeps BUG-106's invariant and removes the cycle.
+ *
+ * `mode` is the lock's STRENGTH, never its position. The pairing-code route asks for
+ * `no-key-update`, which still conflicts with the other writes' `for update` (so they serialise and
+ * the cycle is gone) but is compatible with the FOR KEY SHARE an FK insert takes on this row — so it
+ * does not block the child pairing REDEMPTION path (child-auth.ts POST /pair), which claims the code
+ * row first and reaches `families` only through its inserts' FKs. Taking `for update` here instead
+ * would trade the old cycle for that new one.
+ */
+async function lockFamily(
+  tx: Tx,
+  familyId: string,
+  mode: 'update' | 'no-key-update' = 'update',
+): Promise<void> {
+  if (mode === 'no-key-update') {
+    await tx`select 1 from public.families where id = ${familyId} for no key update`;
+    return;
+  }
+  await tx`select 1 from public.families where id = ${familyId} for update`;
+}
 
 /**
  * A child of the caller's family that is still visible, i.e. has no data deletion under way
@@ -35,7 +85,9 @@ export const CHILD_PROFILE_LIMIT = 12;
  * purge then removed the profile and everything added since, without warning.
  *
  * Returns undefined for an unknown id, another family's child and a child under deletion alike, so
- * a caller learns nothing from the difference (NOT_FOUND on every one).
+ * a caller learns nothing from the difference (NOT_FOUND on every one). That is the gate for
+ * ACTIVATION and PAIRING; the profile edit refuses the same child through childForEdit() with a
+ * named rule instead, because GET /v1/family has already named it to that caller (FL-R4-04).
  */
 async function visibleChild(
   tx: Tx,
@@ -52,11 +104,47 @@ async function visibleChild(
       -- request_deletion), so the join covers that scope the way ownedChild's does.
       join public.families f on f.id = c.family_id and f.deleted_at is null
      where c.id = ${childId} and c.family_id = ${familyId}
+       -- MOB-R4-LOCK-06: the same predicate childForEdit and GET /v1/family use for the
+       -- deletionPending flag, so every child route and both clients agree about which children a
+       -- pending deletion covers. The family scope is included even though its tombstone normally
+       -- makes it unreachable here: the four routes must not drift apart again.
        and not exists (
          select 1 from public.deletion_requests d
-          where d.family_id = c.family_id and d.target_child_id = c.id
+          where d.family_id = c.family_id
+            and (d.scope = 'family' or d.target_child_id = c.id)
             and d.status in ('requested', 'processing'))`;
   return row;
+}
+
+/**
+ * A child of the caller's own family for a PROFILE EDIT, with an open deletion told apart from an
+ * unknown id (FL-R4-04).
+ *
+ * visibleChild() folds the two together on purpose, so activation and pairing leak nothing through
+ * the difference. That reasoning does not carry to the edit of the caller's own child: the same
+ * round deliberately keeps a deletion-pending child in GET /v1/family and flags it
+ * (`deletionPending`), so the response has already named this child to this exact caller. A 404
+ * there protected nothing and only claimed a profile the parent can still see does not exist —
+ * while the adjacent archived case gets a truthful 422. An unknown id, another family's child and a
+ * tombstoned family (a whole-family deletion, whose membership is revoked in the same transaction
+ * anyway) all stay NOT_FOUND, so nothing new is enumerable.
+ */
+async function childForEdit(
+  tx: Tx,
+  familyId: string,
+  childId: string,
+): Promise<{ status: string; deletionPending: boolean } | undefined> {
+  const [row] = await tx<{ status: string; deletion_pending: boolean }[]>`
+    select c.status,
+           exists (
+             select 1 from public.deletion_requests d
+              where d.family_id = c.family_id
+                and (d.scope = 'family' or d.target_child_id = c.id)
+                and d.status in ('requested', 'processing')) as deletion_pending
+      from public.child_profiles c
+      join public.families f on f.id = c.family_id and f.deleted_at is null
+     where c.id = ${childId} and c.family_id = ${familyId}`;
+  return row ? { status: row.status, deletionPending: row.deletion_pending } : undefined;
 }
 
 /** Family, child profile and device management for signed-in parents. */
@@ -114,10 +202,12 @@ export function familyRoutes(): Hono<AppEnv> {
                -- screens: they resolve a nickname out of it for the pending-deletion list, that
                -- child's export rows and any safety report about it, so a family with two children
                -- could no longer tell which child a still-cancellable request covered. The rules
-               -- that matter are enforced where they act: activation, pairing and profile edits go
-               -- through visibleChild() and answer NOT_FOUND, with migration 0860's trigger as the
-               -- database backstop. The flag lets the parent screens label the row and offer no
-               -- control on it.
+               -- that matter are enforced where they act: activation and pairing go through
+               -- visibleChild() and answer NOT_FOUND, the profile edit answers BUSINESS_RULE
+               -- CHILD_DELETION_PENDING (FL-R4-04: this very row has named the child to the caller,
+               -- so denying it exists there misled instead of protecting), with migration 0860's
+               -- trigger as the database backstop. The flag lets the parent screens label the row
+               -- and offer no control on it.
                exists (
                  select 1 from public.deletion_requests d
                   where d.family_id = c.family_id
@@ -159,6 +249,14 @@ export function familyRoutes(): Hono<AppEnv> {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
+    // Per-family bound, as every other parent write in this file has (FL-R4-03). One bucket is
+    // shared with PATCH /children/:childId: both append an audit row and lock the family row.
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `profile-update:${familyId}`,
+      PROFILE_UPDATE_PER_FAMILY,
+      deps.clock(),
+    );
     const body = await readJson(c, updateFamilyRequestSchema);
     // The database check (families_timezone_iana, migration 0720) is the guarantee; this gives the
     // parent a field-level message instead of a constraint violation.
@@ -198,7 +296,7 @@ export function familyRoutes(): Hono<AppEnv> {
     const body = await readJson(c, createChildProfileRequestSchema);
     const row = await deps.db.asService(async (tx) => {
       // Serialize with other profile changes for this family so the cap holds under a race.
-      await tx`select 1 from public.families where id = ${familyId} for update`;
+      await lockFamily(tx, familyId);
       const [count] = await tx<{ n: number }[]>`
         select count(*)::int as n from public.child_profiles
          where family_id = ${familyId} and status <> 'archived'`;
@@ -222,8 +320,9 @@ export function familyRoutes(): Hono<AppEnv> {
    * Correcting a child's nickname, grade and age band (WEB-R2-03). The grade is what practice
    * generation is pitched at (bankGrade/bankCoverage), so with no edit route every family stayed on
    * last year's grade once the school year rolled over, and the only workaround was deleting the
-   * child's whole history. Step-up guarded and audited; an archived profile stays history-only
-   * (spec P11), and a child under a data deletion is invisible (API-AUTH-R2-02).
+   * child's whole history. Step-up guarded, rate limited and audited; an archived profile stays
+   * history-only (spec P11), and a child under a data deletion is refused with a named rule rather
+   * than a NOT_FOUND (API-AUTH-R2-02 as amended by FL-R4-04: see childForEdit).
    */
   r.patch('/children/:childId', async (c) => {
     const { deps, parent } = c.var;
@@ -231,17 +330,31 @@ export function familyRoutes(): Hono<AppEnv> {
     if (!childId.success) throw new ApiError('NOT_FOUND', 'Child not found');
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
+    await enforceRateLimit(
+      deps.rateLimiter,
+      `profile-update:${familyId}`,
+      PROFILE_UPDATE_PER_FAMILY,
+      deps.clock(),
+    );
     const body = await readJson(c, updateChildProfileRequestSchema);
     const row = await deps.db.asService(async (tx) => {
       // Serialize with the family's other profile changes so a concurrent archive or activation
-      // cannot land between the check below and the update.
-      await tx`select 1 from public.families where id = ${familyId} for update`;
+      // cannot land between the check below and the update (canonical order: see lockFamily).
+      await lockFamily(tx, familyId);
       // Service role bypasses RLS, so ownership is checked explicitly (spec E4).
-      const child = await visibleChild(tx, familyId, childId.data);
+      const child = await childForEdit(tx, familyId, childId.data);
       if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
+      // Checked before the archived case: a deletion request archives the child as it files, so
+      // both are true and the deletion is the reason that matters to the parent (FL-R4-04).
+      if (child.deletionPending) {
+        throw businessRule(
+          CHILD_PROFILE_RULES.deletionPending,
+          'This child’s data is being deleted, so the profile can no longer be changed.',
+        );
+      }
       if (child.status === 'archived') {
         throw businessRule(
-          'CHILD_ARCHIVED',
+          CHILD_PROFILE_RULES.archived,
           'This child’s profile is archived. Its history stays available, but nothing can be changed unless the profile is active again.',
         );
       }
@@ -314,8 +427,13 @@ export function familyRoutes(): Hono<AppEnv> {
     const hashHex = toHex(await pairingCodeHash(deps.config.hashPepper, code));
     const expiresAt = new Date(now.getTime() + deps.config.pairingCodeTtlSeconds * 1000);
     await deps.db.asService(async (tx) => {
-      // Child row first, as the insert trigger (0720) does: a code row locked before the child row
-      // deadlocks with an overlapping request (BUG-106).
+      // Family row first (FL-R4-02): the insert below takes FOR KEY SHARE on this row through the
+      // code table's family FK, which the other family writes' FOR UPDATE blocks, so taking it here
+      // is what keeps this route out of an ABBA cycle with them. FOR NO KEY UPDATE, so the redeem
+      // path's own FK locks are not blocked in turn — see lockFamily.
+      await lockFamily(tx, familyId, 'no-key-update');
+      // Then the child row, as the insert trigger (0720) does: a code row locked before the child
+      // row deadlocks with an overlapping request (BUG-106).
       await tx`select 1 from public.child_profiles where id = ${childId.data} for no key update`;
       // One live code per child: older unused codes stop working.
       await tx`update private.child_pairing_codes set consumed_at = ${now} where child_id = ${childId.data} and consumed_at is null`;
@@ -341,7 +459,7 @@ export function familyRoutes(): Hono<AppEnv> {
     const allowTestProvider = acceptsTestProviderConsent(deps.config.environment);
     const result = await deps.db.asService(async (tx) => {
       // Serialize with other slot changes for this family (two guardians, two devices).
-      await tx`select 1 from public.families where id = ${familyId} for update`;
+      await lockFamily(tx, familyId);
       // Service role bypasses RLS, so ownership is checked explicitly (spec E4). A child whose data
       // deletion is `requested` or `processing` is NOT_FOUND, never re-activated (API-AUTH-R2-02):
       // spec P4 stops processing at the request, and the purge would later remove the re-activated
@@ -385,13 +503,19 @@ export function familyRoutes(): Hono<AppEnv> {
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
     const result = await deps.db.asService(async (tx) => {
-      await tx`select 1 from public.families where id = ${familyId} for update`;
-      const [child] = await tx<{ status: string }[]>`
-        select status from public.child_profiles where id = ${childId.data} and family_id = ${familyId}`;
+      await lockFamily(tx, familyId);
+      // MOB-R4-LOCK-06: archiving goes through the same visibility rule as activate, pairing-code
+      // and PATCH. It checked nothing before, so a client that hid Archive on a deletion-pending
+      // child (both of ours do) was refusing what the API would have accepted.
+      const child = await visibleChild(tx, familyId, childId.data);
       if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
+      // The slot release is OUTSIDE the status guard (FL-R4-01), so it also reconciles an
+      // already-archived child that still holds an open assignment — the state a deletion request
+      // used to leave behind, and the state a crash between these statements can leave. A no-op
+      // when the slot was released with the archive, so the route stays idempotent either way.
+      await tx`update public.child_slot_assignments set released_at = now(), release_reason = 'archived'
+                where family_id = ${familyId} and child_id = ${childId.data} and released_at is null`;
       if (child.status !== 'archived') {
-        await tx`update public.child_slot_assignments set released_at = now(), release_reason = 'archived'
-                  where family_id = ${familyId} and child_id = ${childId.data} and released_at is null`;
         await tx`update public.child_profiles set status = 'archived', archived_at = now()
                   where id = ${childId.data} and family_id = ${familyId}`;
         await tx`update public.child_sessions set revoked_at = now(), revoke_reason = 'child_archived'

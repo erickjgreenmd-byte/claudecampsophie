@@ -2345,6 +2345,29 @@ describe('a scan paused at the spend ceiling (JOBS-R2-06)', () => {
     expect(reads).toEqual({ n: 0, bytes: 0 });
   });
 
+  /**
+   * R4-JOBS-3: the pause backoff and the give-up count must count PAUSES. `processing_attempts` on
+   * the assignment counts every transition to 'extracting' — every ordinary retryable failure and
+   * every crashed-worker restart — so a scan that had already failed retryably a few times started
+   * its ceiling backoff at the 6-hour clamp and had ~4 of its 8 pauses left before being abandoned.
+   */
+  it('starts its backoff at the first pause even after earlier retryable failures', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    await tinyBudget(scan.fam);
+    // Four earlier retryable failures of this scan (a provider outage, a dead worker): the ceiling
+    // has not been reached even once yet.
+    await api.db.sql`
+      update public.assignments set processing_attempts = 4 where id = ${scan.assignmentId}`;
+    const first = api.now.value;
+    await runJobs(deps, countingHandler({ n: 0, bytes: 0 }));
+    const [paused] = await api.db.sql<{ run_after: Date; last_error_code: string | null }[]>`
+      select run_after, last_error_code from public.jobs where id = ${scan.jobId}`;
+    expect(paused!.last_error_code).toBe('SPEND_CEILING');
+    // Before: countPause() returned processing_attempts + 1 = 5, so the FIRST pause waited
+    // min(6 h, 1 h * 2^4) = 6 h and only four more pauses were left.
+    expect(paused!.run_after.getTime() - first.getTime()).toBe(3_600_000);
+  });
+
   it('settles to a parent-visible state once it has waited long enough', async () => {
     const scan = await queuedScan({ pages: 1 });
     await tinyBudget(scan.fam);
@@ -2412,6 +2435,36 @@ describe('two questions with the same printed number on one page (DB-R2-06)', ()
     expect(api.logs.map((l) => l.event)).toContain('scan_duplicate_question_label');
     // Both are checked.
     expect(await results(scan.assignmentId)).toHaveLength(2);
+  });
+
+  /**
+   * R4-JOBS-2: the other cause of a repeated printed number is the extraction model listing the same
+   * question twice. Disambiguating that repeat stores a phantom question, shows the child a
+   * duplicate card, pays for it in grading and verification, and — because a disambiguated label is
+   * forced to high uncertainty, which grading answers with 'unresolved' — drags a fully graded scan
+   * into parent review. A repeat of the SAME question must keep the first, as the dropped dedup did.
+   */
+  it('a question the model transcribed twice is stored once, and the scan still finishes', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const twice: ScriptedQuestion = {
+      page: 1,
+      number: '3',
+      prompt: '7 × 8 =',
+      answer: '56',
+      kind: 'numeric',
+      key: '56',
+      primary: { verdict: 'correct', confidence: 'high' },
+      verifier: { verdict: 'correct', confidence: 'high' },
+    };
+    await runJobs(deps, handlerFor(scriptedModel({ questions: [twice, { ...twice }] })));
+    const rows = await api.db.sql<{ question_number: string; uncertainty: string | null }[]>`
+      select question_number, uncertainty from public.extracted_questions
+       where assignment_id = ${scan.assignmentId} order by question_number`;
+    // Before: the repeat was stored as '3#2' with uncertainty forced to 'high'.
+    expect(rows.map((r) => r.question_number)).toEqual(['3']);
+    expect(rows[0]!.uncertainty).toBe('low');
+    expect(await results(scan.assignmentId)).toHaveLength(1);
+    expect(await assignment(scan.assignmentId)).toEqual({ status: 'ready', error_code: null });
   });
 });
 

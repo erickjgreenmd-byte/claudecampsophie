@@ -110,6 +110,34 @@ describe('schema invariants', () => {
     expect(offenders).toEqual([]);
   });
 
+  it('[HR4-0860-01] no client role holds a privilege on a sequence in public', async () => {
+    // The sibling of the two DB-R2-04 cases above, for sequences (migration 0870). A sequence is a
+    // write path of its own: UPDATE on one is all setval() needs, and setval needs no privilege on
+    // the owning table, so neither app.prevent_mutation() on the append-only ledgers nor the revoked
+    // INSERT/UPDATE/DELETE grants can see it — resetting public.audit_events_id_seq makes every
+    // later append fail on audit_events_pkey. USAGE is likewise not a client privilege: every
+    // sequence in public belongs to a `generated always as identity` column, whose inserts are
+    // authorized on the table. The Supabase default privileges grant ALL on sequences, so a new
+    // table with an identity column needs no migration line to be exposed again.
+    const rows = await db.sql<{ sequence_name: string; grantee: string; privilege_type: string }[]>`
+      select c.relname as sequence_name, pg_get_userbyid(a.grantee) as grantee, a.privilege_type
+        from pg_class c, aclexplode(c.relacl) a
+       where c.relkind = 'S' and c.relnamespace = 'public'::regnamespace
+         and pg_get_userbyid(a.grantee) in ('anon', 'authenticated', 'pl_child')
+       order by sequence_name, grantee, a.privilege_type`;
+    expect(rows).toEqual([]);
+  });
+
+  it('[HR4-0860-01] the default privileges for new public sequences grant no client role', async () => {
+    // ACL letters for a sequence: r = SELECT, w = UPDATE, U = USAGE.
+    const rows = await db.sql<{ acl: string }[]>`
+      select unnest(d.defaclacl)::text as acl
+        from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+       where n.nspname = 'public' and d.defaclobjtype = 'S'`;
+    const client = rows.map((r) => r.acl).filter((a) => /^(anon|authenticated|pl_child)=/.test(a));
+    expect(client).toEqual([]);
+  });
+
   it('[BUG-008] every jsonb column rejects scalar JSON (double-encoded strings fail loudly)', async () => {
     const unchecked = await db.sql<{ col: string }[]>`
       select c.table_schema || '.' || c.table_name || '.' || c.column_name as col

@@ -120,14 +120,29 @@ const RECHECK_NOW: readonly AssignmentStatus[] = ['ready', 'needs_parent_review'
 const RESOLVED_REPORTS_PAGE_SIZE = 100;
 
 /**
- * How many UNRESOLVED reports the family list returns. CS-R2-07's first fix lifted the cap on them
- * entirely, which left one response unbounded: nothing resolves a report but a grown-up, a guardian
- * may file 30 an hour with a 500-character note each, and system flags stay 'escalated'.
+ * How many UNRESOLVED reports the family list returns PER REPORTER KIND. CS-R2-07's first fix lifted
+ * the cap on them entirely, which left one response unbounded: nothing resolves a report but a
+ * grown-up, a guardian may file 30 an hour with a 500-character note each, and system flags stay
+ * 'escalated'.
  *
- * The bound takes the OLDEST unresolved, not the newest, which is the whole point of CS-R2-07: a
- * newest-first cap made an old open flag unreachable for good once newer reports filled the page,
- * while an oldest-first bound drains — every report a grown-up acts on makes room for the next, so
- * nothing is permanently out of reach. It is far above any honest family's queue.
+ * CS-R4-01: the bound that replaced it was one page over ALL unresolved rows, taken from the oldest
+ * end and justified with "every report a grown-up acts on makes room for the next". That is not true
+ * of a report the family filed itself: the guardian action path refuses `reporter_kind = 'parent'`
+ * (PRIVACY_RULES.parentActionNotForReport) and migration 0790 permits a resolution only on 'system'
+ * and 'child' reports, so a parent's own report leaves the unresolved set through the owner-admin
+ * queue alone. Once 200 of them were open, every LATER system flag and child report fell outside the
+ * page — absent from the portal, the app and the link in the flag email, and nothing the family could
+ * do freed a slot. Cheap to reach (30/hour per user) and worst in the case this design exists for:
+ * the adult who is the subject of a child's disclosure can pre-fill the window.
+ *
+ * So the bound is per reporter kind, and each kind is ordered the way that kind is reached:
+ *  - SYSTEM flags oldest-first. The family can address or clear a flag, so this bound does drain.
+ *  - The family's OWN reports (parent- and child-filed) newest-first, each kind on its own branch.
+ *    A parent's own report is closed by the reviewer, so nothing the family does drains that branch;
+ *    the newest is what a guardian needs to see, and rows they cannot act on can no longer consume
+ *    the room a flag needs. A child's report is actionable, so it keeps a branch of its own that the
+ *    parent's reports cannot squeeze it out of.
+ * Each bound is far above any honest family's queue.
  */
 export const UNRESOLVED_REPORTS_PAGE_SIZE = 200;
 
@@ -473,6 +488,46 @@ function cursorMicros(digits: string, now: Date): string {
   return micros.toString();
 }
 
+/**
+ * Frees the paid slot a child holds, in the caller's own transaction (FL-R4-01).
+ *
+ * public.request_deletion archives the child and revokes its sessions, devices, jobs and
+ * assignments, but never touched public.child_slot_assignments: only the later purge deleted those
+ * rows. So while a child deletion was `requested` or `processing` the freed child still occupied one
+ * of the family's paid slots, and activating a sibling answered NEEDS_PAID_SLOT — "All 1 paid child
+ * slots are in use. Add a child slot to your plan first." — telling the parent to buy capacity they
+ * already pay for. No route could free it either: activate answers NOT_FOUND for a deletion-pending
+ * child, and the archive route's release sat behind `status !== 'archived'`, which the request had
+ * already made false. If the purge job then exhausted its retries, the slot was consumed for good.
+ *
+ * Lead decision: release it in the SAME transaction as the request, so a rollback cannot leave the
+ * slot released without the request, or the request without the slot released. The release_reason is
+ * `archived`, the reason the same statement in the archive route uses and the status the child now
+ * has; a distinct `deletion` value would need the reason's check constraint widened, which is the db
+ * area's migration to make.
+ *
+ * Only a child-scope request needs this. A family-scope request tombstones the family and revokes
+ * every membership in the same transaction, so no route reads that family's capacity again and no
+ * sibling can be blocked; the purge deletes the assignment rows with the rest.
+ *
+ * The statement runs with the service role because billing tables are read-only to `authenticated`
+ * (migration 0200 revokes insert/update/delete), the same reason the rest of this vertical reaches
+ * for `asService`. It is switched for this one statement inside the caller's transaction rather than
+ * a separate `asService` transaction so the release cannot land apart from the request, and the
+ * family and child ids are ones the handler verified (membership plus assertFamilyChild) before the
+ * RPC re-checked them itself.
+ */
+async function releaseChildSlot(tx: Tx, familyId: string, childId: string): Promise<void> {
+  await tx.unsafe('set local role service_role');
+  await tx`
+    update public.child_slot_assignments set released_at = now(), release_reason = 'archived'
+     where family_id = ${familyId} and child_id = ${childId} and released_at is null`;
+  // Back to the caller's role for anything that follows in this transaction. Not in a `finally`: a
+  // failure above has already aborted the transaction, and a statement in an aborted transaction
+  // would replace the real error with "current transaction is aborted".
+  await tx.unsafe('set local role authenticated');
+}
+
 export function privacyRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
 
@@ -501,10 +556,12 @@ export function privacyRoutes(): Hono<AppEnv> {
       const rows = await deps.db.asParent(parent, async (tx) => {
         // The purge job the RPC enqueues is due at the application's clock (migration 0780).
         await stateRequestInstant(tx, deps.clock());
-        return tx.unsafe<DeletionRow[]>(
+        const requested = await tx.unsafe<DeletionRow[]>(
           `select ${DELETION_COLUMNS} from public.request_deletion($1::uuid, $2::uuid)`,
           [membership.familyId, childId],
         );
+        if (childId) await releaseChildSlot(tx, membership.familyId, childId);
+        return requested;
       });
       row = rows[0]!;
     } catch (error) {
@@ -754,20 +811,39 @@ export function privacyRoutes(): Hono<AppEnv> {
   // Order (CS-R2-07): every report still waiting on a grown-up comes first, then the newest resolved
   // ones up to their cap. A flat `order by created_at desc limit 100` hid an older open flag once a
   // hundred newer reports existed (word-list false matches, the child's own reports and the parent's
-  // own add up), so the guardian could no longer mark it looked into or clear it. The unresolved set
-  // is bounded too, but from the OLDEST end, so the bound drains instead of hiding: see
-  // UNRESOLVED_REPORTS_PAGE_SIZE. BUG-117's keyset paging is not needed while nothing unresolved can
-  // become permanently unreachable.
+  // own add up), so the guardian could no longer mark it looked into or clear it.
+  //
+  // The unresolved rows are bounded PER REPORTER KIND (CS-R4-01), not as one page: a single page over
+  // all of them, taken from the oldest end, let 200 open parent reports — which no family-facing
+  // surface can resolve — hide every later flag and every later child report for good. Flags come
+  // oldest-first (that bound drains), the family's own reports newest-first, each kind on its own
+  // branch; see UNRESOLVED_REPORTS_PAGE_SIZE. BUG-117's keyset paging is not needed while nothing
+  // unresolved can become permanently unreachable.
   r.get('/safety-reports', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     const rows = await deps.db.asParent(
       parent,
       (tx) => tx<ReportRow[]>`
-        with unresolved as (
+        with unresolved_flags as (
+          select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
+           where family_id = ${familyId} and status <> 'resolved' and reporter_kind = 'system'
+           order by created_at asc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
+        ), unresolved_child as (
+          select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
+           where family_id = ${familyId} and status <> 'resolved' and reporter_kind = 'child'
+           order by created_at desc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
+        ), unresolved_parent as (
+          -- The catch-all branch (today: 'parent', the only other kind migration 0760 permits), so a
+          -- reporter kind added later is listed rather than silently dropped from the family's list.
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status <> 'resolved'
-           order by created_at asc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
+             and reporter_kind not in ('system', 'child')
+           order by created_at desc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
+        ), unresolved as (
+          select * from unresolved_flags
+          union all select * from unresolved_child
+          union all select * from unresolved_parent
         ), newest_resolved as (
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status = 'resolved'

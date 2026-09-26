@@ -61,12 +61,26 @@ describe('family view models', () => {
     // No subscription at all.
     const none = { ...family, paidSlots: 0, children: [family.children[1]!] };
     expect(childRows(none)[0]?.activationNote).toMatch(/no paid child slots yet/);
-    // Archived children are never offered a slot here.
+    // WEBR4-01 (lead, round 4): an archived child IS offered a free slot here, the way the portal
+    // does. POST /children/:childId/activate clears archived_at for any profile that is not already
+    // active, and the archive confirmation on both clients promises exactly this ("You can activate
+    // them again later while a paid slot is free"); before this the app could not keep that promise
+    // and an archived child's devices stayed signed out for good. This assertion used to read
+    // `canActivate: false` — that expectation WAS the defect.
     const archived = {
       ...twoSlots,
       children: [{ ...family.children[1]!, status: 'archived' as const }],
     };
-    expect(childRows(archived)[0]).toMatchObject({ canActivate: false, activationNote: null });
+    expect(childRows(archived)[0]).toMatchObject({ canActivate: true, activationNote: null });
+    // With the one paid slot already taken by Riley there is nothing to assign, and the note says
+    // where another slot comes from.
+    const archivedNoSlot = {
+      ...family,
+      paidSlots: 1,
+      children: [family.children[0]!, { ...family.children[1]!, status: 'archived' as const }],
+    };
+    expect(childRows(archivedNoSlot)[1]?.canActivate).toBe(false);
+    expect(childRows(archivedNoSlot)[1]?.activationNote).toMatch(/slot/);
   });
 
   it('confirms activation and maps its refusals by rule code', () => {

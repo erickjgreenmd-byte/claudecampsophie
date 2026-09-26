@@ -285,7 +285,10 @@ export function useParentAccess(): ParentAccess {
         router.replace('/(parent)/unlock');
         return;
       }
-      setAccess({ status: 'ready', api });
+      // Still unlocked: hand back the state the screen already has, so a re-check does not replace
+      // a live ApiClient with an identical new one and make every parent screen reload (the screens
+      // key their load on the client). Its token source reads the live session either way.
+      setAccess((previous) => (previous.status === 'ready' ? previous : { status: 'ready', api }));
     });
     const cancel = () => {
       active = false;
@@ -306,6 +309,19 @@ export function useParentAccess(): ParentAccess {
     });
     return () => subscription.remove();
   }, [check]);
+  /**
+   * And again whenever a parent screen comes back into view (MOB-R4-LOCK-04). A session that ends
+   * elsewhere, or a second parent signing in on this device, used to leave an already-mounted screen
+   * in 'ready' with the previous parent's data on show and a client whose token follows whoever is
+   * signed in now; the way back onto that screen is the header back arrow, which is a focus event.
+   * The unlock itself is forgotten the moment the session goes (src/lib/app-session.ts), so the
+   * grant is closed even before this check runs.
+   *
+   * Not parentAuth.watch: that fires inside app/(parent)/privacy.tsx's own account closure, which
+   * renders its "Account deleted" confirmation inside the `access.status === 'ready'` branch — a
+   * re-gate there replaces the confirmation the parent just earned with a sign-in prompt.
+   */
+  useFocusEffect(check);
   return access;
 }
 
@@ -325,7 +341,7 @@ export function LockParentAreaButton() {
       accessibilityLabel="Lock the parent area on this device"
       onPress={() => {
         setBusy(true);
-        void lockParentAreaOnDevice(modeEffects).finally(() => setBusy(false));
+        void lockParentAreaOnDevice(secureStorage, modeEffects).finally(() => setBusy(false));
       }}
     />
   );

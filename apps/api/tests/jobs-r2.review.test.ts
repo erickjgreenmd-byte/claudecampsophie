@@ -1,6 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { z } from 'zod';
 import { cryptoRandom } from '@pencillift/domain';
+import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
+import {
+  createMockResponsesClient,
+  PROMPTS,
+  PROPOSED_STAGE_LIMITS,
+  runStage,
+  type PromptDefinition,
+} from '@pencillift/ai';
 import { PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
 import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import {
@@ -12,6 +21,7 @@ import {
   type JobHandler,
 } from '../src/jobs/dispatcher.ts';
 import { createExportBuildHandler, storageUploader } from '../src/jobs/export-build.ts';
+import { inputTokenUpperBound } from '../src/jobs/spend-ceiling.ts';
 import { stripImageMetadata } from '../src/services/image-metadata.ts';
 import { createTestApi, type TestApi } from './helpers.ts';
 
@@ -334,6 +344,128 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
     // A tick that starts now has the whole invocation: the scan is claimed.
     await runJobs(deps, handlers, 25, api.now.value);
     expect(scans).toBe(1);
+  });
+
+  /**
+   * R4-JOBS-4: the steps AFTER the ledger (the entitlement sweep, up to 25 sequential store calls)
+   * only run if the ledger leaves them wall time. A scan claimed with exactly its worst case left
+   * runs to the invocation limit, so the sweep got nothing and no family's lapsed subscription was
+   * noticed on that tick. The ledger must reserve the trailing slice.
+   */
+  it('leaves the steps that follow the ledger a reserved slice of the invocation', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const [a] = await api.db.sql<{ id: string }[]>`
+      insert into public.assignments (family_id, child_id, idempotency_key, created_by_kind, page_count, status)
+      values (${fam.familyId}, ${fam.children[0]!.id}, ${'scan-' + randomUUID()}, 'child', 1, 'queued')
+      returning id`;
+    await api.db.sql`
+      insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
+      values ('scan_process', ${'scan:' + a!.id + ':v1'}, ${fam.familyId}, ${fam.children[0]!.id},
+              ${JSON.stringify({ assignmentId: a!.id, mode: 'initial' })}::text::jsonb,
+              ${new Date(api.now.value.getTime() - 1000)})`;
+    let scans = 0;
+    const handlers: Record<string, JobHandler> = {
+      scan_process: () => {
+        scans += 1;
+        return Promise.resolve();
+      },
+    };
+    // Seven minutes in: 15 - 7 = 8 minutes of wall time are left and a scan's worst case is 7, so
+    // the old arithmetic claimed it and the trailing steps started at (or past) the wall.
+    await runJobs(deps, handlers, 25, new Date(api.now.value.getTime() - 7 * 60_000));
+    expect(scans).toBe(0);
+    const [scanJob] = await api.db.sql<{ status: string; attempts: number }[]>`
+      select status, attempts from public.jobs where idempotency_key = ${'scan:' + a!.id + ':v1'}`;
+    expect(scanJob).toMatchObject({ status: 'queued', attempts: 0 });
+
+    // Early in the invocation the scan still runs: the reserve costs the ledger the last minutes
+    // only, not the work itself.
+    await runJobs(deps, handlers, 25, api.now.value);
+    expect(scans).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// R4-JOBS-1: the one raised retry after a truncated answer must be reachable
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A stage whose answer the provider cuts off at `max_output_tokens` raises the output budget once
+ * and tries again, while the stage's cost cap admits it (JOBS-R2-02). The estimate the cap is
+ * measured against uses `inputTokenUpperBound` of the request the scan really sends, so the retry
+ * has to be admissible at THAT bound — not only at a bound no caller ever passes.
+ */
+describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
+  const gate = {
+    containsChildPersonalData: true,
+    ageBand: '8-10' as const,
+    zdrEvidence: null,
+    environment: 'test' as const,
+    now: new Date('2026-09-24T12:00:00Z'),
+  };
+
+  /**
+   * The smallest input a real scan can send for a stage: the instructions, the strict schema and a
+   * two-byte data envelope, with no page image and no question. Every real request is larger, and a
+   * larger request only leaves the cost cap less headroom.
+   */
+  async function raisedRetry<S extends z.ZodType>(prompt: PromptDefinition<S>) {
+    const limits = PROPOSED_STAGE_LIMITS[prompt.stage];
+    const input = [{ type: 'input_text' as const, text: '{}' }];
+    const estimatedInputTokens = inputTokenUpperBound(prompt, input);
+    const client = createMockResponsesClient((request) => ({
+      kind: 'incomplete' as const,
+      usage: {
+        inputTokens: estimatedInputTokens,
+        cachedInputTokens: 0,
+        outputTokens: request.maxOutputTokens,
+      },
+      modelId: 'gpt-5.6-terra',
+      latencyMs: 10,
+      reason: 'max_output_tokens' as const,
+    }));
+    const out = await runStage({
+      prompt,
+      input,
+      client,
+      limits,
+      rates: DEFAULT_RATE_TABLE_2026_09_18,
+      gate,
+      metadata: { stage: prompt.stage },
+      estimatedInputTokens,
+      sleep: () => Promise.resolve(),
+    });
+    return { limits, out, budgets: client.requests.map((r) => r.maxOutputTokens) };
+  }
+
+  /** What the one raised retry must look like, whichever stage was cut off. */
+  function expectRaisedRetry({
+    limits,
+    out,
+    budgets,
+  }: Awaited<ReturnType<typeof raisedRetry>>): void {
+    // Before: extraction's raise to 2 x 4,000 output tokens was estimated at 101,956 micros on top
+    // of the ~53,000 micros the first cut-off answer had already cost — past the 150,000 stage cap —
+    // so canAttempt refused it at every real input size. One call, then SCAN_TOO_MANY_QUESTIONS,
+    // although the comments promised a raised attempt had happened.
+    expect(budgets).toHaveLength(2);
+    expect(budgets[1]!).toBeGreaterThan(limits.maxOutputTokens);
+    // The raise never spends more than the stage cap allows.
+    expect(out.attempts.reduce((n, at) => n + at.costMicros, 0)).toBeLessThanOrEqual(
+      limits.maxCostMicros,
+    );
+    // Two cut-off answers end the stage with its own code; the caller turns that into a
+    // parent-facing outcome.
+    expect(out.result.ok).toBe(false);
+    if (!out.result.ok) expect(out.result.error.code).toBe('OUTPUT_TRUNCATED');
+  }
+
+  it('is admitted for extraction at the input bound the scan really sends', async () => {
+    expectRaisedRetry(await raisedRetry(PROMPTS.extraction));
+  });
+
+  it('is admitted for grading at the input bound the scan really sends', async () => {
+    expectRaisedRetry(await raisedRetry(PROMPTS.grading));
   });
 });
 

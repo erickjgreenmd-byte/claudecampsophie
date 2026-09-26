@@ -13,6 +13,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ChildRewards } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { withChildTokenRetry } from '../../src/family/child-session.ts';
+import { childSession } from '../../src/family/runtime.ts';
 import { ChildNav } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
@@ -41,7 +43,13 @@ type ScreenState =
  */
 export default function ChildRewardsScreen() {
   const tokenSource = childRewardsTokenSource();
-  const api = useMemo(() => (tokenSource ? createMobileApi(tokenSource) : null), [tokenSource]);
+  // HUNT4-MOB-2: the same one-retry rule the homework screens have, so a token the server has
+  // already expired is dropped and retried through the one refresher instead of leaving every tap
+  // refused. Still no second refresher (L-007).
+  const api = useMemo(
+    () => (tokenSource ? withChildTokenRetry(createMobileApi(tokenSource), childSession) : null),
+    [tokenSource],
+  );
   const ids = useMemo(() => createRequestIds(() => Crypto.randomUUID()), []);
   const [state, setState] = useState<ScreenState>(
     api ? { status: 'loading' } : { status: 'not_connected' },

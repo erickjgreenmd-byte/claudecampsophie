@@ -200,6 +200,21 @@ describe('API-AUTH-R2-02 a child under a pending data deletion stays unusable', 
     return { ...ctx, targetId: childId };
   }
 
+  /**
+   * MOB-R4-LOCK-06 (lead, round 4): the four child routes must agree about a pending deletion, or a
+   * client that hides a control is lying in one direction and the server is in the other. activate
+   * and pairing-code went through visibleChild and PATCH through childForEdit, but archive checked
+   * nothing, so both mobile and web hid Archive on a deletion-pending child that the API would have
+   * archived. One shared predicate now backs all four.
+   */
+  it('refuses archiving while the deletion is open, like the other three child routes', async () => {
+    const { targetId, token } = await withPendingDeletion();
+    const before = await childRow(targetId);
+    const res = await api.request(`/v1/children/${targetId}/archive`, { method: 'POST', token });
+    expect(res.status).toBe(404);
+    expect(await childRow(targetId)).toMatchObject({ status: before.status });
+  });
+
   it('refuses activation of a draft child while the deletion is open', async () => {
     // Sam is a draft with no slot, so activation is genuinely attempted: before the fix it answered
     // 200 and set status = 'active', after which the child could be paired and scanned.
@@ -239,8 +254,15 @@ describe('API-AUTH-R2-02 a child under a pending data deletion stays unusable', 
       select count(*)::int as n from private.child_pairing_codes
        where family_id = ${fam.familyId} and child_id = ${riley.id}`;
     expect(codes!.n).toBe(0);
-    // The same state refuses a profile edit and, once archived, re-activation.
-    expect((await patchChild(token, riley.id, { gradeLevel: 7 })).status).toBe(404);
+    // The same state refuses a profile edit and, once archived, re-activation. The edit answers 422
+    // CHILD_DELETION_PENDING rather than 404 (FL-R4-04): GET /v1/family still lists this child to
+    // this caller with deletionPending: true, so a "Child not found" protected nothing and denied a
+    // profile the parent can see. Pairing and activation keep the 404 the cases above assert.
+    const edit = await patchChild(token, riley.id, { gradeLevel: 7 });
+    expect(edit.status).toBe(422);
+    expect((await json<{ error: { rule: string } }>(edit)).error.rule).toBe(
+      'CHILD_DELETION_PENDING',
+    );
   });
 
   it('is what migration 0860 backstops: raw re-activation is refused in the database too', async () => {
@@ -255,8 +277,16 @@ describe('API-AUTH-R2-02 a child under a pending data deletion stays unusable', 
   });
 
   it('refuses a profile edit while the deletion is open', async () => {
+    // 422 CHILD_DELETION_PENDING, not the 404 this assertion first pinned (FL-R4-04): the edit is of
+    // the caller's OWN child, which GET /v1/family names and flags for the same caller, so nothing
+    // is protected by denying it exists and the parent got "Child not found" for a row on screen.
+    // Unknown ids and other families' children still answer 404 (family-hardening-r4.review.test.ts).
     const { targetId, token } = await withPendingDeletion();
-    expect((await patchChild(token, targetId, { gradeLevel: 7 })).status).toBe(404);
+    const res = await patchChild(token, targetId, { gradeLevel: 7 });
+    expect(res.status).toBe(422);
+    expect((await json<{ error: { rule: string } }>(res)).error.rule).toBe(
+      'CHILD_DELETION_PENDING',
+    );
   });
 
   it('refuses activation, pairing and edits while a whole-family deletion is open', async () => {
@@ -285,6 +315,9 @@ describe('API-AUTH-R2-02 a child under a pending data deletion stays unusable', 
         })
       ).status,
     ).toBe(404);
+    // Still 404 on the family scope: that request revokes every membership in the same transaction,
+    // so currentFamilyId no longer resolves a family for this caller at all (FL-R4-04 changed only
+    // the child scope, where the caller's own child is still listed to them).
     expect((await patchChild(ctx.token, ctx.riley.id, { gradeLevel: 6 })).status).toBe(404);
     expect(await childRow(ctx.sam.id)).toMatchObject({ status: 'draft' });
   });

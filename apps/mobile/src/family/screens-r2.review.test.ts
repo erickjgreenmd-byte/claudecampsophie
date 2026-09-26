@@ -18,7 +18,7 @@ const runtime = readFileSync(join(import.meta.dirname, 'runtime.ts'), 'utf8');
 describe('one lock action for backgrounding and both Lock buttons (MOB-R2-01)', () => {
   it('the shared Lock button runs the whole device lock, not only the server relock', () => {
     expect(ui).toMatch(/export function LockParentAreaButton/);
-    expect(ui).toMatch(/lockParentAreaOnDevice\(modeEffects\)/);
+    expect(ui).toMatch(/lockParentAreaOnDevice\(secureStorage, modeEffects\)/);
   });
 
   it('the parent home and the unlock screen both use it instead of lockParentArea(api)', () => {
@@ -31,7 +31,8 @@ describe('one lock action for backgrounding and both Lock buttons (MOB-R2-01)', 
   it('the session layer locks the device on backgrounding, exempting an open purchase sheet', () => {
     const session = readFileSync(join(srcDir, 'lib', 'app-session.ts'), 'utf8');
     expect(session).toMatch(/if \(storePurchaseInFlight\(\)\) return;/);
-    expect(session).toMatch(/await lockParentAreaOnDevice\(modeEffects\)/);
+    // The storage argument is what returns a paired family tablet to the child space (MOB-R4-LOCK-01).
+    expect(session).toMatch(/await lockParentAreaOnDevice\(secureStorage, modeEffects\)/);
   });
 
   it('the plan screen marks its purchase so backgrounding does not lock mid-purchase', () => {
@@ -94,9 +95,12 @@ describe('the biometric PIN never outlives its owner (MOB-R2-06)', () => {
   it('the stored PIN is offered only to the parent who stored it', () => {
     expect(biometricOffer({ enabled: true, ownerUserId: 'user-a' }, 'user-a')).toBe('offer');
     expect(biometricOffer({ enabled: true, ownerUserId: 'user-a' }, 'user-b')).toBe('other_user');
-    // Nobody signed in, or a PIN with no recorded owner (an older build): never offered.
-    expect(biometricOffer({ enabled: true, ownerUserId: 'user-a' }, null)).toBe('other_user');
+    // A PIN with no recorded owner (an older build): never offered, and removed.
     expect(biometricOffer({ enabled: true, ownerUserId: null }, 'user-a')).toBe('other_user');
+    // "Nobody signed in" used to be folded into 'other_user' here, which made the unlock screen
+    // delete the enrolment of the parent who IS signed in whenever the session could not be read
+    // (MOB-R4-LOCK-02). It is its own outcome now; the assertion that pinned 'other_user' was wrong.
+    expect(biometricOffer({ enabled: true, ownerUserId: 'user-a' }, null)).toBe('unknown');
     expect(biometricOffer({ enabled: false, ownerUserId: 'user-a' }, 'user-a')).toBe('off');
   });
 
@@ -107,19 +111,137 @@ describe('the biometric PIN never outlives its owner (MOB-R2-06)', () => {
   });
 
   it('signing out on the device clears the stored PIN', () => {
+    // Both device exits go through the same helper, so neither can drop the PIN removal.
     expect(runtime).toMatch(
-      /export async function signOutParentOnDevice[^]*?biometricPinStore\.clear\(\)/,
+      /export async function signOutParentOnDevice[^]*?await clearDeviceAdultSecrets\(\);/,
+    );
+    expect(runtime).toMatch(
+      /async function clearDeviceAdultSecrets[^]*?biometricPinStore\.clear\(\)/,
     );
   });
 
   it('closing the account goes through the same device sign-out', () => {
     const privacy = screen('(parent)', 'privacy.tsx');
     // The whole device sign-out, so a closed account leaves no PIN, no parent mode and no unlock.
+    // The call takes no argument (MOB-R4-LOCK-05): nothing at the call site can switch part of the
+    // closure off, which is how the first round-4 attempt ended up inert.
     expect(privacy).toMatch(/signOutClosedAccountOnDevice\(\)/);
     expect(privacy).not.toMatch(/parentAuth\.signOut\(\)/);
     expect(runtime).toMatch(
-      /export function signOutClosedAccountOnDevice[^]*?signOutParentOnDevice\(\{/,
+      /export async function signOutClosedAccountOnDevice[^]*?await signOutClosedAccount\(/,
     );
+    expect(runtime).toMatch(
+      /export async function signOutClosedAccountOnDevice[^]*?await clearDeviceAdultSecrets\(\);/,
+    );
+  });
+});
+
+/**
+ * Round-4 hardening of the parent-area lock (MOB-R4-LOCK-02/03/04/05/06). Each check below names
+ * the wiring or the copy that closes one finding, so a refactor cannot quietly drop it; the parts
+ * that can be exercised as logic have real tests in src/lib/mode-r2.review.test.ts and
+ * src/lib/app-session.test.ts.
+ */
+describe('the biometric enrolment survives a session that cannot be read (MOB-R4-LOCK-02)', () => {
+  it('[repro] “nobody signed in” is its own outcome, not the same as a different parent', () => {
+    // An offline device more than the access-token TTL past its last refresh reports no user id
+    // (getSession() yields null once the token is expired and the refresh cannot run), so folding
+    // that into 'other_user' deleted the keychain PIN of the parent who IS signed in.
+    expect(biometricOffer({ enabled: true, ownerUserId: 'user-a' }, null)).toBe('unknown');
+    expect(biometricOffer({ enabled: true, ownerUserId: 'user-a' }, 'user-b')).toBe('other_user');
+  });
+
+  it('the runtime store deletes the stored PIN only for a different owner', () => {
+    expect(runtime).toMatch(/if \(offer === 'other_user'\) \{\s*await clearBiometricPin\(\);/);
+    // 'unknown' falls through to the plain `offer === 'offer'` answer: no offer, no delete.
+    expect(runtime).toMatch(/return offer === 'offer';/);
+  });
+});
+
+describe('no PIN-less visitor can change the parent’s security settings (MOB-R4-LOCK-03)', () => {
+  const unlock = screen('(parent)', 'unlock.tsx');
+
+  it('“Turn off biometric unlock” is behind the parental gate, not a bare button', () => {
+    // It deletes the keychain PIN and both flags, with no PIN, no OS prompt and no confirmation,
+    // and the child's "Grown-ups" button opens this screen with no PIN at all. The gate is the one
+    // already used for the portal link here; the live-unlock condition that hides Lock and Sign out
+    // would put it out of a parent's reach, since they arrive at this screen precisely without one.
+    expect(unlock).toMatch(/<GatedButton\s+label="Turn off biometric unlock"/);
+    expect(unlock).not.toMatch(/<Button\s+label="Turn off biometric unlock"/);
+  });
+});
+
+describe('an auth change closes the client-side unlock (MOB-R4-LOCK-04)', () => {
+  it('the session watcher forgets the unlock when the Supabase session disappears', () => {
+    const session = readFileSync(join(srcDir, 'lib', 'app-session.ts'), 'utf8');
+    expect(session).toMatch(/if \(!signedIn\) \{[^]*?forgetParentUnlock\(\)/);
+  });
+
+  it('the parent gate re-checks when a parent screen comes back into view', () => {
+    // Without a re-check a screen that was already 'ready' kept the previous parent's data on
+    // screen, and its ApiClient followed whoever signed in next: the finding's repro is the header
+    // back arrow from the sign-in/unlock screen onto the still-mounted parent screen underneath,
+    // which is a focus event. Focus is the trigger for it.
+    //
+    // The first round-4 attempt re-checked on parentAuth.watch instead. That assertion was wrong:
+    // the watch fires during app/(parent)/privacy.tsx's own account closure (it calls
+    // parentAuth.signOut()), and privacy.tsx renders its "Account deleted" confirmation inside the
+    // `access.status === 'ready'` branch, so re-gating on that event replaced the confirmation the
+    // parent had just earned with a sign-in prompt. The unlock is still forgotten on the auth
+    // change (src/lib/app-session.ts, the check above), which is what closes the grant.
+    expect(ui).toMatch(/useFocusEffect\(check\)/);
+    expect(ui).not.toMatch(/parentAuth\.watch\(\(\) => check\(\)\)/);
+  });
+
+  it('a screen that is still unlocked keeps the access it already had', () => {
+    // A check that is still 'ready' must hand the screen back the SAME state object. parentApi()
+    // builds a new ApiClient on every call, and the parent screens key their load on that client
+    // (e.g. app/(parent)/home.tsx: useLoad(load) with load = useCallback(…, [api])), so a fresh
+    // object on every focus would re-fetch and flash "Loading your family" over data the parent
+    // was already reading each time they came back from a pushed screen. The client's token source
+    // reads the live session, so reusing it never serves another parent's data.
+    expect(ui).toMatch(
+      /setAccess\(\(previous\) => \(?\s*previous\.status === 'ready' \? previous : \{ status: 'ready', api \}/,
+    );
+  });
+});
+
+describe('closing the account leaves no child pairing on the device (MOB-R4-LOCK-05)', () => {
+  it('the closure is one call with nothing to switch off', () => {
+    // The rule and its behavioural tests live in src/lib/mode.ts / src/lib/mode-r2.review.test.ts
+    // ("closing an account leaves no child pairing on the device"): the closure signs the parent out
+    // and then forgets the child on this device — refresh token, cached nickname, mode 'signed_out'.
+    //
+    // The first round-4 attempt put that forget behind a `familyDeleted` argument so a guardian's own
+    // closure would keep the pairing, and left the single call site passing nothing: the fix never ran
+    // on the finding's repro (the owner deletes the family, then closes their sign-in on the paired
+    // tablet). Nothing on the device can tell the two closures apart, so the forget is unconditional
+    // and purely local — no child session is revoked on the wire — and the signature has no argument
+    // for a call site to omit.
+    expect(runtime).toMatch(
+      /export async function signOutClosedAccountOnDevice\(\): Promise<void>/,
+    );
+    expect(runtime).not.toMatch(/familyDeleted: false/);
+    expect(runtime).not.toMatch(/childSession\.logout\(\)/);
+  });
+
+  it('the child home offers a grown-up route while the device is not connected', () => {
+    const home = screen('(child)', 'home.tsx');
+    const notConnected = /if \(state\.status === 'not_connected'\) \{([^]*?)\n {2}\}/.exec(home);
+    expect(notConnected).not.toBeNull();
+    expect(notConnected?.[1]).toMatch(/label="Grown-ups"/);
+  });
+});
+
+describe('the Children screen does not name the wrong deletion scope (MOB-R4-LOCK-06)', () => {
+  const children = screen('(parent)', 'children.tsx');
+
+  it('the notice never tells the parent they asked for this one child’s data to be deleted', () => {
+    // GET /v1/family sets deletionPending for a FAMILY-scope request too, so the per-child wording
+    // told a parent who asked for the whole family that they had asked for one child.
+    expect(children).toMatch(/Data\s+deletion\s+under\s+way/);
+    expect(children).not.toMatch(/You asked for \{row\.nickname\}/);
+    expect(children).toMatch(/whole\s+family/i);
   });
 });
 

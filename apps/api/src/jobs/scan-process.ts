@@ -165,6 +165,15 @@ const QUESTION_NUMBER_MAX_CHARS = 20;
 /** How many questions on one page may carry the same printed number before the rest are dropped. */
 const DUPLICATE_LABEL_LIMIT = 40;
 
+/**
+ * One transcribed line, normalized for comparing two extracted questions that share a printed number
+ * (R4-JOBS-2): NFKC, whitespace collapsed, trimmed and casefolded. Two entries that agree here are
+ * the same question listed twice; two sections of a page differ in their printed prompt.
+ */
+function sameText(value: string | null): string {
+  return (value ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
 /** Reviewed fallback when a coaching packet fails validation (spec P6: never show unchecked output). */
 export const TEMPLATE_FALLBACK =
   "Let's look at this one again. Read the question slowly, check each step, and try once more. If you're stuck, ask a grown-up to help.";
@@ -224,8 +233,6 @@ interface AssignmentCtx {
   status: string;
   readonly ageBand: AgeBand;
   readonly gradeLevel: number;
-  /** How many times processing has entered extraction, incl. spend-ceiling pauses (JOBS-R2-06). */
-  readonly processingAttempts: number;
 }
 
 interface QuestionRow {
@@ -793,10 +800,9 @@ async function loadAssignment(
         status: string;
         age_band: AgeBand;
         grade_level: number;
-        processing_attempts: number;
       }[]
     >`
-      select a.id, a.family_id, a.child_id, a.status, a.processing_attempts, c.age_band, c.grade_level
+      select a.id, a.family_id, a.child_id, a.status, c.age_band, c.grade_level
         from public.assignments a
         join public.child_profiles c on c.id = a.child_id and c.family_id = a.family_id
         join public.families f on f.id = a.family_id and f.deleted_at is null
@@ -815,7 +821,6 @@ async function loadAssignment(
         status: row.status,
         ageBand: row.age_band,
         gradeLevel: row.grade_level,
-        processingAttempts: row.processing_attempts,
       }
     : null;
 }
@@ -846,7 +851,12 @@ class ScanRun {
 
   // ---- state ---------------------------------------------------------------------------------
 
-  /** Compare-and-set transition; a concurrent change (deletion, cancel) stops the run. */
+  /**
+   * Compare-and-set transition; a concurrent change (deletion, cancel) stops the run.
+   * `processing_attempts` counts the extraction cycles of this scan (an operational counter): every
+   * retry and every crashed-worker restart adds one, which is why it is NOT the pause count
+   * (R4-JOBS-3).
+   */
   private async transition(to: string, errorCode: string | null = null): Promise<void> {
     const from = this.ctx.status;
     const rows = await this.deps.db.asService(
@@ -930,8 +940,7 @@ class ScanRun {
    * JOBS-R2-06: the wait grows with every pause (1 h, 2 h, 4 h, then 6 h) and is bounded. Once the
    * scan has waited SPEND_CEILING_MAX_PAUSES times it stops waiting and settles in a state the
    * parent can see, giving the allowance back, instead of sitting in "being checked" for ever.
-   * `processing_attempts` is the durable count: the initial run's own transition to `extracting`
-   * adds one per cycle, and a paused recheck (which never re-enters extracting) adds one here.
+   * The count is the job row's own `spendPauses` (see countPause), never `processing_attempts`.
    */
   async pause(): Promise<JobDeferral | void> {
     const pauses = await this.countPause();
@@ -961,18 +970,24 @@ class ScanRun {
   }
 
   /**
-   * How many times this scan has been paused (JOBS-R2-06). An initial run already counted this cycle
-   * when it entered `extracting`; a recheck counts it here, since it never re-enters extracting.
+   * How many times this scan has been paused at the owner's ceiling, including this one (JOBS-R2-06).
+   *
+   * R4-JOBS-3: this used to read `assignments.processing_attempts`, which counts every transition to
+   * `extracting` — every ordinary retryable failure and every crashed-worker restart — not pauses. A
+   * scan whose grading had already failed retryably four times therefore started its backoff at the
+   * 6-hour clamp and was abandoned with AI_PAUSED_TOO_LONG after ~4 pauses instead of 8, while a
+   * clean scan of the same family survived the same ceiling. Pauses now have their own durable
+   * counter on the job row (the payload key is ignored by payloadSchema, which strips what it does
+   * not declare), which is bumped once per pause in both modes and is not touched by anything else.
    */
   private async countPause(): Promise<number> {
-    // The initial run's own `enterExtracting` already incremented the stored counter for this cycle,
-    // but the context was read before that, so this cycle is the stored value plus one.
-    if (this.mode === 'initial') return this.ctx.processingAttempts + 1;
     const [row] = await this.deps.db.asService(
       (tx) => tx<{ n: number }[]>`
-        update public.assignments set processing_attempts = processing_attempts + 1
-         where id = ${this.ctx.id} and family_id = ${this.ctx.familyId}
-        returning processing_attempts as n
+        update public.jobs
+           set payload = jsonb_set(payload, '{spendPauses}',
+                 to_jsonb(coalesce((payload->>'spendPauses')::int, 0) + 1), true)
+         where id = ${this.job.id}
+        returning (payload->>'spendPauses')::int as n
       `,
     );
     return row?.n ?? 1;
@@ -1389,9 +1404,26 @@ class ScanRun {
     missingPassage: ReadonlySet<number>,
   ): Promise<void> {
     const seen = new Set<string>();
+    const stored = new Set<string>();
     for (const q of extraction.questions) {
       const pageId = pageIds.get(q.pageNumber);
       if (!pageId) continue; // a page the model invented
+      // R4-JOBS-2: a repeated printed number has two very different causes. Either the page really
+      // has two sections that both number from 1 (DB-R2-06 below), or the extraction model listed
+      // the SAME question twice. Storing the repeat would show the child a duplicate card, pay for
+      // it in grading and verification, write a second skill attempt, and — because a disambiguated
+      // label is forced to high uncertainty — send a fully graded scan to parent review. So the
+      // first is kept whenever the printed prompt and the child's answer match one already stored.
+      const identity = `${q.pageNumber}\u0000${q.questionNumber}\u0000${sameText(q.promptText)}\u0000${sameText(q.studentAnswerText)}`;
+      if (stored.has(identity)) {
+        this.deps.log({
+          level: 'warn',
+          event: 'scan_duplicate_question_dropped',
+          code: 'DUPLICATE_QUESTION',
+        });
+        continue;
+      }
+      stored.add(identity);
       // DB-R2-06: K-8 worksheets restart their numbering per section on one page (Part A 1-5,
       // Part B 1-5), and `extracted_questions` is unique on (assignment, page, question_number).
       // Dropping the later question would silently lose the child's answers to a whole section, so

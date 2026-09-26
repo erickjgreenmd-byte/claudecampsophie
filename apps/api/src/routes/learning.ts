@@ -826,8 +826,16 @@ export function learningRoutes(): Hono<AppEnv> {
   r.delete('/children/:childId/test-dates/:testDateId', requireParent, async (c) => {
     const owned = await ownedChild(c, 'write');
     const testDateId = paramUuid(c, 'testDateId', 'Test date not found');
-    const rows = await c.var.deps.db.asParent(
-      c.var.parent,
+    // Deleted with the service role since migration 0870 (HR4-0860-02): `authenticated` holds the one
+    // client DELETE left in the set 0860 guards, and 0860's test_dates_data_api_guard was insert-only,
+    // so a direct Data-API delete with the parent's own JWT removed an archived child's test dates —
+    // which this route refuses with CHILD_ARCHIVED. 0870 closes that with a `before delete` branch of
+    // the guard, and this route stops depending on the client grant at all, so removing that grant
+    // later changes nothing here. The statement is safe as the service role because
+    // ownedChild(c, 'write') above already resolved the child from verified claims (the caller's own
+    // live family, not archived, no deletion request covering it) and the delete is scoped by that
+    // family and child as well as the id.
+    const rows = await c.var.deps.db.asService(
       (tx) => tx`
         delete from public.test_dates
          where id = ${testDateId} and child_id = ${owned.childId} and family_id = ${owned.familyId}

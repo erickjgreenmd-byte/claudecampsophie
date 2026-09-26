@@ -220,6 +220,27 @@ describe('leaving the app locks the parent area on the device too (MOB-R2-01)', 
     }
   });
 
+  /**
+   * MOB-R4-LOCK-04. The watcher's signed-out branch cleared the adult caches and unbound the store
+   * SDK but left the client-side unlock running, so a session that ended elsewhere (portal "sign out
+   * everywhere", a password change) left the grant open for the rest of its window: the next parent
+   * to sign in on the device reached the parent screens without the fresh PIN unlock the sign-in
+   * screen promises, and a screen still mounted as 'ready' kept the previous parent's data on show.
+   */
+  it('[repro] a session that disappears also closes the client-side unlock', async () => {
+    const stop = initAppSession();
+    try {
+      fake.onAuthChange?.(true);
+      await unlocked();
+      expect(parentUnlockActive(NOW)).toBe(true);
+      // The session ends elsewhere; nothing about this device changed otherwise.
+      fake.onAuthChange?.(false);
+      expect(parentUnlockActive(NOW)).toBe(false);
+    } finally {
+      stop();
+    }
+  });
+
   it('an open store purchase sheet is exempt (it backgrounds the Android activity)', async () => {
     const stop = initAppSession();
     try {

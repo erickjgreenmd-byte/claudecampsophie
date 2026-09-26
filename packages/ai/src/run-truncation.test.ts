@@ -108,12 +108,39 @@ describe('an answer cut off at max_output_tokens (JOBS-R2-02)', () => {
     ]);
   });
 
-  it('never raises the budget past the stage cost cap: the raised retry is not admitted', async () => {
-    // 5,000 estimated input tokens: the first attempt is metered at 58,000 micros and a retry at
-    // 8,000 output tokens would be estimated at 106,000 — past the 150,000 cap, so it is refused
-    // and the stage ends with the truncation code rather than STAGE_LIMIT.
+  /**
+   * R4-JOBS-1: this test used to assert that a cap which cannot admit the FULL 2x raise makes no
+   * second call at all (`expect(requests).toHaveLength(1)`). That assertion was wrong: it described
+   * the unreachable branch it was meant to guard — for extraction and grading the full raise never
+   * fitted at any real input size, so the promised retry never happened for either stage. The raise
+   * is now sized to the headroom the cap leaves, and this asserts the partial raise is really sent.
+   */
+  it('raises only as far as the stage cost cap has room for, and still retries once', async () => {
+    // 5,000 estimated input tokens: the first cut-off answer costs 49,800 micros, leaving 100,200 of
+    // the 150,000 cap; 10,000 of that pays for the estimated input, so 7,516 output tokens fit — a
+    // real raise over 4,000, but short of 8,000.
     const { client, requests } = recordingClient([truncated(4_000), okResult]);
     const out = await runStage({ ...common, client, estimatedInputTokens: 5_000 });
+    expect(requests).toHaveLength(2);
+    const raised = requests[1]!.maxOutputTokens;
+    expect(raised).toBeGreaterThan(PROPOSED_STAGE_LIMITS.extraction.maxOutputTokens);
+    expect(raised).toBeLessThan(
+      PROPOSED_STAGE_LIMITS.extraction.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE,
+    );
+    expect(out.result.ok).toBe(true);
+    // The whole stage still fits the cap it is admitted against.
+    expect(out.attempts.reduce((n, a) => n + a.costMicros, 0)).toBeLessThanOrEqual(
+      PROPOSED_STAGE_LIMITS.extraction.maxCostMicros,
+    );
+  });
+
+  it('makes no second call when the cost cap has no room for a bigger answer at all', async () => {
+    // 30,000 estimated input tokens (60,000 micros): the first attempt is admitted at 108,000 and
+    // costs 49,800, but even one output token more than the configured budget would be estimated at
+    // 108,012 against the 100,200 micros left. The stage settles with the truncation code at once,
+    // never STAGE_LIMIT, so the caller still ends the scan with a parent-facing outcome.
+    const { client, requests } = recordingClient([truncated(4_000), okResult]);
+    const out = await runStage({ ...common, client, estimatedInputTokens: 30_000 });
     expect(requests).toHaveLength(1);
     expect(out.result.ok).toBe(false);
     if (!out.result.ok) expect(out.result.error.code).toBe('OUTPUT_TRUNCATED');

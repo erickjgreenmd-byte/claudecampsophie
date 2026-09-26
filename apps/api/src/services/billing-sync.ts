@@ -168,6 +168,11 @@ export interface StripeInvoice {
   readonly status?: string | null;
   readonly amount_paid?: number;
   readonly subtotal?: number;
+  /**
+   * The customer credit balance Stripe applied to this invoice: negative when a credit (from an
+   * earlier proration) settled part of it, so `amount_paid` is below the invoice total (BILL-R4-4).
+   */
+  readonly starting_balance?: number | null;
   /** Sales tax Stripe added on top of the subscription price; never PencilLift revenue. */
   readonly tax?: number | null;
   /** Stripe's own pre-tax total (total − tax, i.e. after discounts). */
@@ -233,14 +238,29 @@ const cents = (value: number | null | undefined): number | null =>
  * (`total_excluding_tax`, already net of discounts); the pre-tax `subtotal` less invoice-level
  * discounts; finally what was paid less the reported tax. The last two invoice-level figures still
  * include other lines, so any proration line that states its own amount is taken back off.
+ *
+ * BILL-R4-4: gross is money COLLECTED for the subscription, so the figure is also bounded by what the
+ * invoice actually took when a customer credit balance settled part of it. A negative
+ * `starting_balance` (a credit left by an earlier proration) lowers `amount_due`/`amount_paid` while
+ * the line amount, the subtotal and `total_excluding_tax` stay at full price and no discount is
+ * reported: booking the line amount then counted money that was never collected in that month as
+ * revenue AND made the month pass the donation rule's regular_tier_price equality, so the $1 school
+ * accrual was created for a month whose collection was below the tier price.
  */
 function subscriptionChargeCents(
   invoice: StripeInvoice,
   line: StripeLine,
   invoiceDiscountCents: number,
 ): number {
+  const collectedPreTax =
+    cents(invoice.starting_balance) !== null && cents(invoice.starting_balance)! < 0
+      ? Math.max(0, (cents(invoice.amount_paid) ?? 0) - (cents(invoice.tax) ?? 0))
+      : null;
+  const collected = (amount: number): number =>
+    collectedPreTax === null ? amount : Math.min(amount, collectedPreTax);
   const lineAmount = cents(line.amount);
-  if (lineAmount !== null) return Math.max(0, lineAmount - sumAmounts(line.discount_amounts));
+  if (lineAmount !== null)
+    return collected(Math.max(0, lineAmount - sumAmounts(line.discount_amounts)));
   const prorationCents = (invoice.lines?.data ?? [])
     .filter((l) => l !== line && l.proration === true)
     .reduce((sum, l) => sum + (cents(l.amount) ?? 0), 0);
@@ -252,7 +272,7 @@ function subscriptionChargeCents(
       : subtotal !== null
         ? subtotal - invoiceDiscountCents
         : (cents(invoice.amount_paid) ?? 0) - (cents(invoice.tax) ?? 0);
-  return Math.max(0, preTax - prorationCents);
+  return collected(Math.max(0, preTax - prorationCents));
 }
 
 export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeriod | null {
@@ -665,6 +685,39 @@ export async function reconcilePromotionsForPeriod(
 export type SettlementEvent = 'refund' | 'partial_refund' | 'chargeback' | 'chargeback_reversed';
 
 /**
+ * BILL-R4-3: a provider refund amount is money the family got back INCLUDING US sales tax, while
+ * `charged_amount_cents` is the pre-tax subscription amount (BILL-R2-4). The cap at the charge makes
+ * a FULL refund exact (everything came back), but a PARTIAL refund of a taxed charge recorded the
+ * tax-inclusive figure against a pre-tax gross, and the revenue view computes net = gross − refunds,
+ * so net revenue was understated by the tax share of every partial refund.
+ *
+ * Converted with the invoice's own ratio: pre-tax refund = refunded × charged ÷ provider charge
+ * total, rounded half up to the cent and never above the charge. `providerChargeTotalCents` is what
+ * the provider says the whole charge was (Stripe's Charge `amount`); null when the caller has no such
+ * figure (a RevenueCat store refund, which reports no amount at all, or a Stripe DISPUTE, whose
+ * `amount` is the disputed part and not the charge total), and then nothing is converted and the cap
+ * alone applies, exactly as before. A refund at or above the provider total is the whole charge.
+ */
+export function preTaxRefundCents(
+  refundedCents: number,
+  providerChargeTotalCents: number | null,
+  chargedCents: number,
+): number {
+  if (
+    providerChargeTotalCents === null ||
+    !Number.isSafeInteger(providerChargeTotalCents) ||
+    providerChargeTotalCents <= chargedCents ||
+    refundedCents >= providerChargeTotalCents
+  ) {
+    return refundedCents;
+  }
+  return Math.min(
+    chargedCents,
+    Math.round((refundedCents * chargedCents) / providerChargeTotalCents),
+  );
+}
+
+/**
  * Refund/chargeback (and a won dispute): marks the period and records at most one donation
  * reversal (or reinstatement). A full `refund` with a provider amount below the charge is recorded
  * as partial (RV-lead-billing-p17-7). An event for a period we have not recorded yet is parked in
@@ -674,6 +727,11 @@ export type SettlementEvent = 'refund' | 'partial_refund' | 'chargeback' | 'char
  * look like kept revenue. A `chargeback_reversed` (dispute won) gives that amount back, so the
  * period returns to settled/0 (and the $1 donation is reinstated) unless an earlier partial refund
  * remains; `refundedCents` is then the reversed amount, null meaning the whole charge.
+ *
+ * `providerChargeTotalCents` is the provider's own total for the charge the amount came from, used to
+ * state the refund in the same unit as `charged_amount_cents` (see preTaxRefundCents, BILL-R4-3).
+ * A refund parked in `pending_refunds` keeps the provider's figure and is applied with no total, so
+ * the cap alone bounds it (that table records no provider total).
  */
 export async function applyRefund(
   tx: Tx,
@@ -682,6 +740,7 @@ export async function applyRefund(
   providerPeriodId: string,
   kind: SettlementEvent,
   refundedCents: number | null,
+  providerChargeTotalCents: number | null = null,
 ): Promise<{ adjusted: boolean; pending?: boolean }> {
   if (refundedCents !== null && (!Number.isSafeInteger(refundedCents) || refundedCents < 0)) {
     throw new RangeError('refundedCents must be null or a non-negative integer number of cents');
@@ -705,8 +764,15 @@ export async function applyRefund(
     `;
     return { adjusted: false, pending: true };
   }
+  // BILL-R4-3: state the provider's amount in the unit of the recorded charge before anything is
+  // decided by it (a partial refund of a taxed charge is otherwise compared with, and written
+  // against, a pre-tax figure).
+  const inCharge =
+    refundedCents === null
+      ? null
+      : preTaxRefundCents(refundedCents, providerChargeTotalCents, current.charged_amount_cents);
   const effective: SettlementEvent =
-    kind === 'refund' && refundedCents !== null && refundedCents < current.charged_amount_cents
+    kind === 'refund' && inCharge !== null && inCharge < current.charged_amount_cents
       ? 'partial_refund'
       : kind;
   // BILL-R1-1: a chargeback reverses the disputed amount (the whole charge when the provider
@@ -731,7 +797,7 @@ export async function applyRefund(
        set settlement = case
              when ${effective} = 'chargeback_reversed' then
                case when settlement <> 'chargeback' then settlement
-                    when greatest(0, refunded_cents - coalesce(${refundedCents}::int, charged_amount_cents)) > 0
+                    when greatest(0, refunded_cents - coalesce(${inCharge}::int, charged_amount_cents)) > 0
                       then 'partially_refunded'
                     else 'settled' end
              when ${effective} = 'chargeback' then 'chargeback'
@@ -741,16 +807,16 @@ export async function applyRefund(
            refunded_cents = case
              when ${effective} = 'chargeback_reversed' then
                case when settlement <> 'chargeback' then refunded_cents
-                    else greatest(0, refunded_cents - coalesce(${refundedCents}::int, charged_amount_cents)) end
+                    else greatest(0, refunded_cents - coalesce(${inCharge}::int, charged_amount_cents)) end
              when ${effective} = 'refund'
-               then least(charged_amount_cents, greatest(refunded_cents, ${refundedCents ?? 0}, charged_amount_cents))
+               then least(charged_amount_cents, greatest(refunded_cents, ${inCharge ?? 0}, charged_amount_cents))
              when ${effective} = 'chargeback' then
                case when settlement = 'chargeback'
                       then least(charged_amount_cents,
-                                 greatest(refunded_cents, coalesce(${refundedCents}::int, charged_amount_cents)))
+                                 greatest(refunded_cents, coalesce(${inCharge}::int, charged_amount_cents)))
                     else least(charged_amount_cents,
-                               refunded_cents + coalesce(${refundedCents}::int, charged_amount_cents)) end
-             else least(charged_amount_cents, greatest(refunded_cents, ${refundedCents ?? 0})) end
+                               refunded_cents + coalesce(${inCharge}::int, charged_amount_cents)) end
+             else least(charged_amount_cents, greatest(refunded_cents, ${inCharge ?? 0})) end
      where id = ${current.id}
      returning id, settlement, refunded_cents
   `;

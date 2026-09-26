@@ -14,6 +14,7 @@ import {
   cancelScan,
   childUploadMessage,
   newAttempt,
+  stoppedScanOutcome,
   toHex,
   uploadScan,
   type UploadIo,
@@ -571,5 +572,40 @@ describe('stalled requests and memory (MOB-R1-03, MOB-R1-04)', () => {
     }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(UploadTransferError);
     expect(puts).toHaveLength(0);
+  });
+});
+
+/**
+ * HUNT4-MOB-5. cancelScan already computes three outcomes so the caller can tell the child the
+ * truth, but the abort path threw the value away: it always said "Stopped. Your pages are still
+ * here." and rotated the idempotency keys. When the child taps "Stop sending" during the finalize
+ * round trip, the server may have committed the finalize and the scan job may have moved the
+ * assignment out of 'queued', so the cancel is refused INVALID_TRANSITION ('too_late'). The child was
+ * then told the scan had stopped while it was being checked and charged, and with fresh keys "Try
+ * again" created a SECOND assignment for the same homework — two jobs and two page-allowance charges
+ * against AC_CAPTURE_06's one job, one charge.
+ */
+describe('a scan the child stopped too late is not reported as stopped (HUNT4-MOB-5)', () => {
+  it('[repro] keeps the same attempt and says the scan was already sent', () => {
+    const outcome = stoppedScanOutcome('too_late');
+    // Same attempt: "Try again" re-creates with the SAME createKey, which the server answers with
+    // the assignment it already has instead of a second one.
+    expect(outcome.keepAttempt).toBe(true);
+    expect(outcome.message).toMatch(/already sent/i);
+    expect(outcome.message).not.toMatch(/stopped/i);
+  });
+
+  it('a scan that really was stopped keeps the calm "Stopped" copy and a fresh attempt', () => {
+    for (const cancel of ['cancelled', 'nothing_to_cancel'] as const) {
+      const outcome = stoppedScanOutcome(cancel);
+      expect(outcome.keepAttempt).toBe(false);
+      expect(outcome.message).toBe(childUploadMessage(new ScanCancelledError()));
+    }
+  });
+
+  it('never offers a purchase or shows raw server text (spec P11, P14)', () => {
+    for (const cancel of ['cancelled', 'nothing_to_cancel', 'too_late'] as const) {
+      expect(stoppedScanOutcome(cancel).message).not.toMatch(/buy|purchase|upgrade|pay/i);
+    }
   });
 });

@@ -19,16 +19,27 @@ export const BIOMETRIC_ENABLED_KEY = 'pl.parent.biometricEnabled';
  */
 export const BIOMETRIC_OWNER_KEY = 'pl.parent.biometricOwner';
 
-/** Whether biometric unlock may be offered: for the owner only, and never for an unknown owner. */
-export type BiometricOffer = 'offer' | 'off' | 'other_user';
+/**
+ * Whether biometric unlock may be offered: for the owner only, and never for an unknown owner.
+ *
+ * 'unknown' is separate from 'other_user' (MOB-R4-LOCK-02) because the caller DELETES the stored PIN
+ * for 'other_user'. "Nobody signed in" is not the same claim as "somebody else is signed in": the
+ * signed-in user id is unreadable whenever getSession() yields nothing, which includes an offline
+ * device whose access token has passed its expiry and cannot be refreshed. Folding the two together
+ * destroyed the enrolment of the parent who was still signed in, silently, and re-enrolling was
+ * impossible until the device was online again (save() needs a user id to bind the PIN to).
+ */
+export type BiometricOffer = 'offer' | 'off' | 'other_user' | 'unknown';
 
 export function biometricOffer(
   stored: { readonly enabled: boolean; readonly ownerUserId: string | null },
   signedInUserId: string | null,
 ): BiometricOffer {
   if (!stored.enabled) return 'off';
-  // Fails closed: nobody signed in, a different parent, or a PIN stored before owners were recorded.
-  if (signedInUserId === null || stored.ownerUserId === null) return 'other_user';
+  // Fails closed either way; only 'other_user' is a reason to remove the stored PIN.
+  if (signedInUserId === null) return 'unknown';
+  // A PIN stored before owners were recorded (an older build) cannot be shown to belong here.
+  if (stored.ownerUserId === null) return 'other_user';
   return stored.ownerUserId === signedInUserId ? 'offer' : 'other_user';
 }
 

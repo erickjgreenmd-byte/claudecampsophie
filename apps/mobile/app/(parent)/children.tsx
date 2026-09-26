@@ -226,11 +226,18 @@ function ChildCard({
         // API-AUTH-R2-02: a child under an open deletion request stays listed so the parent can see
         // who the request covers, but the server refuses pairing, activation and edits for them, so
         // this screen offers no control either.
+        //
+        // MOB-R4-LOCK-06: `deletionPending` is set for a WHOLE-FAMILY request as well as a
+        // per-child one (GET /v1/family: `d.scope = 'family' or d.target_child_id = c.id`), and the
+        // flag does not say which. The copy used to tell every parent who had asked for the family
+        // account to be deleted that they had asked for one child by name, so it now covers both
+        // and speaks for this screen rather than for the server.
         <Notice>
           <Body>
-            Data deletion under way. You asked for {row.nickname}’s data to be deleted, so nothing
-            can be changed, paired or activated for them. Cancel the request under Privacy if you
-            did not mean it.
+            Data deletion under way. A deletion request covering {row.nickname} is open — it may be
+            for {row.nickname} alone or for your whole family account — so this screen leaves their
+            details as they are. Privacy shows exactly what you asked for, and cancels it if you did
+            not mean it.
           </Body>
         </Notice>
       ) : null}

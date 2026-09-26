@@ -161,12 +161,71 @@ describe('adult step-up (spec P3)', () => {
     };
     expect(await unlocked()).toBe(false);
     expect(await unlocked('00000000-0000-4000-8000-00000000abcd')).toBe(true);
-    const policies = await db.sql<{ policyname: string; with_check: string }[]>`
-      select policyname, with_check from pg_policies
+    // HR4-0860-03. 0860 line 120 keeps the two policies as "the second layer if a column grant is
+    // ever restored", so the second layer has to be pinned by content, not by counting rows: every
+    // INSERT/UPDATE policy in Postgres has a non-empty with_check (`with_check = true` passes a
+    // non-empty-string assertion), so a count plus a non-empty check cannot fail and proved nothing.
+    const policies = await db.sql<
+      { policyname: string; with_check: string; qual: string | null }[]
+    >`
+      select policyname, with_check, qual from pg_policies
        where schemaname = 'public' and tablename = 'child_profiles'
-         and policyname in ('child_profiles_member_insert', 'child_profiles_member_update')`;
-    expect(policies).toHaveLength(2);
-    for (const p of policies) expect(p.with_check ?? '').not.toBe('');
+         and policyname in ('child_profiles_member_insert', 'child_profiles_member_update')
+       order by policyname`;
+    expect(policies.map((p) => p.policyname)).toEqual([
+      'child_profiles_member_insert',
+      'child_profiles_member_update',
+    ]);
+    const insertPolicy = policies[0]!;
+    expect(insertPolicy.with_check).toMatch(/is_family_member/);
+    expect(insertPolicy.with_check).toMatch(/has_recent_adult_unlock/);
+    expect(insertPolicy.with_check).toMatch(/status = 'draft'/);
+    // The update policy gates on USING (the row as it stands), which is where its step-up lives.
+    expect(policies[1]!.qual ?? '').toMatch(/has_recent_adult_unlock/);
+    expect(policies[1]!.with_check).toMatch(/is_family_member/);
+
+    // And behaviourally, which is what the rewritten test dropped: with the insert column grant
+    // temporarily restored (exactly the grant 0001 made and 0860 revoked), the policy alone must
+    // still refuse a profile created without a session-bound step-up, and refuse 'active'. The grant
+    // is revoked again in `finally`, and the assertion after it proves the restore was undone.
+    const probe = await seedFamily(db, { childCount: 0 });
+    const probeSession = '00000000-0000-4000-8000-0000000abcde';
+    await grantAdultUnlock(db, probe.ownerId, probeSession);
+    const insertAs = (sessionId: string | undefined, status?: string) =>
+      db.asParent(
+        probe.ownerId,
+        (tx) =>
+          status === undefined
+            ? tx<{ status: string }[]>`
+                insert into public.child_profiles (family_id, nickname, grade_level, age_band)
+                values (${probe.familyId}, 'Jordan', 2, '5-7') returning status`
+            : tx<{ status: string }[]>`
+                insert into public.child_profiles (family_id, nickname, grade_level, age_band, status)
+                values (${probe.familyId}, 'Jordan', 2, '5-7', ${status}) returning status`,
+        sessionId ? { sessionId } : {},
+      );
+    try {
+      await db.sql`
+        grant insert (family_id, nickname, grade_level, age_band, accessibility, curriculum_notes,
+                      status)
+          on public.child_profiles to authenticated`;
+      // No step-up at all, and a step-up bound to a different auth session: both fail the policy.
+      await expect(insertAs(undefined)).rejects.toThrow(/row-level security/);
+      await expect(insertAs('00000000-0000-4000-8000-00000000abcd')).rejects.toThrow(
+        /row-level security/,
+      );
+      // The matching session passes, and only as a draft: 'active' is refused by the same policy.
+      const [ok] = await insertAs(probeSession);
+      expect(ok!.status).toBe('draft');
+      await expect(insertAs(probeSession, 'active')).rejects.toThrow(/row-level security/);
+    } finally {
+      await db.sql`revoke insert on public.child_profiles from authenticated`;
+    }
+    const restored = await db.sql<{ privilege_type: string }[]>`
+      select privilege_type from information_schema.column_privileges
+       where table_schema = 'public' and table_name = 'child_profiles'
+         and grantee = 'authenticated' and privilege_type = 'INSERT'`;
+    expect(restored).toEqual([]);
 
     // The API's own path (service role) still creates an uncharged draft.
     const [created] = await db.asService(

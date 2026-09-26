@@ -334,6 +334,13 @@ async function processStripeEvent(
     const full =
       object.refunded === true || (refunded !== null && refunded >= (object.amount ?? 0));
     // A partial refund is recorded as partial with its real amount (RV-lead-billing-p17-7).
+    // BILL-R4-3: `amount_refunded` and `amount` are Charge figures, i.e. what the family paid
+    // INCLUDING sales tax, while the recorded charge is the pre-tax subscription amount. The charge
+    // total goes with the refund so applyRefund can state it in that same unit.
+    const chargeTotal =
+      typeof object.amount === 'number' && Number.isSafeInteger(object.amount) && object.amount >= 0
+        ? object.amount
+        : null;
     await applyRefund(
       tx,
       familyId,
@@ -341,11 +348,14 @@ async function processStripeEvent(
       target.invoiceId,
       full ? 'refund' : 'partial_refund',
       refunded,
+      chargeTotal,
     );
     return;
   }
   // The disputed amount (Stripe allows partial disputes); without one the whole charge is
-  // treated as clawed back, and given back when the dispute is won (BILL-R1-1).
+  // treated as clawed back, and given back when the dispute is won (BILL-R1-1). A Dispute carries no
+  // charge total, so there is nothing to convert the amount with (BILL-R4-3): a full dispute is exact
+  // through the cap, and a partial dispute of a taxed charge still carries that charge's tax share.
   const disputed =
     typeof object.amount === 'number' && Number.isSafeInteger(object.amount) && object.amount >= 0
       ? object.amount

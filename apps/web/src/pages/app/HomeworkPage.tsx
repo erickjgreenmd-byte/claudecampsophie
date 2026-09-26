@@ -27,6 +27,7 @@ import {
   correctTranscriptionResponseSchema,
   homeworkImageSizeProblem,
   homeworkRubricSchema,
+  CONSENT_WITHDRAWN_SCAN_COPY,
   homeworkScanFits,
   overrideResultResponseSchema,
   uploadLimitsResponseSchema,
@@ -47,6 +48,7 @@ import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
 import { StepUpPrompt } from '../../components/StepUpPrompt.tsx';
 import { downscaleForUpload } from '../../lib/image-downscale.ts';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
+import { childPickerSuffix } from './ChildrenPage.tsx';
 
 /**
  * Parent homework (spec P5 "Parent selects child", P6, P14 "scan uploader / assignment review /
@@ -130,6 +132,11 @@ const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
     'This worksheet has more questions than one check can handle, so its pages were given back. Split it into two scans with fewer pages each.',
   AI_PAUSED_TOO_LONG:
     'PencilLift could not check this scan in time and its pages were given back. Send the pages again.',
+  // CS-R4-03: a scan the family's own consent withdrawal stopped. The generic line is untrue twice
+  // over (the photos were fine, and the scan was stopped rather than failing) and its advice cannot
+  // work — a new upload re-checks consent and is refused. The wording lives in the contract so the
+  // portal and the app say the same thing.
+  CONSENT_REQUIRED: CONSENT_WITHDRAWN_SCAN_COPY,
 };
 
 function explainStatus(
@@ -309,7 +316,7 @@ function HomeworkManager() {
             {children.map((child) => (
               <option key={child.id} value={child.id}>
                 {child.nickname}
-                {child.status === 'active' ? '' : ' (no paid slot yet)'}
+                {childPickerSuffix(child)}
               </option>
             ))}
           </select>
@@ -401,7 +408,26 @@ function ChildHomework({ child }: { child: FamilyChild }) {
   return (
     <>
       {allowance ? <AllowanceCard allowance={allowance} name={child.nickname} /> : null}
-      <ScanUploader child={child} allowance={allowance} onChanged={reload} />
+      {/*
+        WEBR4-10: no uploader for an archived profile. POST /v1/assignments answers CHILD_NOT_ACTIVE
+        for it and no client can assign a slot to an archived child from the scan screen, so offering
+        the uploader was a dead end. A draft still gets it: activating a draft is one click away on
+        the Children page.
+      */}
+      {child.status === 'archived' ? (
+        <section className="notice" aria-label="Scanning paused" style={{ marginTop: 16 }}>
+          <p style={{ margin: 0 }}>
+            {child.nickname}’s profile is archived, so new scans are not taken. Everything already
+            scanned stays readable below.{' '}
+            <Link to="/app/children">
+              Activate {child.nickname} again on the Children page to scan homework
+            </Link>
+            .
+          </p>
+        </section>
+      ) : (
+        <ScanUploader child={child} allowance={allowance} onChanged={reload} />
+      )}
       <ActionFeedback feedback={action.feedback} what="Cancelling" />
       <section
         className="card"

@@ -506,8 +506,23 @@ async function familyData(tx: Tx, row: ExportRow, now: Date): Promise<Uint8Array
              parent_override_verdict, overridden_at, override_reason
         from public.question_results
        where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    // CS-R4-02: a safety notice's BODY never leaves PencilLift in this file. The notice the child
+    // reads in place of coaching is childSafetyMessage(screen categories, age band), and its wording
+    // is a pure function of those categories — a self-harm screen adds the 988 line, an abuse-type
+    // screen adds the Childhelp line and drops the anger line — so exporting it says WHICH KIND of
+    // concern was flagged. That is the one thing the family never learns (owner decision 2026-09-25),
+    // and it matters most when the adult reading the export is the subject of the child's disclosure;
+    // the safetyFlags block below removed exactly those codes and the body handed them back through
+    // `feedback_id`. What is exported for a safety row is the FACT that a notice was put on that
+    // question, its instant, and the template version that composed it (never the categories).
+    // Coaching feedback (hints, method steps, examples, encouragement) is exported in full as
+    // CS-R2-05 added it.
     childFeedback: await tx`
-      select id, question_id, child_id, kind, body, created_at from public.child_feedback
+      select id, question_id, child_id, kind,
+             case when kind = 'safety' then null else body end as body,
+             case when kind = 'safety' then guard_version end as safety_template_version,
+             created_at
+        from public.child_feedback
        where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
     targetAnswerAttempts: await tx`
       select question_instance_id, child_id, count, updated_at from public.target_answer_attempts

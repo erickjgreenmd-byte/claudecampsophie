@@ -41,11 +41,38 @@ export interface AccountAuth {
  */
 export type SignOutScope = 'local' | 'global';
 
+/**
+ * WEB-R4-AUTH-2: a sign-out the auth service did not carry out. This browser's stored session has
+ * been removed, but the server was never told, so the session may still be usable elsewhere and the
+ * parent has to be told rather than shown a signed-out screen.
+ */
+export interface SignOutRefused {
+  readonly serverNotTold: true;
+}
+
+/**
+ * What a sign-out did: nothing to report (it was carried out), or a refusal.
+ *
+ * ACC-WEB-AUTH-A: reported as a value, never as a rejection. Not every caller can be held up by a
+ * refusal — the account-closure flow signs the device out after the server has already closed the
+ * account and must still reach the page that explains what happens next — and a rejection there
+ * skipped that step and left an unhandled promise. `void` in the union keeps the small test adapters
+ * below (`() => Promise.resolve()`) valid.
+ */
+export type SignOutReport = void | SignOutRefused;
+
 export interface AuthAdapter {
   readonly configured: boolean;
   currentSession(): Promise<ParentSession | null>;
-  /** Defaults to `local`: a sign-out here never reaches the parent's other devices. */
-  signOut(scope?: SignOutScope): Promise<void>;
+  /**
+   * Defaults to `local`: a sign-out here never reaches the parent's other devices.
+   *
+   * WEB-R4-AUTH-2: resolves with a `SignOutRefused` report when the auth service did not end the
+   * session, and with nothing when it did. A caller that would otherwise present a signed-out screen
+   * must read the report (and may re-check `currentSession()`): the stored refresh token may still be
+   * usable server-side. See the Supabase adapter's signOut.
+   */
+  signOut(scope?: SignOutScope): Promise<SignOutReport>;
   /** Present when real sign-in is available. */
   readonly account?: AccountAuth;
   /** Subscribes to sign-in/sign-out changes; returns an unsubscribe function. */

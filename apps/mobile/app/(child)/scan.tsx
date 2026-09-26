@@ -40,6 +40,7 @@ import {
   cancelScan,
   childUploadMessage,
   newAttempt,
+  stoppedScanOutcome,
   uploadScan,
   type UploadAttempt,
   type UploadProgress,
@@ -271,10 +272,15 @@ export default function ScanScreen() {
       setUpload({ kind: 'done', assignmentId: result.assignment.id });
     } catch (error) {
       if (controller.signal.aborted || error instanceof ScanCancelledError) {
-        // Stop means stop: the server releases anything reserved for this scan.
-        await cancelScan(childApi, attemptRef.current).catch(() => undefined);
-        attemptRef.current = newAttempt(newKey);
-        setUpload({ kind: 'error', message: childUploadMessage(new ScanCancelledError()) });
+        // Stop means stop: the server releases anything reserved for this scan. Unless it was too
+        // late — the finalize had committed and the scan is already being checked (HUNT4-MOB-5): then
+        // the child is told it was already sent and the SAME attempt is kept, so "Try again" reports
+        // that one scan instead of creating a second assignment for the same homework.
+        const outcome = stoppedScanOutcome(
+          await cancelScan(childApi, attemptRef.current).catch(() => 'cancelled' as const),
+        );
+        if (!outcome.keepAttempt) attemptRef.current = newAttempt(newKey);
+        setUpload({ kind: 'error', message: outcome.message });
       } else if (error instanceof ScanStoppedError) {
         // The server scan was stopped (e.g. by a grown-up): "Try again" sends a new scan.
         attemptRef.current = newAttempt(newKey);

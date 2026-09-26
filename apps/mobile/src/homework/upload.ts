@@ -289,6 +289,36 @@ export async function cancelScan(
   }
 }
 
+export interface StoppedScanOutcome {
+  /** Child-facing copy for the scan the child stopped. */
+  readonly message: string;
+  /**
+   * True when the SAME attempt must be kept, so "Try again" re-creates with the same idempotency
+   * keys and the server answers with the assignment it already has.
+   */
+  readonly keepAttempt: boolean;
+}
+
+/**
+ * What to tell the child, and whether to keep the attempt, after they stopped a scan (HUNT4-MOB-5).
+ *
+ * "Stop sending" tapped during the finalize round trip aborts the request, but the server may have
+ * committed the finalize; once the scan job moves the assignment out of 'queued' the cancel that
+ * follows is refused INVALID_TRANSITION, which cancelScan reports as 'too_late'. Saying "Stopped" and
+ * starting a fresh attempt there told the child the scan had stopped while it was being checked and
+ * charged, and let "Try again" create a SECOND assignment for the same homework — two jobs and two
+ * page-allowance charges against AC_CAPTURE_06's one job, one charge. So 'too_late' keeps the attempt
+ * and says the scan was already on its way.
+ */
+export function stoppedScanOutcome(
+  cancel: 'cancelled' | 'nothing_to_cancel' | 'too_late',
+): StoppedScanOutcome {
+  if (cancel === 'too_late') {
+    return { message: 'That one was already sent. You can see it in My scans.', keepAttempt: true };
+  }
+  return { message: childUploadMessage(new ScanCancelledError()), keepAttempt: false };
+}
+
 const GENERIC_COPY = 'Something went wrong. Let’s try again.';
 
 const CODE_COPY: Partial<Record<ApiRequestError['code'], string>> = {

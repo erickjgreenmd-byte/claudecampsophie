@@ -5,7 +5,12 @@ import { createMemoryRouter, RouterProvider } from 'react-router';
 import type { ApiClient } from '@pencillift/contracts/client';
 import type { AccountAuth, AuthAdapter, AuthOutcome, ParentSession } from '../../lib/auth.ts';
 import { SessionProvider } from '../../lib/session.tsx';
-import { createSupabaseAuth, type PasswordProofAuth } from '../../lib/supabase-auth.ts';
+import {
+  createSupabaseAuth,
+  type PasswordProofAuth,
+  type RecoveryLinkOutcome,
+  type RecoveryLinkTokens,
+} from '../../lib/supabase-auth.ts';
 import UpdatePasswordPage from './UpdatePasswordPage.tsx';
 
 /**
@@ -317,5 +322,99 @@ describe('WEB-R2-04 the recovery grant is single-use and time-bounded', () => {
     expect(account.recoveryActive()).toBe(true);
     nowMs += 16 * 60_000;
     expect(account.recoveryActive()).toBe(false);
+  });
+});
+
+/**
+ * WEB-R4-AUTH-1: the bound above was only ever checked on the adapter. The page treated its own
+ * `recovery` state — written once when the mobile (implicit-flow) link was adopted and never reset —
+ * as a second, unbounded grant, so an /update-password tab left open on a shared family, school or
+ * library computer still set a new account password with no current password hours later. The page
+ * now reads the grant from the adapter alone, which is what RECOVERY_GRANT_MS, the single use and a
+ * sign-out all act on.
+ *
+ * All emails, tokens and passwords below are synthetic; the account is a labeled fake (no network).
+ */
+describe('WEB-R4-AUTH-1 an abandoned mobile-link tab is not a standing grant', () => {
+  const RECOVERY_HASH =
+    '#access_token=synthetic-access&refresh_token=synthetic-refresh&type=recovery';
+
+  /** Labeled fake account whose grant the test opens (via the link) and lets lapse. */
+  function linkAccount() {
+    let grantOpen = false;
+    const base = fakeAccount();
+    const account: AccountAuth &
+      PasswordProofAuth & {
+        recoveryActive(): boolean;
+        acceptRecoveryLink(t: RecoveryLinkTokens): Promise<RecoveryLinkOutcome>;
+      } = {
+      ...base.account,
+      recoveryActive: () => grantOpen,
+      // Mirrors the adapter: accepting the link is what opens the bounded grant (supabase-auth.ts).
+      acceptRecoveryLink: () => {
+        grantOpen = true;
+        return Promise.resolve({ ok: true, email: 'pat.parent@example.test' });
+      },
+    };
+    return {
+      account,
+      updatePassword: base.updatePassword,
+      verifyPassword: base.verifyPassword,
+      lapse: () => {
+        grantOpen = false;
+      },
+    };
+  }
+
+  function renderLink(account: AccountAuth) {
+    const auth: AuthAdapter = {
+      configured: true,
+      account,
+      currentSession: () => Promise.resolve(SESSION),
+      signOut: () => Promise.resolve(),
+    };
+    const router = createMemoryRouter(
+      [{ path: '/update-password', element: <UpdatePasswordPage /> }],
+      { initialEntries: [`/update-password${RECOVERY_HASH}`] },
+    );
+    render(
+      <SessionProvider
+        value={{
+          config: { apiBaseUrl: '/api', supabaseUrl: null, supabasePublishableKey: null },
+          auth,
+          api,
+        }}
+      >
+        <RouterProvider router={router} />
+      </SessionProvider>,
+    );
+    return router;
+  }
+
+  it('asks for the current password once the fifteen minutes have passed', async () => {
+    const { account, updatePassword, verifyPassword, lapse } = linkAccount();
+    renderLink(account);
+    expect(await screen.findByLabelText('New password')).toBeTruthy();
+    expect(screen.queryByLabelText('Current password')).toBeNull();
+    // Sixteen minutes pass with the tab still open: the adapter's grant has lapsed.
+    lapse();
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('New password'), 'attacker-chosen-pass');
+    expect(await screen.findByLabelText('Current password')).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Save password' }));
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(verifyPassword).not.toHaveBeenCalled();
+    expect(updatePassword).not.toHaveBeenCalled();
+  });
+
+  it('still lets the parent set the password inside the grant', async () => {
+    const { account, updatePassword } = linkAccount();
+    renderLink(account);
+    expect(await screen.findByText('Set a new password for p•••@example.test')).toBeTruthy();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText('New password'), 'a-long-synthetic-pass');
+    await user.click(screen.getByRole('button', { name: 'Save password' }));
+    expect(await screen.findByText(/Your password is changed/)).toBeTruthy();
+    expect(updatePassword).toHaveBeenCalledWith('a-long-synthetic-pass');
   });
 });

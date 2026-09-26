@@ -5,6 +5,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ChildReportCategory } from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
+import { withChildTokenRetry } from '../../src/family/child-session.ts';
+import { childSession } from '../../src/family/runtime.ts';
 import { ChildNav } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import {
@@ -26,7 +28,14 @@ export default function ChildHelpScreen() {
   const params = useLocalSearchParams<{ questionId?: string; feedbackId?: string }>();
   const [context, setContext] = useState<ReportContext>(() => parseReportContext(params));
   const tokenSource = childPrivacyTokenSource();
-  const api = useMemo(() => (tokenSource ? createMobileApi(tokenSource) : null), [tokenSource]);
+  // HUNT4-MOB-2: the retry that every other child client has. A token the server has already
+  // expired (a device clock that moved backwards) is dropped and the call goes again through the one
+  // refresher in child-session.ts, so a child's report is not silently turned into "not connected"
+  // on every tap. Still no second refresher (L-007).
+  const api = useMemo(
+    () => (tokenSource ? withChildTokenRetry(createMobileApi(tokenSource), childSession) : null),
+    [tokenSource],
+  );
   const [busy, setBusy] = useState<ChildReportCategory | null>(null);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
 

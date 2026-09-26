@@ -591,9 +591,17 @@ function ExportsSection({
  * A ready export is fetched through a one-minute signed link (never a durable URL): the parent
  * asks for the link, then opens it. The API checks the family and the step-up.
  */
+/**
+ * How long a signed download link may be offered, measured on the device's own clock from the moment
+ * the link arrives (WEBR4-09). It mirrors DOWNLOAD_URL_SECONDS in apps/api/src/routes/export-download.ts;
+ * the response carries only `url` and `expiresAt`, so there is nothing to read it from.
+ */
+const LINK_WINDOW_MS = 60_000;
+
 function ExportDownload({ exportId }: { exportId: string }) {
   const { api } = useSession();
   const action = useAction();
+  const { setOutcome } = action;
   const [link, setLink] = useState<{ url: string; expiresAt: string } | null>(null);
   const [expired, setExpired] = useState(false);
   // WEB-R2-07: once a link has been asked for, the button stays available as "Get a new link", so a
@@ -605,21 +613,27 @@ function ExportDownload({ exportId }: { exportId: string }) {
    * The API signs the link for one minute (DOWNLOAD_URL_SECONDS). At that instant the link is
    * dropped, so the page can never offer a URL that would answer with the storage service's error
    * document. The parent is told it expired and asks for another.
+   *
+   * WEBR4-09: the window is measured on THIS clock, from the moment the link arrived — it used to be
+   * `new Date(link.expiresAt).getTime() - Date.now()`, the signer's clock minus the device's. A
+   * device five minutes behind kept the dead link on screen and clickable for five minutes after the
+   * signature died, and one running ahead threw a valid link away at once. `expiresAt` is still what
+   * the wall-clock text below shows.
    */
   useEffect(() => {
     if (!link) return;
-    const remaining = new Date(link.expiresAt).getTime() - Date.now();
     const done = () => {
       setLink(null);
       setExpired(true);
+      // WEBR4-08: drop the stale "Your download link is ready." outcome with the link. The render
+      // below shows `action.outcome` again as soon as `link` is null, so the parent used to read
+      // "That download link expired" and "Your download link is ready." side by side, both as
+      // role="status" lines a screen reader reads out one after the other.
+      setOutcome(null);
     };
-    if (!Number.isFinite(remaining) || remaining <= 0) {
-      done();
-      return;
-    }
-    const timer = setTimeout(done, remaining);
+    const timer = setTimeout(done, LINK_WINDOW_MS);
     return () => clearTimeout(timer);
-  }, [link]);
+  }, [link, setOutcome]);
 
   const fetchLink = async () => {
     setExpired(false);
@@ -696,8 +710,15 @@ function AccountCloseSection() {
     });
     if (!ok || status === null) return;
     // The API's signOut flag: clear this device's session through the normal sign-out path, then
-    // explain on the public page (this page needs a signed-in parent to render).
-    await auth.signOut();
+    // explain on the public page (this page needs a signed-in parent to render). A sign-out the auth
+    // server refuses now rejects rather than reporting success (WEB-R4-AUTH-2), and the account is
+    // already closed by this point, so the navigation must not depend on it — otherwise the parent is
+    // left on a page that needs the session they just gave up.
+    try {
+      await auth.signOut();
+    } catch {
+      // Nothing to tell the parent here: the close succeeded, and the public page says what happened.
+    }
     void navigate('/account-deletion', { state: { accountClosed: status } });
   };
 
@@ -1076,13 +1097,23 @@ function SafetyReportsSection({
         send anything or alert anyone. Reviewers see the type of report, its status and item
         references — not homework text, your child’s name or your note.
       </p>
+      {/*
+        WEBR4-07: this paragraph used to say PencilLift "emails the guardians on this account", the
+        exact overclaim CS-R2-06 removed from PARENT_SAFETY_FLAG_COPY.emailSent. The job emails only
+        VERIFIED guardian addresses and records `sent` as soon as one of them accepts, so an
+        unverified co-guardian — or one whose address the provider refused — read on this very screen
+        that they had been emailed. The settled contract copy per flag carries the detail; the intro
+        now claims no more than the delivery actually promises.
+      */}
       <p>
         PencilLift also adds a report here when its safety check flags one of your child’s answers
-        for a grown-up to look at, and emails the guardians on this account so they know to look;
-        each flag below says whether that email was sent. For that question, your child’s results
-        show a calm message about talking with a grown-up they trust instead of a hint, and
-        PencilLift gives no hints on it. Once you have looked into a flag, mark it below; if you are
-        sure it was a false alarm, you can have the question checked normally.
+        for a grown-up to look at, and emails at least one verified guardian address on this account
+        so a grown-up knows to look; an address that is not verified, or that the email provider
+        refused, is not reached, and each flag below says whether that email was sent. For that
+        question, your child’s results show a calm message about talking with a grown-up they trust
+        instead of a hint, and PencilLift gives no hints on it. Once you have looked into a flag,
+        mark it below; if you are sure it was a false alarm, you can have the question checked
+        normally.
       </p>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <label htmlFor={categoryId}>What happened?</label>

@@ -80,6 +80,14 @@ export default function ChildHomeScreen() {
           <Body>This device isn’t connected yet. Ask a grown-up for a connect code.</Body>
           <Button label="Enter a connect code" onPress={() => router.replace('/pair')} />
         </Notice>
+        {/* MOB-R4-LOCK-05: without this, a device left in child mode with no usable child session
+            offered a grown-up no way out of the child space at all. */}
+        <Button
+          label="Grown-ups"
+          secondary
+          accessibilityLabel="Grown-ups: parent area, needs the parent PIN"
+          onPress={() => router.push('/(parent)/unlock')}
+        />
       </Screen>
     );
   }

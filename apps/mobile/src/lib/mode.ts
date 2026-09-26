@@ -59,14 +59,33 @@ export function forgetParentUnlock(): void {
  * the app leaving the foreground in parent mode, and both "Lock parent area" buttons — because
  * revoking only the server step-up left the open parent screen showing its data and every other
  * parent screen one tap away for the rest of the server's window (the read routes behind them need
- * only a signed-in parent). The parent stays signed in and the device stays in parent mode: coming
- * back needs the PIN, not the password.
+ * only a signed-in parent). The parent stays signed in: coming back needs the PIN, not the password.
+ *
+ * A device that holds a child pairing goes back to the child's space (MOB-R4-LOCK-01), the way
+ * signing out already did (MOB-R2-04). Locking used to leave mode 'parent' and replace the whole
+ * stack with the PIN screen, so on a family tablet the child was left on a PIN field with no way
+ * back (one route in the stack means no back arrow) and the next cold start showed the parent/child
+ * chooser, because entryRoute only sends mode 'child' straight to the child home. The child space
+ * needs no PIN; the parent PINs back in from "Grown-ups".
  */
-export async function lockParentAreaOnDevice(effects: ModeEffects): Promise<void> {
+export async function lockParentAreaOnDevice(
+  storage: SecureStorage,
+  effects: ModeEffects,
+): Promise<void> {
   // Local state first: an offline relock must not leave the screens open.
   forgetParentUnlock();
   effects.clearAdultCaches();
-  effects.resetNavigationToUnlock();
+  // A keychain that cannot be read counts as unpaired: the unlock screen is the safe fallback.
+  const childPaired = await storage
+    .getItem(STORAGE_KEYS.childRefreshToken)
+    .then((token) => token !== null)
+    .catch(() => false);
+  if (childPaired) {
+    await storage.setItem(STORAGE_KEYS.mode, 'child').catch(() => undefined);
+    effects.resetNavigationToChildHome();
+  } else {
+    effects.resetNavigationToUnlock();
+  }
   await effects.relockOnServer().catch(() => undefined);
 }
 
@@ -182,6 +201,35 @@ export async function signOutParent(
   if (childPaired) effects.resetNavigationToChildHome();
   else effects.resetNavigationToWelcome();
   await effects.setScreenPrivacy(false);
+}
+
+/**
+ * Closing the parent's own account on this device (MOB-R4-LOCK-05). The same sign-out, and then the
+ * device also stops being the child's: an account closure is not a sign-out, because the adult who
+ * set this device up is gone.
+ *
+ * signOutParent deliberately leaves a paired tablet in child mode with its pairing intact
+ * (MOB-R2-04). After a closure that rule strands the device: the family owner can only close their
+ * sign-in once the whole-family deletion has been requested (ACCOUNT_CLOSE_COPY.familyDeletionRequired),
+ * which already revoked the child's session server-side, so every later launch went straight to the
+ * child home of a deleted family with the child's refresh token and cached nickname still in the
+ * keychain.
+ *
+ * The forget is unconditional and local. The first round-4 attempt made it conditional on a
+ * `familyDeleted` flag, so that a guardian's own closure (the family lives on) kept the pairing —
+ * but no caller passed the flag, and the fix never ran on the path the finding describes. Nothing on
+ * this device can tell the two closures apart, so the honest state after either is a device with no
+ * adult sign-in and no child credential: the child re-enters a connect code, which is one step from
+ * the child home's "Grown-ups" route. Nothing is revoked on the wire, so a guardian's closure costs
+ * a live child session nothing.
+ */
+export async function signOutClosedAccount(
+  storage: SecureStorage,
+  effects: ModeEffects,
+  auth: { signOut(): Promise<void> },
+): Promise<void> {
+  await signOutParent(storage, effects, auth);
+  await unpairChildDevice(storage);
 }
 
 /** Unpairing a child device removes the child's refresh token and cached profile. */
