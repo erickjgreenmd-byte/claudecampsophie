@@ -33,6 +33,8 @@ export default function UpdatePasswordPage() {
   const navigate = useNavigate();
   const [password, setPassword] = useState('');
   const [current, setCurrent] = useState('');
+  /** WEBR5-E-4: set when a submit found the recovery grant closed, so this page asks for the proof. */
+  const [lapsed, setLapsed] = useState(false);
   const account = auth.account;
   const capability = recoveryLinkAuth(account);
   const proof = passwordProofAuth(account);
@@ -96,9 +98,13 @@ export default function UpdatePasswordPage() {
   // left open on a shared family, school or library computer still changed the account password with
   // no current password hours later. `acceptRecoveryLink` opens the bounded, single-use grant
   // (supabase-auth.ts), and RECOVERY_GRANT_MS, the one change and a sign-out all close it.
+  //
+  // WEBR5-E-4: what is computed here draws the form; it does not decide anything. The grant is
+  // re-read at submit time below, and `lapsed` records a grant that had closed by then so this page
+  // renders the "Current password" field the parent now needs.
   const fromRecoveryLink = recoverySession?.recoveryActive() === true;
   const currentEmail = state.status === 'signed_in' ? state.session.email : null;
-  const mustProve = !fromRecoveryLink;
+  const mustProve = lapsed || !fromRecoveryLink;
   if (mustProve && (!proof || !currentEmail)) {
     // No way to prove the old password here (an adapter without the capability): refuse rather than
     // offer a change that would need no proof.
@@ -117,13 +123,29 @@ export default function UpdatePasswordPage() {
         if (password.length < MIN_PASSWORD_LENGTH) {
           return { ok: false, message: `Use at least ${MIN_PASSWORD_LENGTH} characters.` };
         }
-        if (mustProve) {
+        // WEBR5-E-4: whether the recovery grant is still open is decided HERE, at the moment the
+        // account would change, and not at the render that drew this form. `mustProve` is captured by
+        // this closure and AccountForm keeps its own busy/error state (forms.tsx), so a page whose
+        // last render fell inside the window was never re-rendered again: a form filled inside the
+        // fifteen minutes still saved a new password with no current password long after they were up,
+        // which is the one action the bound exists to limit (BUG-242, L-040).
+        const granted = recoverySession?.recoveryActive() === true;
+        // Bring the "Current password" field back on this page's next render.
+        if (!granted && !mustProve) setLapsed(true);
+        if (mustProve || !granted) {
+          if (!proof || !currentEmail) {
+            // No way to prove the old password here: refuse rather than change it without one.
+            return {
+              ok: false,
+              message: 'To change your password, open the newest reset link in your email.',
+            };
+          }
           if (current.length === 0) {
             return { ok: false, message: 'Enter your current password.' };
           }
           // Proved on a second, non-persisting client: this browser's session (and an owner's
           // two-step aal2 session) is left exactly as it was.
-          const proved = await proof!.verifyPassword(currentEmail!, current);
+          const proved = await proof.verifyPassword(currentEmail, current);
           if (!proved.ok) return proved;
         }
         return account.updatePassword(password);

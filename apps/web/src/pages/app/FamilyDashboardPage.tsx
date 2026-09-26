@@ -136,10 +136,17 @@ function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: (
         </p>
       ) : (
         <ul>
+          {/*
+            HUNT5-F-2: a child whose data deletion is under way is archived by request_deletion, so
+            this row used to read "Archived: history only" while the purge was deleting that history.
+            The flag is on this response (the full contract schema), so the row says what is true.
+          */}
           {data.children.map((child) => (
             <li key={child.id}>
               <strong>{child.nickname}</strong> · {gradeLabel(child.gradeLevel)} ·{' '}
-              {childStatusLabel(child.status)}
+              {child.deletionPending === true
+                ? 'Data deletion under way'
+                : childStatusLabel(child.status)}
             </li>
           ))}
         </ul>
@@ -166,21 +173,29 @@ function EditFamilyForm({
   onSaved: () => void;
 }) {
   const { api } = useSession();
-  const [name, setName] = useState(data.displayName);
-  const [timezone, setTimezone] = useState(data.timezone);
+  /**
+   * The family this form was opened on, captured once (HUNT5-F-1). The diff below is against this,
+   * never against `data`: the page query replaces `data` under the open form — the ErrorState's
+   * "Try again" sits beside it after a failed reload — and diffing against the live prop then put
+   * the other guardian's new zone back to the one this form happened to be seeded with.
+   */
+  const [seed] = useState(data);
+  const [name, setName] = useState(seed.displayName);
+  const [timezone, setTimezone] = useState(seed.timezone);
   const [fieldError, setFieldError] = useState<string | null>(null);
   const nameId = useId();
   const zoneId = useId();
   const errorId = useId();
 
   /**
-   * Only what differs from the family this form was opened on (WEBR4-03). Sending both fields every
-   * time reverted the other guardian's time-zone change when a parent corrected only the name, and
-   * the zone is what every daily release, weekly review and school report is planned in.
+   * Only what differs from the family this form was opened on (WEBR4-03, HUNT5-F-1). Sending both
+   * fields every time reverted the other guardian's time-zone change when a parent corrected only
+   * the name, and the zone is what every daily release, weekly review and school report is planned
+   * in.
    */
   const changes = (displayName: string, zone: string): UpdateFamilyRequest => ({
-    ...(displayName === data.displayName ? {} : { displayName }),
-    ...(zone === data.timezone ? {} : { timezone: zone }),
+    ...(displayName === seed.displayName ? {} : { displayName }),
+    ...(zone === seed.timezone ? {} : { timezone: zone }),
   });
   const nothingChanged = Object.keys(changes(name.trim(), timezone.trim())).length === 0;
 

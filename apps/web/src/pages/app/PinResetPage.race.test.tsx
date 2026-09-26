@@ -3,8 +3,15 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import type { ApiClient } from '@pencillift/contracts/client';
-import type { AccountAuth, AuthAdapter, AuthOutcome, ParentSession } from '../../lib/auth.ts';
+import {
+  isTwoStepLookupUnavailable,
+  type AccountAuth,
+  type AuthAdapter,
+  type AuthOutcome,
+  type ParentSession,
+} from '../../lib/auth.ts';
 import { SessionProvider } from '../../lib/session.tsx';
+import { createSupabaseAuth } from '../../lib/supabase-auth.ts';
 import PinResetPage from './PinResetPage.tsx';
 
 /**
@@ -38,12 +45,18 @@ function baseAccount(overrides: Partial<AccountAuth>): AccountAuth {
 }
 
 function renderPage(account: AccountAuth, send: ApiClient['send']) {
-  const auth: AuthAdapter = {
-    configured: true,
-    account,
-    currentSession: () => Promise.resolve(SESSION),
-    signOut: () => Promise.resolve(),
-  };
+  return renderWithAuth(
+    {
+      configured: true,
+      account,
+      currentSession: () => Promise.resolve(SESSION),
+      signOut: () => Promise.resolve(),
+    },
+    send,
+  );
+}
+
+function renderWithAuth(auth: AuthAdapter, send: ApiClient['send']) {
   const router = createMemoryRouter(
     [{ path: '/app/security/reset-pin', element: <PinResetPage /> }],
     { initialEntries: ['/app/security/reset-pin'] },
@@ -148,5 +161,129 @@ describe('WEBR4-05 the owner’s aal2 path does not depend on a race', () => {
     await user.type(screen.getByLabelText('Repeat the new PIN'), '284917');
     await user.click(screen.getByRole('button', { name: 'Save new PIN' }));
     expect(await screen.findByText(/Your new PIN is saved/)).toBeTruthy();
+  });
+});
+
+/**
+ * WEBR5-E-1: the same refusal, driven through the REAL Supabase adapter over a labeled fake client.
+ * auth-js 2.116.0 reports a failed `mfa.listFactors()` (and a failed
+ * `mfa.getAuthenticatorAssuranceLevel()`) as `{ data: null, error }` and never rejects — `_getUser`
+ * catches every AuthError, AuthRetryableFetchError included — so the fixtures above, which reject,
+ * proved the "unavailable" branch only for an adapter shape production does not have. Offline, the
+ * adapter answered `null`, which is byte-identical to "this account has no verified factor", so the
+ * page read a failed lookup as "no two-step" and an owner's own PIN reset dropped their aal2 session.
+ *
+ * Synthetic email, password, PIN and factor id only; the Supabase client is a labeled fake (no
+ * network) and no real project URL or key is used.
+ */
+const SUPABASE_CONFIG = {
+  apiBaseUrl: '/api',
+  supabaseUrl: 'https://example.supabase.co',
+  supabasePublishableKey: 'sb_publishable_test',
+};
+
+/** auth-js's answer shapes for the two MFA lookups, as values — never as rejections. */
+interface FakeMfa {
+  getAuthenticatorAssuranceLevel: () => Promise<unknown>;
+  listFactors: () => Promise<unknown>;
+}
+
+const AAL2_OK = { data: { currentLevel: 'aal2' }, error: null };
+const FETCH_FAILED = { data: null, error: { message: 'Failed to fetch' } };
+const VERIFIED_FACTOR = {
+  data: { totp: [{ id: 'synthetic-factor', status: 'verified' }] },
+  error: null,
+};
+
+function adapterOverFakeClient(mfa: FakeMfa) {
+  const signInWithPassword = vi.fn(() => Promise.resolve({ error: null }));
+  const adapter = createSupabaseAuth(
+    SUPABASE_CONFIG,
+    () =>
+      ({
+        auth: {
+          mfa,
+          signInWithPassword,
+          getSession: () =>
+            Promise.resolve({
+              data: {
+                session: {
+                  access_token: 'synthetic-token',
+                  user: { email: 'pat.parent@example.test' },
+                },
+              },
+            }),
+          onAuthStateChange: () => ({
+            data: { subscription: { unsubscribe: () => undefined } },
+          }),
+        },
+      }) as never,
+  );
+  return { adapter, signInWithPassword };
+}
+
+describe('WEBR5-E-1 a two-step lookup that failed is never read as “no two-step”', () => {
+  it('reports a failed factor lookup as unavailable rather than as “no verified factor”', async () => {
+    const { adapter } = adapterOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL2_OK),
+      listFactors: () => Promise.resolve(FETCH_FAILED),
+    });
+    // `null` is how the adapter says "asked, and this account has no verified factor". A lookup that
+    // never reached the server must not be spendable as that answer.
+    const lookup = await adapter.account!.verifiedTotpFactorId();
+    expect(lookup).not.toBeNull();
+    expect(isTwoStepLookupUnavailable(lookup)).toBe(true);
+  });
+
+  it('refuses the password submit when the factor lookup fails at the network', async () => {
+    const send = vi.fn(() => Promise.resolve({ ok: true }));
+    const { adapter, signInWithPassword } = adapterOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL2_OK),
+      listFactors: () => Promise.resolve(FETCH_FAILED),
+    });
+    renderWithAuth(adapter, send as unknown as ApiClient['send']);
+    await confirmPassword();
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/two-step verification/i);
+    // The aal2 session is untouched, so nothing was dropped and the PIN step is unreachable.
+    expect(signInWithPassword).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('New 6-digit PIN')).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('refuses the password submit when the assurance-level lookup fails beside a real factor', async () => {
+    const send = vi.fn(() => Promise.resolve({ ok: true }));
+    const { adapter, signInWithPassword } = adapterOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(FETCH_FAILED),
+      listFactors: () => Promise.resolve(VERIFIED_FACTOR),
+    });
+    renderWithAuth(adapter, send as unknown as ApiClient['send']);
+    await confirmPassword();
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/two-step verification/i);
+    expect(signInWithPassword).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('New 6-digit PIN')).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('asks again on the next attempt instead of keeping the failed answer for the page', async () => {
+    const send = vi.fn(() => Promise.resolve({ ok: true }));
+    // The lookup started on mount and the one the first submit awaits both fail; the third succeeds.
+    const listFactors = vi
+      .fn<() => Promise<unknown>>()
+      .mockResolvedValueOnce(FETCH_FAILED)
+      .mockResolvedValueOnce(FETCH_FAILED)
+      .mockResolvedValue(VERIFIED_FACTOR);
+    const { adapter } = adapterOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL2_OK),
+      listFactors,
+    });
+    renderWithAuth(adapter, send as unknown as ApiClient['send']);
+    const user = await confirmPassword();
+    expect((await screen.findByRole('alert')).textContent).toMatch(/two-step verification/i);
+
+    await user.click(screen.getByRole('button', { name: 'Confirm it’s you' }));
+    expect(await screen.findByLabelText('Six-digit code from your authenticator app')).toBeTruthy();
+    expect(send).not.toHaveBeenCalled();
   });
 });

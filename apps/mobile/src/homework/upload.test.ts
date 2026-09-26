@@ -599,13 +599,54 @@ describe('a scan the child stopped too late is not reported as stopped (HUNT4-MO
     for (const cancel of ['cancelled', 'nothing_to_cancel'] as const) {
       const outcome = stoppedScanOutcome(cancel);
       expect(outcome.keepAttempt).toBe(false);
+      // The words, not the expression. This used to compare with
+      // `childUploadMessage(new ScanCancelledError())` — the implementation's own expression — so it
+      // pinned the routing and left the copy it is here to protect unverified: any rewording, calm
+      // or not, stayed green. A child who stopped a scan is told plainly that their pages are safe.
+      expect(outcome.message).toBe('Stopped. Your pages are still here.');
       expect(outcome.message).toBe(childUploadMessage(new ScanCancelledError()));
     }
   });
 
   it('never offers a purchase or shows raw server text (spec P11, P14)', () => {
-    for (const cancel of ['cancelled', 'nothing_to_cancel', 'too_late'] as const) {
+    for (const cancel of ['cancelled', 'nothing_to_cancel', 'too_late', 'unsure'] as const) {
       expect(stoppedScanOutcome(cancel).message).not.toMatch(/buy|purchase|upgrade|pay/i);
     }
+  });
+});
+
+/**
+ * HUNT5-H-4. `cancelScan` answered 'too_late' for INVALID_TRANSITION and rethrew everything else,
+ * and the scan screen turned that throw into the affirmative 'cancelled' with
+ * `.catch(() => 'cancelled' as const)`. So a cancel that never reached the server — offline, the 20 s
+ * timeout, a 5xx, a 429, which is the common case when a child taps "Stop sending" on a flaky
+ * connection — was reported to the child as a successful stop AND rotated the idempotency keys. If
+ * the abort had raced a finalize that already committed, that scan stayed queued with its page-
+ * allowance reservation and its scan_process job, while "Try again" created a SECOND assignment with
+ * a second reservation and a second job: the two jobs and two page charges HUNT4-MOB-5 closed,
+ * against AC_CAPTURE_06's one job, one charge.
+ */
+describe('a cancel that never reached the server is not reported as a stop (HUNT5-H-4)', () => {
+  it('[repro] a cancel that fails for any other reason answers “unsure”, it does not throw', async () => {
+    // The shape packages/contracts/src/client.ts produces for a fetch failure or its own timeout.
+    const { api } = fakeApi({
+      fail: (call) =>
+        call.path.endsWith('/cancel')
+          ? new ApiRequestError('NETWORK', 'offline', 0, 'TIMEOUT')
+          : null,
+    });
+    expect(await cancelScan(api, { ...newAttempt(newKey), assignmentId: ASSIGNMENT })).toBe(
+      'unsure',
+    );
+  });
+
+  it('[repro] an unsure cancel keeps the attempt and tells the child something true', () => {
+    const outcome = stoppedScanOutcome('unsure');
+    // The same keys make "Try again" idempotent whatever the server did with the finalize: it either
+    // finds that assignment (reported as sent) or, if the cancel did land after all, raises
+    // ScanStoppedError, which the screen already handles.
+    expect(outcome.keepAttempt).toBe(true);
+    expect(outcome.message).not.toMatch(/stopped/i);
+    expect(outcome.message).toMatch(/My scans/);
   });
 });

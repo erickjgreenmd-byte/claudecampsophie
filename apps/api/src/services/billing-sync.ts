@@ -49,6 +49,15 @@ export interface NormalizedPeriod {
   readonly periodStart: Date;
   readonly periodEnd: Date;
   readonly chargedCents: number;
+  /**
+   * Sales tax that belongs to `chargedCents` — the tax on THIS period's charge, in integer cents; 0
+   * when the channel reports no tax figure at all. NEVER revenue (HUNT5-C-2): it is carried only so a
+   * refund amount, which the provider states INCLUDING tax, can be put back into `chargedCents`' unit
+   * without dividing by the whole charge (see preTaxRefundCents). It is NOT the invoice's whole tax
+   * when the invoice also carried lines this period never booked: a proration line's tax is no part
+   * of this charge and may not scale a refund of it either (N1-TAX-APPORTION, subscriptionTaxCents).
+   */
+  readonly taxCents: number;
   /** Provider-reported discount on the subscription charge, if the provider reports one. */
   readonly reportedDiscountCents: number | null;
   readonly discountSources: DiscountSource[];
@@ -105,6 +114,9 @@ export function mapRevenueCatEventToPeriod(event: RevenueCatEvent): NormalizedPe
     periodStart: new Date(event.purchased_at_ms),
     periodEnd: new Date(event.expiration_at_ms),
     chargedCents: Math.round(event.price_in_purchased_currency * 100),
+    // RevenueCat reports one price and no tax breakdown, so there is no tax figure to record and
+    // nothing to convert a store refund with (a store refund reports no amount either).
+    taxCents: 0,
     reportedDiscountCents: null,
     discountSources,
     currency: (event.currency ?? 'USD').toUpperCase(),
@@ -275,6 +287,51 @@ function subscriptionChargeCents(
   return collected(Math.max(0, preTax - prorationCents));
 }
 
+/**
+ * N1-TAX-APPORTION: the sales tax that belongs to THIS period's charge, which is the only tax a
+ * refund of this period's money carries. `invoice.tax` is the WHOLE invoice's tax, and a renewal
+ * invoice routinely also carries a mid-cycle proration line that is no part of this charge
+ * (BILL-R2-4; that money is revenue on its own invoice, HUNT5-C-4). Converting a partial refund by
+ * charged / (charged + WHOLE tax) therefore still scaled it down by tax belonging to a line this
+ * period never booked as revenue — the residual of HUNT5-C-2, about 2% of that defect and in the same
+ * direction (net revenue overstated): on subtotal 4999 = proration 1000 + subscription 3999 with tax
+ * 412, a $20 refund was recorded as 1813 where the subscription's own tax gives 1848.
+ *
+ * So the invoice's tax is apportioned to the charge in proportion to the pre-tax amounts it was added
+ * to: tax x charged / (charged + every other line's amount). All integer cents — the product is well
+ * inside the safe integer range at any invoice a family can be sent, and no float rate is formed.
+ * Other lines are counted whatever they are (a proration, an add-on): a larger denominator can only
+ * make the share smaller, which is the safe direction below. An invoice whose only line is this
+ * charge keeps the whole tax, so a tax-only renewal converts exactly as before.
+ *
+ * Rounding: the share is FLOORED, so it is never more than the tax really on this charge. A smaller
+ * stored tax makes the refund denominator smaller and the recorded pre-tax refund larger by at most a
+ * cent, i.e. net revenue understated by at most a cent rather than overstated — the same safe
+ * direction migration 0900 chose for a period recorded with no tax at all, and the direction that
+ * cannot make clawed-back money look like kept revenue.
+ *
+ * ASSUMPTION, stated because it is not free: apportioning by pre-tax amount assumes every line on the
+ * invoice carries the SAME tax rate. Stripe states tax per invoice LINE, so the exact figure exists —
+ * the `StripeInvoice` shape this module models simply does not carry it (it models each line's amount
+ * and discount_amounts only). Where the rates really differ, this share is wrong in whichever
+ * direction the other line's rate differs, and if the subscription line were the exempt one the share
+ * would be overstated, which is the unsafe direction. That case needs the provider's per-line tax in
+ * the model, not a cleverer ratio, and it is recorded as an open item rather than guessed at here.
+ */
+function subscriptionTaxCents(
+  invoice: StripeInvoice,
+  line: StripeLine,
+  chargedCents: number,
+): number {
+  const tax = Math.max(0, cents(invoice.tax) ?? 0);
+  if (tax === 0 || chargedCents <= 0) return 0;
+  const otherLinesCents = (invoice.lines?.data ?? [])
+    .filter((l) => l !== line)
+    .reduce((sum, l) => sum + Math.max(0, cents(l.amount) ?? 0), 0);
+  if (otherLinesCents <= 0) return tax;
+  return Math.floor((tax * chargedCents) / (chargedCents + otherLinesCents));
+}
+
 export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeriod | null {
   const line = subscriptionLine(invoice);
   const period = line?.period;
@@ -287,6 +344,7 @@ export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeri
         ? 'proration'
         : 'addon';
   const discount = sumAmounts(invoice.total_discount_amounts);
+  const chargedCents = subscriptionChargeCents(invoice, line, discount);
   return {
     channel: 'stripe',
     providerPeriodId: invoice.id,
@@ -294,7 +352,12 @@ export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeri
     kind,
     periodStart: new Date(period.start * 1000),
     periodEnd: new Date(period.end * 1000),
-    chargedCents: subscriptionChargeCents(invoice, line, discount),
+    chargedCents,
+    // The tax on THIS charge, kept beside the pre-tax charge so a later refund can be stated in the
+    // charge's unit without going back to Stripe for this invoice (HUNT5-C-2) — the invoice's tax
+    // apportioned to the subscription portion, never the tax of lines this period never booked
+    // (N1-TAX-APPORTION).
+    taxCents: subscriptionTaxCents(invoice, line, chargedCents),
     reportedDiscountCents: discount,
     discountSources: discount > 0 ? ['promo_code'] : [],
     currency: (invoice.currency ?? 'usd').toUpperCase(),
@@ -546,10 +609,11 @@ export async function recordBillingPeriod(
     (period.discountSources.length > 0 ? Math.max(0, regularCents - period.chargedCents) : 0);
   const [row] = await tx<{ id: string; inserted: boolean }[]>`
     insert into public.billing_periods (family_id, channel, provider_period_id, kind, period_start, period_end, paid_slots,
-      regular_amount_cents, charged_amount_cents, discount_cents, discount_sources, settlement, settled_at, currency)
+      regular_amount_cents, charged_amount_cents, discount_cents, discount_sources, settlement, settled_at, currency,
+      tax_amount_cents)
     values (${familyId}, ${period.channel}, ${period.providerPeriodId}, ${period.kind}, ${period.periodStart}, ${period.periodEnd},
       ${paidSlots}, ${regularCents}, ${period.chargedCents}, ${discountCents}, ${period.discountSources}, 'settled',
-      ${period.settledAt}, ${period.currency})
+      ${period.settledAt}, ${period.currency}, ${period.taxCents})
     on conflict (channel, provider_period_id) do update set
       settlement = case when public.billing_periods.settlement in ('refunded', 'partially_refunded', 'chargeback')
                         then public.billing_periods.settlement else 'settled' end,
@@ -691,29 +755,52 @@ export type SettlementEvent = 'refund' | 'partial_refund' | 'chargeback' | 'char
  * tax-inclusive figure against a pre-tax gross, and the revenue view computes net = gross − refunds,
  * so net revenue was understated by the tax share of every partial refund.
  *
- * Converted with the invoice's own ratio: pre-tax refund = refunded × charged ÷ provider charge
- * total, rounded half up to the cent and never above the charge. `providerChargeTotalCents` is what
- * the provider says the whole charge was (Stripe's Charge `amount`); null when the caller has no such
- * figure (a RevenueCat store refund, which reports no amount at all, or a Stripe DISPUTE, whose
- * `amount` is the disputed part and not the charge total), and then nothing is converted and the cap
- * alone applies, exactly as before. A refund at or above the provider total is the whole charge.
+ * HUNT5-C-2: the ratio may take off the TAX and nothing else. It used to divide by the whole Charge —
+ * i.e. by the invoice total — and a renewal invoice carrying a mid-cycle proration line is the normal
+ * shape for a family that added a child, Stripe putting the pending proration item on the next
+ * renewal. That line is no part of THIS period's charge (BILL-R2-4, `subscriptionChargeCents` books
+ * the subscription line only; the proration money is revenue on its own invoice, HUNT5-C-4), so
+ * dividing by a total that includes it attributed part of the refund to money this period's gross
+ * never counted: a $39.99 refund on a 3999 + 1000 invoice was recorded as
+ * round(3999 × 3999 ÷ 4999) = 3199, and the owner's net revenue read 799 cents of kept subscription
+ * revenue for a period whose whole charge had come back.
+ *
+ * So the denominator is the charge plus THAT charge's tax: pre-tax refund =
+ * refunded × charged ÷ (charged + tax), rounded half up to the cent and never above the charge.
+ * `taxCents` is the tax stored with the period at invoice.paid time (billing_periods.tax_amount_cents,
+ * migration 0900) — the refund webhook never goes back to the provider for the invoice. N1-TAX-APPORTION:
+ * it is the invoice's tax APPORTIONED TO THIS CHARGE (subscriptionTaxCents), because a proration line's
+ * tax is as much outside this period's revenue as the proration line itself; passing the invoice's
+ * whole tax here scaled a partial refund down by tax this period never booked. A period recorded
+ * BEFORE that migration has tax 0, which makes the ratio 1 and this an exact no-op; that is the
+ * pre-BILL-R4-3 behaviour, not a bug.
+ *
+ * `providerChargeTotalCents` no longer scales anything; it only says whether the amount came from a
+ * Charge whose total we know, which is what makes it a tax-inclusive figure worth converting. Null
+ * for a RevenueCat store refund (no amount at all) and for a Stripe DISPUTE (whose `amount` is the
+ * disputed part, not the charge total), and then nothing is converted and the cap alone applies,
+ * exactly as before. A refund at or above the provider total took the whole charge back, so the cap
+ * states it; a total no larger than the pre-tax charge carries no tax to strip.
  */
 export function preTaxRefundCents(
   refundedCents: number,
   providerChargeTotalCents: number | null,
   chargedCents: number,
+  taxCents: number,
 ): number {
   if (
     providerChargeTotalCents === null ||
     !Number.isSafeInteger(providerChargeTotalCents) ||
     providerChargeTotalCents <= chargedCents ||
-    refundedCents >= providerChargeTotalCents
+    refundedCents >= providerChargeTotalCents ||
+    !Number.isSafeInteger(taxCents) ||
+    taxCents <= 0
   ) {
     return refundedCents;
   }
   return Math.min(
     chargedCents,
-    Math.round((refundedCents * chargedCents) / providerChargeTotalCents),
+    Math.round((refundedCents * chargedCents) / (chargedCents + taxCents)),
   );
 }
 
@@ -728,10 +815,12 @@ export function preTaxRefundCents(
  * period returns to settled/0 (and the $1 donation is reinstated) unless an earlier partial refund
  * remains; `refundedCents` is then the reversed amount, null meaning the whole charge.
  *
- * `providerChargeTotalCents` is the provider's own total for the charge the amount came from, used to
- * state the refund in the same unit as `charged_amount_cents` (see preTaxRefundCents, BILL-R4-3).
- * A refund parked in `pending_refunds` keeps the provider's figure and is applied with no total, so
- * the cap alone bounds it (that table records no provider total).
+ * `providerChargeTotalCents` is the provider's own total for the charge the amount came from; it says
+ * the amount is a tax-inclusive Charge figure, so it is restated in the unit of
+ * `charged_amount_cents` before anything is decided by it — by the tax stored for this period's own
+ * charge, never by that total (see preTaxRefundCents, BILL-R4-3 / HUNT5-C-2 / N1-TAX-APPORTION). A refund parked in `pending_refunds`
+ * keeps the provider's figure and is applied with no total, so the cap alone bounds it (that table
+ * records no provider total).
  */
 export async function applyRefund(
   tx: Tx,
@@ -745,8 +834,15 @@ export async function applyRefund(
   if (refundedCents !== null && (!Number.isSafeInteger(refundedCents) || refundedCents < 0)) {
     throw new RangeError('refundedCents must be null or a non-negative integer number of cents');
   }
-  const [current] = await tx<{ id: string; charged_amount_cents: number; settlement: string }[]>`
-    select id, charged_amount_cents, settlement from public.billing_periods
+  const [current] = await tx<
+    {
+      id: string;
+      charged_amount_cents: number;
+      tax_amount_cents: number;
+      settlement: string;
+    }[]
+  >`
+    select id, charged_amount_cents, tax_amount_cents, settlement from public.billing_periods
      where family_id = ${familyId} and channel = ${channel} and provider_period_id = ${providerPeriodId}
      for update
   `;
@@ -766,11 +862,19 @@ export async function applyRefund(
   }
   // BILL-R4-3: state the provider's amount in the unit of the recorded charge before anything is
   // decided by it (a partial refund of a taxed charge is otherwise compared with, and written
-  // against, a pre-tax figure).
+  // against, a pre-tax figure). HUNT5-C-2 / N1-TAX-APPORTION: by the tax on THIS charge, stored with
+  // the period at invoice.paid time (the invoice's tax apportioned to the subscription portion) — 0
+  // for a period recorded before migration 0900, which makes the ratio 1 and the conversion a no-op
+  // rather than a wrong number.
   const inCharge =
     refundedCents === null
       ? null
-      : preTaxRefundCents(refundedCents, providerChargeTotalCents, current.charged_amount_cents);
+      : preTaxRefundCents(
+          refundedCents,
+          providerChargeTotalCents,
+          current.charged_amount_cents,
+          current.tax_amount_cents,
+        );
   const effective: SettlementEvent =
     kind === 'refund' && inCharge !== null && inCharge < current.charged_amount_cents
       ? 'partial_refund'

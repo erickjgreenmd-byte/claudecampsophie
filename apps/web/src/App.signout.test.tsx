@@ -1,3 +1,4 @@
+import type { ReactElement } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,10 +7,11 @@ import type { ApiClient } from '@pencillift/contracts/client';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { appRoutes } from './App.tsx';
 import { routes } from './routes.tsx';
-import type { AuthAdapter, SignOutScope } from './lib/auth.ts';
+import type { AccountAuth, AuthAdapter, AuthOutcome, SignOutScope } from './lib/auth.ts';
 import { SessionProvider } from './lib/session.tsx';
 import { createSupabaseAuth } from './lib/supabase-auth.ts';
 import PrivacyControlsPage from './pages/app/PrivacyControlsPage.tsx';
+import SignInPage from './pages/auth/SignInPage.tsx';
 
 /**
  * WEB-R2-01: the parent portal had no way to end the session. A parent on a shared family, school
@@ -61,6 +63,25 @@ function fakes(
   let current = session;
   const auth: AuthAdapter = {
     configured: true,
+    // Present so /sign-in renders its real form rather than the "not configured" notice: the
+    // WEBR5-E-2 test below lands there and reads what the parent is actually told. Nothing in these
+    // tests signs in, so every method is a labeled refusal.
+    account: {
+      signInWithPassword: () =>
+        Promise.resolve<AuthOutcome>({ ok: false, message: 'not used in these tests' }),
+      signUp: () => Promise.resolve<AuthOutcome>({ ok: false, message: 'not used in these tests' }),
+      sendMagicLink: () =>
+        Promise.resolve<AuthOutcome>({ ok: false, message: 'not used in these tests' }),
+      sendPasswordReset: () =>
+        Promise.resolve<AuthOutcome>({ ok: false, message: 'not used in these tests' }),
+      updatePassword: () =>
+        Promise.resolve<AuthOutcome>({ ok: false, message: 'not used in these tests' }),
+      assuranceLevel: () => Promise.resolve(null),
+      enrollTotp: () => Promise.resolve({ error: 'not used in these tests' }),
+      verifyTotp: () =>
+        Promise.resolve<AuthOutcome>({ ok: false, message: 'not used in these tests' }),
+      verifiedTotpFactorId: () => Promise.resolve(null),
+    } satisfies AccountAuth,
     currentSession: () => Promise.resolve(current),
     signOut: async (scope) => {
       if (!options.refuse || options.refuse === 'cleared') current = null;
@@ -86,9 +107,14 @@ function fakes(
   return { auth, api, signOut, send };
 }
 
-function renderShell(path: string, parts: { auth: AuthAdapter; api: ApiClient }) {
+function renderShell(
+  path: string,
+  parts: { auth: AuthAdapter; api: ApiClient },
+  /** Real pages to mount instead of a stub, by path (WEBR5-E-2 mounts the real /sign-in). */
+  real: Readonly<Record<string, ReactElement>> = {},
+) {
   const stubs: RouteObject[] = [...new Set([...PORTAL_PATHS, ...ADMIN_PATHS, '/sign-in', '/'])].map(
-    (stub) => ({ path: stub, element: <h1>{`Page ${stub}`}</h1> }),
+    (stub) => ({ path: stub, element: real[stub] ?? <h1>{`Page ${stub}`}</h1> }),
   );
   const router = createMemoryRouter(appRoutes(stubs), { initialEntries: [path] });
   render(
@@ -179,20 +205,53 @@ describe('WEB-R4-AUTH-2 a refused sign-out is never reported as success', () => 
     expect(screen.getByText(/Signed in as p•••@example\.test/)).toBeTruthy();
   });
 
-  it('says the server was not told when the refusal cleared this browser’s session', async () => {
+  /**
+   * WEBR5-E-2: on this one path the adapter has already cleared this origin's session (it is the
+   * only way the still-valid refresh token does not stay behind), and a bare storage removal raises
+   * no SIGNED_OUT — so the shell's session state is stale, `RequireParent` keeps rendering and the
+   * route page keeps everything it had loaded. Staying put therefore left the family's page, and a
+   * "Signed in as …" line, on screen at the shared computer this control exists for, and advised a
+   * retry that can no longer reach the server: auth-js finds no access token, skips the server call
+   * and returns `{ error: null }`, so the second press only looks like it worked. This browser IS
+   * signed out, so the portal must say so and leave.
+   *
+   * E-NOTICE: carrying the notice in router state is not telling the parent anything — the real
+   * /sign-in page is mounted here (not the stub) and the assertions read what is on screen, because
+   * the first round of this fix carried a notice no page rendered and the parent was told nothing at
+   * all: not that this computer is signed out, not that the server was never told, not what to do.
+   */
+  it('leaves the portal for the sign-in page when the refusal cleared this browser’s session', async () => {
     const parts = fakes(
       { accessToken: 'synthetic-token', email: 'pat.parent@example.test' },
       {
         refuse: 'cleared',
       },
     );
-    const router = renderShell('/app', parts);
+    const router = renderShell('/app/children', parts, { '/sign-in': <SignInPage /> });
     const user = userEvent.setup();
     await user.click(await screen.findByRole('button', { name: 'Sign out' }));
     await waitFor(() => expect(parts.signOut).toHaveBeenCalledWith('local'));
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toMatch(/could not tell the server/i);
-    expect(router.state.location.pathname).toBe('/app');
+    // What the parent can act on, on screen and announced, above the sign-in form. Awaited first:
+    // the router's location changes before React has committed the new page, so asserting what is
+    // rendered has to wait for the render, not for the navigation.
+    const notice = await screen.findByRole('alert');
+    expect(router.state.location.pathname).toBe('/sign-in');
+    // The family's page and the account line are gone, and there is no second press to mislead.
+    expect(screen.queryByText('Page /app/children')).toBeNull();
+    expect(screen.queryByText(/Signed in as/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+    expect(notice.textContent).toMatch(/This computer is signed out/i);
+    expect(notice.textContent).toMatch(/could not tell PencilLift’s servers/i);
+    expect(notice.textContent).toMatch(/sign out on your phone/i);
+    expect(notice.textContent).toMatch(/change your password/i);
+    // Never "try signing out again": with the stored refresh token gone, auth-js skips the server
+    // call altogether, so a second press cannot reach it and would only look like it worked.
+    expect(notice.textContent).not.toMatch(/again/i);
+    const form = document.querySelector('form');
+    expect(form).not.toBeNull();
+    // Above the form, so a parent reads it before they start typing.
+    expect(notice.compareDocumentPosition(form!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByLabelText('Email')).toBeTruthy();
   });
 
   it('treats an adapter that rejects the same way, rather than moving on', async () => {
@@ -299,11 +358,15 @@ describe('WEB-R4-AUTH-2 the Supabase adapter surfaces a refused sign-out', () =>
 /**
  * ACC-WEB-AUTH-A: the account-closure flow is the other production caller of `auth.signOut()`
  * (apps/web/src/pages/app/PrivacyControlsPage.tsx: `await auth.signOut()` and then
- * `navigate('/account-deletion', …)`). It has no catch and must not grow one for a refused sign-out:
- * the account is already closed on the server and the parent still needs the page that explains what
- * happens next. So a refused sign-out is reported as a value and never as a rejection — a rejection
- * there skipped the navigation and left an unhandled promise. The sign-out control reads the same
- * value (above) and refuses to look signed out.
+ * `navigate('/account-deletion', …)`). The account is already closed on the server and the parent
+ * still needs the page that explains what happens next, so a refused sign-out is reported as a value
+ * and never as a rejection — a rejection there skipped the navigation and left an unhandled promise.
+ * The sign-out control reads the same value (above) and refuses to look signed out.
+ *
+ * HUNT5-E-3: that flow now has a try/catch around the call (as does SignOutControl), so it carries on
+ * either way and this page-level test holds whichever contract the adapter has. It is the guard for
+ * the navigation, not for the contract; the contract is asserted on the adapter in the second test
+ * below, which is the one a change to a throwing sign-out turns red.
  *
  * The adapter here is the real one; only the Supabase client and the API are labeled fakes.
  */
@@ -359,5 +422,18 @@ describe('ACC-WEB-AUTH-A a refused sign-out still explains a closed account', ()
     await user.click(within(card).getByRole('button', { name: /delete my account/i }));
     expect(await screen.findByText('deletion page: closed')).toBeTruthy();
     expect(signOut).toHaveBeenCalledWith({ scope: 'local' });
+  });
+
+  /**
+   * HUNT5-E-3: the test above cannot be the guard for this requirement. PrivacyControlsPage wraps its
+   * `await auth.signOut()` in a try/catch, so it reaches the deletion page whether the adapter reports
+   * the refusal or throws it — and SignOutControl has a catch of its own. With no catch-free caller
+   * left, the rule is asserted on the adapter, exactly as the closure flow calls it (no scope
+   * argument, so the adapter's own `local` default applies).
+   */
+  it('reports a refusal to the closure caller as a value, never as a rejection', async () => {
+    localStorage.setItem(STORED, JSON.stringify({ refresh_token: 'synthetic-refresh' }));
+    const { adapter } = adapterWith({ error: { message: 'Failed to fetch' } });
+    await expect(adapter.signOut()).resolves.toEqual({ serverNotTold: true });
   });
 });

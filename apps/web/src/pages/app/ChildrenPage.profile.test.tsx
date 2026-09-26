@@ -60,8 +60,12 @@ function fakeApi() {
               status: 'active',
             },
           };
-      const parsed = schema.safeParse(value);
-      return parsed.success ? Promise.resolve(parsed.data) : Promise.resolve(value as z.infer<S>);
+      // HUNT5-F-11: parsed the way the production client parses, with no fallback. This used to
+      // resolve an unvalidated fixture when safeParse failed, cast to the contract's type, so a
+      // response fixture that drifted from packages/contracts/src/family.ts kept these tests green
+      // while the real page (contracts/src/client.ts throws on a failed parse) would have rejected
+      // the response or rendered `undefined` in its success message. The `get` above always parsed.
+      return Promise.resolve(schema.parse(value));
     },
   };
   return { api, sends };
@@ -167,9 +171,14 @@ describe('[WEB-R2-03] a child can be archived from the portal', () => {
 describe('[ACC-FAM-03] a child whose data deletion is under way is listed, labelled and read-only', () => {
   /**
    * GET /v1/family keeps such a child (the privacy screens resolve its nickname out of that list for
-   * the pending-deletion list, its exports and its safety reports, and the request is still
-   * cancellable) and flags it with `deletionPending`. The server refuses activation, pairing and
-   * edits for it, so this page must offer no control on it and say why.
+   * the pending-deletion list, its exports and its safety reports) and flags it with
+   * `deletionPending`. The server refuses activation, pairing and edits for it, so this page must
+   * offer no control on it and say why.
+   *
+   * HUNT5-F-9: this used to give a second reason, that the request could still be called off. It
+   * cannot — see ChildrenPage.tsx's deletion-pending notice (WEBR4-02): /v1/privacy exposes only
+   * POST and GET /deletion, nothing moves deletion_requests.status to 'cancelled', and BUG-221
+   * removed that claim from the parent copy, which now says deletion can't be undone from the app.
    */
   const pending: FamilyOverview = {
     ...family(),

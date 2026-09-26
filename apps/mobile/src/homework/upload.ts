@@ -269,11 +269,20 @@ export async function uploadScan(args: {
   return { assignment: finalized.assignment, attempt };
 }
 
-/** Tells the server to stop a scan the child abandoned; releases any reserved page allowance. */
+/**
+ * Tells the server to stop a scan the child abandoned; releases any reserved page allowance.
+ *
+ * Every answer is an answer the caller can act on, including "the request did not land" (HUNT5-H-4):
+ * a cancel refused INVALID_TRANSITION is 'too_late' (the scan is already being checked), and a cancel
+ * that failed any other way — offline, the client's own timeout, a 5xx, a 429 — is 'unsure', because
+ * this device cannot know whether the server stopped the scan. It used to rethrow those, and the one
+ * caller turned the throw into 'cancelled', which told the child the scan had stopped when it may
+ * well have been sent.
+ */
 export async function cancelScan(
   api: ApiClient,
   attempt: UploadAttempt,
-): Promise<'cancelled' | 'nothing_to_cancel' | 'too_late'> {
+): Promise<'cancelled' | 'nothing_to_cancel' | 'too_late' | 'unsure'> {
   if (attempt.assignmentId === null) return 'nothing_to_cancel';
   try {
     await api.send(
@@ -285,7 +294,7 @@ export async function cancelScan(
     return 'cancelled';
   } catch (error) {
     if (error instanceof ApiRequestError && error.rule === 'INVALID_TRANSITION') return 'too_late';
-    throw error;
+    return 'unsure';
   }
 }
 
@@ -309,12 +318,23 @@ export interface StoppedScanOutcome {
  * charged, and let "Try again" create a SECOND assignment for the same homework — two jobs and two
  * page-allowance charges against AC_CAPTURE_06's one job, one charge. So 'too_late' keeps the attempt
  * and says the scan was already on its way.
+ *
+ * 'unsure' — the cancel itself never reached the server (HUNT5-H-4) — keeps the attempt for the same
+ * reason and says so plainly: this device cannot promise the scan stopped, and the retained keys make
+ * "Try again" the same scan whatever the server did, so one piece of homework is never checked and
+ * charged twice.
  */
 export function stoppedScanOutcome(
-  cancel: 'cancelled' | 'nothing_to_cancel' | 'too_late',
+  cancel: 'cancelled' | 'nothing_to_cancel' | 'too_late' | 'unsure',
 ): StoppedScanOutcome {
   if (cancel === 'too_late') {
     return { message: 'That one was already sent. You can see it in My scans.', keepAttempt: true };
+  }
+  if (cancel === 'unsure') {
+    return {
+      message: 'We couldn’t stop that one. Check My scans to see if it went.',
+      keepAttempt: true,
+    };
   }
   return { message: childUploadMessage(new ScanCancelledError()), keepAttempt: false };
 }

@@ -227,18 +227,34 @@ function ChildCard({
         // who the request covers, but the server refuses pairing, activation and edits for them, so
         // this screen offers no control either.
         //
-        // MOB-R4-LOCK-06: `deletionPending` is set for a WHOLE-FAMILY request as well as a
-        // per-child one (GET /v1/family: `d.scope = 'family' or d.target_child_id = c.id`), and the
-        // flag does not say which. The copy used to tell every parent who had asked for the family
-        // account to be deleted that they had asked for one child by name, so it now covers both
-        // and speaks for this screen rather than for the server.
+        // The wording is the web client's (apps/web/src/pages/app/ChildrenPage.tsx), so the two
+        // surfaces say the same thing about the same flag; the web's two inline links are the two
+        // buttons below, which is the only difference. MOB-R4-LOCK-06 rewrote it here to
+        // hedge the scope, because `deletionPending` covers a whole-family request too (GET
+        // /v1/family: `d.scope = 'family' or d.target_child_id = c.id`). That hedge named a state
+        // this screen cannot reach (HUNT5-H-3): a family-scope request revokes every adult membership
+        // with the family tombstone, so currentFamilyId() answers NOT_FOUND and this screen renders
+        // its no-family notice instead of any child card — while it ALSO ended by promising that
+        // Privacy "cancels it if you did not mean it" (HUNT5-H-2), and there is no cancel anywhere:
+        // /v1/privacy has only POST and GET /deletion, nothing marks a request cancelled, and the
+        // purge is enqueued with the request. Support is where a mistake is actually handled.
         <Notice>
           <Body>
-            Data deletion under way. A deletion request covering {row.nickname} is open — it may be
-            for {row.nickname} alone or for your whole family account — so this screen leaves their
-            details as they are. Privacy shows exactly what you asked for, and cancels it if you did
-            not mean it.
+            Data deletion under way. You asked for {row.nickname}’s data to be deleted. Processing
+            has already stopped, so nothing can be changed, paired or activated for them, and they
+            stay listed here until the deletion finishes. Deletion can’t be undone from the app: if
+            you did not mean it, contact support straight away.
           </Body>
+          <Button
+            label="Privacy and data"
+            secondary
+            onPress={() => router.push('/(parent)/privacy')}
+          />
+          <Button
+            label="Contact support"
+            secondary
+            onPress={() => router.push('/(parent)/support')}
+          />
         </Notice>
       ) : null}
       {deletionPending ? null : row.canPair ? (

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
+import { RATE_RULES } from '../src/middleware/rate-limit.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
 
 /**
@@ -31,6 +32,24 @@ function sessionId(): string {
   return `b2d0${seq.toString(16).padStart(4, '0')}-0000-4000-8000-000000000000`;
 }
 
+let pairCount = 0;
+/**
+ * A client network of its own for each POST /v1/child/pair in this file. Pairing is limited per
+ * client network (RATE_RULES.pairingRedeemPerNetwork, 20 per 15 minutes, keyed on cf-connecting-ip
+ * by clientNetworkKey), and this file pins the clock, so the 15-minute window never advances and
+ * every pairing that states no address spends the same 'unknown' bucket — with a case per device
+ * the file ran two pairings short of a 429 that has nothing to do with what it tests. An address in
+ * the IPv6 documentation prefix per pairing keeps the limit from binding here however many cases
+ * the file grows: the limiter keys IPv6 on the /64 (and the pairing failure budget on the /48), so
+ * varying the third group gives each pairing a network and a site of its own, with room for 65,535
+ * of them. The limit itself is untouched and still bites per network (the case at the end of this
+ * file, and child-auth-hardening.test.ts).
+ */
+function pairingAddress(): string {
+  pairCount += 1;
+  return `2001:db8:${pairCount.toString(16)}::1`;
+}
+
 interface PairedDevice {
   fam: SeededFamily;
   childId: string;
@@ -50,6 +69,7 @@ async function pairedDevice(label = 'Kitchen tablet'): Promise<PairedDevice> {
   );
   const paired = await api.request('/v1/child/pair', {
     method: 'POST',
+    headers: { 'cf-connecting-ip': pairingAddress() },
     body: { code, deviceLabel: label, platform: 'android' },
   });
   expect(paired.status).toBe(201);
@@ -86,6 +106,7 @@ describe('child token responses state a device-relative lifetime (MOB-R2-02)', (
     const device = await pairedDevice();
     const paired = await api.request('/v1/child/pair', {
       method: 'POST',
+      headers: { 'cf-connecting-ip': pairingAddress() },
       body: { code: 'ZZZZ-ZZZZ', deviceLabel: 'x', platform: 'ios' },
     });
     // The pairing above already succeeded; this one only shows a wrong code still answers 404.
@@ -120,6 +141,7 @@ describe('child token responses state a device-relative lifetime (MOB-R2-02)', (
     );
     const paired = await api.request('/v1/child/pair', {
       method: 'POST',
+      headers: { 'cf-connecting-ip': pairingAddress() },
       body: { code, deviceLabel: 'Bedroom tablet', platform: 'ios' },
     });
     const body = await json<{ accessTokenExpiresInSeconds: number }>(paired);
@@ -178,11 +200,16 @@ describe('a device that signs itself out stops being listed as connected (API-AU
   it('a second live session on the same device keeps it connected', async () => {
     const device = await pairedDevice('Shared tablet');
     const [deviceRow] = await devices(device.parentToken, 'Shared tablet');
-    // A second session on the same device row, as a re-pair of the same tablet would make.
+    // A unit case for the `not exists` clause of stampDeviceWhenNoLiveSession, not a re-pair: no
+    // API path puts two sessions on one device row (/v1/child/pair always inserts a fresh
+    // child_devices row), so the second session is made with raw SQL. Its timestamps are
+    // database-relative because the clause compares expires_at with the database clock, not with
+    // the pinned request instant — a fixture built from FIXED_NOW goes stale on a fixed date
+    // (L-027, HUNT5-A-3).
     await api.db.sql`
       insert into public.child_sessions (family_id, child_id, device_id, created_at, expires_at)
-      values (${device.fam.familyId}, ${device.childId}, ${deviceRow!.id}, ${FIXED_NOW},
-              ${new Date(FIXED_NOW.getTime() + 7 * 24 * 3600 * 1000)})`;
+      values (${device.fam.familyId}, ${device.childId}, ${deviceRow!.id}, now(),
+              now() + interval '7 days')`;
 
     expect(
       (await api.request('/v1/child/logout', { method: 'POST', token: device.childToken })).status,
@@ -230,29 +257,20 @@ async function sessionRow(
 }
 
 /**
- * HUNT4-MOB-1 — OPEN, not fixed here; these cases pin the behaviour the attempted fix removed.
+ * HUNT4-MOB-1 / BUG-244, closed by the recovery below: reuse of a rotated refresh token is still
+ * immediate revocation, EXCEPT for the one case the recovery names — a re-presentation that carries
+ * the id which consumed the token, within the retry window, while the replacement is unclaimed.
  *
- * The finding is real: POST /v1/child/refresh commits the rotation before the response goes out, so a
- * response lost on the way back (the client's own 20s timeout, a wifi/cellular switch, a Worker
- * evicted after commit) leaves the tablet holding a token the server has marked used. Presenting it
- * again is read as theft, the session is revoked, and the client unpairs — a parent has to mint a new
- * pairing code over one dropped HTTP response. But the only remedy on this side is to serve some
- * re-presentations of a rotated token, and the server cannot tell the tablet from a replayer: a 60s
- * grace (tried and withdrawn in this round) hands whoever replays the older token a live child access
- * token with no audit event, and retires the rightful holder's unclaimed replacement, so the real
- * tablet is the one that gets kicked. It also contradicts tests/auth.test.ts:189 ("refresh tokens
- * rotate and reuse revokes the session"), which requires an immediate replay to revoke, and
- * docs/Threat_Model.md T20. Weakening either is a lead decision, so reuse stays immediate revocation
- * and this case keeps it that way.
+ * This case pins the replay that carries NO id, which is every installed client and every replayer
+ * who only holds the token: it takes the recovery branch's first condition away, so the session is
+ * revoked at once, audited, and the replacement the rotation issued dies with it. That is what
+ * tests/auth.test.ts:189 ("refresh tokens rotate and reuse revokes the session") and
+ * docs/Threat_Model.md T20 require, and weakening it is a lead decision, not a fixer's.
  *
- * So this case is a PIN, not a repro: it passes against src/routes/child-auth.ts unchanged, and no
- * failing-test-first for HUNT4-MOB-1 exists, because nothing about the reuse gate was changed. If the
- * lead does accept a bounded "the response never arrived" grace, this case is the one to update (age
- * the rotation first: update private.child_refresh_tokens set used_at = used_at - interval '5 minutes'
- * for this family, then replay, and keep the 401 + audit + revoke_reason assertions), never to delete
- * — an immediate replay would then be served, but a replay outside the window must still be theft.
+ * It is a PIN, not a repro: it passed before the recovery existed and passes after it. The recovery's
+ * own cases — including the two replays the id alone would have served — are in the describe below.
  */
-describe('reuse of a rotated refresh token revokes the session at once (HUNT4-MOB-1 open)', () => {
+describe('reuse of a rotated refresh token revokes the session at once', () => {
   it('an immediate replay is revoked and audited, and the rotated replacement dies with it', async () => {
     const device = await pairedDevice('Replay tablet');
     const rotated = await json<{ refreshToken: string }>(await refresh(device.refreshToken));
@@ -271,11 +289,12 @@ describe('reuse of a rotated refresh token revokes the session at once (HUNT4-MO
  * BUG-244, closed: the tablet's own retry of a refresh whose response was lost is served, and every
  * other re-presentation of a rotated token is still theft.
  *
- * The rejected alternative was a time window, which cannot separate the two cases — inside it a
+ * The rejected alternative was a time window ALONE, which cannot separate the two cases — inside it a
  * replayer looks exactly like the rightful holder. The request identifies itself instead: one id per
  * refresh, kept by the device across its own retries of that refresh, recorded by the server as the id
- * that consumed the token. A used token presented again WITH that id is the same attempt finishing;
- * with another id, or none, it is theft and the session is revoked as before.
+ * that consumed the token. A used token presented again WITH that id, within the client retry window
+ * the rotation is bounded to, is the same attempt finishing, and it is audited; with another id, none,
+ * or after that window, it is theft and the session is revoked as before (HUNT5-A-1).
  */
 describe('a refresh whose response was lost is recoverable by its own id (BUG-244)', () => {
   it('[repro] the same token and the same request id issues tokens instead of revoking', async () => {
@@ -292,6 +311,9 @@ describe('a refresh whose response was lost is recoverable by its own id (BUG-24
     expect(await auditActions(device.fam.familyId)).not.toContain(
       'child_session.revoked_token_reuse',
     );
+    // But it is not silent either (HUNT5-A-1): serving a rotated token is recorded for the family
+    // and for ops, so a replay inside the window is visible instead of living in a log line alone.
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.refresh_recovered');
     expect((await sessionRow(device.fam.familyId, 'Lost response tablet')).revoked_at).toBeNull();
     // The token the lost response carried is retired. Only someone who intercepted that response
     // holds it, so presenting it is a real theft signal and is treated as one.
@@ -339,6 +361,53 @@ describe('a refresh whose response was lost is recoverable by its own id (BUG-24
     expect((await refresh(device.refreshToken, randomUUID())).status).toBe(401);
     expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
   });
+
+  /**
+   * HUNT5-A-1. The id says who is asking, not that anything was lost: after a fully successful
+   * refresh the consumed token and its id sit together in one captured request body, and the
+   * replacement stays unclaimed in the tablet's storage for the whole access-token lifetime (900s,
+   * longer while the app is closed). Without a bound on the rotation's age that body stayed a live
+   * child session for that entire interval, and serving it unpaired the tablet on its next refresh.
+   * A client's own retry horizon is seconds, so the recovery is bounded to the retry window and a
+   * later replay is theft again, exactly as before BUG-244.
+   */
+  it('[repro] a replay after the retry window is theft, however right the id is', async () => {
+    const device = await pairedDevice('Replayed body tablet');
+    const rid = randomUUID();
+    // Nothing was lost: this response arrived and the tablet holds the token it carried.
+    await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
+
+    const pinned = api.now.value;
+    // Three minutes later — past any client retry horizon — the same body is posted again.
+    api.now.value = new Date(pinned.getTime() + 3 * 60_000);
+    try {
+      expect((await refresh(device.refreshToken, rid)).status).toBe(401);
+    } finally {
+      api.now.value = pinned;
+    }
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+    expect((await sessionRow(device.fam.familyId, 'Replayed body tablet')).revoke_reason).toBe(
+      'refresh_token_reuse',
+    );
+  });
+
+  /**
+   * HUNT5-A-2. Retiring the replacement must end its lineage, not hand out a second recovery key:
+   * whoever intercepted the lost response holds that token and saw the id in the same exchange, so
+   * if the retired row keeps the id it satisfies the recovery predicate in its own right.
+   */
+  it('[repro] the retired replacement is not a recovery key of its own', async () => {
+    const device = await pairedDevice('Intercepted tablet');
+    const rid = randomUUID();
+    const lost = await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
+    // The tablet never saw that response and recovers; lost.refreshToken is retired.
+    expect((await refresh(device.refreshToken, rid)).status).toBe(200);
+
+    // Only an interceptor of the lost response holds that token: presenting it is theft whatever
+    // id it carries, including the id of the exchange it was captured from.
+    expect((await refresh(lost.refreshToken, rid)).status).toBe(401);
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+  });
 });
 
 /**
@@ -374,12 +443,52 @@ describe('a session that ends any other way stops being listed as connected (HUN
   it('a device that still has a live session stays connected', async () => {
     const device = await pairedDevice('Shared reuse tablet');
     const [deviceRow] = await devices(device.parentToken, 'Shared reuse tablet');
+    // Raw SQL and database-relative timestamps for the same two reasons as the logout case above
+    // (HUNT5-A-5: no API path makes this state; HUNT5-A-3: the guard reads the database clock).
     await api.db.sql`
       insert into public.child_sessions (family_id, child_id, device_id, created_at, expires_at)
-      values (${device.fam.familyId}, ${device.childId}, ${deviceRow!.id}, ${FIXED_NOW},
-              ${new Date(FIXED_NOW.getTime() + 7 * 24 * 3600 * 1000)})`;
+      values (${device.fam.familyId}, ${device.childId}, ${deviceRow!.id}, now(),
+              now() + interval '7 days')`;
     expect((await refresh(device.refreshToken)).status).toBe(200);
     expect((await refresh(device.refreshToken)).status).toBe(401);
     expect((await devices(device.parentToken, 'Shared reuse tablet'))[0]!.revokedAt).toBeNull();
+  });
+});
+
+/**
+ * HYGIENE. Every case above pairs a device, and a pairing is one POST /v1/child/pair counted against
+ * RATE_RULES.pairingRedeemPerNetwork (20 per 15 minutes per client network) under a clock pinned to
+ * FIXED_NOW, so the window never advances: before pairingAddress() the whole file spent one bucket
+ * and stood two pairings from a 429 that would have reddened the next case anyone added. These two
+ * cases hold both halves of the fix, so neither can rot silently: the first pairs more devices than
+ * any one network may, the second shows that budget still runs out on one network. The limit is a
+ * real defence against pairing-code guessing (docs/Threat_Model.md T24) and nothing here relaxes it.
+ */
+describe('pairing a device per case does not spend one network’s pairing budget', () => {
+  it('more devices than one network may pair all pair, because each pairs from its own', async () => {
+    const limit = RATE_RULES.pairingRedeemPerNetwork.limit;
+    // pairedDevice asserts its own 201, so a 429 from a shared bucket fails right here.
+    for (let i = 0; i < limit + 2; i += 1) await pairedDevice(`Fleet tablet ${i + 1}`);
+  });
+
+  it('the limit still bites: one network’s pairing attempts stop at the limit', async () => {
+    const limit = RATE_RULES.pairingRedeemPerNetwork.limit;
+    const address = pairingAddress();
+    // Wrong codes: an attempt counts against the network before the code is looked at, so this
+    // spends the budget without seeding anything. The service-wide failure budget is 200 an hour,
+    // far above these, so the refusal below is the per-network rule and not that one.
+    const statuses: number[] = [];
+    for (let i = 0; i <= limit; i += 1) {
+      const attempt = await api.request('/v1/child/pair', {
+        method: 'POST',
+        headers: { 'cf-connecting-ip': address },
+        body: { code: 'ZZZZ-ZZZZ', deviceLabel: 'Guessing tablet', platform: 'android' },
+      });
+      statuses.push(attempt.status);
+    }
+    expect(statuses.slice(0, limit)).toEqual(new Array<number>(limit).fill(404));
+    expect(statuses[limit]).toBe(429);
+    // And it bites that network only: a real pairing from the next one is unaffected.
+    await pairedDevice('Own network tablet');
   });
 });

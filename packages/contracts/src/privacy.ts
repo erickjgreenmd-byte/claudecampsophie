@@ -277,7 +277,32 @@ export const PARENT_SAFETY_FLAG_COPY = {
  * that the pages were given back.
  */
 export const CONSENT_WITHDRAWN_SCAN_COPY =
-  'Checking stopped because parental consent for this child’s learning data was withdrawn, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Give consent again on the privacy page before scanning this worksheet once more.';
+  'Checking stopped because parental consent for this child’s learning data was withdrawn, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Give consent again on your family dashboard before scanning this worksheet once more.';
+
+/**
+ * Parent-facing wording for the other two permanent outcomes of the same job (HUNT5-F-5): the child
+ * was archived while the scan was in flight (scan-process.ts throws PermanentFailure
+ * 'CHILD_ARCHIVED'), or the profile lost its paid slot, which a store downgrade does
+ * (billing-sync.ts) and which ends a paid-AI scan 'CHILD_NOT_ACTIVE'. Both end `failed_final` and
+ * release the page allowance, like the consent case above.
+ *
+ * Neither had its own line, so both fell back to the portal's generic `failed_final` copy — "This
+ * scan could not be processed after several tries. Please start a new scan with clear photos." —
+ * which is untrue twice over (the photos were fine, and the scan was stopped once rather than
+ * retried) and cannot work: POST /v1/assignments answers CHILD_NOT_ACTIVE for an archived or
+ * slotless child. On an archived child the parent read it directly under the page's own notice that
+ * new scans are not taken.
+ *
+ * Both name the Children page, which is where a slot is assigned and an archived profile activated
+ * again, and neither promises capacity this portal cannot sell (WEB-R1-04): with no unused slot that
+ * page says where a slot comes from. Here rather than in a page so the portal and the app say the
+ * same thing.
+ */
+export const ARCHIVED_CHILD_SCAN_COPY =
+  'Checking stopped because this child’s profile was archived, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Earlier scans and their results stay readable. Activate the profile again on the Children page, while a paid slot is free, to scan this worksheet once more.';
+
+export const INACTIVE_CHILD_SCAN_COPY =
+  'Checking stopped because this child no longer has a paid slot, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Earlier scans and their results stay readable. Give the profile a paid slot again on the Children page to scan this worksheet once more.';
 
 /**
  * The two actions a guardian can take on an unresolved flag (portal and app; both need a recent PIN

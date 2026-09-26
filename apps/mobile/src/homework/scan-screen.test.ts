@@ -53,6 +53,15 @@ describe('the camera and the hardware Back button (MOB-R1-07)', () => {
  * src/homework/upload.ts `stoppedScanOutcome` and is unit-tested there.
  */
 describe('stopping a scan the server already took (HUNT4-MOB-5)', () => {
+  /**
+   * The abort branch of `send()`'s catch, on its own: everything from the `ScanCancelledError` test
+   * up to the `ScanStoppedError` branch that follows it.
+   */
+  const abortBranch =
+    /if \(controller\.signal\.aborted \|\| error instanceof ScanCancelledError\) \{([\s\S]*?)\n {6}\} else if/.exec(
+      scanScreen,
+    )?.[1] ?? '';
+
   it('branches on what the cancel answered instead of assuming it stopped', () => {
     expect(scanScreen).toMatch(/stoppedScanOutcome\(/);
     expect(scanScreen).toMatch(/await cancelScan\(childApi, attemptRef\.current\)/);
@@ -63,9 +72,25 @@ describe('stopping a scan the server already took (HUNT4-MOB-5)', () => {
     );
   });
 
-  it('no longer hard-codes the "Stopped" message on the abort path', () => {
-    expect(scanScreen).not.toMatch(
-      /ScanCancelledError\) \{[\s\S]{0,400}?setUpload\(\{ kind: 'error', message: childUploadMessage\(new ScanCancelledError\(\)\) \}\)/,
+  it('[repro] does not report a cancel that never reached the server as a stop (HUNT5-H-4)', () => {
+    // `.catch(() => 'cancelled' as const)` asserted success for a thrown cancel — offline, a timeout,
+    // a 5xx — so the child was told the scan stopped and the keys were rotated, which let "Try again"
+    // send the same homework a second time. cancelScan answers 'unsure' for those now, and the screen
+    // branches on it like the rest.
+    expect(scanScreen).not.toMatch(/catch\(\(\) => 'cancelled'/);
+    expect(scanScreen).toMatch(
+      /stoppedScanOutcome\(await cancelScan\(childApi, attemptRef\.current\)\);/,
     );
+  });
+
+  it('no longer hard-codes the "Stopped" message on the abort path', () => {
+    // This used to search 400 characters from `ScanCancelledError) {` for the hard-coded message.
+    // The branch is longer than that — its own comment runs past the bound, and this round made it
+    // longer still — so the negative match covered no code at all and could not fail whatever the
+    // screen did. It is bounded to the branch itself now: the two branches AFTER this one do use
+    // childUploadMessage(error), legitimately, which is why the whole file cannot be searched.
+    expect(abortBranch).not.toBe('');
+    expect(abortBranch).toMatch(/setUpload\(\{ kind: 'error', message: outcome\.message \}\);/);
+    expect(abortBranch).not.toMatch(/childUploadMessage/);
   });
 });

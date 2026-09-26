@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { revenueResponseSchema } from '@pencillift/contracts';
 import { seedFamily, seedOwnerAdmin, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { cryptoRandom } from '@pencillift/domain';
 import type { ProviderSubscriptionSnapshot } from '@pencillift/domain/entitlements';
@@ -388,6 +389,8 @@ function stripeInvoicePaid(
     totalExcludingTax?: number;
     /** Stripe's customer credit balance applied to this invoice (negative; BILL-R4-4). */
     startingBalance?: number;
+    /** Stripe's reason for the invoice; 'subscription_update' is a standalone proration invoice. */
+    billingReason?: string;
     lines?: unknown[];
   },
 ): unknown {
@@ -397,7 +400,7 @@ function stripeInvoicePaid(
     data: {
       object: {
         id: invoiceId,
-        billing_reason: 'subscription_cycle',
+        billing_reason: amounts.billingReason ?? 'subscription_cycle',
         status: 'paid',
         ...(amounts.subtotal === undefined ? {} : { subtotal: amounts.subtotal }),
         ...(amounts.tax === undefined ? {} : { tax: amounts.tax }),
@@ -422,12 +425,17 @@ function stripeInvoicePaid(
   };
 }
 
-/** The Stripe line of the owner's revenue view for the pinned clock's month. */
-async function stripeRevenue(): Promise<{ gross: number; refunds: number }> {
-  const rev = await api.apiDb.asService(async (tx) => {
+/** The owner's revenue view for the pinned clock's month, as the admin pages render it. */
+async function revenueView() {
+  return api.apiDb.asService(async (tx) => {
     const { rates } = await loadStoreFeeRates(tx);
     return loadRevenueMonths(tx, api.now.value, 1, rates);
   });
+}
+
+/** The Stripe line of the owner's revenue view for the pinned clock's month. */
+async function stripeRevenue(): Promise<{ gross: number; refunds: number }> {
+  const rev = await revenueView();
   const line = rev.months[0]!.channels.find((c) => c.channel === 'stripe');
   return { gross: line!.grossChargedCents, refunds: line!.refundedCents };
 }
@@ -551,6 +559,90 @@ describe('BILL-R2-4: sales tax is not part of the Stripe subscription charge', (
     const after = await stripeRevenue();
     expect(after.gross - before.gross).toBe(3999);
     expect(after.refunds - before.refunds).toBe(3999);
+  });
+
+  /**
+   * The case that tells the denominators apart: an invoice with BOTH a proration line AND tax. With
+   * no tax the conversion is skipped outright, and on a tax-only invoice the Charge total and
+   * charge + tax are the same number — so neither of the two cases above can catch a denominator that
+   * is still the whole Charge, nor one that is the charge plus the WHOLE invoice's tax.
+   *
+   * N1-TAX-APPORTION: the tax on this invoice was added to BOTH lines, and the proration line is no
+   * part of this period's charge, so the tax that belongs to that line may no more scale a refund of
+   * subscription money than the line's own amount may. The denominator is the charge plus the tax
+   * apportioned TO THE CHARGE (subscriptionTaxCents), which is what the period stores.
+   */
+  it('converts a partial refund by the tax on the subscription portion, not the whole invoice’s tax', async () => {
+    api.now.value = SEPTEMBER;
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-13T00:00:00Z') / 1000;
+    const invoiceId = `in_r5_prorate_taxed_${randomUUID()}`;
+    // $39.99 renewal + a $10 proration item, with 8.25% sales tax on the 4999: the family paid 5411,
+    // and the charge booked as revenue is the subscription line's 3999 (BILL-R2-4).
+    expect(
+      (
+        await postStripe(
+          stripeInvoicePaid(invoiceId, ref, start, {
+            subtotal: 4999,
+            tax: 412,
+            amountPaid: 5411,
+            lines: [
+              {
+                period: { start: start - 86400, end: start },
+                price: { id: 'price_family_1' },
+                proration: true,
+                amount: 1000,
+              },
+              {
+                period: { start, end: start + 30 * 86400 },
+                price: { id: 'price_family_1' },
+                amount: 3999,
+              },
+            ],
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    const refunded = await postStripe({
+      id: `evt_${randomUUID()}`,
+      type: 'charge.refunded',
+      data: {
+        object: {
+          id: chargeId,
+          object: 'charge',
+          amount: 5411,
+          amount_refunded: 2000,
+          refunded: false,
+          invoice: invoiceId,
+          metadata: { billing_ref: ref },
+        },
+      },
+    });
+    expect(refunded.status).toBe(200);
+    const [period] = await api.db.sql<
+      { charged_amount_cents: number; tax_amount_cents: number; refunded_cents: number }[]
+    >`
+      select charged_amount_cents, tax_amount_cents, refunded_cents from public.billing_periods
+       where provider_period_id = ${invoiceId}`;
+    // The $20 came back out of a charge whose taxed part was the $39.99 subscription at 8.25%, so
+    // 1848 of it was subscription revenue (2000 x 3999 / (3999 + 329)) and the remaining 152 was the
+    // state's. The stored tax is the invoice's 412 apportioned to the charge:
+    // floor(412 x 3999 / (3999 + 1000)) = 329, the proration line's ~83 cents of tax left out of it.
+    //
+    // The two denominators this rules out: the whole Charge, round(2000 x 3999 / 5411) = 1478, which
+    // hands the proration line a 370-cent share of a refund it never received; and the charge plus
+    // the WHOLE invoice tax, round(2000 x 3999 / (3999 + 412)) = 1813, which still scales the refund
+    // down by the tax of a line this period never booked as revenue. Both overstate net revenue.
+    expect(period).toMatchObject({
+      charged_amount_cents: 3999,
+      tax_amount_cents: 329,
+      refunded_cents: 1848,
+    });
+    // Nothing of the proration's money is in either figure: the period books the subscription line
+    // (3999) and 1848 of it came back.
   });
 });
 
@@ -957,20 +1049,109 @@ describe('BILL-R4-3: a partial refund is recorded in the same unit as the charge
     });
     expect(refunded.status).toBe(200);
     const [period] = await api.db.sql<
-      { settlement: string; charged_amount_cents: number; refunded_cents: number }[]
+      {
+        settlement: string;
+        charged_amount_cents: number;
+        tax_amount_cents: number;
+        refunded_cents: number;
+      }[]
     >`
-      select settlement, charged_amount_cents, refunded_cents from public.billing_periods
-       where provider_period_id = ${invoiceId}`;
+      select settlement, charged_amount_cents, tax_amount_cents, refunded_cents
+        from public.billing_periods where provider_period_id = ${invoiceId}`;
     // Before the fix: refunded_cents 2000, the tax-inclusive provider figure, against a pre-tax
     // charge of 3999, so the owner's net revenue was understated by the tax share of the refund.
+    // HUNT5-C-2: 1848 now comes from the invoice's OWN tax, recorded with the period at invoice.paid
+    // time (migration 0900) — stop writing tax_amount_cents and the ratio becomes 1 and this reads
+    // 2000 again, so the assertion covers the stored column as well as the conversion.
     expect(period).toMatchObject({
       settlement: 'partially_refunded',
       charged_amount_cents: 3999,
+      tax_amount_cents: 330,
       refunded_cents: 1848,
     });
     const after = await stripeRevenue();
     expect(after.gross - before.gross).toBe(3999);
     expect(after.refunds - before.refunds).toBe(1848);
+  });
+
+  /**
+   * HUNT5-C-2: the conversion may only take the TAX off the provider's figure. A renewal invoice that
+   * also carries a mid-cycle proration line is the normal shape for a family that added a child
+   * (Stripe puts the pending proration item on the next renewal invoice), and that line is no part of
+   * THIS period's charge (BILL-R2-4 — it is revenue on its own invoice instead, HUNT5-C-4), so it must
+   * stay out of the denominator: dividing by the whole Charge attributes part of the refund to money
+   * this period's gross never counted.
+   */
+  it('a partial refund on an invoice that also carried a proration line is not scaled down', async () => {
+    api.now.value = SEPTEMBER;
+    const before = await stripeRevenue();
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-12T00:00:00Z') / 1000;
+    const invoiceId = `in_r5_prorate_refund_${randomUUID()}`;
+    // No sales tax: $39.99 for the renewal plus a $10 proration item from a mid-cycle plan change.
+    // charged_amount_cents is the subscription line alone, 3999 (BILL-R2-4).
+    expect(
+      (
+        await postStripe(
+          stripeInvoicePaid(invoiceId, ref, start, {
+            subtotal: 4999,
+            tax: 0,
+            amountPaid: 4999,
+            lines: [
+              {
+                period: { start: start - 86400, end: start },
+                price: { id: 'price_family_1' },
+                proration: true,
+                amount: 1000,
+              },
+              {
+                period: { start, end: start + 30 * 86400 },
+                price: { id: 'price_family_1' },
+                amount: 3999,
+              },
+            ],
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    // The owner gives the $39.99 subscription back and keeps the $10 proration: nothing of this
+    // period's revenue was kept, so the whole 3999 of gross is reversed. There is no tax to convert.
+    const refunded = await postStripe({
+      id: `evt_${randomUUID()}`,
+      type: 'charge.refunded',
+      data: {
+        object: {
+          id: chargeId,
+          object: 'charge',
+          amount: 4999,
+          amount_refunded: 3999,
+          refunded: false,
+          invoice: invoiceId,
+          metadata: { billing_ref: ref },
+        },
+      },
+    });
+    expect(refunded.status).toBe(200);
+    const [period] = await api.db.sql<
+      { charged_amount_cents: number; tax_amount_cents: number; refunded_cents: number }[]
+    >`
+      select charged_amount_cents, tax_amount_cents, refunded_cents from public.billing_periods
+       where provider_period_id = ${invoiceId}`;
+    // Before the fix: refunded_cents 3199, i.e. round(3999 x 3999 / 4999) — the refund scaled by the
+    // proration's share of the Charge, so 800 cents of it reversed nothing at all. The invoice states
+    // no tax, so the stored tax is 0, the ratio charged/(charged + 0) is 1 and there is nothing to
+    // convert: the whole 3999 comes back.
+    expect(period).toMatchObject({
+      charged_amount_cents: 3999,
+      tax_amount_cents: 0,
+      refunded_cents: 3999,
+    });
+    const after = await stripeRevenue();
+    expect(after.gross - before.gross).toBe(3999);
+    expect(after.refunds - before.refunds).toBe(3999);
   });
 });
 
@@ -1018,5 +1199,169 @@ describe('BILL-R4-4: a renewal settled from a credit balance books what was coll
       select count(*)::int as n from public.donation_accruals where family_id = ${fam.familyId}`;
     // Before the fix the regular_tier_price rule passed and the school accrued $1 for it.
     expect(accrued!.n).toBe(0);
+  });
+});
+
+describe('HUNT5-C-3: the owner-facing refund-unit note is true of every refund figure', () => {
+  it('a partial chargeback is recorded at the provider amount, and the note says so', async () => {
+    api.now.value = SEPTEMBER;
+    const before = await stripeRevenue();
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-14T00:00:00Z') / 1000;
+    const invoiceId = `in_r5_dispute_${randomUUID()}`;
+    // $39.99 renewal plus $3.30 state sales tax: the recorded charge is the pre-tax 3999.
+    expect(
+      (
+        await postStripe(
+          stripeInvoicePaid(invoiceId, ref, start, { subtotal: 3999, tax: 330, amountPaid: 4329 }),
+        )
+      ).status,
+    ).toBe(200);
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    // A real Stripe Dispute: it states the disputed amount and references the charge, and carries no
+    // charge total, so there is nothing to convert the tax-inclusive figure with (webhooks.ts).
+    const dispute = await postStripe({
+      id: `evt_${randomUUID()}`,
+      type: 'charge.dispute.created',
+      data: {
+        object: {
+          id: `dp_${randomUUID()}`,
+          object: 'dispute',
+          amount: 2000,
+          currency: 'usd',
+          charge: chargeId,
+          payment_intent: `pi_${randomUUID()}`,
+          reason: 'fraudulent',
+          status: 'needs_response',
+          metadata: { billing_ref: ref },
+        },
+      },
+    });
+    expect(dispute.status).toBe(200);
+    const [period] = await api.db.sql<{ refunded_cents: number }[]>`
+      select refunded_cents from public.billing_periods where provider_period_id = ${invoiceId}`;
+    // $20 of a tax-inclusive charge, written against a pre-tax gross of 3999: NOT converted, because
+    // a Dispute states no charge total to convert with. The pre-tax share would have been 1848.
+    expect(period!.refunded_cents).toBe(2000);
+    const after = await stripeRevenue();
+    expect(after.refunds - before.refunds).toBe(2000);
+    // So the note the owner reads beside that column may not promise the pre-tax unit for every
+    // refund. Before the fix it did: "a refund is recorded in that same pre-tax unit, capped at the
+    // charge", with no mention of the chargeback figure beside it.
+    const rev = await revenueView();
+    const refundNote = rev.notes.find((n) => n.includes('refund is recorded'));
+    expect(refundNote).toBeDefined();
+    expect(refundNote).toMatch(/chargeback/);
+    expect(rev.definition).toMatch(/where the provider states the charge total/);
+  });
+});
+
+describe('HUNT5-C-4: a proration charge is revenue, counted exactly once', () => {
+  /**
+   * REOPENED by the lead, reversing the previous fix. A mid-cycle proration charge is money a family
+   * paid for service in that month, so it belongs in the owner's gross: understating revenue is worse
+   * than an imprecise note, and the note is what was wrong. What BILL-R2-4 established is narrower —
+   * a proration LINE listed on a RENEWAL invoice is not part of that renewal's charge — and both
+   * halves together are what makes the money count once: the standalone proration invoice carries it,
+   * and a renewal that lists the same item as a pending line does not carry it again.
+   */
+  it('a standalone proration invoice is counted once in gross, and a renewal does not count it again', async () => {
+    api.now.value = SEPTEMBER;
+    const before = await stripeRevenue();
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-16T00:00:00Z') / 1000;
+    const invoiceId = `in_r5_proration_only_${randomUUID()}`;
+    // Stripe configured to invoice a mid-cycle change immediately: billing_reason
+    // 'subscription_update' and a single proration line, which billing-sync maps to kind 'proration'.
+    const prorationInvoice = () =>
+      stripeInvoicePaid(invoiceId, ref, start, {
+        subtotal: 1000,
+        tax: 0,
+        amountPaid: 1000,
+        billingReason: 'subscription_update',
+        lines: [
+          {
+            period: { start, end: start + 30 * 86400 },
+            price: { id: 'price_family_1' },
+            proration: true,
+            amount: 1000,
+          },
+        ],
+      });
+    expect((await postStripe(prorationInvoice())).status).toBe(200);
+    const [period] = await api.db.sql<{ kind: string; charged_amount_cents: number }[]>`
+      select kind, charged_amount_cents from public.billing_periods
+       where provider_period_id = ${invoiceId}`;
+    expect(period).toMatchObject({ kind: 'proration', charged_amount_cents: 1000 });
+    // The $10 the family really paid this month is in the owner's gross. The previous fix excluded
+    // kind 'proration' from loadRevenueMonths, so this read 0 and the owner's revenue was understated
+    // by every mid-cycle upgrade.
+    const afterProration = await stripeRevenue();
+    expect(afterProration.gross - before.gross).toBe(1000);
+    expect(afterProration.refunds - before.refunds).toBe(0);
+
+    // Counted ONCE: the same invoice.paid delivered again (a provider retry, a new event id) writes
+    // no second period and adds nothing.
+    expect((await postStripe(prorationInvoice())).status).toBe(200);
+    const [rows] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.billing_periods where provider_period_id = ${invoiceId}`;
+    expect(rows!.n).toBe(1);
+    expect((await stripeRevenue()).gross - before.gross).toBe(1000);
+
+    // And not counted a second time through a renewal: when Stripe leaves the item pending instead,
+    // it lists it on the next renewal invoice, whose charge is the subscription line alone (BILL-R2-4)
+    // — so whichever way Stripe bills the change, the $10 lands in gross exactly once.
+    const renewalStart = Date.parse('2026-09-18T00:00:00Z') / 1000;
+    const renewalId = `in_r5_proration_renewal_${randomUUID()}`;
+    expect(
+      (
+        await postStripe(
+          stripeInvoicePaid(renewalId, ref, renewalStart, {
+            subtotal: 4999,
+            tax: 0,
+            amountPaid: 4999,
+            lines: [
+              {
+                period: { start: renewalStart - 86400, end: renewalStart },
+                price: { id: 'price_family_1' },
+                proration: true,
+                amount: 1000,
+              },
+              {
+                period: { start: renewalStart, end: renewalStart + 30 * 86400 },
+                price: { id: 'price_family_1' },
+                amount: 3999,
+              },
+            ],
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const [renewal] = await api.db.sql<{ charged_amount_cents: number }[]>`
+      select charged_amount_cents from public.billing_periods
+       where provider_period_id = ${renewalId}`;
+    expect(renewal!.charged_amount_cents).toBe(3999);
+    const end = await stripeRevenue();
+    expect(end.gross - before.gross).toBe(1000 + 3999);
+
+    // The owner-facing prose now says what is true. It may NOT say a proration item is never revenue:
+    // this test just counted one. (The previous note did, which is what reopened this.)
+    const rev = await revenueView();
+    const grossNote = rev.notes.find((n) => n.includes('refund is recorded'));
+    expect(grossNote).toBeDefined();
+    expect(grossNote).not.toMatch(/proration[^.]*never revenue/);
+    expect(grossNote).toMatch(/mid-cycle proration charge is collected money/);
+    // US sales tax is still never revenue, and the refund-unit sentence HUNT5-C-3 added survives.
+    expect(grossNote).toMatch(/US sales tax[^;]*never revenue/);
+    expect(grossNote).toMatch(/chargeback/);
+    expect(rev.definition).toMatch(/proration charge included/);
+    // The owner reads both verbatim, so they have to fit the contract's own caps (400 per note, 600
+    // for the definition). Parsed against the contract rather than against a copied number, so a
+    // longer rewrite fails here instead of at the admin endpoint.
+    expect(() => revenueResponseSchema.shape.notes.parse(rev.notes)).not.toThrow();
+    expect(() => revenueResponseSchema.shape.definition.parse(rev.definition)).not.toThrow();
   });
 });

@@ -1314,9 +1314,13 @@ export async function runScheduledTick(
   // BILLING_REQUEST_TIMEOUT_MS, but the sweep makes up to 25 of them one after another, and the work
   // a family is actually waiting on — a scan, a safety email, an export — is in the ledger. A store
   // that answers slowly now delays only itself; entitlement staleness is measured in days, so a sweep
-  // that misses the end of a tick loses nothing. It is not starvable either: the ledger stops
-  // claiming TICK_TRAILING_RESERVE_MS before the invocation limit, so this step always gets a slice
-  // (R4-JOBS-4).
+  // that misses the end of a tick loses nothing. The LEDGER alone cannot starve it: no job is claimed
+  // that would run past TICK_WALL_LIMIT_MS − TICK_TRAILING_RESERVE_MS (R4-JOBS-4). That is the whole
+  // guarantee: every step BEFORE the ledger is unbounded in wall time (see TICK_WALL_LIMIT_MS — an
+  // inactivity sweep sends up to 50 emails with a 10 s timeout each, entitlement syncs call the
+  // store), so a long enough one still leaves this step nothing and `entitlementsReconciled` 0 on
+  // such a tick is not by itself a defect. Guaranteeing it a slice would take a deadline check on the
+  // steps in front of the ledger, which none of them has (HUNT5-C-5).
   const entitlementsReconciled = await step('entitlements', 0, () =>
     reconcileStaleEntitlements(deps),
   );

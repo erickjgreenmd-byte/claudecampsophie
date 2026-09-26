@@ -37,11 +37,14 @@ export const STORAGE_KEYS = {
   childRefreshToken: 'pl.child.refresh',
   childProfile: 'pl.child.profile',
   /**
-   * The id of the refresh this device has not finished yet (BUG-244). Persisted, not in memory only:
-   * the OS can kill a backgrounded tablet app while a refresh is in flight, which loses the response
-   * exactly as a dropped connection does, and the next attempt has to present the SAME id to be
-   * recognised as this device finishing its own refresh rather than a replay of a stolen token. It is
-   * not a credential — it opens nothing on its own, and only ever matches the one token it rotated.
+   * The refresh this device has not finished yet (BUG-244): the request id together with the instant
+   * this device minted it. Persisted, not in memory only: the OS can kill a backgrounded tablet app
+   * while a refresh is in flight, which loses the response exactly as a dropped connection does, and
+   * the next attempt has to present the SAME id to be recognised as this device finishing its own
+   * refresh rather than a replay of a stolen token. The instant bounds that: the server serves such a
+   * retry only briefly after the rotation, so an id older than its window is replaced rather than
+   * presented for a later refresh (src/family/child-session.ts). Neither part is a credential — the
+   * id opens nothing on its own, and only ever matches the one token it rotated.
    */
   childRefreshRequestId: 'pl.child.refresh.rid',
 } as const;
@@ -60,6 +63,52 @@ export function parentUnlockActive(now: Date): boolean {
 
 export function forgetParentUnlock(): void {
   parentUnlockedUntilMs = null;
+}
+
+/**
+ * Which adult the client-side parent state belongs to (HUNT5-H-1). Memory only, like the unlock
+ * above: the signed-in parent's user id, recorded by the session watcher (src/lib/app-session.ts) on
+ * every auth change, and a counter that moves whenever that is somebody else (or nobody).
+ *
+ * A parent screen that is already 'ready' is handed its own state back on a re-check, so an ordinary
+ * back-navigation does not flash "Loading your family" over data the parent is reading. The data on
+ * that screen belongs to the adult who fetched it, though, while the client's token source follows
+ * whoever is signed in now — so on a handed-on tablet the next adult was shown the previous one's
+ * children. The screen records the generation its state was published under and compares it on every
+ * re-check: the same adult keeps the screen, a different one gets fresh state and a refetch.
+ */
+let parentStateOwnerUserId: string | null = null;
+let parentIdentityChanges = 0;
+
+/** The identity a parent screen's state is published under; it moves when the adult changes. */
+export function parentIdentityGeneration(): number {
+  return parentIdentityChanges;
+}
+
+/**
+ * Records the adult the parent state belongs to now: their user id, or null when nobody is signed in
+ * on this device — or when this device cannot read who is. The same id twice (supabase-js reports a
+ * token refresh as an auth change too) is not a new adult and leaves the screens alone.
+ *
+ * Null is never "the same adult": nobody is not the same person twice. `parentAuth.userId()` reads
+ * the session and resolves to nothing on a device that is offline past its token expiry, so null
+ * stands for an adult this device cannot name as well as for no adult at all — and an early return on
+ * null after null left a screen published for the previous adult current for the next one, which is
+ * the handed-on tablet HUNT5-H-1 is about. So an unnamed owner always moves the identity: it costs a
+ * mounted screen one refetch and never keeps its rows.
+ */
+export function noteParentIdentity(userId: string | null): void {
+  if (userId !== null && userId === parentStateOwnerUserId) return;
+  parentStateOwnerUserId = userId;
+  parentIdentityChanges += 1;
+}
+
+/**
+ * Whether state a parent screen already published still belongs to the adult at the device. A screen
+ * that has published nothing (null) has nothing to keep.
+ */
+export function parentStateStillCurrent(publishedUnder: number | null): boolean {
+  return publishedUnder !== null && publishedUnder === parentIdentityChanges;
 }
 
 /**
@@ -91,7 +140,13 @@ export async function lockParentAreaOnDevice(
   if (childPaired) {
     await storage.setItem(STORAGE_KEYS.mode, 'child').catch(() => undefined);
     effects.resetNavigationToChildHome();
+    // The child's space is not an adult screen: screen privacy goes off here as it does on every
+    // other way in (enterChildMode, signOutParent), or the child keeps a tablet that refuses
+    // screenshots, screen recording and casting (MOB-R2-05, HUNT5-G-4). useChildModeOnFocus cannot
+    // correct it, because the mode written above makes that hook return early.
+    await effects.setScreenPrivacy(false).catch(() => undefined);
   } else {
+    // A parent-only device stays in parent mode on the unlock screen: adult privacy stays on.
     effects.resetNavigationToUnlock();
   }
   await effects.relockOnServer().catch(() => undefined);

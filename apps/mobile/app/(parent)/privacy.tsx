@@ -24,6 +24,7 @@ import { ParentAccessState, useParentAccess } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import { signOutClosedAccountOnDevice } from '../../src/family/runtime.ts';
 import {
+  accountClosedStillSignedInMessage,
   closeAccountAction,
   confirmationPhrase,
   deletableChildren,
@@ -143,8 +144,22 @@ export default function ParentPrivacyScreen() {
     // The API's signOut flag: the app's normal sign-out path clears the parent session. It goes
     // through the whole device sign-out (MOB-R2-06), so the closed account leaves no biometric PIN,
     // no parent mode and no live unlock behind; the outcome stays on screen until the parent leaves.
-    setState({ status: 'account_closed', message: result.message });
-    await signOutClosedAccountOnDevice().catch(() => undefined);
+    //
+    // HUNT5-N6 / L-037: the sign-out is awaited BEFORE the outcome is shown, and its failure is not
+    // swallowed. `result.message` ends "and this device is signed out", which is this app's half of
+    // the job, not the server's — so showing it first meant a parent read that the device was signed
+    // out while the sign-out was still running, and a thrown sign-out left the sentence on screen
+    // untrue. The portal draws exactly this distinction (PrivacyControlsPage's stillSignedInCopy),
+    // and a claim about the device in front of the parent is the dangerous one to get wrong: they put
+    // it down. The account is closed either way, so that fact is in both messages.
+    const signedOut = await signOutClosedAccountOnDevice().then(
+      () => true,
+      () => false,
+    );
+    setState({
+      status: 'account_closed',
+      message: signedOut ? result.message : accountClosedStillSignedInMessage(result.status),
+    });
   };
 
   const requestDeletion = async () => {

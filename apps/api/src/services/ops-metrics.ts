@@ -147,7 +147,16 @@ export const STORE_FEE_RATES_NOTES: readonly string[] = [
   'Store fees are an estimate at the configured rate on charged minus refunded amounts, rounded half up to the cent; the store statements are the truth.',
   STRIPE_FEE_NOTE,
   // BILL-R4-3 / BILL-R4-4: what "gross" means, stated where the owner reads the figure.
-  "Gross is the money collected for the subscription itself: US sales tax (a state's money), a mid-cycle proration item and any amount settled from a Stripe customer credit balance are never revenue, and a refund is recorded in that same pre-tax unit, capped at the charge.",
+  // HUNT5-C-3: the refund half is stated per surface. A Stripe refund carries its Charge's total, so
+  // the tax share of a partial refund can be taken off it; a Dispute states only the disputed amount
+  // and a refund parked before its charge keeps the provider's figure (webhooks.ts, applyRefund), so
+  // those are recorded as the provider stated them. The note may not promise one unit for all three.
+  // HUNT5-C-4: nor may it say a mid-cycle proration item is never revenue. Only the narrower claim is
+  // true — a proration LINE on a renewal invoice is not part of THAT renewal's charge (BILL-R2-4) —
+  // while the proration charge itself is money the family paid, counted in the month it settles.
+  // Every note is at most 400 characters (packages/contracts/src/admin-ops.ts) and the owner reads it
+  // verbatim under the figures, so it stays short: the per-surface detail is in this comment.
+  "Gross is the money collected for the subscription: US sales tax (a state's money) and anything paid from a Stripe credit balance are never revenue; a mid-cycle proration charge is collected money, counted in the month it settles. A refund is recorded in that same pre-tax unit where the provider states the charge total (a Stripe refund), else at its own amount capped at the charge (a chargeback).",
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -155,7 +164,8 @@ export const STORE_FEE_RATES_NOTES: readonly string[] = [
 // ---------------------------------------------------------------------------------------------
 
 const REVENUE_SOURCE = 'public.billing_periods';
-const REVENUE_DEFINITION = `Charged periods in ${REVENUE_CURRENCY} (settlement settled, refunded, partially_refunded or chargeback) bucketed by the UTC month of settled_at (period_start when unsettled); gross = charged_amount_cents (the pre-tax subscription money collected), refunds = refunded_cents in that same unit, attributed to the month of the charge they reverse (a chargeback counts as a refund of the disputed amount, or of the whole charge when the store reports none), fee = estimate at the channel rate, net = gross − refunds − fee. A period charged in another currency is counted in the notes, never in these sums.`;
+/** At most 600 characters (packages/contracts/src/admin-ops.ts): the owner reads it under the table. */
+const REVENUE_DEFINITION = `Charged periods in ${REVENUE_CURRENCY} (settlement settled, refunded, partially_refunded or chargeback), a proration charge included, bucketed by the UTC month of settled_at (period_start if unsettled); gross = charged_amount_cents (pre-tax money collected), refunds = refunded_cents — in that unit where the provider states the charge total, else its own figure capped at the charge; a chargeback counts as a refund of the disputed amount, or of the whole charge if none is given — in that charge's month; fee = channel-rate estimate, net = gross − refunds − fee. Other currencies: notes only.`;
 
 /** The revenue note listing periods left out because they were not charged in USD (BILL-R1-5). */
 export function foreignCurrencyNote(counts: ReadonlyMap<string, number>): string | null {
@@ -194,6 +204,13 @@ export async function loadRevenueMonths(
            count(*) filter (where currency <> ${REVENUE_CURRENCY})::int as foreign_periods
       from public.billing_periods
      where settlement in ('settled', 'refunded', 'partially_refunded', 'chargeback')
+       -- HUNT5-C-4: EVERY kind counts, proration included. A mid-cycle proration charge is money the
+       -- family paid for service in that month, so leaving it out understated the owner's revenue by
+       -- every upgrade. What BILL-R2-4 established is narrower and lives in billing-sync: a proration
+       -- LINE on a RENEWAL invoice is not part of that renewal's charge. The two together are what
+       -- make the money count exactly once — on its own invoice when Stripe bills it immediately
+       -- (billing_reason subscription_update, kind 'proration'), and never again inside the renewal
+       -- that lists it as pending. The note beside the figure says so in as many words.
        and coalesce(settled_at, period_start) >= ${start}
        and coalesce(settled_at, period_start) < ${end}
      group by 1, 2

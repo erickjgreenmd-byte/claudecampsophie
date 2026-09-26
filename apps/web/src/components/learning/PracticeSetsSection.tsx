@@ -74,17 +74,31 @@ const FILTERS: readonly { value: KindFilter; label: string }[] = [
  * key is a separate, protected request that needs a recent parent PIN; it is held only in this
  * component's memory and never mixed into the child's view. PDF exports are requested here and
  * listed on the Privacy page when ready.
+ *
+ * HUNT5-F-10: `childStatus` is the profile's status as GET /v1/family reports it ('active', 'draft'
+ * or 'archived'; the planner types it as a plain string, so an unknown value is treated as live). It
+ * is read for exactly one sentence, the per-set release line, and the test is "is this profile
+ * ACTIVE?", not "is it archived?" — a draft cannot open a set either. An archived profile's sets stay listed
+ * — that history is what BUG-070 made readable — and their release instants stay printed, because the
+ * planner's archived notice frames every time below it as what the schedule would produce if the
+ * profile were active again. What cannot stay is the PROMISE: `app.current_child_id()` requires
+ * `c.status = 'active'` (migration 0001), so no request from the child's device can open a set at
+ * all, whatever its release instant, and the API refuses every write with CHILD_ARCHIVED. So the
+ * instant is kept and re-worded as the notice's conditional. Omitting the prop keeps the live
+ * behaviour, so a caller that has no status shows what it always showed.
  */
 export function PracticeSetsSection({
   childId,
   childName,
   subjects,
   zone,
+  childStatus,
 }: {
   childId: string;
   childName: string;
   subjects: readonly ChildSubject[];
   zone: string;
+  childStatus?: string;
 }) {
   const { api } = useSession();
   const [filter, setFilter] = useState<KindFilter>('all');
@@ -163,6 +177,7 @@ export function PracticeSetsSection({
           filter={filter}
           subjects={subjects}
           zone={zone}
+          childStatus={childStatus}
         />
       ) : null}
     </section>
@@ -181,6 +196,7 @@ function SetList({
   filter,
   subjects,
   zone,
+  childStatus,
 }: {
   first: readonly ParentPracticeSet[];
   firstCursor: string | null;
@@ -192,6 +208,8 @@ function SetList({
   filter: KindFilter;
   subjects: readonly ChildSubject[];
   zone: string;
+  /** Internal pass-through: always given, `undefined` when the caller named no status. */
+  childStatus: string | undefined;
 }) {
   const attached = older !== null && older.from === firstCursor ? older : null;
   const nextCursor = attached ? attached.nextCursor : firstCursor;
@@ -214,7 +232,14 @@ function SetList({
     <>
       <ul style={listReset}>
         {sets.map((set) => (
-          <SetCard key={set.id} set={set} subjects={subjects} zone={zone} />
+          <SetCard
+            key={set.id}
+            set={set}
+            subjects={subjects}
+            zone={zone}
+            childName={childName}
+            childStatus={childStatus}
+          />
         ))}
       </ul>
       {nextCursor !== null && firstCursor !== null ? (
@@ -269,10 +294,15 @@ function SetCard({
   set,
   subjects,
   zone,
+  childName,
+  childStatus,
 }: {
   set: ParentPracticeSet;
   subjects: readonly ChildSubject[];
   zone: string;
+  childName: string;
+  /** Internal pass-through: always given, `undefined` when the caller named no status. */
+  childStatus: string | undefined;
 }) {
   const { api } = useSession();
   const { busy, feedback, run } = useAction();
@@ -324,9 +354,22 @@ function SetCard({
           ? ` · ${finished} of ${questionsLabel(set.items.length)} finished · ${firstTryRight} right on the first try`
           : ''}
       </p>
-      {set.releaseAt ? (
+      {/* HUNT5-F-10: "Shown to your child from <instant>" is a promise no profile can keep unless it is
+          ACTIVE. `app.current_child_id()` requires `c.status = 'active'` (migration 0001), so nothing
+          from the child's device can open a set while the profile is archived OR still a draft waiting
+          for its paid slot — the first shipped fix tested only 'archived' and left the draft promising.
+          The set stays listed and the instant stays printed, under the same conditional framing the
+          planner's notice gives everything below it; only the promise becomes a hypothetical. A
+          hypothetical time under that heading is honest, a promise to the child is not. An unknown
+          status is treated as live, so an unwired caller loses nothing. */}
+      {set.releaseAt === null ? null : childStatus !== undefined && childStatus !== 'active' ? (
+        <p style={hintStyle}>
+          Would open for {childName} from {formatInZone(set.releaseAt, zone)} once the profile is
+          active{childStatus === 'archived' ? ' again' : ''}.
+        </p>
+      ) : (
         <p style={hintStyle}>Shown to your child from {formatInZone(set.releaseAt, zone)}.</p>
-      ) : null}
+      )}
       {mix ? <p style={hintStyle}>Mix: {mix}.</p> : null}
       {set.notes.length > 0 ? (
         <ul style={{ margin: '4px 0' }} aria-label="How this set was put together">

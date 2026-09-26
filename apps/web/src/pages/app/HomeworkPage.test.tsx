@@ -864,6 +864,76 @@ describe('honest follow-up states (RV-homework-6, 7, 8)', () => {
     expect(within(scans).queryByText(new RegExp(code))).toBeNull();
   });
 
+  /**
+   * HUNT5-B-3 / HUNT5-F-4: the consent line named "the privacy page", and /app/privacy has no consent
+   * control at all — Retention, Exports, Deletion, Account close and Safety reports only. Give,
+   * refresh and withdraw consent live on the family dashboard at /app, which is where ChildrenPage's
+   * own consent notice sends the parent for the same refusal, and where the mobile app puts the
+   * consent card. The copy is in packages/contracts/src/privacy.ts so both clients say one thing.
+   */
+  it('a consent-stopped scan names the surface that carries the consent control', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path.startsWith('/v1/assignments?')
+          ? {
+              ...list(),
+              assignments: [{ ...summary(FINAL, 'failed_final'), errorCode: 'CONSENT_REQUIRED' }],
+            }
+          : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getByText(/family dashboard/i)).toBeTruthy();
+    expect(within(scans).queryByText(/privacy page/i)).toBeNull();
+  });
+
+  /**
+   * HUNT5-F-5: scan-process.ts records two more permanent codes, CHILD_ARCHIVED and CHILD_NOT_ACTIVE
+   * (an archive, or a downgrade that takes the paid slot away). Neither had a line here, so both fell
+   * back to "could not be processed after several tries. Please start a new scan with clear photos."
+   * — untrue twice over, and the advice cannot work: POST /v1/assignments answers CHILD_NOT_ACTIVE
+   * for such a child. On an archived child the page contradicted itself, since the notice above the
+   * list already says new scans are not taken.
+   */
+  it.each([
+    ['CHILD_ARCHIVED', 'archived', /profile was archived/i],
+    ['CHILD_NOT_ACTIVE', 'draft', /no longer has a paid slot/i],
+  ])(
+    'a %s scan says the profile stopped the check, not the photos',
+    async (code, childStatus, copy) => {
+      const { api } = fakeApi({
+        get: (path) =>
+          path === '/v1/family'
+            ? {
+                ...family,
+                children: [
+                  {
+                    id: RILEY,
+                    nickname: 'Riley',
+                    gradeLevel: 3,
+                    ageBand: '8-10',
+                    status: childStatus,
+                  },
+                ],
+              }
+            : path.startsWith('/v1/assignments?')
+              ? { ...list(), assignments: [{ ...summary(FINAL, 'failed_final'), errorCode: code }] }
+              : undefined,
+      });
+      renderPage(<HomeworkPage />, { api });
+      const scans = await screen.findByRole('region', { name: 'Scans' });
+      expect(within(scans).getByText(copy)).toBeTruthy();
+      // Never the generic line: the photos were fine and rescanning is refused for such a child.
+      expect(within(scans).queryByText(/start a new scan with clear photos/i)).toBeNull();
+      expect(within(scans).queryByText(/could not be processed after several tries/)).toBeNull();
+      // The one good fact the settlement delivers, and where the parent can actually act.
+      expect(within(scans).getByText(/given back to your monthly allowance/i)).toBeTruthy();
+      expect(within(scans).getByText(/Children page/)).toBeTruthy();
+      // The parent never sees the raw code.
+      expect(within(scans).queryByText(new RegExp(code))).toBeNull();
+    },
+  );
+
   it('the transcription-fix confirmation survives the refresh that follows it', async () => {
     const { api, gets } = fakeApi({
       latencyMs: 20,

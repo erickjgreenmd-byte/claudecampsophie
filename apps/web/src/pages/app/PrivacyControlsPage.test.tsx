@@ -10,6 +10,7 @@ import type {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
+  ACCOUNT_CLOSE_COPY,
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
   type SafetyReport,
@@ -18,12 +19,20 @@ import { createMemoryRouter, RouterProvider, useLocation } from 'react-router';
 import type { AuthAdapter } from '../../lib/auth.ts';
 import { SessionProvider } from '../../lib/session.tsx';
 import { renderPage } from '../../test/render.tsx';
+import AccountDeletionPage from '../public/AccountDeletionPage.tsx';
 import PrivacyControlsPage from './PrivacyControlsPage.tsx';
 
 /** Stands in for the public deletion page, echoing the router state the portal hands it. */
 function DeletionPageStub() {
-  const state = useLocation().state as { accountClosed?: string } | null;
-  return <p>{`deletion page: ${state?.accountClosed ?? 'no state'}`}</p>;
+  const state = useLocation().state as { accountClosed?: string; signOutRefused?: boolean } | null;
+  return (
+    <>
+      <p>{`deletion page: ${state?.accountClosed ?? 'no state'}`}</p>
+      {/* HUNT5-F-8: the closure flow must hand this page the sign-out report, so the parent on a
+          shared computer is told when the auth service was never told to end the session. */}
+      <p>{`sign-out report: ${state?.signOutRefused === true ? 'server not told' : 'carried out'}`}</p>
+    </>
+  );
 }
 
 /** Renders the privacy page with a route for the public deletion page (account closure lands there). */
@@ -32,6 +41,37 @@ function renderWithDeletionRoute(api: Partial<ApiClient>, auth: AuthAdapter) {
     [
       { path: '/app/privacy', element: <PrivacyControlsPage /> },
       { path: '/account-deletion', element: <DeletionPageStub /> },
+    ],
+    { initialEntries: ['/app/privacy'] },
+  );
+  const client: ApiClient = {
+    get: () => Promise.reject(new Error('unexpected GET')),
+    send: () => Promise.reject(new Error('unexpected send')),
+    ...api,
+  };
+  return render(
+    <SessionProvider
+      value={{
+        config: { apiBaseUrl: '/api', supabaseUrl: null, supabasePublishableKey: null },
+        auth,
+        api: client,
+      }}
+    >
+      <RouterProvider router={router} />
+    </SessionProvider>,
+  );
+}
+
+/**
+ * The same flow, landing on the REAL public deletion page rather than the stub, so what a parent
+ * actually reads after an account closure is asserted rather than the router state alone
+ * (HUNT5-F-8's other half: the flag was handed over and nothing rendered it).
+ */
+function renderWithRealDeletionPage(api: Partial<ApiClient>, auth: AuthAdapter) {
+  const router = createMemoryRouter(
+    [
+      { path: '/app/privacy', element: <PrivacyControlsPage /> },
+      { path: '/account-deletion', element: <AccountDeletionPage /> },
     ],
     { initialEntries: ['/app/privacy'] },
   );
@@ -964,15 +1004,64 @@ describe('PrivacyControlsPage', () => {
   });
 
   /**
-   * Lead follow-up to WEB-R4-AUTH-2 (round 4): a sign-out the auth server refuses now rejects
-   * instead of reporting success. This handler awaited it bare, so a refused sign-out swallowed the
-   * navigation and left the parent on a page that needs a signed-in parent — with their account
-   * already closed on the server. The close is done by then, so the page moves on either way.
+   * Lead follow-up to WEB-R4-AUTH-2 (round 4): a refused sign-out must not swallow the navigation.
+   * This handler awaited it bare, so the parent was left on a page that needs a signed-in parent —
+   * with their account already closed on the server. The close is done by then, so the page moves on
+   * either way.
+   *
+   * HUNT5-F-8: the shape of a refusal is the one ACC-WEB-AUTH-A settled — the adapter RETURNS
+   * `{ serverNotTold: true }`, it does not throw (supabase-auth.ts, and auth.ts's SignOutReport),
+   * precisely so this flow can carry on. The earlier test supplied a rejecting adapter, a shape the
+   * contract forbids, so it exercised a path the real adapter never takes and the report was thrown
+   * away on a screen that then tells the parent the device is signed out. Both shapes are covered
+   * here, and the report travels with the navigation the way SignOutControl reports it.
+   *
+   * These two cases pin the handover (the stub echoes the router state); what the parent READS at the
+   * other end is pinned against the real page in the two [HUNT5-F-8] cases at the end of this file.
    */
-  it('lands on the public page even when the device sign-out is refused', async () => {
+  it('carries the refusal report to the public page when the adapter reports one', async () => {
     let attempted = 0;
     const auth: AuthAdapter = {
       configured: true,
+      currentSession: () =>
+        Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
+      signOut: () => {
+        attempted += 1;
+        return Promise.resolve({ serverNotTold: true as const });
+      },
+    };
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', signOut: true }
+          : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('deletion page: pending')).toBeTruthy();
+    expect(await screen.findByText('sign-out report: server not told')).toBeTruthy();
+    expect(attempted).toBe(1);
+  });
+
+  /**
+   * HUNT5-N6: a sign-out that THREW is off the adapter's contract, so nothing about it is known —
+   * least of all that this browser's stored session was removed. Reporting it as `signOutRefused`
+   * made the public page say "This computer is signed out", a sentence nothing had checked, exactly
+   * the claim SignOutControl refuses to make: it re-reads `currentSession()` first and, when the
+   * session survived, stays put and says so. The close flow now does the same. Two cases, told apart
+   * by that re-read and nothing else.
+   *
+   * This case replaces one that asserted the opposite ("a sign-out that threw did not end the session
+   * either, so it is reported the same way"): that sentence is about the SERVER's session, and the
+   * page's sentence is about THIS COMPUTER's, so it licensed a claim the flow had not verified.
+   */
+  it('[HUNT5-N6] does not say this computer is signed out when a thrown sign-out left the session in place', async () => {
+    let attempted = 0;
+    const auth: AuthAdapter = {
+      configured: true,
+      // Unchanged by the sign-out: the stored session is still here afterwards.
       currentSession: () =>
         Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
       signOut: () => {
@@ -988,8 +1077,67 @@ describe('PrivacyControlsPage', () => {
     const card = await screen.findByRole('region', { name: /delete my account/i });
     await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
     await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
-    expect(await screen.findByText('deletion page: closed')).toBeTruthy();
+    // The parent is told the session survived, in SignOutControl's words for the same fact, and the
+    // closure itself is still reported here (the action outcome carries it).
+    expect(text(await within(card).findByRole('alert'))).toMatch(
+      /you are still signed in on this computer/i,
+    );
+    expect(card.textContent).toMatch(/your PencilLift account is closed/i);
     expect(attempted).toBe(1);
+    // No navigation, so nothing anywhere claims this computer is signed out.
+    expect(screen.queryByText(/deletion page:/)).toBeNull();
+    expect(document.body.textContent).not.toMatch(/this computer is signed out/i);
+    // And the SUCCESS outcome is gone too. Its copy ends "and this device is signed out" — the same
+    // untrue half, in the word the copy actually uses, which is why the assertion above (looking for
+    // "computer") left the flow's `action.setOutcome(null)` unpinned: deleting that line kept every
+    // case here green. Asserted against the contract string itself so it cannot drift, and NOT over
+    // the whole body loosely: the section's intro legitimately describes what closing will do, in
+    // nearly the same words, before the parent does it.
+    expect(document.body.textContent).not.toContain(ACCOUNT_CLOSE_COPY.closed);
+    expect(document.body.textContent).not.toContain(ACCOUNT_CLOSE_COPY.pending);
+  });
+
+  it('[HUNT5-N6] still reports the refusal when the thrown sign-out did clear this browser', async () => {
+    let attempted = 0;
+    let cleared = false;
+    const auth: AuthAdapter = {
+      configured: true,
+      currentSession: () =>
+        Promise.resolve(
+          cleared ? null : { accessToken: 'test-token', email: 'parent@example.test' },
+        ),
+      signOut: () => {
+        attempted += 1;
+        cleared = true;
+        return Promise.reject(new Error('auth server refused the sign-out'));
+      },
+    };
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close' ? { status: 'closed', signOut: true } : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('deletion page: closed')).toBeTruthy();
+    // This computer really is signed out, and the server was never told: both halves are true.
+    expect(await screen.findByText('sign-out report: server not told')).toBeTruthy();
+    expect(attempted).toBe(1);
+  });
+
+  it('says the sign-out was carried out when the adapter reports nothing', async () => {
+    const { auth, count } = signOutCounter();
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close' ? { status: 'closed', signOut: true } : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('sign-out report: carried out')).toBeTruthy();
+    expect(count()).toBe(1);
   });
 
   it('a family owner is told to delete the family account first (409 rule), and nothing signs out', async () => {
@@ -1080,5 +1228,60 @@ describe('PrivacyControlsPage', () => {
     });
     await waitFor(() => expect(document.body.textContent).toMatch(/please sign in/i));
     await waitFor(() => expect(gets).toEqual([]));
+  });
+
+  /**
+   * HUNT5-F-8, second half: the closure flow hands /account-deletion `signOutRefused`, and that page
+   * rendered nothing for it — a parent whose sign-out the auth service refused was told the account is
+   * closed and this device signed out, and nothing at all about the session that may still be usable
+   * elsewhere. SignOutControl tells a parent exactly this on its own path; the same fact reaches them
+   * here. Asserted on the real public page, not the stub, because the stub can only echo the state.
+   */
+  it('[HUNT5-F-8] the public page tells the parent when the servers were never told to end the session', async () => {
+    const auth: AuthAdapter = {
+      configured: true,
+      currentSession: () =>
+        Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
+      signOut: () => Promise.resolve({ serverNotTold: true as const }),
+    };
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', signOut: true }
+          : new Error('nope'),
+    });
+    renderWithRealDeletionPage(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    // Waiting for the public page's own heading first: the privacy page's action outcome carries the
+    // same closure sentence in its own role="status" line, so a bare findByRole would read that one.
+    await screen.findByRole('heading', { level: 1, name: /delete your PencilLift account/i });
+    const notice = screen.getByRole('status');
+    // The closure itself is still reported, in its own words.
+    expect(notice.textContent).toMatch(/your request is recorded/i);
+    // And the session fact, in the words SignOutControl uses for the same refusal.
+    expect(notice.textContent).toMatch(/this computer is signed out/i);
+    expect(notice.textContent).toMatch(/could not tell PencilLift’s servers/i);
+    expect(notice.textContent).toMatch(/sign out on your phone/i);
+    expect(notice.textContent).toMatch(/change your password/i);
+  });
+
+  it('[HUNT5-F-8] says nothing about the session when the sign-out was carried out', async () => {
+    const { auth } = signOutCounter();
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close' ? { status: 'closed', signOut: true } : new Error('nope'),
+    });
+    renderWithRealDeletionPage(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    await screen.findByRole('heading', { level: 1, name: /delete your PencilLift account/i });
+    const notice = screen.getByRole('status');
+    expect(notice.textContent).toMatch(/your PencilLift account is closed/i);
+    // The refusal sentence is for the refusal path only: the normal path must not raise the alarm.
+    expect(notice.textContent).not.toMatch(/could not tell PencilLift’s servers/i);
+    expect(document.body.textContent).not.toMatch(/change your password if you are worried/i);
   });
 });

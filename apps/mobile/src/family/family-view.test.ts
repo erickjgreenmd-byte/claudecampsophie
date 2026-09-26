@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { ChildDevice, FamilyOverview } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
@@ -173,5 +175,30 @@ describe('family view models', () => {
     expect(parentActionError(new Error('x')).message).toBe(
       'Something went wrong. Please try again.',
     );
+  });
+});
+
+/**
+ * HUNT5-H-5. WEBR4-01 widened canActivate/activationNote to archived children, and left the doc
+ * comments that DEFINE those fields saying "a draft". They are the only description a consumer has —
+ * app/(parent)/children.tsx renders `row.canActivate` with no status logic of its own — so a reader
+ * who trusted the contract would add a `status === 'draft'` guard at a new call site and quietly take
+ * the archived offer away again, breaking the promise the archive confirmation on that screen makes
+ * ("You can activate them again later while a paid slot is free"), which is what WEBR4-01/BUG-220 was
+ * filed for. The behaviour above is right; only its description was wrong.
+ */
+describe('the ChildRow contract describes the behaviour the code has (HUNT5-H-5)', () => {
+  const source = readFileSync(join(import.meta.dirname, 'family-view.ts'), 'utf8');
+  /** The doc comment immediately above `declaration` (no other comment can slip in between). */
+  const docFor = (declaration: string) =>
+    new RegExp(`/\\*\\*((?:(?!\\*/)[\\s\\S])*)\\*/\\s*${declaration}`).exec(source)?.[1] ?? '';
+
+  it('[repro] both activation fields say an archived child is covered too', () => {
+    expect(docFor('readonly canActivate: boolean;')).toMatch(/archived/i);
+    expect(docFor('readonly activationNote: string \\| null;')).toMatch(/archived/i);
+  });
+
+  it('the note helper still named for drafts says it serves both cases', () => {
+    expect(docFor('function draftActivationNote')).toMatch(/archived/i);
   });
 });

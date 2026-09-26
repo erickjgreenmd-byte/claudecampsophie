@@ -407,6 +407,33 @@ describe('WEB-R4-AUTH-1 an abandoned mobile-link tab is not a standing grant', (
     expect(updatePassword).not.toHaveBeenCalled();
   });
 
+  /**
+   * HUNT5-E-4: the test above only escapes the render-time capture because it types the new password
+   * AFTER the grant lapses, and typing is what re-renders this page and brings the "Current password"
+   * field back. Swap the two steps and the decision is the one taken at the last render, which fell
+   * inside the window: `mustProve` is captured by the submit closure and AccountForm keeps its own
+   * busy/error state (forms.tsx), so nothing re-renders the page between the typing and the click.
+   * The deadline has to be enforced at the moment the account is changed, which is what BUG-242 and
+   * L-040 are about.
+   */
+  it('refuses a form filled inside the grant but submitted after it lapsed', async () => {
+    const { account, updatePassword, verifyPassword, lapse } = linkAccount();
+    renderLink(account);
+    const user = userEvent.setup();
+    // Typed while the grant was open, so this page's last render fell inside the window.
+    await user.type(await screen.findByLabelText('New password'), 'a-long-synthetic-pass');
+    expect(screen.queryByLabelText('Current password')).toBeNull();
+    // Sixteen minutes pass with the form filled in and the tab abandoned, then it is submitted.
+    lapse();
+    await user.click(screen.getByRole('button', { name: 'Save password' }));
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/current password/i);
+    expect(updatePassword).not.toHaveBeenCalled();
+    expect(verifyPassword).not.toHaveBeenCalled();
+    // And the field the parent now needs is on screen, not only demanded.
+    expect(await screen.findByLabelText('Current password')).toBeTruthy();
+  });
+
   it('still lets the parent set the password inside the grant', async () => {
     const { account, updatePassword } = linkAccount();
     renderLink(account);

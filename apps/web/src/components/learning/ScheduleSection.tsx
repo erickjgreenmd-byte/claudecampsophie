@@ -34,6 +34,15 @@ import {
  * Daily practice + weekly review schedule (spec P7, P8). Every time is the family's local time
  * in its IANA zone, which is named on screen; the server computes the next releases with the zone's
  * daylight-saving rules. `refreshKey` reloads the releases after subject or test-date changes.
+ *
+ * HUNT5-F-10: the section takes no child status and does not branch on one. For an archived profile
+ * the planner's own notice frames every time below it — "the times below are what the schedule would
+ * produce if the profile were active again" — so these instants are read as the hypothetical they
+ * are, and the stored plan the parent came to read stays on screen. A branch that blanked them was
+ * built for the other design of that finding and removed with it: the planner, this section's only
+ * caller, never passed a status, so it was dead for every real archived child. What the section must
+ * not do is PROMISE a child something (see PracticeSetsSection's `childStatus`, which exists for one
+ * such sentence); nothing here addresses the child at all.
  */
 export function ScheduleSection({
   childId,

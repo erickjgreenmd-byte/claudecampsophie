@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
+import { RATE_RULES } from '../src/middleware/rate-limit.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
 
 let api: TestApi;
@@ -135,9 +136,28 @@ describe('child pairing and sessions (AC_ACCESS_04, AC_ACCESS_06, AC_ACCESS_08)'
     return (await json<{ code: string }>(res)).code;
   }
 
+  let pairCount = 0;
+  /**
+   * A client network of its own for each POST /v1/child/pair this file makes (N3-AUTH-RATE, the same
+   * structural fix mobile-r2.review.test.ts carries). Pairing is limited per client network
+   * (RATE_RULES.pairingRedeemPerNetwork, 20 per 15 minutes, keyed on cf-connecting-ip by
+   * clientNetworkKey) and this file pins the clock, so the 15-minute window never advances and every
+   * pairing that states no address spends the same 'unknown' bucket. An address in the IPv6
+   * documentation prefix per pairing keeps the limit from binding here however many cases the file
+   * grows: the limiter keys IPv6 on the /64 (and the pairing failure budget on the /48), so varying
+   * the third group gives each pairing a network and a site of its own, with room for 65,535 of them.
+   * The limit itself is untouched and still bites per network (the hygiene case at the end of this
+   * describe, mobile-r2.review.test.ts and child-auth-hardening.test.ts).
+   */
+  function pairingAddress(): string {
+    pairCount += 1;
+    return `2001:db8:${pairCount.toString(16)}::1`;
+  }
+
   async function pair(code: string) {
     return api.request('/v1/child/pair', {
       method: 'POST',
+      headers: { 'cf-connecting-ip': pairingAddress() },
       body: { code, deviceLabel: 'Kitchen tablet', platform: 'ios' },
     });
   }
@@ -247,6 +267,25 @@ describe('child pairing and sessions (AC_ACCESS_04, AC_ACCESS_06, AC_ACCESS_08)'
       { revoked_at: Date | null }[]
     >`select revoked_at from public.child_devices where id = ${otherFam.children[0]!.deviceId}`;
     expect(device!.revoked_at).toBeNull();
+  });
+
+  /**
+   * HYGIENE (N3-AUTH-RATE). Every pairing above is one POST /v1/child/pair counted against
+   * RATE_RULES.pairingRedeemPerNetwork (20 per 15 minutes per client network) under a clock this
+   * file pins, so the window never advances: while `pair` stated no address, every pairing in the
+   * file spent the ONE 'unknown' bucket and the file sat at about half that limit — headroom, not a
+   * failure, until the next case anyone added turned it into a 429 that has nothing to do with what
+   * the file tests. This case holds the fix: `pair` states a network of its own each time, so more
+   * attempts than any one network may make still all reach the code. The limit itself is untouched
+   * and still bites per network (mobile-r2.review.test.ts, child-auth-hardening.test.ts).
+   */
+  it('more attempts than one network may make all reach the code, because each states its own', async () => {
+    const limit = RATE_RULES.pairingRedeemPerNetwork.limit;
+    // Wrong codes: an attempt is counted against the network before the code is looked at, so this
+    // spends a pairing budget without needing a code. A shared bucket answers 429 from attempt 21.
+    const statuses: number[] = [];
+    for (let i = 0; i < limit + 2; i += 1) statuses.push((await pair('ZZZZ-ZZZZ')).status);
+    expect(statuses).toEqual(new Array<number>(limit + 2).fill(404));
   });
 
   it('draft children cannot be paired', async () => {

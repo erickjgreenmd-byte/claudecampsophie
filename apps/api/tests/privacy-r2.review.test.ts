@@ -776,9 +776,14 @@ describe('CS-R4-02 the family_data export and the child’s safety notice', () =
     for (const phrase of ['call or text 988', '1-800-422-4453']) {
       expect(body).not.toContain(phrase);
     }
+    // Every column jobs/export-build.ts selects for childFeedback, so the shape here cannot hide one
+    // from the sweep below (HUNT5-B-6: `question_id` and `child_id` were missing from this
+    // annotation, and that is how they stayed in the searched string).
     const data = JSON.parse(body) as {
       childFeedback: {
         id: string;
+        question_id: string | null;
+        child_id: string;
         kind: string;
         body: string | null;
         created_at: string;
@@ -799,13 +804,172 @@ describe('CS-R4-02 the family_data export and the child’s safety notice', () =
     const safetyRows = data.childFeedback.filter((f) => f.kind === 'safety');
     expect(safetyRows.length).toBeGreaterThan(0);
     expect(safetyRows.every((f) => f.body === null)).toBe(true);
-    // The identifiers and the instant are dropped before the hotline check: a v4 UUID group or a
-    // millisecond timestamp can contain '988' by chance, which reddened this run about once in fifty
-    // while nothing had leaked (measured by the round-4 checker over 20 runs). The assertion itself
-    // is unchanged in strength — every field that could carry wording is still searched.
-    const withoutIds = safetyRows.map(({ id: _id, created_at: _at, ...rest }) => rest);
-    expect(JSON.stringify(withoutIds)).not.toMatch(/988|422-4453/);
+    // The hotline check searches the three fields that could carry wording, listed rather than
+    // rest-spread (HUNT5-B-6). A v4 UUID group or a millisecond timestamp can contain '988' by
+    // chance: dropping `id` and `created_at` and searching the REST left `question_id` and `child_id`
+    // — two more random UUIDs per row — in the string, so the flake this sweep's comment claimed to
+    // have removed was still there at about the same rate. Naming the fields also means a column
+    // added to the export cannot slip into the sweep unnoticed; the row-level assertions above are
+    // what prove nothing else leaked.
+    const wording = safetyRows.map((f) => ({
+      kind: f.kind,
+      body: f.body,
+      safety_template_version: f.safety_template_version,
+    }));
+    expect(Object.keys(wording[0]!)).toEqual(['kind', 'body', 'safety_template_version']);
+    expect(JSON.stringify(wording)).not.toMatch(/988|422-4453/);
     // The coaching feedback CS-R2-05 added is untouched: only the safety notice loses its wording.
     expect(data.childFeedback.some((f) => f.kind !== 'safety' && f.body !== null)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round-5 findings on the round-4 fixes (HUNT5-B-2, HUNT5-B-4, HUNT5-B-5).
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * HUNT5-B-2, the API half. FL-R4-01's slot release (releaseChildSlot) switches to the service role
+ * for one UPDATE inside the caller's transaction, and every statement of it sat inside the try block
+ * whose catch maps SQLSTATE 42501 to STEP_UP_REQUIRED "Enter your parent PIN to continue". 42501 from
+ * the RPC does mean a missing step-up; 42501 from the release means the deployment's UPDATE grant on
+ * public.child_slot_assignments is gone, which no PIN can satisfy — so the parent was asked for a PIN
+ * forever and their child's data was never deleted. (The database half is migration 0890 plus
+ * supabase/tests/hardening_r5_db.test.ts; the release stays here as idempotent belt-and-braces.)
+ */
+describe('HUNT5-B-2 a slot-release permission failure is not reported as a missing PIN', () => {
+  it('answers an honest server error instead of asking for a PIN no PIN can satisfy', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const child = fam.children[0]!;
+    await api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${fam.familyId}, 1, 'app_store')`;
+    await api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id)
+      values (${fam.familyId}, ${child.id})`;
+    const parent = await unlockedParent(fam.ownerId);
+    // The release's only plausible failure mode, made reachable: take the service role's UPDATE grant
+    // away so its statement raises 42501. Restored in `finally` — the grant is the deployment's.
+    await api.db.sql`revoke update on public.child_slot_assignments from service_role`;
+    let res: Response;
+    try {
+      res = await api.request('/v1/deletion', {
+        method: 'POST',
+        token: parent,
+        body: { scope: 'child', childId: child.id },
+      });
+    } finally {
+      await api.db.sql`grant update on public.child_slot_assignments to service_role`;
+    }
+    const body = await json<{ error?: { code?: string; message?: string } }>(res);
+    expect(body.error?.code).not.toBe('STEP_UP_REQUIRED');
+    expect(body.error?.message ?? '').not.toContain('PIN');
+    // A missing grant is a server fault, and the request still rolls back whole: the release must
+    // never land apart from the request, so no deletion row is acknowledged either.
+    expect(res.status).toBe(500);
+    const [open] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.deletion_requests
+       where family_id = ${fam.familyId} and status in ('requested', 'processing')`;
+    expect(open!.n).toBe(0);
+  });
+});
+
+/**
+ * HUNT5-B-4. The unresolved CHILD branch was bounded newest-first while the system branch beside it
+ * was oldest-first, and the file's own rule for the direction is whether the family can drain the
+ * branch: a guardian resolves a child's report through PATCH /safety-reports/:id (only
+ * `reporter_kind = 'parent'` is refused, and migration 0790 permits 'addressed' on 'system' and
+ * 'child'), nothing else ever closes one, and a child may file 20 an hour. So past 200 open child
+ * reports the EARLIEST one — the most likely genuine disclosure — was absent from the family's only
+ * list, which is the failure CS-R2-07 removed. The branch is oldest-first now, like the system one.
+ */
+describe('HUNT5-B-4 a child’s oldest open report is not hidden by newer ones', () => {
+  it('lists the child’s earliest open report behind 200+ newer child reports', async () => {
+    const { fam, reportId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    const childId = fam.children[0]!.id;
+    // The child's first report, an hour before the flag. Every instant derives from the flag's own
+    // row, never from a second clock (L-027).
+    const [earliest] = await api.db.sql<{ id: string }[]>`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, ${childId}, 'child', 'upsetting', 'open',
+             flag.created_at - interval '1 hour'
+        from (select created_at from public.safety_reports where id = ${reportId}) as flag
+      returning id`;
+    // Then more than a page of NEWER child reports — eleven hours of the 20/hour child limit.
+    await api.db.sql`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, ${childId}, 'child', 'wrong_or_confusing', 'open',
+             flag.created_at - interval '1 hour' + (n * interval '10 seconds')
+        from generate_series(1, ${UNRESOLVED_REPORTS_PAGE_SIZE + 5}) as n,
+             (select created_at from public.safety_reports where id = ${reportId}) as flag`;
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    // Before the fix the child branch was `order by created_at desc limit 200`, so the six oldest
+    // child reports — including the child's first — were not in the response at all.
+    expect(reports.map((r) => r.id)).toContain(earliest!.id);
+    // Still bounded on that branch, and the flag on its own branch is untouched.
+    const pendingChild = reports.filter(
+      (r) => r.reporterKind === 'child' && r.status !== 'resolved',
+    );
+    expect(pendingChild.length).toBeLessThanOrEqual(UNRESOLVED_REPORTS_PAGE_SIZE + 1);
+    expect(reports.map((r) => r.id)).toContain(reportId);
+
+    // The drain, through the product's own path: a guardian may act on the child's earliest report.
+    const patched = await api.request(`/v1/safety-reports/${earliest!.id}`, {
+      method: 'PATCH',
+      token: parent,
+      body: { outcome: 'addressed' },
+    });
+    expect(patched.status).toBe(200);
+  });
+});
+
+/**
+ * HUNT5-B-5. The system branch takes the 200 OLDEST unresolved flags, so with 200 already open a
+ * flag filed now was row 201 and absent from the response — while its email tells the parent
+ * "open Privacy & safety to see the flag and what you can do next: <origin>/app/privacy"
+ * (providers/index.ts), the page renders exactly this list, and there is no GET
+ * /v1/safety-reports/:id and no per-report deep link. Eventual reachability is not what the email
+ * promises. The oldest-first window stays (it drains), and the NEWEST unresolved row of each kind is
+ * always in the response as well, so a just-emailed flag is never missing.
+ */
+describe('HUNT5-B-5 the newest unresolved flag is on the page its email names', () => {
+  it('lists a just-filed flag behind a full page of older open flags', async () => {
+    const { fam, reportId, questionId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    // A full page of system flags OLDER than the real one, shaped to satisfy
+    // safety_reports_system_shape (child, question, no note, 'escalated', screen columns) and
+    // distinct on safety_reports_system_once's (question_id, transcription_at).
+    await api.db.sql`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id,
+                                         status, created_at, transcription_at, screen_version, screen_categories)
+      select ${fam.familyId}, ${fam.children[0]!.id}, 'system', 'severe_risk', ${questionId},
+             'escalated', flag.created_at - (n * interval '1 minute'),
+             flag.transcription_at - (n * interval '1 minute'), flag.screen_version, flag.screen_categories
+        from generate_series(1, ${UNRESOLVED_REPORTS_PAGE_SIZE}) as n,
+             (select created_at, transcription_at, screen_version, screen_categories
+                from public.safety_reports where id = ${reportId}) as flag`;
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    // Before the fix the 200 oldest flags filled the branch and the newest — the one the email
+    // announced — was not in the response at all.
+    expect(reports.map((r) => r.id)).toContain(reportId);
+    // Bounded still: the drain window plus at most the newest row of that kind.
+    const pendingFlags = reports.filter(
+      (r) => r.reporterKind === 'system' && r.status !== 'resolved',
+    );
+    expect(pendingFlags).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE + 1);
+    // And the oldest flag still leads the drain, so the page a guardian works through is unchanged.
+    const oldest = pendingFlags.reduce((a, b) => (a.createdAt <= b.createdAt ? a : b));
+    const patched = await api.request(`/v1/safety-reports/${oldest.id}`, {
+      method: 'PATCH',
+      token: parent,
+      body: { outcome: 'addressed' },
+    });
+    expect(patched.status).toBe(200);
   });
 });

@@ -167,6 +167,24 @@ export type CloseAccountResult =
  * the family account first (the server's FAMILY_DELETION_REQUIRED rule); `closed` and `pending`
  * both mean the device must sign out now (the API's signOut flag).
  */
+/**
+ * What the screen says when the account really is closed but this DEVICE could not be signed out
+ * (HUNT5-N6 / L-037: the portal makes the same distinction, so the two surfaces must not differ).
+ *
+ * `ACCOUNT_CLOSE_COPY.closed` and `.pending` both end "and this device is signed out", which is the
+ * app's own half of the job: the server closed the sign-in, and the app then clears the parent
+ * session, the biometric PIN and every adult secret. When that second half fails, the first sentence
+ * is still true and the second is not — and it is the dangerous half to get wrong, because a parent
+ * who reads it walks away from a device that is still unlocked.
+ */
+export function accountClosedStillSignedInMessage(status: 'closed' | 'pending'): string {
+  const closure =
+    status === 'closed'
+      ? 'Your PencilLift account is closed.'
+      : 'Your request is recorded, and your sign-in closes automatically once your family account\u2019s deletion has finished.';
+  return `${closure} We could not sign this device out. Sign out from the parent menu before you put it down, and if you are worried, change your password from another device.`;
+}
+
 export async function closeAccountAction(
   api: ApiClient,
   confirmed: boolean,

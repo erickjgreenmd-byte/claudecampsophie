@@ -37,11 +37,16 @@ export interface ChildRow {
   /** Why pairing is unavailable, shown instead of a disabled/dead button. */
   readonly pairingNote: string | null;
   /**
-   * A draft can take one of the family's unused paid slots without a new purchase (spec P11,
-   * AC_CAPACITY_03) via POST /v1/children/:id/activate. The server re-checks everything.
+   * A draft, or an archived child, can take one of the family's unused paid slots without a new
+   * purchase (spec P11, AC_CAPACITY_03, WEBR4-01) via POST /v1/children/:id/activate: that route
+   * clears archived_at for any profile that is not already active, and the archive confirmation on
+   * the Children screen promises it. The server re-checks everything.
    */
   readonly canActivate: boolean;
-  /** Why a draft can't be activated here (no unused slot), shown instead of a dead button. */
+  /**
+   * Why that draft or archived child can't be activated here (no unused slot), shown instead of a
+   * dead button.
+   */
   readonly activationNote: string | null;
 }
 
@@ -51,6 +56,10 @@ export function unusedPaidSlots(family: FamilyOverview): number {
   return Math.max(0, family.paidSlots - active);
 }
 
+/**
+ * The note for a child who could take a slot if the family had one free: a draft or an archived
+ * child (WEBR4-01 widened the offer; the name is from when only drafts could be activated).
+ */
 function draftActivationNote(family: FamilyOverview, nickname: string): string {
   if (family.paidSlots === 0) {
     return `Your family has no paid child slots yet. To activate ${nickname}, choose a plan under Plan and child slots.`;

@@ -592,9 +592,10 @@ function ExportsSection({
  * asks for the link, then opens it. The API checks the family and the step-up.
  */
 /**
- * How long a signed download link may be offered, measured on the device's own clock from the moment
- * the link arrives (WEBR4-09). It mirrors DOWNLOAD_URL_SECONDS in apps/api/src/routes/export-download.ts;
- * the response carries only `url` and `expiresAt`, so there is nothing to read it from.
+ * The longest a signed download link may be offered, measured on the device's own clock from the
+ * moment the request was SENT (WEBR4-09, HUNT5-F-7 — it used to run from the moment the link
+ * arrived). It mirrors DOWNLOAD_URL_SECONDS in apps/api/src/routes/export-download.ts; the response
+ * carries only `url` and `expiresAt`, so there is nothing to read the lifetime itself from.
  */
 const LINK_WINDOW_MS = 60_000;
 
@@ -602,7 +603,13 @@ function ExportDownload({ exportId }: { exportId: string }) {
   const { api } = useSession();
   const action = useAction();
   const { setOutcome } = action;
-  const [link, setLink] = useState<{ url: string; expiresAt: string } | null>(null);
+  /**
+   * `requestedAt` is this device's clock when the request was SENT (HUNT5-F-7). The API signs the link
+   * when it handles the request, so the round trip is part of the signature's minute, not extra.
+   */
+  const [link, setLink] = useState<{ url: string; expiresAt: string; requestedAt: number } | null>(
+    null,
+  );
   const [expired, setExpired] = useState(false);
   // WEB-R2-07: once a link has been asked for, the button stays available as "Get a new link", so a
   // parent never has to reload the portal to replace one that ran out.
@@ -610,15 +617,27 @@ function ExportDownload({ exportId }: { exportId: string }) {
   const label = fetched ? 'Get a new link' : 'Get download link';
 
   /**
-   * The API signs the link for one minute (DOWNLOAD_URL_SECONDS). At that instant the link is
-   * dropped, so the page can never offer a URL that would answer with the storage service's error
-   * document. The parent is told it expired and asks for another.
+   * The API signs the link for one minute (DOWNLOAD_URL_SECONDS), measured from the instant it signs.
+   * The link is dropped no later than that instant, so a URL that would answer with the storage
+   * service's error document is not left on offer. It is a bound rather than a promise: a timer on a
+   * busy page fires late, and the parent is told the link expired either way.
    *
-   * WEBR4-09: the window is measured on THIS clock, from the moment the link arrived — it used to be
+   * WEBR4-09: the window is measured on THIS clock — it used to be
    * `new Date(link.expiresAt).getTime() - Date.now()`, the signer's clock minus the device's. A
    * device five minutes behind kept the dead link on screen and clickable for five minutes after the
-   * signature died, and one running ahead threw a valid link away at once. `expiresAt` is still what
-   * the wall-clock text below shows.
+   * signature died, and one running ahead threw a valid link away at once.
+   *
+   * HUNT5-F-7: but it used to start the fixed minute when the RESPONSE LANDED, which added the whole
+   * round trip to the signature's life; on a cold Worker over mobile data the link stayed clickable
+   * for seconds after it was dead, and the comment here claimed that could not happen. The window now
+   * runs from `requestedAt`, the instant the request was SENT, so the round trip is spent out of the
+   * minute rather than added to it — the API signs at or after that instant, so the link is dropped by
+   * the time its signature dies.
+   *
+   * Still no cross-clock arithmetic: a signature's life is a DURATION, and both ends of this
+   * subtraction are this device's clock. Bounding it by `expiresAt - requestedAt` as well would read
+   * as a shorter window on a device running AHEAD of the signer and throw a valid link away at once —
+   * the other half of WEBR4-09. `expiresAt` stays what the wall-clock text below shows.
    */
   useEffect(() => {
     if (!link) return;
@@ -631,15 +650,26 @@ function ExportDownload({ exportId }: { exportId: string }) {
       // role="status" lines a screen reader reads out one after the other.
       setOutcome(null);
     };
-    const timer = setTimeout(done, LINK_WINDOW_MS);
+    const spent = Date.now() - link.requestedAt;
+    const timer = setTimeout(done, Math.max(0, LINK_WINDOW_MS - spent));
     return () => clearTimeout(timer);
   }, [link, setOutcome]);
 
   const fetchLink = async () => {
     setExpired(false);
     setFetched(true);
+    const requestedAt = Date.now();
     const ok = await action.run(async () => {
-      setLink(await api.get(`/v1/exports/${exportId}/download`, exportDownloadResponseSchema));
+      const result = await api.get(
+        `/v1/exports/${exportId}/download`,
+        exportDownloadResponseSchema,
+      );
+      setLink({ ...result, requestedAt });
+      // HUNT5-F-6: clear the expiry notice with the link it belonged to. It was cleared only at the
+      // top of this function, so a replacement asked for just before the old window ended — the old
+      // timer firing while this request was in flight — arrived beside "That download link expired for
+      // your safety. Ask for a new one", a valid link and its own denial read out one after the other.
+      setExpired(false);
       return 'Your download link is ready.';
     });
     if (!ok) setLink(null);
@@ -682,13 +712,42 @@ function ExportDownload({ exportId }: { exportId: string }) {
  * server enforces the order: FAMILY_DELETION_REQUIRED). On success the device is signed out through
  * the normal sign-out path and the public deletion page shows what happened.
  */
+/**
+ * HUNT5-N6: what the parent reads when the closure went through but this browser's session survived
+ * the sign-out. Neither ACCOUNT_CLOSE_COPY line can be shown on this path — both end "this device is
+ * signed out", the one thing that did not happen — and /account-deletion's refusal notice opens
+ * "This computer is signed out", so the flow must not travel there either. The session sentence is
+ * SignOutControl's, word for word, because it reports the same fact on its own path; the closure is
+ * restated here because this is the only line the parent gets.
+ */
+function stillSignedInCopy(status: 'closed' | 'pending'): string {
+  const closure =
+    status === 'closed'
+      ? 'Your PencilLift account is closed.'
+      : 'Your request is recorded, and your sign-in closes automatically once your family account’s deletion has finished.';
+  return `${closure} We could not end your session — you are still signed in on this computer. Use “Sign out” at the top of this page before you leave it.`;
+}
+
 function AccountCloseSection() {
   const { api, auth } = useSession();
   const navigate = useNavigate();
   const action = useAction();
   const [confirmed, setConfirmed] = useState(false);
   const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [sessionStillOpen, setSessionStillOpen] = useState<string | null>(null);
   const confirmId = useId();
+
+  /**
+   * Whether this browser is still holding a session, however the sign-out ended — SignOutControl's
+   * check, for the same reason: a session that cannot even be read cannot be shown as ended.
+   */
+  const stillSignedIn = async () => {
+    try {
+      return (await auth.currentSession()) !== null;
+    } catch {
+      return true;
+    }
+  };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -697,6 +756,7 @@ function AccountCloseSection() {
       return;
     }
     setConfirmError(null);
+    setSessionStillOpen(null);
     let status: 'closed' | 'pending' | null = null;
     const ok = await action.run(async () => {
       const result = await api.send(
@@ -710,16 +770,55 @@ function AccountCloseSection() {
     });
     if (!ok || status === null) return;
     // The API's signOut flag: clear this device's session through the normal sign-out path, then
-    // explain on the public page (this page needs a signed-in parent to render). A sign-out the auth
-    // server refuses now rejects rather than reporting success (WEB-R4-AUTH-2), and the account is
-    // already closed by this point, so the navigation must not depend on it — otherwise the parent is
-    // left on a page that needs the session they just gave up.
+    // explain on the public page (this page needs a signed-in parent to render). The account is
+    // already closed by this point, so the navigation must not depend on the sign-out — otherwise the
+    // parent is left on a page that needs the session they just gave up (WEB-R4-AUTH-2).
+    //
+    // HUNT5-F-8: a sign-out the auth server refuses is REPORTED as a refusal, not thrown, and this
+    // browser's stored session is cleared either way (ACC-WEB-AUTH-A: the adapter removes the stored
+    // session and resolves with `{ serverNotTold: true }`, exactly so this flow can carry on — see
+    // apps/web/src/lib/auth.ts and lib/supabase-auth.ts's signOut). So both halves are true at once:
+    // this computer IS signed out, and the auth service was never told, so the session may still be
+    // usable on the parent's phone — on the `pending` path the sign-in is not closed yet either. That
+    // is the one case WEB-R4-AUTH-2 exists for, and the report used to be dropped here, on a screen
+    // that then tells the parent the device is signed out and nothing more.
+    //
+    // The report now travels in the router state and /account-deletion says that sentence beside the
+    // closure notice (AccountDeletionPage's SERVER_NOT_TOLD, word for word SignOutControl's, which
+    // reports the same fact on its own path). The catch stays for an adapter that fails some other
+    // way; what such a throw can honestly be reported as is the paragraph below.
+    //
+    // HUNT5-N6: "reported the same way" held for the SERVER's session — an adapter that threw did not
+    // end that either — but the sentence the public page then says is about THIS COMPUTER, and on the
+    // catch branch nothing had checked it. A REPORTED refusal has: the adapter removes this origin's
+    // stored session before it returns `{ serverNotTold: true }` (supabase-auth.ts's
+    // forgetStoredSession, pinned in App.signout.test.tsx), so "this computer is signed out" is the
+    // adapter's own guarantee and is not re-derived here — re-reading `currentSession()` there would
+    // only ask supabase-js about its in-memory copy and could talk the flow out of a true sentence. A
+    // THROW carries no such guarantee: it may have come from anywhere, including before that removal,
+    // leaving the stored session exactly where it was while the parent walks away from a shared
+    // computer having read that it was signed out. So that one path re-reads the session the way
+    // SignOutControl does, and the two cases are told apart by that read: a session really gone
+    // travels to the public page with the refusal report, a session still here keeps the parent on
+    // this page — where the portal's own Sign out is — and is said out loud. The account is closed
+    // either way, so that fact travels with both.
+    let signOutRefused: boolean;
+    // Set only by the catch: the one path on which no removal was promised.
+    let unverified = false;
     try {
-      await auth.signOut();
+      signOutRefused = (await auth.signOut())?.serverNotTold === true;
     } catch {
-      // Nothing to tell the parent here: the close succeeded, and the public page says what happened.
+      signOutRefused = true;
+      unverified = true;
     }
-    void navigate('/account-deletion', { state: { accountClosed: status } });
+    if (unverified && (await stillSignedIn())) {
+      // The closure line belongs to this message now: the outcome's own copy ends "this device is
+      // signed out", which is the half that failed.
+      action.setOutcome(null);
+      setSessionStillOpen(stillSignedInCopy(status));
+      return;
+    }
+    void navigate('/account-deletion', { state: { accountClosed: status, signOutRefused } });
   };
 
   const rule = (error: ApiRequestError): string | null =>
@@ -769,6 +868,11 @@ function AccountCloseSection() {
           </button>
         </div>
       </form>
+      {sessionStillOpen ? (
+        <p role="alert" style={fieldError}>
+          {sessionStillOpen}
+        </p>
+      ) : null}
       {action.outcome?.kind === 'error' && rule(action.outcome.error) ? (
         <p role="alert" style={fieldError}>
           {rule(action.outcome.error)}

@@ -193,15 +193,47 @@ describe('an auth change closes the client-side unlock (MOB-R4-LOCK-04)', () => 
     expect(ui).not.toMatch(/parentAuth\.watch\(\(\) => check\(\)\)/);
   });
 
-  it('a screen that is still unlocked keeps the access it already had', () => {
-    // A check that is still 'ready' must hand the screen back the SAME state object. parentApi()
-    // builds a new ApiClient on every call, and the parent screens key their load on that client
-    // (e.g. app/(parent)/home.tsx: useLoad(load) with load = useCallback(…, [api])), so a fresh
-    // object on every focus would re-fetch and flash "Loading your family" over data the parent
-    // was already reading each time they came back from a pushed screen. The client's token source
-    // reads the live session, so reusing it never serves another parent's data.
+  it('a screen that is still unlocked keeps the access it already had — for the SAME adult', () => {
+    // A check that is still 'ready' hands the screen back the SAME state object. parentApi() builds
+    // a new ApiClient on every call, and the parent screens key their load on that client (e.g.
+    // app/(parent)/home.tsx: useLoad(load) with load = useCallback(…, [api])), so a fresh object on
+    // every focus would re-fetch and flash "Loading your family" over data the parent was already
+    // reading each time they came back from a pushed screen.
+    //
+    // HUNT5-H-1: that reuse used to be unconditional, and the last sentence of this rationale used
+    // to read "the client's token source reads the live session, so reusing it never serves another
+    // parent's data" — which was the defect, not the guarantee. The token source does follow whoever
+    // is signed in now, but the DATA already on the screen belongs to whoever fetched it: on a
+    // handed-on tablet (A's Children screen mounted underneath, A's session ended, B signs in and
+    // unlocks with B's own PIN, B taps the header back arrow) the re-check handed B A's children.
+    // The state is reused only while it still belongs to the adult at the device: the gate records
+    // parentIdentityGeneration() when it publishes 'ready', and the rule lives in src/lib/mode.ts
+    // with behavioural tests in src/lib/mode-r2.review.test.ts and src/lib/app-session.test.ts.
+    expect(ui).toMatch(/const readyIdentity = useRef<number \| null>\(null\)/);
     expect(ui).toMatch(
-      /setAccess\(\(previous\) => \(?\s*previous\.status === 'ready' \? previous : \{ status: 'ready', api \}/,
+      /previous\.status === 'ready' && parentStateStillCurrent\(publishedUnder\)\s*\?\s*previous\s*:\s*\{ status: 'ready', api \}/,
+    );
+    expect(ui).toMatch(/readyIdentity\.current = identity;/);
+  });
+
+  it('[repro] the identity the updater compares is read BEFORE the setter, not inside it', () => {
+    // The first HUNT5-H-1 fix read the ref INSIDE the updater — `parentStateStillCurrent(
+    // readyIdentity.current)` — and overwrote `readyIdentity.current` on the very next line.
+    // React's documented contract is that a state updater runs during the next render, i.e. AFTER
+    // that overwrite, at which point the guard compares the new identity with itself, returns
+    // `previous`, and hands parent B parent A's state: the one case the whole fix exists for. It
+    // happened to work only because React can compute an update eagerly when a fiber's queue is
+    // empty (an implementation detail, not a contract), and this check runs inside a promise
+    // callback where a queued update is entirely ordinary. So the identity the screen's state was
+    // published under is captured in a local first, the updater closes over that local, and only
+    // then is the new identity recorded. This suite cannot render the hook (react-native, see the
+    // file header), so the ordering is pinned at source level: the three statements must appear in
+    // that order, and the updater must not reach for the ref at all.
+    expect(ui).toMatch(
+      /const publishedUnder = readyIdentity\.current;\s*setAccess\(\(previous\) =>[\s\S]*?parentStateStillCurrent\(publishedUnder\)[\s\S]*?readyIdentity\.current = identity;/,
+    );
+    expect(ui).not.toMatch(
+      /setAccess\(\(previous\) =>[\s\S]*?parentStateStillCurrent\(readyIdentity\.current\)/,
     );
   });
 });
@@ -233,15 +265,40 @@ describe('closing the account leaves no child pairing on the device (MOB-R4-LOCK
   });
 });
 
-describe('the Children screen does not name the wrong deletion scope (MOB-R4-LOCK-06)', () => {
+describe('the Children screen tells the truth about an open deletion (HUNT5-H-2, HUNT5-H-3)', () => {
   const children = screen('(parent)', 'children.tsx');
+  /** Only the deletion notice: the rest of the screen has its own copy (e.g. "Cancel edit"). */
+  const notice = /Data\s+deletion\s+under\s+way\.([^]*?)<\/Notice>/.exec(children)?.[1] ?? '';
 
-  it('the notice never tells the parent they asked for this one child’s data to be deleted', () => {
-    // GET /v1/family sets deletionPending for a FAMILY-scope request too, so the per-child wording
-    // told a parent who asked for the whole family that they had asked for one child.
+  it('[repro] never promises a cancel, because nothing in PencilLift can cancel a deletion', () => {
+    // MOB-R4-LOCK-06 rewrote this notice and ended it "Privacy shows exactly what you asked for, and
+    // cancels it if you did not mean it". There is no cancel: apps/api/src/routes/privacy.ts exposes
+    // only POST and GET /deletion, nothing sets deletion_requests.status = 'cancelled', and the
+    // mobile Privacy screen says in so many words that deleting "can't be undone". A parent who
+    // deleted the wrong child's data went looking for the cancel and burned the only window in which
+    // support could still have stopped the purge, which is enqueued with the request itself. The web
+    // client's identical claim was fixed in the same round (WEBR4-02 / BUG-221) and its suite makes
+    // this same assertion (apps/web/src/pages/app/ChildrenPage.archive.test.tsx).
+    expect(notice).not.toBe('');
+    expect(notice).not.toMatch(/cancel/i);
+    expect(notice).toMatch(/can’t\s+be\s+undone\s+from\s+the\s+app/);
+    expect(notice).toMatch(/contact\s+support/i);
+    expect(children).toMatch(/router\.push\('\/\(parent\)\/support'\)/);
+  });
+
+  it('says what is true of the only request this screen can show: it covers this child', () => {
+    // HUNT5-H-3: the rewrite hedged that the deletion "may be for {nickname} alone or for your whole
+    // family account", a state this screen cannot reach. A family-scope request revokes every adult
+    // membership in the same transaction as the family tombstone
+    // (supabase/migrations/0840_hardening_r1_db.sql), so currentFamilyId() answers NOT_FOUND, GET
+    // /v1/family cannot answer for any adult of that family, and the screen renders its no-family
+    // notice instead of a child card at all. Telling a parent who asked for one child that their
+    // whole family account may be being deleted — and that the app cannot say which — was the most
+    // alarming ambiguity on this screen. The web client states the reachable truth
+    // (apps/web/src/pages/app/ChildrenPage.tsx) and the two surfaces now agree.
+    expect(notice).toMatch(/You\s+asked\s+for\s+\{row\.nickname\}/);
+    expect(notice).not.toMatch(/whole\s+family/i);
     expect(children).toMatch(/Data\s+deletion\s+under\s+way/);
-    expect(children).not.toMatch(/You asked for \{row\.nickname\}/);
-    expect(children).toMatch(/whole\s+family/i);
   });
 });
 

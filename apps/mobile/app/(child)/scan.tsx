@@ -273,12 +273,13 @@ export default function ScanScreen() {
     } catch (error) {
       if (controller.signal.aborted || error instanceof ScanCancelledError) {
         // Stop means stop: the server releases anything reserved for this scan. Unless it was too
-        // late — the finalize had committed and the scan is already being checked (HUNT4-MOB-5): then
-        // the child is told it was already sent and the SAME attempt is kept, so "Try again" reports
-        // that one scan instead of creating a second assignment for the same homework.
-        const outcome = stoppedScanOutcome(
-          await cancelScan(childApi, attemptRef.current).catch(() => 'cancelled' as const),
-        );
+        // late — the finalize had committed and the scan is already being checked (HUNT4-MOB-5) — or
+        // the cancel itself never landed (HUNT5-H-4: this used to catch a failed cancel as a
+        // successful one, reporting a scan that may well have been sent as stopped). Then the child
+        // is told what is true and the SAME attempt is kept, so "Try again" reports that one scan
+        // instead of creating a second assignment, a second page charge and a second job for the
+        // same homework.
+        const outcome = stoppedScanOutcome(await cancelScan(childApi, attemptRef.current));
         if (!outcome.keepAttempt) attemptRef.current = newAttempt(newKey);
         setUpload({ kind: 'error', message: outcome.message });
       } else if (error instanceof ScanStoppedError) {

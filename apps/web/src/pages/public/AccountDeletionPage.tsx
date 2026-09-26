@@ -27,8 +27,33 @@ function closedFromState(state: unknown): ClosedState | null {
   return value === 'closed' || value === 'pending' ? value : null;
 }
 
+/**
+ * WEB-R4-AUTH-2 / ACC-WEB-AUTH-A: whether the sign-out that went with the closure was refused by the
+ * auth service. The closure flow (PrivacyControlsPage's AccountCloseSection) reads the adapter's
+ * report and hands it over in the same router state as `accountClosed`; anything else means "not
+ * reported", which is read as carried out — this page is public, so a stranger's plain GET must never
+ * raise an alarm about a session nobody told us about.
+ */
+function signOutRefusedFromState(state: unknown): boolean {
+  return (state as { signOutRefused?: unknown } | null)?.signOutRefused === true;
+}
+
+/**
+ * Said only on the refusal path, beside the closure line. The adapter has already removed this
+ * browser's stored session, so "this computer is signed out" is true; what failed is telling the auth
+ * service, so a session elsewhere may still work — on the `pending` path the sign-in is not closed
+ * yet either. Word for word SignOutControl's SERVER_NOT_TOLD (components/SignOutControl.tsx), because
+ * the two paths report the same fact and a parent should not have to tell them apart.
+ */
+const SERVER_NOT_TOLD =
+  'This computer is signed out. We could not tell PencilLift’s servers to end the session, so sign out on your phone, or change your password if you are worried.';
+
 export default function AccountDeletionPage() {
-  const closed = closedFromState(useLocation().state);
+  const state: unknown = useLocation().state;
+  const closed = closedFromState(state);
+  // Only a closure that happened in the parent area can report its sign-out, so the sentence is tied
+  // to that notice rather than shown on its own.
+  const signOutRefused = closed !== null && signOutRefusedFromState(state);
   return (
     <>
       <DraftBanner />
@@ -41,6 +66,7 @@ export default function AccountDeletionPage() {
               {closed === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending}
             </strong>
           </p>
+          {signOutRefused ? <p style={{ margin: '8px 0 0' }}>{SERVER_NOT_TOLD}</p> : null}
         </div>
       ) : null}
       <p style={lead}>

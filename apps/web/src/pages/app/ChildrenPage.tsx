@@ -61,7 +61,12 @@ const AGE_BAND_OPTIONS: readonly AgeBand[] = ageBandSchema.options;
  * WEB-R2-03 makes 'archived' reachable in one click, and a requested deletion archives a child too:
  * for those two there is no slot waiting to be bought, so the sentence was false and unactionable.
  */
-export function childPickerSuffix(child: { status: string; deletionPending?: boolean }): string {
+export function childPickerSuffix(child: {
+  status: string;
+  // `| undefined` explicitly: with exactOptionalPropertyTypes a caller's parsed
+  // `deletionPending?: boolean | undefined` is not assignable to a bare optional (HUNT5-F-2).
+  deletionPending?: boolean | undefined;
+}): string {
   if (child.deletionPending === true) return ' (data deletion under way)';
   switch (child.status) {
     case 'active':
@@ -253,6 +258,10 @@ function ChildCard({
     // `saveProfile` below already worked this way.
     if (ok) {
       setConfirmArchive(false);
+      // HUNT5-F-3: close the edit form too. The row that holds "Cancel edit" is hidden for an
+      // archived child (below), so an open form survived the archive with no way to dismiss it and a
+      // live-looking "Save …" button whose PATCH the API refuses with BUSINESS_RULE CHILD_ARCHIVED.
+      setEditing(false);
       onChanged();
     }
   };
@@ -402,7 +411,14 @@ function ChildCard({
           </button>
         </div>
       )}
-      {editing ? <EditChildForm child={child} busy={busy === 'edit'} onSave={saveProfile} /> : null}
+      {/*
+        HUNT5-F-3: the status is part of the condition, so a change from ANY source — this card's own
+        archive, another card's action, a reload started elsewhere — closes a form the server would
+        refuse to save. `setEditing(false)` in archive() covers this card; this covers the rest.
+      */}
+      {editing && child.status !== 'archived' && !deletionPending ? (
+        <EditChildForm child={child} busy={busy === 'edit'} onSave={saveProfile} />
+      ) : null}
       {confirmArchive ? (
         <div className="notice" role="group" aria-label={`Confirm archiving ${child.nickname}`}>
           <p style={{ margin: '0 0 8px' }}>
@@ -476,6 +492,13 @@ function ChildCard({
  * practice generation is pitched at. The diff below is against the props the form was seeded with,
  * and the submit button stays disabled while the diff is empty (the contract's refine rejects an
  * empty body anyway).
+ *
+ * HUNT5-F-1: "seeded with" is now true. The diff used to compare the field state (seeded once, at
+ * mount) against the LIVE `child` prop, which the page query replaces on every reload — and this
+ * card is keyed on `child.id`, so a reload never remounts it. Any sibling action (a child added, a
+ * card activated or archived) landed guardian B's grade 4 under the open form, and from that moment
+ * the untouched grade select differed from the prop, so a nickname-only save carried grade 3 and
+ * reverted the change WEBR4-03 was filed to protect.
  */
 function EditChildForm({
   child,
@@ -486,20 +509,25 @@ function EditChildForm({
   busy: boolean;
   onSave: (body: UpdateChildProfileRequest) => Promise<boolean>;
 }) {
-  const [nickname, setNickname] = useState(child.nickname);
-  const [grade, setGrade] = useState(String(child.gradeLevel));
-  const [ageBand, setAgeBand] = useState<AgeBand>(child.ageBand);
+  /**
+   * The profile this form was opened on, captured once (HUNT5-F-1). Everything below diffs against
+   * this, never against `child`, which the page query refreshes under the open form.
+   */
+  const [seed] = useState(child);
+  const [nickname, setNickname] = useState(seed.nickname);
+  const [grade, setGrade] = useState(String(seed.gradeLevel));
+  const [ageBand, setAgeBand] = useState<AgeBand>(seed.ageBand);
   const [fieldError, setFieldError] = useState<string | null>(null);
   const nicknameId = useId();
   const gradeId = useId();
   const bandId = useId();
   const errorId = useId();
 
-  /** Only what differs from the profile this form was opened on (WEBR4-03). */
+  /** Only what differs from the profile this form was opened on (WEBR4-03, HUNT5-F-1). */
   const changes = (name: string): UpdateChildProfileRequest => ({
-    ...(name === child.nickname ? {} : { nickname: name }),
-    ...(Number(grade) === child.gradeLevel ? {} : { gradeLevel: Number(grade) }),
-    ...(ageBand === child.ageBand ? {} : { ageBand }),
+    ...(name === seed.nickname ? {} : { nickname: name }),
+    ...(Number(grade) === seed.gradeLevel ? {} : { gradeLevel: Number(grade) }),
+    ...(ageBand === seed.ageBand ? {} : { ageBand }),
   });
   const nothingChanged = Object.keys(changes(nickname.trim())).length === 0;
 

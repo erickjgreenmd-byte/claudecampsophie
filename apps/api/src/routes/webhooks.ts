@@ -336,7 +336,11 @@ async function processStripeEvent(
     // A partial refund is recorded as partial with its real amount (RV-lead-billing-p17-7).
     // BILL-R4-3: `amount_refunded` and `amount` are Charge figures, i.e. what the family paid
     // INCLUDING sales tax, while the recorded charge is the pre-tax subscription amount. The charge
-    // total goes with the refund so applyRefund can state it in that same unit.
+    // total goes with the refund so applyRefund knows the amount is in that provider unit and
+    // restates it. HUNT5-C-2: it is only that signal — the conversion divides by the tax stored for
+    // this period's own charge, because this total is the whole invoice and may include proration
+    // lines that were never booked as revenue (N1-TAX-APPORTION: nor is the invoice's whole TAX that
+    // unit, since part of it was added to those lines).
     const chargeTotal =
       typeof object.amount === 'number' && Number.isSafeInteger(object.amount) && object.amount >= 0
         ? object.amount

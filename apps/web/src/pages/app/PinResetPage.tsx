@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { okResponseSchema } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
+import { isTwoStepLookupUnavailable } from '../../lib/auth.ts';
 import { RequireParent, useParentSession, useSession } from '../../lib/session.tsx';
 import { Notice } from '../../components/states.tsx';
 import { AccountForm, Field } from '../auth/forms.tsx';
@@ -25,6 +26,11 @@ import { AccountForm, Field } from '../auth/forms.tsx';
  * used to send an owner straight to the PIN step on a fresh aal1 session with no re-verification.
  * The grant now waits for the lookup to settle, and a failed lookup refuses the submit instead of
  * being read as "this account has no two-step".
+ *
+ * WEBR5-E-1: "a failed lookup" means a resolved one as well. auth-js never rejects these two calls —
+ * it reports every failure as `{ data: null, error }` — so the refusal cannot be hung on a rejection
+ * handler alone. The adapter now reports an unreadable level as `null` and an unreachable factor list
+ * as its own value (lib/auth.ts), and both land in the `unavailable` branch below.
  */
 type TwoStepLookup =
   | { readonly state: 'required'; readonly factorId: string }
@@ -51,19 +57,27 @@ function PinReset() {
 
   const readTwoStep = useCallback((): Promise<TwoStepLookup> => {
     if (!account) return Promise.resolve<TwoStepLookup>({ state: 'not_needed' });
+    // A failed lookup is not proof that there is no two-step factor, so it is never treated as one.
+    // Forgetting it here also makes the parent's next attempt ask again, rather than spending one
+    // failure for the life of the page.
+    const unavailable = (): TwoStepLookup => {
+      inFlight.current = null;
+      return { state: 'unavailable' };
+    };
     inFlight.current ??= Promise.all([
       account.assuranceLevel(),
       account.verifiedTotpFactorId(),
-    ]).then(
-      ([level, factorId]): TwoStepLookup =>
-        level === 'aal2' && factorId ? { state: 'required', factorId } : { state: 'not_needed' },
-      (): TwoStepLookup => {
-        // A failed lookup is not proof that there is no two-step factor, so it is never treated as
-        // one. Forgetting it here also makes the parent's next attempt ask again.
-        inFlight.current = null;
-        return { state: 'unavailable' };
-      },
-    );
+    ]).then(([level, factorId]): TwoStepLookup => {
+      // WEBR5-E-1: the failure arrives as a resolved value, not as a rejection — auth-js reports a
+      // failed mfa.listFactors()/getAuthenticatorAssuranceLevel() as `{ data: null, error }`. A
+      // level of `null` means "could not be read" and the factor lookup says so explicitly;
+      // neither may be spent as "this account has no two-step", which is what used to drop an
+      // owner's aal2 session on the password grant below.
+      if (level === null || isTwoStepLookupUnavailable(factorId)) return unavailable();
+      return level === 'aal2' && factorId
+        ? { state: 'required', factorId }
+        : { state: 'not_needed' };
+    }, unavailable);
     return inFlight.current;
   }, [account]);
 

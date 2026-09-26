@@ -55,7 +55,7 @@ const okResult: ResponsesResult = {
 /**
  * A small input keeps every raised retry inside the stage's cost cap, so the loop's own budget rule
  * is what this test observes (not the cap). 900 input tokens at $2/M plus 8,000 output tokens at
- * $12/M is 97,800 micros against the extraction cap of 150,000.
+ * $12/M is 97,800 micros, well inside extraction's cost cap whatever that cap is set to.
  */
 const common = {
   prompt: PROMPTS.extraction,
@@ -67,6 +67,18 @@ const common = {
   estimatedInputTokens: 900,
   sleep: () => Promise.resolve(),
 };
+
+/**
+ * The estimated input size at which extraction's cost cap leaves exactly `retryMicros` for the one
+ * raised retry. The first cut-off answer is metered at the usage `truncated()` reports (900 input
+ * tokens and the whole 4,000-token budget: 49,800 micros at terra's 2 and 12 micros per token), and
+ * a retry at x output tokens is estimated at 2E + 12x, so the headroom left for it is
+ * maxCostMicros − 49,800 − 2E. Derived from the cap instead of hardcoded, so the two cases below
+ * still exercise the branch they name if the stage's cost cap changes (R4-JOBS-1).
+ */
+function inputTokensLeaving(retryMicros: number): number {
+  return Math.floor((PROPOSED_STAGE_LIMITS.extraction.maxCostMicros - 49_800 - retryMicros) / 2);
+}
 
 function recordingClient(answers: readonly ResponsesResult[]) {
   const queue = [...answers];
@@ -116,11 +128,16 @@ describe('an answer cut off at max_output_tokens (JOBS-R2-02)', () => {
    * is now sized to the headroom the cap leaves, and this asserts the partial raise is really sent.
    */
   it('raises only as far as the stage cost cap has room for, and still retries once', async () => {
-    // 5,000 estimated input tokens: the first cut-off answer costs 49,800 micros, leaving 100,200 of
-    // the 150,000 cap; 10,000 of that pays for the estimated input, so 7,516 output tokens fit — a
-    // real raise over 4,000, but short of 8,000.
+    // An input sized so the cap leaves room for a 6,000-token answer and no more: a real raise over
+    // the configured 4,000, short of the full 8,000. At extraction's 216,816-micro cap that is 47,508
+    // estimated input tokens (49,800 micros for the cut-off answer, 95,016 for the input, 72,000 left
+    // for the retry) — the helper re-derives it if the cap moves.
     const { client, requests } = recordingClient([truncated(4_000), okResult]);
-    const out = await runStage({ ...common, client, estimatedInputTokens: 5_000 });
+    const out = await runStage({
+      ...common,
+      client,
+      estimatedInputTokens: inputTokensLeaving(12 * 6_000),
+    });
     expect(requests).toHaveLength(2);
     const raised = requests[1]!.maxOutputTokens;
     expect(raised).toBeGreaterThan(PROPOSED_STAGE_LIMITS.extraction.maxOutputTokens);
@@ -135,12 +152,17 @@ describe('an answer cut off at max_output_tokens (JOBS-R2-02)', () => {
   });
 
   it('makes no second call when the cost cap has no room for a bigger answer at all', async () => {
-    // 30,000 estimated input tokens (60,000 micros): the first attempt is admitted at 108,000 and
-    // costs 49,800, but even one output token more than the configured budget would be estimated at
-    // 108,012 against the 100,200 micros left. The stage settles with the truncation code at once,
-    // never STAGE_LIMIT, so the caller still ends the scan with a parent-facing outcome.
+    // One input token more than the largest input at which a retry at 4,001 output tokens still fits:
+    // the first attempt is admitted and costs 49,800 micros, but even one output token more than the
+    // configured budget is estimated 2 micros past what the cap has left. The stage settles with the
+    // truncation code at once, never STAGE_LIMIT, so the caller still ends the scan with a
+    // parent-facing outcome. At extraction's 216,816-micro cap that input is 59,503 tokens.
     const { client, requests } = recordingClient([truncated(4_000), okResult]);
-    const out = await runStage({ ...common, client, estimatedInputTokens: 30_000 });
+    const out = await runStage({
+      ...common,
+      client,
+      estimatedInputTokens: inputTokensLeaving(12 * 4_001) + 1,
+    });
     expect(requests).toHaveLength(1);
     expect(out.result.ok).toBe(false);
     if (!out.result.ok) expect(out.result.error.code).toBe('OUTPUT_TRUNCATED');

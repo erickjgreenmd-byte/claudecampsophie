@@ -42,12 +42,27 @@ async function issueRefreshToken(
 const PAIR_FAILURES_KEY = 'pair-fail:global';
 
 /**
+ * How long after a rotation the tablet's own retry of that refresh is still served (HUNT5-A-1). A
+ * client retry horizon, not a grace period: the id below decides WHO may recover, this only bounds
+ * how long a consumed token stays recoverable at all. Compared against `used_at`, which the request
+ * instant writes, so both sides of the comparison come from one clock (RV-lead-identity-access-8) —
+ * `now()` is the database's and would mix two.
+ */
+const RECOVERY_WINDOW_MS = 2 * 60_000;
+
+/**
  * A device with no live session left is not connected any more (HUNT4-MOB-4). The parent's device
  * list derives "Connected" from `child_devices.revoked_at` alone, so a session that ended any way
  * except logout or a parent action left the tablet listed as connected for good — with a live
- * "Disconnect" button — while the child was being told to ask a grown-up to connect it again. Only
- * stamped when this device has no other live session, so a second session on a shared tablet keeps
- * it connected.
+ * "Disconnect" button — while the child was being told to ask a grown-up to connect it again.
+ *
+ * Only stamped when this device has no OTHER live session. That is defence in depth, not a shared
+ * tablet (HUNT5-A-5): /pair always inserts a fresh `child_devices` row, and every path that ends a
+ * session for a reason other than the session itself ending — archive (routes/family.ts), consent
+ * withdrawal (routes/guardians.ts), deletion (migration 0620) — revokes the device row in the same
+ * transaction, so no API path today reaches a device row that has a second live session. The clause
+ * is what keeps this stamp from disconnecting a working tablet if one ever does; the two raw-SQL
+ * cases in tests/mobile-r2.review.test.ts exercise it directly, since nothing else can.
  */
 async function stampDeviceWhenNoLiveSession(tx: Tx, sessionId: string): Promise<void> {
   await tx`
@@ -240,21 +255,33 @@ export function childAuthRoutes(): Hono<AppEnv> {
         // a Worker evicted after commit) left the tablet holding a token the server had marked used,
         // and its next refresh unpaired the device over one dropped HTTP response.
         //
-        // A time WINDOW was rejected for this: inside it a replayer looks exactly like the rightful
-        // holder, so it would hand out a live child session in the case it exists to help. The
-        // request identifies itself instead. Three things must all hold for a recovery:
+        // A time window ALONE was rejected for this: inside it a replayer looks exactly like the
+        // rightful holder, so on its own it would hand out a live child session in the case it
+        // exists to help. The request identifies itself instead. Four things must all hold:
         //   1. the request carries an id AND it is the id that consumed this token — a blind replayer
         //      does not know it, and a client that sends none never takes this path at all;
-        //   2. the replacement that the lost response carried is still UNCLAIMED — once it has been
+        //   2. the rotation is no older than RECOVERY_WINDOW_MS — a retry follows its own attempt by
+        //      seconds, so nothing is lost, while a replay of a body captured from a refresh that
+        //      SUCCEEDED is refused: the id alone cannot tell those apart, because a successful
+        //      refresh leaves its own consumed token, its id and an unclaimed replacement in exactly
+        //      the state this branch looks for, for as long as the tablet does not refresh again
+        //      (HUNT5-A-1);
+        //   3. the replacement that the lost response carried is still UNCLAIMED — once it has been
         //      used, two parties hold this token's lineage and that is theft whatever id is sent;
-        //   3. the session is still live and consent still allows access (checked below, as always).
-        // The unclaimed replacement is then retired and a fresh one issued, carrying the same id, so
-        // a second lost response in a row still recovers. Only the token hash is stored, so the
-        // replacement itself cannot be re-served; retiring it also kills any copy intercepted from
-        // the lost response.
+        //   4. the session is still live and consent still allows access (checked below, as always).
+        // The unclaimed replacement is then retired and a fresh one issued, so a second lost response
+        // in a row still recovers — through THIS row, whose id and whose used_at still stand. Only
+        // the token hash is stored, so the replacement itself can never be re-served.
+        //
+        // Residual, stated plainly: inside the window a captured request body (which necessarily
+        // carries a refresh token that was live when it was captured) is served once, and the tablet
+        // is then unpaired on its next refresh, as a reuse always unpairs it. Every recovery is
+        // audited, so that is visible to the family and to ops rather than silent. Outside the
+        // window, behaviour is exactly the pre-BUG-244 unpairing.
         const recovering =
           refreshRequestId !== undefined &&
           row.used_request_id === refreshRequestId &&
+          now.getTime() - row.used_at.getTime() < RECOVERY_WINDOW_MS &&
           row.replaced_by !== null &&
           row.live;
         if (recovering) {
@@ -271,11 +298,13 @@ export function childAuthRoutes(): Hono<AppEnv> {
               now,
             );
             const next = await issueRefreshToken(tx, deps, row.session_id);
-            // The retired replacement keeps this token's original used_at, so it never gets a
-            // recovery window of its own.
+            // The retired replacement is the end of its own lineage: it keeps this token's original
+            // used_at (so the window is measured from the one rotation the id consumed) and carries
+            // NO request id, so it can never satisfy the predicate above in its own right. Only an
+            // interceptor of the lost response holds it, and presenting it is theft (HUNT5-A-2).
             await tx`update private.child_refresh_tokens
                         set used_at = ${row.used_at}, replaced_by = ${next.id},
-                            used_request_id = ${refreshRequestId}
+                            used_request_id = null
                       where id = ${replacement.id}`;
             await tx`update private.child_refresh_tokens set replaced_by = ${next.id} where id = ${row.id}`;
             deps.log({
@@ -283,6 +312,12 @@ export function childAuthRoutes(): Hono<AppEnv> {
               event: 'child_refresh_recovered',
               code: 'LOST_RESPONSE',
             });
+            // Serving a rotated token is recorded, not only logged: a replay inside the window is
+            // then visible to the family and to ops instead of silent (HUNT5-A-1).
+            await tx`
+              insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
+              values (${row.family_id}, 'system', 'child_session.refresh_recovered', 'child_session', ${row.session_id})
+            `;
             return {
               kind: 'ok' as const,
               principal: {

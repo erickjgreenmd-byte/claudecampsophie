@@ -7,6 +7,8 @@ import { parentRewardsTokenSource } from '../rewards/session.ts';
 import {
   enterParentMode,
   forgetParentUnlock,
+  parentIdentityGeneration,
+  parentStateStillCurrent,
   parentUnlockActive,
   STORAGE_KEYS,
   whileStorePurchaseOpen,
@@ -15,6 +17,8 @@ import {
 const fake = vi.hoisted(() => ({
   keychain: new Map<string, string>(),
   onAuthChange: null as null | ((signedIn: boolean) => void),
+  /** Who the mocked Supabase session belongs to (MOB-R2-06 uses the same accessor). */
+  userId: null as string | null,
   relocks: 0,
   cacheClears: 0,
   unlockScreens: 0,
@@ -63,6 +67,7 @@ vi.mock('./parent-auth.ts', () => ({
       };
     },
     tokenSource: () => Promise.resolve('parent-token-mock'),
+    userId: () => Promise.resolve(fake.userId),
   },
 }));
 vi.mock('./secure-storage.ts', () => ({
@@ -83,6 +88,7 @@ const { initAppSession, parentSourceOutsideChildMode } = await import('./app-ses
 
 afterEach(() => {
   fake.keychain.clear();
+  fake.userId = null;
   fake.relocks = 0;
   fake.cacheClears = 0;
   fake.unlockScreens = 0;
@@ -257,6 +263,74 @@ describe('leaving the app locks the parent area on the device too (MOB-R2-01)', 
       await settle();
       expect(parentUnlockActive(NOW)).toBe(false);
       expect(fake.unlockScreens).toBe(1);
+    } finally {
+      stop();
+    }
+  });
+});
+
+/**
+ * HUNT5-H-1 / HUNT5-G-5. The signed-out branch's comment claimed it stopped "a screen still mounted
+ * as 'ready'" keeping the previous parent's data. Nothing in it did: it closed the client-side grant
+ * (which the next parent's own PIN re-arms) and cleared the registered caches, which are not a
+ * screen's own state — so the parent gate handed a still-mounted screen its old state straight back.
+ * The watcher now records WHOSE the parent state is, which is what lets the gate tell "the same
+ * adult came back to this screen" from "a different adult is holding the tablet".
+ */
+describe('the watcher records which adult the parent state belongs to (HUNT5-H-1)', () => {
+  it('[repro] an ended session, and a different parent signing in, both change the identity', async () => {
+    const stop = initAppSession();
+    try {
+      fake.userId = 'user-a';
+      fake.onAuthChange?.(true);
+      await settle();
+      const publishedForA = parentIdentityGeneration();
+      expect(parentStateStillCurrent(publishedForA)).toBe(true);
+
+      // The same session firing again (supabase-js reports a token refresh as an auth change) must
+      // not invalidate A's screens: that is the "Loading your family" flash the gate avoids.
+      fake.onAuthChange?.(true);
+      await settle();
+      expect(parentStateStillCurrent(publishedForA)).toBe(true);
+
+      // A's session ends elsewhere. Nothing about this device changed otherwise, and A's screen is
+      // still mounted: from this moment its state belongs to nobody.
+      fake.onAuthChange?.(false);
+      expect(parentStateStillCurrent(publishedForA)).toBe(false);
+
+      // Parent B signs in on the handed-on tablet and unlocks with their own PIN.
+      fake.userId = 'user-b';
+      fake.onAuthChange?.(true);
+      await settle();
+      expect(parentStateStillCurrent(publishedForA)).toBe(false);
+    } finally {
+      stop();
+    }
+  });
+
+  it('[repro] a session whose user id cannot be read moves the identity every time', async () => {
+    // parentAuth.userId() reads the session, and an offline device past its token expiry resolves to
+    // nothing — so the watcher records null for an adult who is signed in. Recording null twice in a
+    // row used to move nothing (mode.ts returned early when the id equalled the stored owner), so a
+    // screen published while this device could not read WHOSE session it was stayed "current" for
+    // the next adult, on the very path the comment in the branch below says never keeps its rows.
+    const stop = initAppSession();
+    try {
+      fake.userId = null;
+      fake.onAuthChange?.(true);
+      await settle();
+      const publishedWhileNobodyKnown = parentIdentityGeneration();
+      expect(parentStateStillCurrent(publishedWhileNobodyKnown)).toBe(true);
+
+      // The session ends and a different adult signs in, with the id still unreadable: two more
+      // unknown adults, and the screen published for the first of them keeps nothing.
+      fake.onAuthChange?.(false);
+      await settle();
+      expect(parentStateStillCurrent(publishedWhileNobodyKnown)).toBe(false);
+      const publishedWhileSignedOut = parentIdentityGeneration();
+      fake.onAuthChange?.(true);
+      await settle();
+      expect(parentStateStillCurrent(publishedWhileSignedOut)).toBe(false);
     } finally {
       stop();
     }

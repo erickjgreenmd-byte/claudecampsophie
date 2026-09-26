@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestDb, type TestDb, type Tx } from './harness.ts';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from './fixtures.ts';
@@ -983,19 +985,42 @@ describe("[HR4-0860-01] the append-only ledgers' identity sequences are not clie
     // Why revoking USAGE as well as UPDATE is safe: a `generated always as identity` sequence is
     // advanced internally and authorized on the table, never through a client's USAGE on the
     // sequence. A future `serial` column in public would break this and must be reviewed here.
-    const rows = await db.sql<{ seq: string; deptype: string }[]>`
+    //
+    // The join to pg_depend is a LEFT join on purpose. Only a column-owned sequence has a
+    // pg_class -> pg_class dependency at all: `create sequence public.x` plus a column default
+    // records its dependency under pg_attrdef, so an inner join silently DROPS exactly the
+    // sequence the migration's blanket revoke would break (its insert path needs USAGE). A
+    // sequence that belongs to no column therefore has to surface with deptype null and fail,
+    // not vanish from the result set.
+    const unownedSequences = () => db.sql<{ seq: string; deptype: string | null }[]>`
       select s.relname as seq, d.deptype
         from pg_class s
-        join pg_depend d on d.objid = s.oid and d.classid = 'pg_class'::regclass
-                        and d.refclassid = 'pg_class'::regclass
-        join pg_class t on t.oid = d.refobjid
+        left join pg_depend d on d.objid = s.oid and d.classid = 'pg_class'::regclass
+                             and d.refclassid = 'pg_class'::regclass
        where s.relkind = 'S' and s.relnamespace = 'public'::regnamespace
        order by s.relname`;
+    const rows = await unownedSequences();
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.filter((r) => r.deptype !== 'i')).toEqual([]);
+
+    // And the guard can see that case: a standalone sequence, planted and dropped again, is
+    // reported. Without this the query above would be green on a schema the revoke has broken.
+    await db.sql`create sequence public.hr4_unowned_probe_seq`;
+    try {
+      expect((await unownedSequences()).filter((r) => r.deptype !== 'i')).toEqual([
+        { seq: 'hr4_unowned_probe_seq', deptype: null },
+      ]);
+    } finally {
+      await db.sql`drop sequence public.hr4_unowned_probe_seq`;
+    }
+    expect((await unownedSequences()).filter((r) => r.deptype !== 'i')).toEqual([]);
   });
 
-  it('the ledger insert path is untouched: an identity column needs no sequence privilege', async () => {
+  it('the append path the API uses still works after the revoke (service role)', async () => {
+    // A regression check on the production path only: every real points_ledger append runs as the
+    // service role (or inside a SECURITY DEFINER function), and 0870:41 keeps service_role's
+    // sequence privileges deliberately. So this case cannot speak to the USAGE argument at
+    // 0870:38-43 — the case below does that, as a role the revoke actually hit.
     const fam = await seedFamily(db, { childCount: 1 });
     expect(
       await pgMessage(
@@ -1010,6 +1035,233 @@ describe("[HR4-0860-01] the append-only ledgers' identity sequences are not clie
     const [row] = await db.sql<{ n: number }[]>`
       select count(*)::int as n from public.points_ledger where family_id = ${fam.familyId}`;
     expect(row!.n).toBe(1);
+  });
+
+  it('an identity insert by a role stripped of every sequence privilege still advances the sequence', async () => {
+    // The claim 0870:38-43 rests on, tested as `authenticated` — one of the three roles 0870:46
+    // revoked — rather than as service_role, which keeps its grants and so can never fail here.
+    //
+    // No production path inserts into public.audit_events as a client role: the API appends with
+    // the service role or inside SECURITY DEFINER functions, and 0001_core_identity.sql revoked
+    // the client INSERT grant. The grant and the permissive policy below exist only to clear the
+    // table-level gates, so that the sequence ACL is the one thing left that could refuse the
+    // insert. Both are removed in `finally` and the removal is asserted, as
+    // supabase/tests/core_identity.test.ts does for its column-grant probe.
+    const fam = await seedFamily(db, { childCount: 0 });
+    const sequenceGrants = () => db.sql<{ grantee: string; privilege_type: string }[]>`
+      select pg_get_userbyid(a.grantee) as grantee, a.privilege_type
+        from pg_class c, aclexplode(c.relacl) a
+       where c.relkind = 'S' and c.relnamespace = 'public'::regnamespace
+         and c.relname = 'audit_events_id_seq'
+         and pg_get_userbyid(a.grantee) in ('anon', 'authenticated', 'pl_child')
+       order by grantee, a.privilege_type`;
+    // Premise of the case: the revoke really happened, so nothing below passes because the role
+    // still holds USAGE.
+    expect(await sequenceGrants()).toEqual([]);
+    try {
+      await db.sql`grant insert on public.audit_events to authenticated`;
+      await db.sql`create policy hr4_0860_01_probe_insert on public.audit_events
+        for insert to authenticated with check (true)`;
+      expect(
+        await pgMessage(
+          db.asParent(
+            fam.ownerId,
+            (tx) => tx`
+              insert into public.audit_events (family_id, actor_kind, action)
+              values (${fam.familyId}, 'system', 'hr4.0860.01.probe')`,
+          ),
+        ),
+      ).toBeUndefined();
+    } finally {
+      await db.sql`drop policy if exists hr4_0860_01_probe_insert on public.audit_events`;
+      await db.sql`revoke insert on public.audit_events from authenticated`;
+    }
+    const restored = await db.sql<{ privilege_type: string }[]>`
+      select privilege_type from information_schema.role_table_grants
+       where table_schema = 'public' and table_name = 'audit_events'
+         and grantee = 'authenticated' and privilege_type = 'INSERT'`;
+    expect(restored).toEqual([]);
+    expect(
+      await db.sql<{ policyname: string }[]>`
+        select policyname from pg_policies
+         where schemaname = 'public' and tablename = 'audit_events'
+           and policyname = 'hr4_0860_01_probe_insert'`,
+    ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HR4-0860-01 residual: PUBLIC holds sequence privileges for every role (migration 0910)
+// ---------------------------------------------------------------------------------------------
+
+describe('[HR4-0860-01] migration 0910 takes the sequence privileges of PUBLIC away as well', () => {
+  const MIGRATION = '0910_sequence_public_revoke.sql';
+
+  /** Privileges PUBLIC holds on a public sequence (aclexplode reports PUBLIC as grantee 0). */
+  const publicSequenceAcl = (tx: Tx) => tx<{ sequence_name: string; privilege_type: string }[]>`
+    select c.relname as sequence_name, a.privilege_type
+      from pg_class c, aclexplode(c.relacl) a
+     where c.relkind = 'S' and c.relnamespace = 'public'::regnamespace and a.grantee = 0
+     order by sequence_name, a.privilege_type`;
+
+  /** Default privileges for new public sequences granted to PUBLIC (the bare `=rwU/owner` form). */
+  const publicSequenceDefaults = async (tx: Tx): Promise<string[]> =>
+    (
+      await tx<{ acl: string }[]>`
+        select unnest(d.defaclacl)::text as acl
+          from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+         where n.nspname = 'public' and d.defaclobjtype = 'S'`
+    )
+      .map((r) => r.acl)
+      .filter((acl) => acl.startsWith('='));
+
+  /** What each client role effectively holds — a PUBLIC grant is held by every role there is. */
+  const effective = (tx: Tx, sequence: string) => tx<
+    { role: string; usage: boolean; update: boolean }[]
+  >`
+    select r.role,
+           has_sequence_privilege(r.role, ${sequence}, 'USAGE') as usage,
+           has_sequence_privilege(r.role, ${sequence}, 'UPDATE') as update
+      from (values ('anon'), ('authenticated'), ('pl_child')) as r(role)
+     order by r.role`;
+
+  it('revokes from PUBLIC what 0870 revoked from the three named roles', async () => {
+    // 0870:44 and 0870:49 name anon, authenticated and pl_child only, so a privilege held by PUBLIC
+    // survived both statements — and PUBLIC is held by every role there is, including the three.
+    // One `grant all on all sequences in schema public to public` (or a hosted platform that set
+    // that default before this schema was deployed) hands `authenticated` back the UPDATE that
+    // setval() needs, which is the whole of HR4-0860-01. 0910 closes it in both shapes 0870 uses:
+    // the existing sequences and the schema default for new ones.
+    //
+    // Asserting today's state would prove nothing — no PUBLIC grant exists in this schema either
+    // way, and schema_invariants.test.ts already carries that standing guard. What bites is
+    // applying the migration to a schema that DOES carry the grant: plant both shapes, check the
+    // hole is real, re-apply 0910's own text and require the hole to be gone. Without the migration
+    // (or with `public` dropped from either of its two revoke lists) the planted grant survives and
+    // this case is red. It all happens in a transaction that is rolled back.
+    const text = await readFile(
+      fileURLToPath(new URL(`../migrations/${MIGRATION}`, import.meta.url)),
+      'utf8',
+    );
+
+    let observed:
+      | {
+          plantedAcl: { sequence_name: string; privilege_type: string }[];
+          plantedDefaults: string[];
+          plantedEffective: { role: string; usage: boolean; update: boolean }[];
+          plantedNewSequence: { role: string; usage: boolean; update: boolean }[];
+          revokedAcl: { sequence_name: string; privilege_type: string }[];
+          revokedDefaults: string[];
+          revokedEffective: { role: string; usage: boolean; update: boolean }[];
+          revokedNewSequence: { role: string; usage: boolean; update: boolean }[];
+        }
+      | undefined;
+    const rollback = new Error('rollback');
+    try {
+      await db.sql.begin(async (tx) => {
+        // Premise: the schema under test starts clean, so nothing below passes by accident.
+        expect(await publicSequenceAcl(tx)).toEqual([]);
+        expect(await publicSequenceDefaults(tx)).toEqual([]);
+
+        await tx`grant all on all sequences in schema public to public`;
+        await tx`alter default privileges in schema public grant all on sequences to public`;
+        await tx`create sequence public.hr4_0910_before_seq`;
+        const plantedAcl = await publicSequenceAcl(tx);
+        const plantedDefaults = await publicSequenceDefaults(tx);
+        const plantedEffective = await effective(tx, 'public.audit_events_id_seq');
+        const plantedNewSequence = await effective(tx, 'public.hr4_0910_before_seq');
+
+        await tx.unsafe(text);
+
+        await tx`create sequence public.hr4_0910_after_seq`;
+        observed = {
+          plantedAcl,
+          plantedDefaults,
+          plantedEffective,
+          plantedNewSequence,
+          revokedAcl: await publicSequenceAcl(tx),
+          revokedDefaults: await publicSequenceDefaults(tx),
+          revokedEffective: await effective(tx, 'public.audit_events_id_seq'),
+          revokedNewSequence: await effective(tx, 'public.hr4_0910_after_seq'),
+        };
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+
+    // The hole the migration is for: with the PUBLIC grant in place every client role holds USAGE
+    // and UPDATE on the ledger sequence 0870 set out to protect, and on any sequence created after.
+    expect(observed!.plantedAcl.map((r) => r.privilege_type)).toContain('UPDATE');
+    expect(observed!.plantedAcl.map((r) => r.sequence_name)).toContain('audit_events_id_seq');
+    expect(observed!.plantedDefaults).toHaveLength(1);
+    expect(observed!.plantedDefaults[0]).toMatch(/^=rwU\//);
+    expect(observed!.plantedEffective).toEqual([
+      { role: 'anon', usage: true, update: true },
+      { role: 'authenticated', usage: true, update: true },
+      { role: 'pl_child', usage: true, update: true },
+    ]);
+    expect(observed!.plantedNewSequence.every((r) => r.usage && r.update)).toBe(true);
+
+    // And what 0910 does about it: nothing left for PUBLIC on the sequences that exist, nothing in
+    // the schema default, so a sequence created afterwards is client-free too.
+    expect(observed!.revokedAcl).toEqual([]);
+    expect(observed!.revokedDefaults).toEqual([]);
+    expect(observed!.revokedEffective).toEqual([
+      { role: 'anon', usage: false, update: false },
+      { role: 'authenticated', usage: false, update: false },
+      { role: 'pl_child', usage: false, update: false },
+    ]);
+    expect(observed!.revokedNewSequence).toEqual([
+      { role: 'anon', usage: false, update: false },
+      { role: 'authenticated', usage: false, update: false },
+      { role: 'pl_child', usage: false, update: false },
+    ]);
+
+    // The plant is gone with the transaction: the live schema is as the migrations left it, and the
+    // probe sequences never existed outside it.
+    await db.sql.begin(async (tx) => {
+      expect(await publicSequenceAcl(tx)).toEqual([]);
+      expect(await publicSequenceDefaults(tx)).toEqual([]);
+    });
+    const [probes] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from pg_class
+       where relkind = 'S' and relnamespace = 'public'::regnamespace
+         and relname like 'hr4_0910_%'`;
+    expect(probes!.n).toBe(0);
+  });
+
+  it('is idempotent, and 0870 is left exactly as it was', async () => {
+    // Re-applying 0910 on a schema it has already been applied to changes nothing, so a re-run of
+    // the migration set is safe. 0870 is another round's file and this item does not touch it: its
+    // three named roles stay named there, and 0910 is additive.
+    const text = await readFile(
+      fileURLToPath(new URL(`../migrations/${MIGRATION}`, import.meta.url)),
+      'utf8',
+    );
+    const before = await db.sql<{ acl: string | null }[]>`
+      select unnest(d.defaclacl)::text as acl
+        from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+       where n.nspname = 'public' and d.defaclobjtype = 'S'
+       order by acl`;
+    await db.sql.begin(async (tx) => {
+      await tx.unsafe(text);
+    });
+    expect(
+      await db.sql<{ acl: string | null }[]>`
+        select unnest(d.defaclacl)::text as acl
+          from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+         where n.nspname = 'public' and d.defaclobjtype = 'S'
+         order by acl`,
+    ).toEqual(before);
+
+    const text0870 = await readFile(
+      fileURLToPath(new URL('../migrations/0870_hardening_r4_db.sql', import.meta.url)),
+      'utf8',
+    );
+    expect(text0870).toContain(
+      'revoke all on all sequences in schema public from anon, authenticated, pl_child;',
+    );
   });
 });
 

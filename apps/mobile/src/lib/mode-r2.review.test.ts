@@ -5,6 +5,9 @@ import {
   enterParentMode,
   forgetParentUnlock,
   lockParentAreaOnDevice,
+  noteParentIdentity,
+  parentIdentityGeneration,
+  parentStateStillCurrent,
   parentUnlockActive,
   signOutClosedAccount,
   signOutParent,
@@ -210,6 +213,41 @@ describe('locking a paired family tablet returns it to the child space (MOB-R4-L
     expect(await currentMode(storage)).toBe('parent');
   });
 
+  it('[repro] the child space gets screen privacy back, as every other way into it does', async () => {
+    // enterParentMode switches screen privacy ON (mode.ts). Both other ways back into the child
+    // space switch it off — enterChildMode and signOutParent — and MOB-R2-05 counts "screen privacy
+    // stayed on" as part of that defect. The lock's child branch did not, and useChildModeOnFocus
+    // cannot heal it: the lock has already written mode 'child', so that hook returns early. The
+    // child's own space then blocked screenshots, screen recording and casting for the whole
+    // session, on a device the child is meant to be holding.
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-6-abcdefghijkl');
+    await enterParentMode(
+      storage,
+      effects(),
+      { unlocked: true, unlockedUntil: SERVER_UNTIL, unlockSeconds: UNLOCK_SECONDS },
+      SERVER_NOW,
+    );
+    const fx = effects();
+    await lockParentAreaOnDevice(storage, fx);
+    expect(fx.calls).toContain('privacy:false');
+  });
+
+  it('a parent-only device keeps screen privacy on behind the PIN', async () => {
+    // Nothing changes for the unpaired case: the device stays in parent mode on the unlock screen,
+    // so the adult protection the next adult expects is still in place.
+    const storage = memoryStorage();
+    await enterParentMode(
+      storage,
+      effects(),
+      { unlocked: true, unlockedUntil: SERVER_UNTIL, unlockSeconds: UNLOCK_SECONDS },
+      SERVER_NOW,
+    );
+    const fx = effects();
+    await lockParentAreaOnDevice(storage, fx);
+    expect(fx.calls).not.toContain('privacy:false');
+  });
+
   it('a keychain that cannot be read falls back to the unlock screen', async () => {
     const storage: SecureStorage = {
       getItem: () => Promise.reject(new Error('keychain unavailable')),
@@ -393,5 +431,56 @@ describe('closing an account leaves no child pairing on the device (MOB-R4-LOCK-
     expect(parentUnlockActive(SERVER_NOW)).toBe(true);
     await signOutClosedAccount(storage, effects(), { signOut: () => Promise.resolve() });
     expect(parentUnlockActive(SERVER_NOW)).toBe(false);
+  });
+});
+
+/**
+ * HUNT5-H-1. A parent screen that is already 'ready' is handed its own state back on a re-check, so
+ * an ordinary back-navigation does not flash "Loading your family" over data the parent is reading.
+ * That was unconditional, and the ApiClient's token source follows whoever is signed in NOW: on a
+ * handed-on tablet — parent A's Children screen still mounted underneath, A's session ended, parent
+ * B signs in and unlocks with their own PIN, B taps the header back arrow — the re-check handed B
+ * the state holding A's children (nicknames, grades, age bands) with no reload and no PIN in
+ * between. The state is kept only while it still belongs to the adult at the device; the session
+ * watcher (src/lib/app-session.ts) records who that is.
+ */
+describe('a parent screen’s state belongs to the adult it was published for (HUNT5-H-1)', () => {
+  it('[repro] a state published for one adult is not current for the next one', () => {
+    noteParentIdentity('user-a');
+    const publishedForA = parentIdentityGeneration();
+    expect(parentStateStillCurrent(publishedForA)).toBe(true);
+    // The same adult's session firing the watcher again (a token refresh) is not a new adult, so
+    // the screens keep their state: the no-flash behaviour survives.
+    noteParentIdentity('user-a');
+    expect(parentStateStillCurrent(publishedForA)).toBe(true);
+    // A's session ends elsewhere ("sign out everywhere", a password change), then B signs in.
+    noteParentIdentity(null);
+    expect(parentStateStillCurrent(publishedForA)).toBe(false);
+    noteParentIdentity('user-b');
+    expect(parentStateStillCurrent(publishedForA)).toBe(false);
+    // B's own screens start from B's identity, and a screen that has published nothing yet has
+    // nothing to keep.
+    expect(parentStateStillCurrent(parentIdentityGeneration())).toBe(true);
+    expect(parentStateStillCurrent(null)).toBe(false);
+  });
+
+  it('[repro] an unreadable id always moves the identity: nobody is not the same person twice', () => {
+    // `parentAuth.userId()` reads the Supabase session, and it resolves to nothing on a device that
+    // is offline past its token expiry — so the session watcher records null for an adult who IS
+    // signed in (src/lib/app-session.ts). The early return compared the new id with the stored one,
+    // so null after null moved nothing: adult A's screen, published while this device could not read
+    // A's id, stayed "current" when A's session ended and B signed in with an id that could not be
+    // read either. That is exactly the handed-on tablet HUNT5-H-1 is about, and it is the state the
+    // watcher's own comment promised "never keeps its rows".
+    noteParentIdentity(null);
+    const publishedWhileNobodyKnown = parentIdentityGeneration();
+    expect(parentStateStillCurrent(publishedWhileNobodyKnown)).toBe(true);
+    // A second unreadable id is a second unknown adult, not the same one: the screen loses its state.
+    noteParentIdentity(null);
+    expect(parentStateStillCurrent(publishedWhileNobodyKnown)).toBe(false);
+    // And a known adult after an unknown one still moves it, as it always did.
+    const publishedForNobody = parentIdentityGeneration();
+    noteParentIdentity('user-c');
+    expect(parentStateStillCurrent(publishedForNobody)).toBe(false);
   });
 });

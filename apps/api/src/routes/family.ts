@@ -201,7 +201,12 @@ export function familyRoutes(): Hono<AppEnv> {
                -- (API-AUTH-R2-02). Dropping it broke the one thing this list is for on the privacy
                -- screens: they resolve a nickname out of it for the pending-deletion list, that
                -- child's export rows and any safety report about it, so a family with two children
-               -- could no longer tell which child a still-cancellable request covered. The rules
+               -- saw "Deletion requested" — and their child's export and safety rows — with no name
+               -- against any of them, and could not tell which child each one was about. (HUNT5-B-7:
+               -- this reason used to be that the request could still be called off. It cannot — the
+               -- API offers POST and GET /deletion only, nothing moves deletion_requests.status to
+               -- 'cancelled', and BUG-221 removed that same claim from the portal copy, which now
+               -- says deletion can't be undone from the app.) The rules
                -- that matter are enforced where they act: activation and pairing go through
                -- visibleChild() and answer NOT_FOUND, the profile edit answers BUSINESS_RULE
                -- CHILD_DELETION_PENDING (FL-R4-04: this very row has named the child to the caller,
@@ -509,10 +514,21 @@ export function familyRoutes(): Hono<AppEnv> {
       // child (both of ours do) was refusing what the API would have accepted.
       const child = await visibleChild(tx, familyId, childId.data);
       if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
-      // The slot release is OUTSIDE the status guard (FL-R4-01), so it also reconciles an
-      // already-archived child that still holds an open assignment — the state a deletion request
-      // used to leave behind, and the state a crash between these statements can leave. A no-op
-      // when the slot was released with the archive, so the route stays idempotent either way.
+      // The slot release is OUTSIDE the status guard (FL-R4-01) as idempotent defence in depth: it
+      // is a no-op when the slot was released with the archive, so the route behaves the same on a
+      // retry.
+      //
+      // HUNT5-B-1: it reconciles NOTHING in production, and the comment here used to claim it did.
+      // No path produces "archived with an open slot assignment": a deletion request releases the
+      // slot in the same transaction that archives the child (migration 0890 inside
+      // public.request_deletion, plus routes/privacy.ts as the API-side belt-and-braces), the
+      // statements below run in this one transaction so a crash rolls them back together, and
+      // billing's releaseSlotlessProfiles only touches `status = 'active'` rows. Were such a row to
+      // exist anyway, the visibleChild 404 above reaches it FIRST whenever the stranding came with
+      // an open deletion request, so this statement is not a parent-visible remedy for that state —
+      // it is a support/ops fix. Keep the 404 (MOB-R4-LOCK-06: both clients hide Archive on a
+      // deletion-pending child, and client/server agreement matters more than an unreachable
+      // reconciliation).
       await tx`update public.child_slot_assignments set released_at = now(), release_reason = 'archived'
                 where family_id = ${familyId} and child_id = ${childId.data} and released_at is null`;
       if (child.status !== 'archived') {

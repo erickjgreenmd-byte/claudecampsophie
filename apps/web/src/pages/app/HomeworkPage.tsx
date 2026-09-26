@@ -27,7 +27,9 @@ import {
   correctTranscriptionResponseSchema,
   homeworkImageSizeProblem,
   homeworkRubricSchema,
+  ARCHIVED_CHILD_SCAN_COPY,
   CONSENT_WITHDRAWN_SCAN_COPY,
+  INACTIVE_CHILD_SCAN_COPY,
   homeworkScanFits,
   overrideResultResponseSchema,
   uploadLimitsResponseSchema,
@@ -68,8 +70,21 @@ export default function HomeworkPage() {
 
 // Only the fields this page needs from GET /v1/family (owned by the family vertical); unknown keys
 // are ignored rather than rendered.
+//
+// HUNT5-F-2: `deletionPending` is one of the fields this page needs. z.object strips what it does not
+// name, so leaving it out silently emptied childPickerSuffix's first branch and the notice below: a
+// child whose data deletion is under way was labelled "(archived — history only)" while the purge
+// deletes that history, and the list GET — which answers NOT_FOUND for such a child — showed only
+// "Child not found" with a Try again, for a child this page's own picker names.
 const familyChildrenSchema = z.object({
-  children: z.array(z.object({ id: z.uuid(), nickname: z.string(), status: z.string() })),
+  children: z.array(
+    z.object({
+      id: z.uuid(),
+      nickname: z.string(),
+      status: z.string(),
+      deletionPending: z.boolean().optional(),
+    }),
+  ),
 });
 type FamilyChild = z.infer<typeof familyChildrenSchema>['children'][number];
 
@@ -137,6 +152,13 @@ const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
   // work — a new upload re-checks consent and is refused. The wording lives in the contract so the
   // portal and the app say the same thing.
   CONSENT_REQUIRED: CONSENT_WITHDRAWN_SCAN_COPY,
+  // HUNT5-F-5: the two other permanent codes the scan job records — an archive (reachable in one
+  // click from this portal's Children page, WEB-R2-03) and a profile that lost its paid slot to a
+  // store downgrade. The generic line blamed the photos and asked for a rescan the API refuses with
+  // CHILD_NOT_ACTIVE, and on an archived child it contradicted the "Scanning paused" notice above
+  // this list. Wording in the contract, beside the consent line, for the same reason.
+  CHILD_ARCHIVED: ARCHIVED_CHILD_SCAN_COPY,
+  CHILD_NOT_ACTIVE: INACTIVE_CHILD_SCAN_COPY,
 };
 
 function explainStatus(
@@ -393,6 +415,24 @@ function ChildHomework({ child }: { child: FamilyChild }) {
         if (ok) reload();
       });
 
+  // HUNT5-F-2: before the query's own states, because GET /v1/assignments answers NOT_FOUND for a
+  // child whose data deletion is `requested` or `processing` (homework.ts) — so the parent read
+  // "Child not found" and a Try again that can never succeed. Processing has stopped for this child,
+  // so there is nothing to scan, nothing to load and no retry to offer: only what is happening and
+  // where a mistake is handled. The wording matches ChildrenPage's notice for the same state.
+  if (child.deletionPending === true) {
+    return (
+      <section className="notice" aria-label="Data deletion under way" style={{ marginTop: 16 }}>
+        <p style={{ margin: 0 }}>
+          <strong>Data deletion under way.</strong> You asked for {child.nickname}’s data to be
+          deleted. Processing has already stopped, so no homework is checked or kept for them and
+          nothing new can be scanned. You can follow it on the{' '}
+          <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the app: if you
+          did not mean it, <Link to="/app/support">contact support</Link> straight away.
+        </p>
+      </section>
+    );
+  }
   if (query.status === 'loading') return <Loading label="Loading scans…" />;
   if (query.status === 'error') {
     return <ErrorState message={query.error.message} onRetry={reload} />;

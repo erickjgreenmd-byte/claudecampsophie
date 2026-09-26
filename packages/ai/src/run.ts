@@ -70,11 +70,30 @@ export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE = 2;
  *
  * R4-JOBS-1: raising straight to the full multiple made the retry UNREACHABLE for extraction and
  * grading — 2 x 4,000 output tokens is estimated at ~102,000 micros on top of the ~53,000 the first
- * cut-off answer already cost, past their 150,000-micro cap, at every input size a real scan sends
- * (the floor for extraction is 2,478 input tokens). A worksheet a few hundred tokens too long was
- * abandoned although the retry the comments promised had never been made. The raise is now sized to
- * the headroom that exists, so the single retry is always really attempted when there is room for a
- * bigger answer at all. Monotone in the budget, so a binary search finds the largest admissible one.
+ * cut-off answer already cost, past their 150,000-micro cap, at every input size a real scan sends.
+ * A worksheet a few hundred tokens too long was abandoned although the retry the comments promised
+ * had never been made. The raise is now sized to the headroom that exists, so the single retry is
+ * always really attempted when there is room for a bigger answer at all. Monotone in the budget, so
+ * a binary search finds the largest admissible one.
+ *
+ * Whether there is room at all is set by the STAGE'S COST CAP, not by this function. With terra at 2
+ * micros per input token and 12 per output token, a retry at x output tokens needs
+ * (2E + 48,000) + (2E + 12x) <= maxCostMicros, the first bracket being the cut-off answer metered at
+ * the bound it was admitted with; E is inputTokenUpperBound of the request the caller sends, which
+ * for extraction is the data envelope PLUS one image part per page (1,516 tokens each), i.e. 4,541
+ * tokens for one page and 18,204 for the ten of DEFAULT_HOMEWORK_UPLOAD_LIMITS. At the old
+ * 150,000-micro cap no raise fitted from 7 pages up, so HUNT5-C-1 raised both caps to
+ * 4E + 144,000 at ten pages = 216,816 micros (see EXTRACTION_GRADING_COST_MICROS in routing.ts),
+ * which makes extraction's FULL 2x raise reachable at every page count the product accepts.
+ *
+ * GRADING is bounded by QUESTIONS, not pages: it sends one data envelope and no image, so its E grows
+ * with the questions and answers extraction found. On the same cap the full raise holds to about 85
+ * questions of average length and disappears past about 149 — the count moves with question length,
+ * since the bound is in bytes. A ten-page worksheet of dense questions can therefore still be cut off
+ * in grading with no retry; that gap is measured and named in the cases below rather than claimed to
+ * be covered. The parameterised cases in apps/api/tests/jobs-r2.review.test.ts pin extraction over
+ * 1..maxPages on its real input and grading over a question sweep on ITS real input (envelope only,
+ * no image part), and state where grading's bound bites; lower either cap and they go red.
  */
 function raisedOutputBudget(args: {
   readonly limits: StageLimits;

@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import {
   maskEmail,
+  TWO_STEP_LOOKUP_UNAVAILABLE,
   type AccountAuth,
   type AuthAdapter,
   type AuthOutcome,
@@ -303,9 +304,10 @@ export function createSupabaseAuth(
         return { ok: false };
       }
     },
+    /** `null` only when the level could not be read at all — never as a stand-in for aal1. */
     async assuranceLevel() {
       const { data, error } = await auth.mfa.getAuthenticatorAssuranceLevel();
-      if (error) return null;
+      if (error || !data) return null;
       return data.currentLevel === 'aal2' ? 'aal2' : 'aal1';
     },
     async enrollTotp() {
@@ -319,9 +321,16 @@ export function createSupabaseAuth(
         ? failure('That code did not work. Check the time on your device and try again.')
         : { ok: true, next: 'done' };
     },
+    /**
+     * WEBR5-E-1: a lookup that failed is reported as such, not as `null`. auth-js resolves
+     * `mfa.listFactors()` with `{ data: null, error }` for every failure it knows — an offline
+     * fetch, a captive portal, an auth outage — and never rejects, so returning `null` here made a
+     * failure indistinguishable from "this account has no verified factor". PinResetPage then
+     * skipped the two-step re-verification and the owner's own PIN reset left them at aal1.
+     */
     async verifiedTotpFactorId() {
       const { data, error } = await auth.mfa.listFactors();
-      if (error) return null;
+      if (error || !data) return TWO_STEP_LOOKUP_UNAVAILABLE;
       return data.totp.find((f) => f.status === 'verified')?.id ?? null;
     },
   };
@@ -349,10 +358,16 @@ export function createSupabaseAuth(
       // whose refresh token was still in this browser. The session is cleared here and the failure
       // is reported, so no caller can present a refused sign-out as a finished one.
       //
-      // ACC-WEB-AUTH-A: reported by returning, not by throwing. The account-closure flow awaits this
-      // with no catch and must still reach the page that explains the closure, so a rejection here
-      // lost that page and left an unhandled promise. Callers that would show a signed-out screen
-      // read the report instead (SignOutControl).
+      // ACC-WEB-AUTH-A: reported by returning, not by throwing. The account-closure flow must still
+      // reach the page that explains the closure, so a rejection here lost that page and left an
+      // unhandled promise. Callers that would show a signed-out screen read the report instead
+      // (SignOutControl).
+      //
+      // HUNT5-E-3: that flow has since grown a try/catch of its own (PrivacyControlsPage), and
+      // SignOutControl has one too, so no production caller is catch-free any more. The rule stands
+      // — those catches are belt and braces, and a page that swallows a refusal cannot tell the
+      // parent about it — but it is no longer observable through either page, so it is asserted on
+      // this adapter directly (App.signout.test.tsx, ACC-WEB-AUTH-A).
       const { error } = await auth.signOut({ scope });
       if (!error) return;
       forgetStoredSession(storageKey);

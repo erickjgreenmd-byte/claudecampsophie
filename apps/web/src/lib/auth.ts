@@ -21,6 +21,31 @@ export interface TotpEnrollment {
   readonly secret: string;
 }
 
+/**
+ * WEBR5-E-1: a two-step lookup that could not be made — offline, a captive portal, an auth outage.
+ * auth-js answers a failed `mfa.listFactors()` with `{ data: null, error }` rather than by throwing,
+ * so the adapter's only way to report it used to be `null`, which is also how it says "this account
+ * has no verified factor". Spending the failure as that answer drops an owner's two-step (aal2)
+ * session on the next password grant (WEB-R2-08), so the failure is a value of its own and never an
+ * answer. A caller must refuse rather than guess.
+ */
+export interface TwoStepLookupUnavailable {
+  readonly twoStepLookup: 'unavailable';
+}
+
+export const TWO_STEP_LOOKUP_UNAVAILABLE: TwoStepLookupUnavailable = {
+  twoStepLookup: 'unavailable',
+};
+
+/** The verified TOTP factor's id, `null` for "asked, and there is none", or a lookup that failed. */
+export type TotpFactorLookup = string | null | TwoStepLookupUnavailable;
+
+export function isTwoStepLookupUnavailable(
+  value: TotpFactorLookup,
+): value is TwoStepLookupUnavailable {
+  return typeof value === 'object' && value !== null && value.twoStepLookup === 'unavailable';
+}
+
 /** Account operations (optional so simple test adapters stay small). */
 export interface AccountAuth {
   signInWithPassword(email: string, password: string): Promise<AuthOutcome>;
@@ -28,10 +53,14 @@ export interface AccountAuth {
   sendMagicLink(email: string, redirectTo: string): Promise<AuthOutcome>;
   sendPasswordReset(email: string, redirectTo: string): Promise<AuthOutcome>;
   updatePassword(password: string): Promise<AuthOutcome>;
+  /**
+   * This session's assurance level, or `null` when it could not be read at all (WEBR5-E-1): `null`
+   * is never "aal1", so a caller deciding whether an owner has to re-prove a factor must refuse.
+   */
   assuranceLevel(): Promise<'aal1' | 'aal2' | null>;
   enrollTotp(): Promise<TotpEnrollment | { readonly error: string }>;
   verifyTotp(factorId: string, code: string): Promise<AuthOutcome>;
-  verifiedTotpFactorId(): Promise<string | null>;
+  verifiedTotpFactorId(): Promise<TotpFactorLookup>;
 }
 
 /**

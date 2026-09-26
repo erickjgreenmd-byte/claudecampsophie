@@ -22,6 +22,8 @@ import {
   currentMode,
   enterChildMode,
   lockParentAreaOnDevice,
+  parentIdentityGeneration,
+  parentStateStillCurrent,
   parentUnlockActive,
 } from '../lib/mode.ts';
 import { parentAuth, portalUrl } from '../lib/parent-auth.ts';
@@ -266,6 +268,8 @@ export function useParentAccess(): ParentAccess {
   // could still be in flight when the next one starts, and the slower of the two would win the race
   // to setAccess — a screen could go back to 'ready' after a lock (the round-3 checker's residual).
   const cancelPrevious = useRef<(() => void) | null>(null);
+  /** The parent identity this screen's 'ready' state was published under (HUNT5-H-1). */
+  const readyIdentity = useRef<number | null>(null);
   const check = useCallback(() => {
     cancelPrevious.current?.();
     let active = true;
@@ -287,8 +291,25 @@ export function useParentAccess(): ParentAccess {
       }
       // Still unlocked: hand back the state the screen already has, so a re-check does not replace
       // a live ApiClient with an identical new one and make every parent screen reload (the screens
-      // key their load on the client). Its token source reads the live session either way.
-      setAccess((previous) => (previous.status === 'ready' ? previous : { status: 'ready', api }));
+      // key their load on the client) — but only while that state still belongs to the adult holding
+      // the device (HUNT5-H-1). The client's token source follows whoever is signed in now; the rows
+      // already on the screen belong to whoever fetched them, so on a handed-on tablet an
+      // unconditional reuse showed the next parent the previous parent's children. A different
+      // identity publishes fresh state, which is what makes the screen refetch.
+      const identity = parentIdentityGeneration();
+      // The identity the state ON SCREEN was published under, captured before the setter: a state
+      // updater runs during the next render, so an updater that read `readyIdentity.current` would
+      // read what the line below wrote and compare the new identity with itself — it would keep
+      // `previous` for every adult and hand parent B parent A's state, the one case this guard
+      // exists for. It only appeared to work because React can compute an update eagerly when the
+      // fiber's queue is empty, which is an implementation detail and not a contract.
+      const publishedUnder = readyIdentity.current;
+      setAccess((previous) =>
+        previous.status === 'ready' && parentStateStillCurrent(publishedUnder)
+          ? previous
+          : { status: 'ready', api },
+      );
+      readyIdentity.current = identity;
     });
     const cancel = () => {
       active = false;
@@ -315,11 +336,16 @@ export function useParentAccess(): ParentAccess {
    * in 'ready' with the previous parent's data on show and a client whose token follows whoever is
    * signed in now; the way back onto that screen is the header back arrow, which is a focus event.
    * The unlock itself is forgotten the moment the session goes (src/lib/app-session.ts), so the
-   * grant is closed even before this check runs.
+   * grant is closed even before this check runs — and the check above replaces the state rather than
+   * reusing it, because the adult it was published for is no longer the one at the device
+   * (HUNT5-H-1: the focus re-check on its own handed that state straight back).
    *
    * Not parentAuth.watch: that fires inside app/(parent)/privacy.tsx's own account closure, which
    * renders its "Account deleted" confirmation inside the `access.status === 'ready'` branch — a
-   * re-gate there replaces the confirmation the parent just earned with a sign-in prompt.
+   * re-gate there replaces the confirmation the parent just earned with a sign-in prompt. So a
+   * screen in view when the session ends keeps rendering until it is re-checked (its focus, or the
+   * app returning to the foreground); what it can no longer do is serve that state to a different
+   * adult.
    */
   useFocusEffect(check);
   return access;

@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { grantAdultUnlock, seedChild, seedFamily } from '@pencillift/db/testing/fixtures';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
@@ -89,9 +91,19 @@ describe('FL-R4-01 a child-scope deletion releases that child’s paid slot', ()
     });
   });
 
-  it('lets the archive route reconcile an already-archived child that still holds a slot', async () => {
-    // The parent-visible remedy if a slot is ever stranded (a purge that dead-letters, a crash
-    // between the archive statements): the release must not sit behind `status !== 'archived'`.
+  /**
+   * HUNT5-B-1. This case used to be named "lets the archive route reconcile an already-archived
+   * child that still holds a slot" and its comment called the route "the parent-visible remedy if a
+   * slot is ever stranded (a purge that dead-letters, a crash between the archive statements)".
+   * Both were untrue of the state they named, and the fixture never created it (L-046): with an open
+   * deletion request the route answers 404 two lines before the release runs (visibleChild,
+   * MOB-R4-LOCK-06), and a crash cannot strand a slot because every statement of the route runs in
+   * one transaction. The lead's decision is to keep the 404 and make the prose honest, so this case
+   * now claims only what it exercises: the release sits OUTSIDE `status !== 'archived'`, so
+   * re-archiving an archived child is idempotent and still ends with the slot free. That is the
+   * defensive path only — not a remedy for a deletion-pending child, which the next case pins.
+   */
+  it('releases the slot outside the status guard, so re-archiving an archived child is idempotent', async () => {
     const { fam, token } = await family({ paidSlots: 2 });
     const stuck = await seedChild(api.db, fam.familyId, 'Avery', 'archived');
     await api.db.sql`
@@ -102,6 +114,28 @@ describe('FL-R4-01 a child-scope deletion releases that child’s paid slot', ()
     expect(res.status).toBe(200);
     expect(await json(res)).toMatchObject({ status: 'archived', assignedSlots: 1 });
     expect(await openSlots(fam.familyId)).toBe(1);
+  });
+
+  /**
+   * HUNT5-B-1, the other half: what the archive route does NOT do. An archived child with an open
+   * deletion request AND an open slot assignment is refused 404 and keeps the slot — the state the
+   * old comment promised this route reconciled. Migration 0890 and routes/privacy.ts mean the state
+   * is not producible in the first place; this case exists so nobody re-reads the release statement
+   * as a parent-visible remedy for it.
+   */
+  it('refuses a deletion-pending child and leaves a stranded slot for support, not the parent', async () => {
+    const { fam, token } = await family({ paidSlots: 2 });
+    const stuck = await seedChild(api.db, fam.familyId, 'Avery', 'archived');
+    await api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id) values (${fam.familyId}, ${stuck.id})`;
+    await api.db.sql`
+      insert into public.deletion_requests (family_id, scope, child_id, target_child_id, requested_by, status)
+      values (${fam.familyId}, 'child', ${stuck.id}, ${stuck.id}, ${fam.ownerId}, 'requested')`;
+    expect(await openSlots(fam.familyId)).toBe(2);
+
+    const res = await api.request(`/v1/children/${stuck.id}/archive`, { method: 'POST', token });
+    expect(res.status).toBe(404);
+    expect(await openSlots(fam.familyId)).toBe(2);
   });
 });
 
@@ -289,5 +323,49 @@ describe('FL-R4-04 a profile edit under an open deletion says why', () => {
         })
       ).status,
     ).toBe(404);
+  });
+});
+
+// -----------------------------------------------------------------------------------------------
+// HUNT5-B-7: the rationale for listing a deletion-pending child names something that exists
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * BUG-221 removed "cancel the request" from the parent-facing copy (ChildrenPage.tsx now says
+ * "Deletion can't be undone from the app"), because no cancellation exists: privacy.ts registers only
+ * POST /deletion and GET /deletion, and nothing anywhere moves a request to 'cancelled'. The
+ * rationale for keeping a deletion-pending child in GET /v1/family kept the claim anyway — "a family
+ * with two children could no longer tell which child a still-cancellable request covered" — so the
+ * next person to write copy from it would re-introduce exactly what BUG-221 had to remove.
+ *
+ * This is a source assertion, like tests/guard-call-sites.test.ts: it pins the premise (no surface
+ * cancels a deletion request) together with the rationale that must not contradict it.
+ */
+describe('HUNT5-B-7 GET /v1/family’s rationale for a deletion-pending child', () => {
+  const ROOT = resolve(__dirname, '../../..');
+
+  it('does not justify the listing by a cancellation the product does not offer', () => {
+    const family = readFileSync(join(ROOT, 'apps/api/src/routes/family.ts'), 'utf8');
+    expect(family).not.toMatch(/cancellab|cancel the request/i);
+  });
+
+  it('and no surface cancels a deletion request, which is why', () => {
+    // Every `update public.deletion_requests ... set status` in the schema, statement by statement.
+    const dir = join(ROOT, 'supabase/migrations');
+    const updates: string[] = [];
+    for (const name of readdirSync(dir).filter((n) => n.endsWith('.sql'))) {
+      const sql = readFileSync(join(dir, name), 'utf8');
+      for (let at = sql.indexOf('update public.deletion_requests'); at !== -1;) {
+        const end = sql.indexOf(';', at);
+        updates.push(sql.slice(at, end === -1 ? sql.length : end));
+        at = sql.indexOf('update public.deletion_requests', at + 1);
+      }
+    }
+    expect(updates.length).toBeGreaterThan(0);
+    expect(updates.filter((s) => s.includes("'cancelled'"))).toEqual([]);
+    // And no route offers one: the deletion surface is POST and GET only.
+    const privacy = readFileSync(join(ROOT, 'apps/api/src/routes/privacy.ts'), 'utf8');
+    expect(privacy).not.toMatch(/r\.(delete|patch)\('\/deletion/);
+    expect(privacy).not.toMatch(/'\/deletion\/[^']*cancel/);
   });
 });

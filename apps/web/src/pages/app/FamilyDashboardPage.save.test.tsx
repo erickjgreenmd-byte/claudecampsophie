@@ -49,14 +49,30 @@ interface Call {
   body: unknown;
 }
 
-/** `familyReloadFails`: the GET after a successful PATCH rejects, as an offline blip would. */
-function fakeApi(options: { familyReloadFails?: boolean } = {}) {
+/**
+ * `familyReloadFails`: the GET after a successful PATCH rejects, as an offline blip would.
+ * `familyByGet`: what each GET /v1/family answers, by call number (the last entry repeats), so a
+ * later read can land the other guardian's change under a form the parent has open (HUNT5-F-1).
+ */
+function fakeApi(
+  options: {
+    familyReloadFails?: boolean;
+    familyByGet?: readonly (FamilyOverview | ApiRequestError)[];
+  } = {},
+) {
   const sends: Call[] = [];
   let familyGets = 0;
   const api: Partial<ApiClient> = {
     get: <S extends z.ZodType>(path: string, schema: S) => {
       if (path.startsWith('/v1/consent')) return Promise.resolve(schema.parse(consent));
       familyGets += 1;
+      if (options.familyByGet) {
+        const answer =
+          options.familyByGet[Math.min(familyGets - 1, options.familyByGet.length - 1)]!;
+        return answer instanceof ApiRequestError
+          ? Promise.reject(answer)
+          : Promise.resolve(schema.parse(answer));
+      }
       if (options.familyReloadFails && familyGets > 1) {
         return Promise.reject(new ApiRequestError('NETWORK', 'Network request failed', 0));
       }
@@ -127,5 +143,70 @@ describe('[WEBR4-03] a family edit sends only the fields the parent changed', ()
       'disabled',
       true,
     );
+  });
+});
+
+describe('[HUNT5-F-1] the family form diffs against the props it was SEEDED with', () => {
+  it('does not put the stale time zone back when a retry lands the other guardian’s change', async () => {
+    // The path: a save whose reload failed leaves the ErrorState's "Try again" beside the form
+    // (WEBR4-04 keeps the last good family on screen). The parent reopens the form, presses Try
+    // again, and that read lands guardian B's new zone under the open form.
+    const user = userEvent.setup();
+    const moved: FamilyOverview = { ...family, timezone: 'Europe/Berlin' };
+    const { api, sends } = fakeApi({
+      familyByGet: [family, new ApiRequestError('NETWORK', 'Network request failed', 0), moved],
+    });
+    renderPage(<FamilyDashboardPage />, { api });
+    await openForm(user);
+    const name = screen.getByLabelText(/family name/i);
+    await user.clear(name);
+    await user.type(name, 'The Riveras');
+    await user.click(screen.getByRole('button', { name: /^save family details$/i }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    // The reload failed: the old family is still on screen, with a retry.
+    const retry = await screen.findByRole('button', { name: /try again/i });
+
+    await openForm(user);
+    expect(screen.getByLabelText(/time zone/i)).toHaveProperty('value', 'America/Chicago');
+    await user.click(retry);
+    // The read lands: the summary above the open form now reads the new zone. The form's own field
+    // still shows what it was seeded with, which is the point — it is not a change the parent made.
+    await waitFor(() => expect(screen.getAllByText(/Europe\/Berlin/).length).toBeGreaterThan(0));
+    expect(screen.getByLabelText(/time zone/i)).toHaveProperty('value', 'America/Chicago');
+
+    const name2 = screen.getByLabelText(/family name/i);
+    await user.clear(name2);
+    await user.type(name2, 'The Riveras');
+    await user.click(screen.getByRole('button', { name: /^save family details$/i }));
+    await waitFor(() => expect(sends).toHaveLength(2));
+    // Sending America/Chicago here would revert the zone every release, review and report is
+    // planned in — the loss WEBR4-03 was filed for.
+    expect(sends[1]!.body).toEqual({ displayName: 'The Riveras' });
+  });
+});
+
+describe('[HUNT5-F-2] the dashboard row of a child under deletion does not claim its history is kept', () => {
+  it('says the deletion is under way instead of "Archived: history only"', async () => {
+    const { api } = fakeApi({
+      familyByGet: [
+        {
+          ...family,
+          children: [
+            {
+              id: RILEY,
+              nickname: 'Riley',
+              gradeLevel: 3,
+              ageBand: '8-10',
+              status: 'archived',
+              deletionPending: true,
+            },
+          ],
+        },
+      ],
+    });
+    renderPage(<FamilyDashboardPage />, { api });
+    const row = await screen.findByText(/Riley/);
+    expect(row.closest('li')!.textContent).toMatch(/data deletion under way/i);
+    expect(row.closest('li')!.textContent).not.toMatch(/history only/i);
   });
 });

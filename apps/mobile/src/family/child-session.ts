@@ -32,6 +32,53 @@ type ChildTokenResponse = ReturnType<typeof childTokenResponseSchema.parse>;
 /** Refresh this long before expiry so a request never starts with an about-to-expire token. */
 const EXPIRY_SKEW_MS = 30_000;
 
+/**
+ * How long a request id found in secure storage may still be adopted, measured on this device's own
+ * clock from the instant this device minted it.
+ *
+ * It mirrors RECOVERY_WINDOW_MS in apps/api/src/routes/child-auth.ts (two minutes after the rotation
+ * the id consumed), and is deliberately far longer, because the two ends measure it on different
+ * clocks and this one is not the server's (L-038): a device clock nudged forward by NTP, or a cold
+ * start that takes its time, must not make the device throw away an id the server would still honour.
+ * The slack only ever ADMITS an id, and an admitted id the server has finished with is refused
+ * exactly as a fresh one would be.
+ *
+ * Past it, the stored id belongs to an attempt the server can no longer serve a recovery for, so
+ * presenting it buys nothing and costs the rule the whole mechanism rests on — one id per logical
+ * attempt (L-049). A fresh one is minted instead. That also ends the id that used to be presented on
+ * every later refresh of the device's life when the deleteItem in refreshFinished() failed and the
+ * failure was swallowed.
+ */
+const REQUEST_ID_MAX_AGE_MS = 10 * 60_000;
+
+/** The unfinished refresh as secure storage holds it: the id, and when this device minted it. */
+interface PendingRequest {
+  readonly id: string;
+  readonly mintedAtMs: number;
+}
+
+/**
+ * Reads the stored record back. Anything this device cannot vouch for — junk, an older build's bare
+ * id, a record with no readable mint instant — is no record at all, so the caller mints instead of
+ * presenting an id whose age is unknown.
+ */
+function parseStoredRequest(raw: string | null): PendingRequest | null {
+  if (raw === null) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof value !== 'object' || value === null) return null;
+  const { id, mintedAtMs } = value as { id?: unknown; mintedAtMs?: unknown };
+  // A stored id that is not a uuid would be refused by the contract on every attempt, which would
+  // wedge this device out of refreshing entirely.
+  if (typeof id !== 'string' || !uuidSchema.safeParse(id).success) return null;
+  if (typeof mintedAtMs !== 'number' || !Number.isFinite(mintedAtMs)) return null;
+  return { id, mintedAtMs };
+}
+
 export interface ChildSessionDeps {
   readonly storage: SecureStorage;
   /** Unauthenticated client (pairing and refresh carry their own credentials in the body). */
@@ -97,9 +144,17 @@ export interface ChildSession {
  */
 export function withChildTokenRetry(
   api: ApiClient,
-  session: Pick<ChildSession, 'invalidateAccessToken' | 'accessTokenGeneration'>,
+  session: Pick<ChildSession, 'accessToken' | 'invalidateAccessToken' | 'accessTokenGeneration'>,
 ): ApiClient {
   const once = async <T>(run: () => Promise<T>): Promise<T> => {
+    // The token for this call is resolved FIRST, so the generation below is the one the call will
+    // actually present (HUNT5-G-3). The bearer is fetched inside the request, and resolving it can
+    // rotate the token: a call whose cached token had expired on the device's own clock refreshed
+    // for itself, which moved the generation, so its refusal read as "another call replaced the
+    // token I presented" and retried the SAME token — the drop this wrapper exists for never ran.
+    // Resolving it here is free: the session caches the token and joins its one single-flight
+    // refresh, so the request's own fetch finds it ready.
+    await session.accessToken();
     const generation = session.accessTokenGeneration();
     try {
       return await run();
@@ -123,10 +178,10 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
   let access: { token: string; expiresAtMs: number } | null = null;
   let inflight: Promise<string | null> | null = null;
   /**
-   * The id of the refresh this device is still trying to finish (BUG-244); null between refreshes.
-   * Mirrored in secure storage, so an app the OS kills mid-refresh still finishes that refresh.
+   * The refresh this device is still trying to finish (BUG-244); null between refreshes. Mirrored in
+   * secure storage, so an app the OS kills mid-refresh still finishes that refresh.
    */
-  let pendingRequestId: string | null = null;
+  let pendingRequest: PendingRequest | null = null;
   const newRequestId = deps.newRequestId;
   /** Bumped on every change to `access`, so a caller can tell a token apart from its successor. */
   let generation = 0;
@@ -150,32 +205,45 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
   async function forget(): Promise<void> {
     access = null;
     generation += 1;
+    // The unfinished refresh dies with the session it belonged to (HUNT5-G-1). Leaving it in memory
+    // let a LATER session's first refresh present a dead session's id — and skip the write below,
+    // because the id was only stored when it was minted — so an app killed mid-refresh came back,
+    // found nothing stored, minted a new id and presented an already-rotated token under it, which
+    // the server reads as theft.
+    pendingRequest = null;
     await unpairChildDevice(deps.storage);
   }
 
   /** The id of the attempt in flight, minted once and then read back from storage on every retry. */
-  async function requestIdForThisRefresh(): Promise<string> {
-    if (pendingRequestId === null) {
-      const stored = await deps.storage
-        .getItem(STORAGE_KEYS.childRefreshRequestId)
-        .catch(() => null);
-      // A stored value that is not a uuid would be refused by the contract on every attempt, which
-      // would wedge this device out of refreshing entirely; mint a new id instead.
-      if (stored !== null && uuidSchema.safeParse(stored).success) {
-        pendingRequestId = stored;
-      } else {
-        pendingRequestId = newRequestId();
-        await deps.storage
-          .setItem(STORAGE_KEYS.childRefreshRequestId, pendingRequestId)
-          .catch(() => undefined);
-      }
+  async function requestIdForThisRefresh(nowMs: number): Promise<string> {
+    if (pendingRequest === null) {
+      const stored = parseStoredRequest(
+        await deps.storage.getItem(STORAGE_KEYS.childRefreshRequestId).catch(() => null),
+      );
+      // An id this device minted longer ago than REQUEST_ID_MAX_AGE_MS is an id from an attempt the
+      // server has finished with, so this refresh is a new attempt and takes a new id. A mint
+      // instant in the future (a clock moved back) reads as young, which is the side to err on: the
+      // slack exists to keep a recoverable id, never to discard one.
+      pendingRequest =
+        stored !== null && nowMs - stored.mintedAtMs <= REQUEST_ID_MAX_AGE_MS
+          ? stored
+          : { id: newRequestId(), mintedAtMs: nowMs };
     }
-    return pendingRequestId;
+    // Written on EVERY path, not only when the id is minted (HUNT5-G-1): the invariant this refresh
+    // depends on is that the id is in storage before the request goes out, and a refresh that
+    // carries an id already in memory has to hold it too — a first write the keychain refused, and a
+    // retry that then skipped the write, left the id in memory alone. One record, so the id and its
+    // mint instant can never be stored apart; the instant is the MINT's, not this write's, or an id
+    // rewritten on every retry would never age.
+    await deps.storage
+      .setItem(STORAGE_KEYS.childRefreshRequestId, JSON.stringify(pendingRequest))
+      .catch(() => undefined);
+    return pendingRequest.id;
   }
 
   /** This refresh is over, whichever way it ended: the next one is a new attempt with a new id. */
   async function refreshFinished(): Promise<void> {
-    pendingRequestId = null;
+    pendingRequest = null;
     await deps.storage.deleteItem(STORAGE_KEYS.childRefreshRequestId).catch(() => undefined);
   }
 
@@ -189,7 +257,7 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
     // replay. A new id on the retry would be a new refresh, and would be treated as theft — so the id
     // is only cleared when this refresh actually finished, either with tokens or with a refusal.
     // The id is written BEFORE the request goes out, so it survives the process that sent it.
-    const refreshRequestId = await requestIdForThisRefresh();
+    const refreshRequestId = await requestIdForThisRefresh(deps.now().getTime());
     try {
       const response = await deps.publicApi.send(
         'POST',
@@ -241,6 +309,9 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
           childTokenResponseSchema,
         );
         await persist(response, deps.now());
+        // A new session starts with no refresh of its own in flight: an id left by the session this
+        // pairing replaces must never be presented for this one's token (HUNT5-G-1).
+        await refreshFinished();
         return { ok: true, child: response.child };
       } catch (error) {
         return { ok: false, message: pairingErrorMessage(error) };

@@ -1,16 +1,21 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import { cryptoRandom } from '@pencillift/domain';
 import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
 import {
   createMockResponsesClient,
+  dataEnvelope,
+  imagePart,
+  OUTPUT_TRUNCATED_BUDGET_MULTIPLE,
   PROMPTS,
   PROPOSED_STAGE_LIMITS,
   runStage,
+  type InputPart,
   type PromptDefinition,
 } from '@pencillift/ai';
-import { PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
+import { DEFAULT_HOMEWORK_UPLOAD_LIMITS, PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
 import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import {
   DEFAULT_HANDLERS,
@@ -383,6 +388,28 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
     await runJobs(deps, handlers, 25, api.now.value);
     expect(scans).toBe(1);
   });
+
+  /**
+   * HUNT5-C-5: the reserve bounds the LEDGER only. The twelve steps that run before it in
+   * runScheduledTick have no wall-clock budget at all — the same file says so in
+   * TICK_WALL_LIMIT_MS's docstring — so a long inactivity sweep can still leave the trailing
+   * entitlement step nothing. There is no run-time assertion for a promise made in a comment: the
+   * claim is the defect, so the source is what this checks. It failed on "so this step always gets a
+   * slice (R4-JOBS-4)", which a reader would have trusted while looking for the wrong bug the next
+   * time `entitlementsReconciled` was 0.
+   */
+  it('does not promise the trailing entitlement step a slice the tick cannot give it', () => {
+    const source = readFileSync(new URL('../src/jobs/dispatcher.ts', import.meta.url), 'utf8');
+    const ledger = source.indexOf("const jobs = await step('jobs'");
+    const sweep = source.indexOf('const entitlementsReconciled = await step(');
+    expect(ledger).toBeGreaterThan(-1);
+    expect(sweep).toBeGreaterThan(ledger);
+    const note = source.slice(ledger, sweep);
+    expect(note).toMatch(/R4-JOBS-4/);
+    expect(note).not.toMatch(/always gets a slice/);
+    // It must point at what really bounds the step: the steps in front of it are unbounded.
+    expect(note).toMatch(/unbounded/);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -393,7 +420,18 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
  * A stage whose answer the provider cuts off at `max_output_tokens` raises the output budget once
  * and tries again, while the stage's cost cap admits it (JOBS-R2-02). The estimate the cap is
  * measured against uses `inputTokenUpperBound` of the request the scan really sends, so the retry
- * has to be admissible at THAT bound — not only at a bound no caller ever passes.
+ * has to be admissible at THAT bound — for EXTRACTION at every page count the product accepts, not
+ * only at the smallest one.
+ *
+ * N2-GRADING-ENVELOPE: the two stages do not send the same shape and are no longer parameterised as
+ * if they did. Extraction sends the envelope PLUS one image part per page, so its bound is set by the
+ * page count (1,516 tokens a page) and the cases below cover 1..maxPages. Grading sends ONE data
+ * envelope of question prompts and answers and NO image at all, so its bound is set by the extracted
+ * questions' bytes; driving it with image parts proved a shape grading never sends. On grading's real
+ * envelope the full 2x raise is admitted up to GRADING_FULL_RAISE_MAX_QUESTIONS questions of the size
+ * fixed below and no further — short of the ~100 questions a ten-page worksheet hands it — so the
+ * cases state that bound instead of implying coverage to ten pages. The ceiling is NOT raised here:
+ * the last case records where the raise starts shrinking and where it stops altogether, for the lead.
  */
 describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
   const gate = {
@@ -404,14 +442,65 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
     now: new Date('2026-09-24T12:00:00Z'),
   };
 
+  const PAGE_COUNTS = Array.from(
+    { length: DEFAULT_HOMEWORK_UPLOAD_LIMITS.maxPages },
+    (_, i) => i + 1,
+  );
+
   /**
-   * The smallest input a real scan can send for a stage: the instructions, the strict schema and a
-   * two-byte data envelope, with no page image and no question. Every real request is larger, and a
-   * larger request only leaves the cost cap less headroom.
+   * EXTRACTION's real input for a scan of `pages` pages: the data envelope plus one `input_image`
+   * part per page (apps/api/src/jobs/scan-process.ts's extract() always sends both, and refuses a
+   * scan of zero pages with NO_PAGES). inputTokenUpperBound charges IMAGE_INPUT_TOKEN_BOUND + the
+   * part overhead for each image, so this is the bound the stage's cost cap is really measured
+   * against — the image-free floor no caller can send is 1,500 tokens per page smaller.
    */
-  async function raisedRetry<S extends z.ZodType>(prompt: PromptDefinition<S>) {
+  function extractionInput(pages: number): InputPart[] {
+    return [
+      dataEnvelope({
+        pageNumbers: Array.from({ length: pages }, (_, i) => i + 1),
+        gradeLevel: 4,
+      }),
+      ...Array.from({ length: pages }, () => imagePart('image/jpeg', 'AAAA')),
+    ];
+  }
+
+  /**
+   * One extracted question as GRADING's envelope carries it: a short grade-4 answer, 185 bytes of
+   * JSON with its `q<n>` ref. Grading's bound grows with these BYTES, so the size is stated here and
+   * pinned below — the question count the cap admits is only meaningful next to it.
+   */
+  const GRADING_QUESTION = {
+    prompt: 'Write 3/4 as a decimal and explain how you know.',
+    studentAnswer: '0.75 because 3 divided by 4 is 0.75.',
+    answerKind: 'open_response',
+    subject: 'math',
+  } as const;
+
+  /**
+   * GRADING's real input: ONE data envelope of the grade level, the pages whose source passage was
+   * missing and every extracted question's prompt and answer — and NO image part. Grading never sends
+   * a page image; only extraction does (apps/api/src/jobs/scan-process.ts's grade()). So grading's
+   * input bound is set by the number and size of the extracted questions, and the page count reaches
+   * it only through how many questions those pages carried.
+   */
+  function gradingInput(questions: number): InputPart[] {
+    return [
+      dataEnvelope({
+        gradeLevel: 4,
+        pagesMissingSourcePassage: [],
+        questions: Array.from({ length: questions }, (_, i) => ({
+          questionNumber: `q${i + 1}`,
+          ...GRADING_QUESTION,
+        })),
+      }),
+    ];
+  }
+
+  async function raisedRetry<S extends z.ZodType>(
+    prompt: PromptDefinition<S>,
+    input: readonly InputPart[],
+  ) {
     const limits = PROPOSED_STAGE_LIMITS[prompt.stage];
-    const input = [{ type: 'input_text' as const, text: '{}' }];
     const estimatedInputTokens = inputTokenUpperBound(prompt, input);
     const client = createMockResponsesClient((request) => ({
       kind: 'incomplete' as const,
@@ -435,21 +524,38 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
       estimatedInputTokens,
       sleep: () => Promise.resolve(),
     });
-    return { limits, out, budgets: client.requests.map((r) => r.maxOutputTokens) };
+    return {
+      limits,
+      out,
+      estimatedInputTokens,
+      budgets: client.requests.map((r) => r.maxOutputTokens),
+    };
   }
 
-  /** What the one raised retry must look like, whichever stage was cut off. */
+  /** What the one raised retry must look like, whichever stage was cut off at whatever size. */
   function expectRaisedRetry({
     limits,
     out,
+    estimatedInputTokens,
     budgets,
   }: Awaited<ReturnType<typeof raisedRetry>>): void {
     // Before: extraction's raise to 2 x 4,000 output tokens was estimated at 101,956 micros on top
     // of the ~53,000 micros the first cut-off answer had already cost — past the 150,000 stage cap —
     // so canAttempt refused it at every real input size. One call, then SCAN_TOO_MANY_QUESTIONS,
-    // although the comments promised a raised attempt had happened.
-    expect(budgets).toHaveLength(2);
-    expect(budgets[1]!).toBeGreaterThan(limits.maxOutputTokens);
+    // although the comments promised a raised attempt had happened. R4-JOBS-1 sized the raise to the
+    // headroom that exists, which leaves the retry unreachable from 7 pages (extraction) up unless the
+    // stage's cost cap has room for it.
+    expect(budgets, `input bound ${estimatedInputTokens} tokens`).toHaveLength(2);
+    // HUNT5-C-1: the retry gets the FULL multiple, not a token more than the configured budget. A
+    // retry that may add one token cannot fit an answer that overran by a paragraph, so the cheapest
+    // ceiling that merely makes `raisedOutputBudget` non-null is not the fix — the lead refused it.
+    // This is what makes 216,816 micros the smallest ceiling that passes: at 214,108 the ten-page
+    // extraction case goes red, and at the old 150,000 the 7-10 page extraction cases all do. The
+    // same 18,204-token bound is what limits grading, whose input carries questions instead of pages
+    // (N2-GRADING-ENVELOPE, and the last case in this describe).
+    expect(budgets[1]!, `input bound ${estimatedInputTokens} tokens`).toBe(
+      limits.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE,
+    );
     // The raise never spends more than the stage cap allows.
     expect(out.attempts.reduce((n, at) => n + at.costMicros, 0)).toBeLessThanOrEqual(
       limits.maxCostMicros,
@@ -460,12 +566,93 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
     if (!out.result.ok) expect(out.result.error.code).toBe('OUTPUT_TRUNCATED');
   }
 
-  it('is admitted for extraction at the input bound the scan really sends', async () => {
-    expectRaisedRetry(await raisedRetry(PROMPTS.extraction));
-  });
+  it.each(PAGE_COUNTS)(
+    'is admitted for extraction at the input bound a %i-page scan really sends',
+    async (pages) => {
+      expectRaisedRetry(await raisedRetry(PROMPTS.extraction, extractionInput(pages)));
+    },
+  );
 
-  it('is admitted for grading at the input bound the scan really sends', async () => {
-    expectRaisedRetry(await raisedRetry(PROMPTS.grading));
+  /** A worksheet page of a K-8 assignment carries about ten numbered questions. */
+  const QUESTIONS_PER_PAGE = 10;
+
+  /**
+   * MEASURED, not assumed: the most extracted questions of GRADING_QUESTION's size (185 bytes of
+   * envelope JSON each) at which grading's cost cap still admits the FULL 2x raise. At 85 the input
+   * bound is 18,176 tokens and the two attempts cost 216,704 of the 216,816-micro cap; one question
+   * more takes the bound past the 18,204 the cap allows ((216,816 − 12 x 4,000 − 12 x 8,000) / 4) and
+   * the raise starts shrinking. Change GRADING_QUESTION and this number moves with it.
+   */
+  const GRADING_FULL_RAISE_MAX_QUESTIONS = 85;
+
+  /** The last count at which ANY raise is still admitted; past it a cut-off answer gets one attempt. */
+  const GRADING_ANY_RAISE_MAX_QUESTIONS = 149;
+
+  const GRADING_QUESTION_COUNTS = [
+    1,
+    QUESTIONS_PER_PAGE,
+    2 * QUESTIONS_PER_PAGE,
+    4 * QUESTIONS_PER_PAGE,
+    6 * QUESTIONS_PER_PAGE,
+    8 * QUESTIONS_PER_PAGE,
+    GRADING_FULL_RAISE_MAX_QUESTIONS,
+  ];
+
+  it.each(GRADING_QUESTION_COUNTS)(
+    'is admitted for grading at the input bound %i extracted questions really send (one envelope, no image)',
+    async (questions) => {
+      const input = gradingInput(questions);
+      // The shape itself, so the image-part stand-in cannot come back: grade() sends one text part.
+      expect(input).toHaveLength(1);
+      expect(input[0]!.type).toBe('input_text');
+      expectRaisedRetry(await raisedRetry(PROMPTS.grading, input));
+    },
+  );
+
+  it(`grading's full raise stops above ${GRADING_FULL_RAISE_MAX_QUESTIONS} extracted questions and any raise above ${GRADING_ANY_RAISE_MAX_QUESTIONS}, so a ten-page worksheet is NOT covered (lead decision, no ceiling raised here)`, async () => {
+    const limits = PROPOSED_STAGE_LIMITS.grading;
+    const full = limits.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE;
+    // The bound is bytes, so the size the counts above are stated for is pinned here.
+    const oneQuestion = { questionNumber: 'q10', ...GRADING_QUESTION };
+    expect(new TextEncoder().encode(JSON.stringify(oneQuestion)).length).toBe(185);
+
+    // One question past the sweep: the retry still happens, but NOT at the full multiple. The stage
+    // keeps its promise (a raised attempt is made) and loses part of the raise, which is why this is
+    // the lead's call and not a ceiling to bump here.
+    const over = await raisedRetry(
+      PROMPTS.grading,
+      gradingInput(GRADING_FULL_RAISE_MAX_QUESTIONS + 1),
+    );
+    expect(over.budgets).toHaveLength(2);
+    expect(over.budgets[1]!).toBeGreaterThan(limits.maxOutputTokens);
+    expect(over.budgets[1]!).toBeLessThan(full);
+    expect(over.out.attempts.reduce((n, at) => n + at.costMicros, 0)).toBeLessThanOrEqual(
+      limits.maxCostMicros,
+    );
+
+    // A ten-page worksheet of ten questions a page is inside the product's own page limit
+    // (DEFAULT_HOMEWORK_UPLOAD_LIMITS.maxPages, and the extraction cases above admit it): grading
+    // gives it a raise, but a shrunken one.
+    const tenPages = await raisedRetry(
+      PROMPTS.grading,
+      gradingInput(DEFAULT_HOMEWORK_UPLOAD_LIMITS.maxPages * QUESTIONS_PER_PAGE),
+    );
+    expect(tenPages.budgets).toHaveLength(2);
+    expect(tenPages.budgets[1]!).toBeLessThan(full);
+
+    // And where the raise runs out altogether: at the last count it is still made, one more and the
+    // cut-off answer gets a single attempt and OUTPUT_TRUNCATED at once (SCAN_TOO_MANY_QUESTIONS to
+    // the parent). Fifteen pages of ten questions would be needed to reach that; the page limit is 10.
+    const last = await raisedRetry(PROMPTS.grading, gradingInput(GRADING_ANY_RAISE_MAX_QUESTIONS));
+    expect(last.budgets).toHaveLength(2);
+    expect(last.budgets[1]!).toBeGreaterThan(limits.maxOutputTokens);
+    const none = await raisedRetry(
+      PROMPTS.grading,
+      gradingInput(GRADING_ANY_RAISE_MAX_QUESTIONS + 1),
+    );
+    expect(none.budgets).toHaveLength(1);
+    expect(none.out.result.ok).toBe(false);
+    if (!none.out.result.ok) expect(none.out.result.error.code).toBe('OUTPUT_TRUNCATED');
   });
 });
 

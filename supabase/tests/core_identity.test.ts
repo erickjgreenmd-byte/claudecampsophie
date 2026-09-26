@@ -185,9 +185,15 @@ describe('adult step-up (spec P3)', () => {
     expect(policies[1]!.with_check).toMatch(/is_family_member/);
 
     // And behaviourally, which is what the rewritten test dropped: with the insert column grant
-    // temporarily restored (exactly the grant 0001 made and 0860 revoked), the policy alone must
-    // still refuse a profile created without a session-bound step-up, and refuse 'active'. The grant
-    // is revoked again in `finally`, and the assertion after it proves the restore was undone.
+    // temporarily restored, the policy alone must still refuse a profile created without a
+    // session-bound step-up. Two grants, because they are refused by different layers:
+    //   * exactly the six columns 0001_core_identity.sql:480 granted and 0860 revoked. `status` is
+    //     NOT among them, so under this grant an insert that names `status` is refused by the
+    //     column ACL before the policy is consulted at all;
+    //   * that grant PLUS `status`, a shape this schema has never carried, so that the policy's
+    //     `status = 'draft'` clause — not the ACL — is what refuses an active profile.
+    // Both are revoked in `finally` (a table-wide revoke drops the matching column privileges) and
+    // the assertion after it proves the restore was undone.
     const probe = await seedFamily(db, { childCount: 0 });
     const probeSession = '00000000-0000-4000-8000-0000000abcde';
     await grantAdultUnlock(db, probe.ownerId, probeSession);
@@ -206,18 +212,27 @@ describe('adult step-up (spec P3)', () => {
       );
     try {
       await db.sql`
-        grant insert (family_id, nickname, grade_level, age_band, accessibility, curriculum_notes,
-                      status)
+        grant insert (family_id, nickname, grade_level, age_band, accessibility, curriculum_notes)
           on public.child_profiles to authenticated`;
       // No step-up at all, and a step-up bound to a different auth session: both fail the policy.
       await expect(insertAs(undefined)).rejects.toThrow(/row-level security/);
       await expect(insertAs('00000000-0000-4000-8000-00000000abcd')).rejects.toThrow(
         /row-level security/,
       );
-      // The matching session passes, and only as a draft: 'active' is refused by the same policy.
+      // The matching session passes, and only as a draft.
       const [ok] = await insertAs(probeSession);
       expect(ok!.status).toBe('draft');
+      // Under 0001's own grant, naming `status` never reaches the policy: the column privilege
+      // refuses it first. This is what restoring the revoked grant would actually expose.
+      await expect(insertAs(probeSession, 'active')).rejects.toThrow(
+        /permission denied for table child_profiles/,
+      );
+      // Widen the grant past anything 0001 granted, so the policy is the only layer left: 'active'
+      // is refused by child_profiles_member_insert itself, which is the second layer 0860:120 keeps.
+      await db.sql`grant insert (status) on public.child_profiles to authenticated`;
       await expect(insertAs(probeSession, 'active')).rejects.toThrow(/row-level security/);
+      const [stillDraft] = await insertAs(probeSession, 'draft');
+      expect(stillDraft!.status).toBe('draft');
     } finally {
       await db.sql`revoke insert on public.child_profiles from authenticated`;
     }

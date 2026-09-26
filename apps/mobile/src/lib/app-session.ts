@@ -9,6 +9,7 @@ import {
   currentMode,
   forgetParentUnlock,
   lockParentAreaOnDevice,
+  noteParentIdentity,
   storePurchaseInFlight,
   type AppMode,
 } from './mode.ts';
@@ -63,12 +64,31 @@ export function initAppSession(): () => void {
       // The client-side unlock belongs to the session that earned it (MOB-R4-LOCK-04). A session
       // that ends elsewhere (portal "sign out everywhere", a password change) used to leave the
       // grant running for the rest of its window, so the next parent to sign in on this device
-      // reached the parent screens with no fresh PIN unlock, and a screen still mounted as 'ready'
-      // kept the previous parent's data on show.
+      // reached the parent screens with no fresh PIN unlock.
       forgetParentUnlock();
+      // And the parent state on this device now belongs to nobody (HUNT5-G-5/H-1). This is what a
+      // screen still mounted as 'ready' is measured against: the gate reuses such a screen's state
+      // only while it belongs to the adult at the device, so the next re-check of that screen (its
+      // focus, or the app returning to the foreground) publishes fresh state and refetches instead
+      // of handing on the previous parent's data. It is recorded here, synchronously, because this
+      // is the moment the session goes; the gate deliberately does not re-check on this event
+      // itself (src/family/ui.tsx explains why: privacy.tsx's own closure confirmation).
+      noteParentIdentity(null);
       clearAdultCaches();
       // The store SDK must stop acting for the signed-out family (RV-billing-7).
       void forgetStoreIdentity().catch(() => undefined);
+    } else {
+      // A session that appears: record WHOSE it is, so a screen mounted under the previous adult is
+      // replaced rather than reused even if this device never saw that session end (HUNT5-H-1).
+      // Reading the id is asynchronous; it cannot leave a gap, because a session ending has already
+      // moved the identity above, and the same id twice changes nothing. An id that cannot be read
+      // counts as nobody's, which costs a mounted screen one refetch and never keeps its rows —
+      // including when the previous owner was also nobody, because noteParentIdentity treats an
+      // unnamed owner as a new one every time (src/lib/mode.ts: nobody is not the same person
+      // twice). userId() reads the session, so an offline device past its token expiry reaches this
+      // line with null for an adult who is signed in.
+      const recordParentIdentity = async () => noteParentIdentity(await parentAuth.userId());
+      void recordParentIdentity().catch(() => noteParentIdentity(null));
     }
   });
 

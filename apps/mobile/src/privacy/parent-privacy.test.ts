@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   PARENT_SAFETY_FLAG_ACTIONS,
@@ -8,6 +10,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
+  accountClosedStillSignedInMessage,
   closeAccountAction,
   confirmationPhrase,
   deletableChildren,
@@ -286,6 +289,46 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     });
     expect(await exportDownloadAction(stepUp.api, EXPORT, open)).toEqual({ status: 'step_up' });
     expect(opened).toHaveLength(1);
+  });
+
+  /**
+   * HUNT5-N6 / L-037. `ACCOUNT_CLOSE_COPY.closed` and `.pending` both end "and this device is signed
+   * out", which is the APP's half of closing an account, not the server's: the app clears the parent
+   * session, the biometric PIN and the adult secrets afterwards. The screen used to print that
+   * sentence before the sign-out had even run, and swallowed its failure, so a parent could read that
+   * the device was signed out while it was not — and then put it down. The portal already told the two
+   * cases apart; this is the same distinction on the app, in the app's own words.
+   */
+  it('[HUNT5-N6] says the account is closed WITHOUT claiming the device is signed out, when it is not', () => {
+    for (const status of ['closed', 'pending'] as const) {
+      const message = accountClosedStillSignedInMessage(status);
+      // The true half survives: the account really is closed (or its closure is recorded).
+      expect(message).toMatch(status === 'closed' ? /account is closed/i : /closes automatically/i);
+      // The untrue half is gone, in the word the copy uses.
+      expect(message).not.toMatch(/this device is signed out/i);
+      // And the parent is told what to do about the device in front of them.
+      expect(message).toMatch(/could not sign this device out/i);
+      expect(message).toMatch(/sign out from the parent menu/i);
+      expect(message).toMatch(/change your password/i);
+    }
+  });
+
+  it('[HUNT5-N6] the screen awaits the device sign-out before it claims one, and does not swallow its failure', () => {
+    // privacy.tsx imports react-native, so this suite reads its source, as the other screen tests do.
+    const source = readFileSync(
+      join(import.meta.dirname, '..', '..', 'app', '(parent)', 'privacy.tsx'),
+      'utf8',
+    );
+    // The sign-out is awaited and its outcome captured...
+    expect(source).toMatch(/const signedOut = await signOutClosedAccountOnDevice\(\)/);
+    // ...and the message is chosen by that outcome, not printed before it.
+    expect(source).toMatch(
+      /signedOut \? result\.message : accountClosedStillSignedInMessage\(result\.status\)/,
+    );
+    // The old shape: the outcome set first, the failure thrown away.
+    expect(source).not.toMatch(
+      /setState\(\{ status: 'account_closed', message: result\.message \}\);\s*\n\s*await signOutClosedAccountOnDevice\(\)\.catch/,
+    );
   });
 
   it('[APL-07 / PLAY-10] deletes the parent’s own sign-in only once confirmed, and maps the owner rule and step-up', async () => {
