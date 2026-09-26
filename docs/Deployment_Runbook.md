@@ -159,6 +159,27 @@ subject of another child; only a hand-crafted Data-API request could have made o
 the counts per table: review each row with its family (clear the subject or move it to the subject's child) and
 re-run the migration.
 
+Migration 0860 (round 3) revokes `truncate, trigger, references` from `anon`, `authenticated` and `pl_child` on
+every table in `public` and from the schema's default privileges, revokes the `child_profiles` and
+`safety_reports` write grants from `authenticated` (those tables are only ever written with the service role),
+and adds BEFORE triggers that hold the API's own per-family rules for the learning, reward and support tables on
+the Data API path. Two things to do after applying it:
+
+- `alter default privileges … revoke` is stored **per granting role**, so 0860's line only cancels the entry made
+  by the role that runs migrations. Check the hosted project and repeat the revoke as the owning role if a client
+  role still carries D, x or t (Owner action #44):
+
+  ```sql
+  select defaclrole::regrole, defaclacl from pg_default_acl d
+    join pg_namespace n on n.oid = d.defaclnamespace
+   where n.nspname = 'public' and d.defaclobjtype = 'r';
+  ```
+
+- The trigger `app.child_profiles_no_activation_under_deletion` refuses `status -> 'active'` while a deletion
+  covers the child, for **every** writer including the service role. A fixture or a support script that must stage
+  that state turns triggers off inside its own transaction (`set local session_replication_role = replica`), the
+  same pattern the database tests use; nothing in the application does this.
+
 ### 3.2 Secret scanning (AC_SECURITY_04)
 
 - **Tracked files**: `node scripts/scan-secrets.mjs` (CI) and `--staged` (pre-commit gate, `scripts/verify.sh`).
@@ -366,7 +387,9 @@ never free text (JOBS-R1-04). A dead-lettered `deletion_purge` or `account_close
 `DELETION_PURGE_DEAD_LETTER` / `ACCOUNT_CLOSE_DEAD_LETTER` at error level: alert on those two codes, because a
 configuration fault (for example the Auth Admin adapter missing in production) re-queues every six hours until it
 is fixed. Child sessions, their refresh tokens and adult step-ups that ended more than 30 days ago are deleted by
-the tick's identity housekeeping (`app.prune_session_rows`, migration 0850).
+the tick's identity housekeeping (`app.prune_session_rows`, migration 0850), which also prunes pairing codes whose
+usable life ended and spend holds whose expiry passed over a day ago (`app.prune_credential_rows`, migration 0860,
+reported as `endedCredentialRows`).
 Error codes are payload-free (exception class names or pipeline codes such as `EXTRACTION_PROVIDER_FAILED`).
 To retry after fixing the cause, insert a **new** job with a new idempotency key version (e.g. `scan:<id>:v3`);
 terminal job rows are immutable by trigger. Scans that exhausted retries are already `failed_final` with their

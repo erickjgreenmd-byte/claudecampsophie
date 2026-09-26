@@ -34,6 +34,8 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | [#60](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36182729411) | `0c82443` | **success** (19:56–20:03 UTC) | records-only commit on the round-2b code with the raised test floors |
 | [#61](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36186014426) | `110ff0f` | **success** (20:28–20:36 UTC) | hardening round 2c (BUG-160..164): the tree had passed `scripts/verify.sh` in an isolated worktree: domain 3,656, ui-tokens 4, db 366, contracts 20, mobile 658, web 603, ai 59, api 997 (6,363 tests, 0 failed) |
 | #37 | `1de2803` | **success** (19:49–19:55 UTC) | every step (records and the restored ai floor) |
+| [#64](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36208130669) | `6d4a3a9` | **success** (2026-09-26 01:21–01:28 UTC) | docs-only commit keeping the round-3 checker results and the lead worklist; every step |
+| [#65](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36214301640) | `8bc022b` | **success** (03:16–03:24 UTC) | hardening round 3 (BUG-165..210, migration 0860): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,614 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#35](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36049019610) | `e123e5c` | **success** (19:34–19:40 UTC) | every step, after 15:00 UTC real time: confirms the BUG-090 clock fix (at 4a07ac9 the pinned-clock tests would fail after 15:00) |
 | [#34](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35999435932) | `4a07ac9` | **success** (12:30–12:36 UTC) | every step |
 | [#24](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35988504627) | `13bb3dc` | **success** (10:39–10:45 UTC) | every step above plus the new release-artifact secret scan (web build, Worker dry run, Expo web export, native public config; negative control) |
@@ -46,6 +48,24 @@ CI first ran on this branch at `e067f32`, when pushes to `claude/**` were added 
 had never executed (it triggered only on pull requests and `main`).
 
 ## Local full gate
+
+`scripts/verify.sh` + `node scripts/assert-test-count.mjs` in an isolated worktree on the exact tree of the
+hardening round-3 commit `8bc022b`, 2026-09-26 03:09–03:15 UTC, exit 0: api 1,065, domain 3,656, db 393, web 705,
+mobile 707, ai 64, contracts 20, ui-tokens 4 (6,614; 0 failed, 0 skipped); gate audit; finance; release-artifact
+scan with negative control. New suites in this round: `apps/api/tests/mobile-r2.review.test.ts`,
+`family-profile.review.test.ts`, `privacy-r2.review.test.ts`, `jobs-r2.review.test.ts`,
+`billing-r2.review.test.ts`, `supabase/tests/hardening_r2_db.test.ts`, `packages/ai/src/run-truncation.test.ts`,
+`apps/web/src/App.signout.test.tsx`, `App.navigation.test.tsx`, `lib/session.unauthenticated.test.tsx`,
+`pages/app/StepUpNotice.test.tsx`, `components/StepUpPrompt.reuse.test.tsx`,
+`pages/app/PrivacyControlsPage.exports.test.tsx`, `pages/app/ChildrenPage.profile.test.tsx`,
+`apps/mobile/src/lib/mode-r2.review.test.ts`, `src/family/child-session-r2.review.test.ts` and
+`src/family/screens-r2.review.test.ts`. Floors raised to ~95% of these counts (api 1,011, domain 3,473, db 373,
+web 669, mobile 671, ai 60, contracts 19, ui-tokens 4).
+
+**The gate caught what the typechecks did not.** Its first run on this tree failed three mobile tests: tightening
+`adultUnlockResponseSchema.unlockSeconds` from optional to required made three older fixtures invalid, and every
+package's `tsc` had passed because the fixtures are parsed at runtime, not typed. Fixed, then re-gated from a fresh
+temp commit — the reason the pattern is 'build a temp commit, gate it in a worktree, only then move the branch'.
 
 `scripts/verify.sh` on the round-5 tree (committed as 8a84780..5f02621), 2026-09-24, reports written 21:50–21:53 UTC, exit 0: api 845,
 domain 3,610, db 255, web 406, mobile 400, ai 49, contracts 14, ui-tokens 4 (5,583; 0 failed, 0 skipped); gate

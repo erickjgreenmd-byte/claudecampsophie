@@ -47,9 +47,11 @@ Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `110ff0f`:
-api 997, domain 3,656, db 366, web 603, mobile 658, ai 59, contracts 20, ui-tokens 4 (6,363 tests, 0 failed,
-0 skipped), gate audit, finance, release-artifact scan with negative control. Earlier gates caught BUG-114 (a
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `8bc022b`:
+api 1,065, domain 3,656, db 393, web 705, mobile 707, ai 64, contracts 20, ui-tokens 4 (6,614 tests, 0 failed,
+0 skipped), gate audit, finance, release-artifact scan with negative control. The gate earned its keep again in
+round 3: its first run on that tree failed on three mobile fixtures that a tightened contract had made invalid,
+which every package's typecheck had passed. Earlier gates caught BUG-114 (a
 stale function re-creation, L-026) and BUG-115 (a pinned-clock time bomb, L-027) before their commits. CI runs and their results are listed in `docs/Test_Evidence.md` (the table
 there is the source of truth; a records-only commit may still have its run in progress).
 
@@ -90,8 +92,12 @@ then gate, push and record as the earlier rounds did.
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Fix what the second finder round confirms (failing test first, checkers, isolated gate), then record it.
-3. Owner actions in `docs/Owner_Actions.md` (#1–#37) unblock everything else: accounts (Apple, Google Play, Amazon
+2. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
+   failing test first and are fixed, every area's acceptance checker ends `ok`, and the lead closed the checkers'
+   cross-area residuals in the same round (`docs/Bug_Ledger.md` BUG-165..210, `docs/ECC_Runs.md` `wf_56274b45-95e`,
+   code at `8bc022b`, 6,614 tests green). What was not reproduced, and what was deliberately left open, is listed
+   in that ECC row rather than dropped. Next: a third finder round over the round-3 tree, or store submission.
+3. Owner actions in `docs/Owner_Actions.md` (#1–#44) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety

@@ -70,6 +70,16 @@ Rules:
   90 days are pruned by the tick's `job_retention` step (`app.prune_terminal_jobs`, migration 0840), except the
   `deletion_purge` and `account_close` kinds, which stay as the audit trail of a deletion. Per-family reads of the
   ledger use `jobs_family_child`; lease recovery uses `jobs_running`.
+- The scheduled tick runs the JOB LEDGER before the provider sweeps (round 3, JOBS-R2-04). Each provider request is
+  bounded (`BILLING_REQUEST_TIMEOUT_MS`, 10 s), but the entitlement sweep makes up to 25 of them one after another,
+  and the work a family is waiting on — a scan, a safety email, an export — is in the ledger. Entitlement staleness
+  is measured in days, so a sweep cut short by the end of the tick loses nothing. The claim budget is measured from
+  the tick's own start, and a kind whose worst case no longer fits the remaining wall time is not claimed.
+- Client roles hold no `truncate`, `trigger` or `references` on any `public` table (migration 0860): TRUNCATE was the
+  one write that bypassed both RLS and `app.prevent_mutation()`. Where the API writes as the parent role (learning,
+  reward and support tables), the API's own per-family rules are backstopped by BEFORE triggers that fire only when
+  `current_user = 'authenticated'`, so the Data API path cannot be a generic database passthrough (spec line 340);
+  where it writes only as the service role (`child_profiles`, `safety_reports`), the client grants are revoked.
 - A family-scope deletion request releases the adults' memberships in the same transaction as the tombstone
   (`revoked_at = deletion_requested_at`, migration 0840), so a parent can start a new family before the purge
   runs; the deletion view, account closure and the account-close job treat a membership the deletion itself

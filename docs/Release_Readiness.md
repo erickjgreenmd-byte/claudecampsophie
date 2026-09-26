@@ -15,7 +15,16 @@ yet. This page separates what is *built*, *tested*, *deployed*, *signed*, *submi
 | Store products / agreements | **No** | Owner actions #1, #4, #11 |
 | Submitted / approved | **No** | — |
 
-## Store submission checklist (audited 2026-09-25, workflow `wf_2a9a8aa6-7c4`; code gaps closed in `wf_b0de02d8-ca2` (`6d0d5d0`); round-1 bug-hunt fixes in `wf_8b66cd30-e71` (`54ca934`))
+## Store submission checklist (audited 2026-09-25, workflow `wf_2a9a8aa6-7c4`; code gaps closed in `wf_b0de02d8-ca2` (`6d0d5d0`); round-1 bug-hunt fixes in `wf_8b66cd30-e71` (`54ca934`); rounds 2a–2c in `wf_81f5d47c-d55`, `wf_90c8faf6-975` and `wf_1eaa94df-496` (`77c13b1`, `6728bea`, `110ff0f`); round 3 in `wf_56274b45-95e` (`8bc022b`))
+
+Software readiness moved in round 3 in ways a reviewer will notice: the portal has a sign-out control, a password
+change outside a recovery link needs the current password, a step-up refusal is answered without losing the form,
+a child's grade, nickname, age band and the family's time zone are editable, every mobile route has an error
+boundary, the parent area closes on the device when the app is backgrounded, and a scan the pipeline cannot finish
+says why in words a parent can act on. Four owner actions were added by the same round (#41 Supabase secure
+password change, #42 the fallback safety category, #43 the kept Exif Orientation tag, #44 the post-0860 default
+privileges check); none of them is a code change, and the verdict above is unchanged: nothing is deployed, signed
+or submitted.
 
 Evidence levels as in `docs/Provider_Capability_Matrix.md`: `doc-verified` (read in the store's current documentation
 during the audit), `secondary`, `candidate` (documentation unreachable from the build environment — Amazon and

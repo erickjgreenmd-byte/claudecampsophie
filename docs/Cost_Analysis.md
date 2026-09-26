@@ -77,6 +77,7 @@ cap, so a slow provider fails a scan sooner rather than spending past the cap.
 | Actual tokens per homework page (vision + grading + verification) | Largest AI line; drives sibling margin | `usage_events` table with model, stage, input/cached/output tokens, micro-USD (P12) |
 | Fresh daily-set generation cost | $5.10 of the $19.36 two-child typical AI | Same, stage `daily_set` |
 | Unreadable/retry rate | Retries cost money even with no child result | Failed billed attempts are recorded, not dropped |
+| Truncated-answer rate (JOBS-R2-02) | An answer cut off at the output budget used to be re-sent unchanged ten times — ten billed calls for one scan. The stage budget is now raised once and a second truncation ends the scan with a parent-facing code, so the worst case is two calls, not ten | `ai_usage_events` per stage plus the `SCAN_TOO_MANY_QUESTIONS` count on assignments |
 | Redemption and repeat-redemption rates | Promotion subsidy | `promo_redemptions` confirmed rows × discount cents |
 | Store fee tier actually granted | 15% vs 30% | Store agreements |
 
