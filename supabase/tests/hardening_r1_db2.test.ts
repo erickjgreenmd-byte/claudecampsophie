@@ -518,3 +518,31 @@ describe('[DB-R1-07] child session tables are indexed and ended rows can be prun
     ).rejects.toThrow(/permission denied/);
   });
 });
+
+/**
+ * BUG-244 / migration 0880: the column that makes a child refresh idempotent. The behaviour is
+ * exercised end to end in apps/api/tests/mobile-r2.review.test.ts; this pins the schema the route
+ * depends on, including that it is NULLABLE — a client that sends no id must keep working exactly as
+ * before, and its rotated tokens carry no id at all.
+ */
+describe('BUG-244 child refresh idempotency column (migration 0880)', () => {
+  it('records the consuming request id, is nullable, and is indexed only where set', async () => {
+    const [column] = await db.sql<{ data_type: string; is_nullable: string }[]>`
+      select data_type, is_nullable from information_schema.columns
+       where table_schema = 'private' and table_name = 'child_refresh_tokens'
+         and column_name = 'used_request_id'`;
+    expect(column).toEqual({ data_type: 'uuid', is_nullable: 'YES' });
+    const [index] = await db.sql<{ indexdef: string }[]>`
+      select indexdef from pg_indexes
+       where schemaname = 'private' and indexname = 'child_refresh_tokens_used_request'`;
+    expect(index!.indexdef).toMatch(/used_request_id/);
+    // Partial: a token nobody has used carries no id, and there are far more of those.
+    expect(index!.indexdef).toMatch(/WHERE \(used_request_id IS NOT NULL\)/);
+    // Still private: no client role can read the ids that would let it forge a recovery.
+    const [grants] = await db.sql<Record<string, boolean>[]>`
+      select has_table_privilege('anon', 'private.child_refresh_tokens', 'select') as anon,
+             has_table_privilege('authenticated', 'private.child_refresh_tokens', 'select') as authenticated,
+             has_table_privilege('pl_child', 'private.child_refresh_tokens', 'select') as pl_child`;
+    expect(grants).toEqual({ anon: false, authenticated: false, pl_child: false });
+  });
+});

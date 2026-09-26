@@ -1,3 +1,4 @@
+import { randomUUID } from 'expo-crypto';
 import { Platform } from 'react-native';
 import { router } from 'expo-router';
 import * as ScreenCapture from 'expo-screen-capture';
@@ -35,6 +36,11 @@ export const childSession = createChildSession({
   publicApi: createMobileApi(() => Promise.resolve(null)),
   authedApi: (token) => createMobileApi(token),
   now: () => new Date(),
+  // BUG-244: the refresh request's own id. It is wired here rather than imported inside
+  // child-session.ts because expo-crypto reaches into react-native, which that module's test project
+  // cannot parse — and an unguessable id matters: it is what separates this device's retry from a
+  // replay of a stolen token.
+  newRequestId: () => randomUUID(),
 });
 
 /**

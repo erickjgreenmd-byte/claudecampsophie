@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { childMeResponseSchema } from '@pencillift/contracts';
-import { STORAGE_KEYS, type SecureStorage } from '../lib/mode.ts';
+import { STORAGE_KEYS, unpairChildDevice, type SecureStorage } from '../lib/mode.ts';
 import { createChildSession, withChildTokenRetry } from './child-session.ts';
 
 /**
@@ -128,6 +128,7 @@ function setup(skewMinutes: number) {
     publicApi: server.publicApi,
     authedApi: (token) => server.dataApi(token),
     now: deviceClock,
+    newRequestId: () => 'aaaaaaaa-0000-4000-8000-00000000000a',
   });
   return {
     server,
@@ -306,4 +307,188 @@ describe('every child surface gets the token retry, not only homework (HUNT4-MOB
       expect(source).not.toMatch(/=>\s*\(tokenSource \? createMobileApi\(tokenSource\) : null\)/);
     });
   }
+});
+
+/** A storage that already holds a pairing, so refresh() has a token to present. */
+function pairedStorage(): SecureStorage & { data: Map<string, string> } {
+  const storage = memoryStorage();
+  storage.data.set(STORAGE_KEYS.childRefreshToken, 'stored-refresh-token');
+  return storage;
+}
+
+/** The shape POST /v1/child/refresh answers with, as childTokenResponseSchema parses it. */
+function freshTokens(accessToken: string, refreshToken: string) {
+  return {
+    accessToken,
+    refreshToken,
+    accessTokenExpiresAt: '2026-09-26T12:15:00.000Z',
+    accessTokenExpiresInSeconds: 900,
+    child: { id: RILEY, nickname: 'Riley' },
+  } as never;
+}
+
+/**
+ * BUG-244: one refresh, one id, kept across this device's own retries of that refresh.
+ *
+ * The server commits the rotation before its response goes out, so a lost response leaves this device
+ * holding a token the server has marked used. Presenting it again with the id that consumed it is how
+ * the server recognises the rightful holder finishing its attempt; a NEW id on the retry would be a
+ * new refresh and would be treated as theft, which is what unpaired tablets before this.
+ */
+describe('a refresh keeps its request id across this device’s own retries (BUG-244)', () => {
+  it('[repro] a retry after a network failure sends the SAME id, and a later refresh a new one', async () => {
+    const ids: (string | undefined)[] = [];
+    let attempt = 0;
+    let issued = 0;
+    const session = createChildSession({
+      storage: pairedStorage(),
+      publicApi: {
+        get: () => Promise.reject(new Error('unexpected GET')),
+        send: (_method, _path, body) => {
+          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
+          attempt += 1;
+          // The first attempt's response never arrives; the second and third succeed.
+          if (attempt === 1) return Promise.reject(new Error('network down'));
+          issued += 1;
+          return Promise.resolve(freshTokens(`access-${issued}`, `rotated-${issued}`));
+        },
+      },
+      authedApi: () => ({
+        get: () => Promise.reject(new Error('unexpected GET')),
+        send: () => Promise.reject(new Error('unexpected send')),
+      }),
+      now: () => new Date('2026-09-26T12:00:00.000Z'),
+      newRequestId: (() => {
+        let n = 0;
+        return () => `00000000-0000-4000-8000-00000000000${++n}`;
+      })(),
+    });
+
+    await expect(session.accessToken()).rejects.toThrow('network down');
+    expect(await session.accessToken()).toBe('access-1');
+    // Same refresh, so the same id: the retry is the first attempt finishing, not a second refresh.
+    expect(ids).toEqual([
+      '00000000-0000-4000-8000-000000000001',
+      '00000000-0000-4000-8000-000000000001',
+    ]);
+
+    // A later refresh, after this one finished, is a new refresh and takes a new id.
+    session.invalidateAccessToken();
+    expect(await session.accessToken()).toBe('access-2');
+    expect(ids[2]).toBe('00000000-0000-4000-8000-000000000002');
+  });
+
+  it('a refusal ends the refresh, so the next one does not reuse its id', async () => {
+    const ids: (string | undefined)[] = [];
+    let attempt = 0;
+    const storage = pairedStorage();
+    const session = createChildSession({
+      storage,
+      publicApi: {
+        get: () => Promise.reject(new Error('unexpected GET')),
+        send: (_method, _path, body) => {
+          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
+          attempt += 1;
+          return attempt === 1
+            ? Promise.reject(new ApiRequestError('UNAUTHENTICATED', 'no', 401))
+            : Promise.resolve(freshTokens('access-after', 'rotated-after'));
+        },
+      },
+      authedApi: () => ({
+        get: () => Promise.reject(new Error('unexpected GET')),
+        send: () => Promise.reject(new Error('unexpected send')),
+      }),
+      now: () => new Date('2026-09-26T12:00:00.000Z'),
+      newRequestId: (() => {
+        let n = 0;
+        return () => `00000000-0000-4000-8000-00000000001${++n}`;
+      })(),
+    });
+    // The refusal forgets the pairing, so this device asks for nothing more until it is paired again.
+    expect(await session.accessToken()).toBeNull();
+    expect(await storage.getItem(STORAGE_KEYS.childRefreshToken)).toBeNull();
+    expect(ids).toEqual(['00000000-0000-4000-8000-000000000011']);
+  });
+
+  /**
+   * The id has to outlive the PROCESS, not just the promise. A tablet's OS kills a backgrounded app
+   * whenever it likes, and a child who closes the app while a refresh is spinning loses the response
+   * exactly as a dropped connection does — so the next cold start has to finish that same refresh.
+   */
+  it('a process killed mid-refresh finishes that same refresh after a cold start', async () => {
+    const ids: (string | undefined)[] = [];
+    const storage = pairedStorage();
+    let allowed = false;
+    const build = (idPrefix: string) =>
+      createChildSession({
+        storage,
+        publicApi: {
+          get: () => Promise.reject(new Error('unexpected GET')),
+          send: (_method, _path, body) => {
+            ids.push((body as { refreshRequestId?: string }).refreshRequestId);
+            return allowed
+              ? Promise.resolve(freshTokens('access-cold', 'rotated-cold'))
+              : Promise.reject(new Error('network down'));
+          },
+        },
+        authedApi: () => ({
+          get: () => Promise.reject(new Error('unexpected GET')),
+          send: () => Promise.reject(new Error('unexpected send')),
+        }),
+        now: () => new Date('2026-09-26T12:00:00.000Z'),
+        // A second process would mint a DIFFERENT id, which the server would read as theft.
+        newRequestId: () => `${idPrefix}-0000-4000-8000-000000000021`,
+      });
+
+    const first = build('11111111');
+    await expect(first.accessToken()).rejects.toThrow('network down');
+    // The app dies here: `first` is gone and nothing in memory survives — only storage does.
+    expect(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)).toBe(
+      '11111111-0000-4000-8000-000000000021',
+    );
+
+    allowed = true;
+    const afterRestart = build('22222222');
+    expect(await afterRestart.accessToken()).toBe('access-cold');
+    expect(ids).toEqual([
+      '11111111-0000-4000-8000-000000000021',
+      '11111111-0000-4000-8000-000000000021',
+    ]);
+    // Finished, so the id is gone and the next refresh is a new attempt.
+    expect(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)).toBeNull();
+    expect(await storage.getItem(STORAGE_KEYS.childRefreshToken)).toBe('rotated-cold');
+  });
+
+  it('a stored id that is not a uuid is replaced instead of wedging every refresh', async () => {
+    const ids: (string | undefined)[] = [];
+    const storage = pairedStorage();
+    // Whatever wrote this — a corrupted keychain entry, an older build — the contract would refuse it
+    // on every attempt, so refresh must not keep presenting it.
+    storage.data.set(STORAGE_KEYS.childRefreshRequestId, 'not-a-uuid');
+    const session = createChildSession({
+      storage,
+      publicApi: {
+        get: () => Promise.reject(new Error('unexpected GET')),
+        send: (_method, _path, body) => {
+          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
+          return Promise.resolve(freshTokens('access-clean', 'rotated-clean'));
+        },
+      },
+      authedApi: () => ({
+        get: () => Promise.reject(new Error('unexpected GET')),
+        send: () => Promise.reject(new Error('unexpected send')),
+      }),
+      now: () => new Date('2026-09-26T12:00:00.000Z'),
+      newRequestId: () => '33333333-0000-4000-8000-000000000031',
+    });
+    expect(await session.accessToken()).toBe('access-clean');
+    expect(ids).toEqual(['33333333-0000-4000-8000-000000000031']);
+  });
+
+  it('unpairing takes the unfinished refresh with it', async () => {
+    const storage = pairedStorage();
+    storage.data.set(STORAGE_KEYS.childRefreshRequestId, '44444444-0000-4000-8000-000000000041');
+    await unpairChildDevice(storage);
+    expect(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)).toBeNull();
+  });
 });

@@ -196,7 +196,7 @@ export function childAuthRoutes(): Hono<AppEnv> {
       RATE_RULES.childRefreshPerNetwork,
       now,
     );
-    const { refreshToken } = await readJson(c, childRefreshRequestSchema);
+    const { refreshToken, refreshRequestId } = await readJson(c, childRefreshRequestSchema);
     const refreshHashHex = await sha256Hex(refreshToken);
     const outcome = await deps.db.asService(async (tx) => {
       const [row] = await tx<
@@ -204,13 +204,16 @@ export function childAuthRoutes(): Hono<AppEnv> {
           id: string;
           session_id: string;
           used_at: Date | null;
+          used_request_id: string | null;
+          replaced_by: string | null;
           family_id: string;
           child_id: string;
           live: boolean;
           nickname: string;
         }[]
       >`
-        select t.id, t.session_id, t.used_at, s.family_id, s.child_id, c.nickname,
+        select t.id, t.session_id, t.used_at, t.used_request_id, t.replaced_by,
+               s.family_id, s.child_id, c.nickname,
                (t.expires_at > now() and s.revoked_at is null and s.expires_at > now()
                 and d.revoked_at is null and c.status = 'active' and f.deleted_at is null) as live
           from private.child_refresh_tokens t
@@ -231,23 +234,68 @@ export function childAuthRoutes(): Hono<AppEnv> {
           allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
         });
       if (row.used_at) {
-        // Reuse of a rotated token signals theft: revoke the whole session (spec P3), at once and
-        // without any grace window.
+        // A rotated token presented again is theft — UNLESS it is the rightful holder retrying the
+        // very refresh that rotated it, which BUG-244 is about: the rotation commits before the
+        // response goes out, so a response lost on the way back (a client timeout, a network switch,
+        // a Worker evicted after commit) left the tablet holding a token the server had marked used,
+        // and its next refresh unpaired the device over one dropped HTTP response.
         //
-        // HUNT4-MOB-1 (round 4) is a CONFIRMED and still-open defect here, kept open deliberately:
-        // this also fires when a rotation's response is lost on the way back to the tablet, so one
-        // dropped HTTP response unpairs a child's device and the parent has to mint a new pairing
-        // code. A 60-second "the response never arrived" grace was written and then withdrawn in the
-        // same round, and the lead's decision is NOT to take it: a time window cannot tell the
-        // rightful holder's retry from a blind replay of a stolen token, so it would hand a replayer
-        // a live child session in exactly the case it is meant to help.
-        //
-        // The remedy that does distinguish them is an IDEMPOTENT refresh keyed on a client-supplied
-        // request id the tablet keeps across its own retries: the same id is the rightful holder
-        // finishing an attempt, any other presentation of a rotated token stays theft. That needs a
-        // contract field, a column, and mobile changes, so it is a designed change for its own round
-        // (docs/Bug_Ledger.md BUG-2xx HUNT4-MOB-1, docs/Progress.md), not a late edit to this one.
-        // Until then this gate stays closed and the unpairing is the accepted cost.
+        // A time WINDOW was rejected for this: inside it a replayer looks exactly like the rightful
+        // holder, so it would hand out a live child session in the case it exists to help. The
+        // request identifies itself instead. Three things must all hold for a recovery:
+        //   1. the request carries an id AND it is the id that consumed this token — a blind replayer
+        //      does not know it, and a client that sends none never takes this path at all;
+        //   2. the replacement that the lost response carried is still UNCLAIMED — once it has been
+        //      used, two parties hold this token's lineage and that is theft whatever id is sent;
+        //   3. the session is still live and consent still allows access (checked below, as always).
+        // The unclaimed replacement is then retired and a fresh one issued, carrying the same id, so
+        // a second lost response in a row still recovers. Only the token hash is stored, so the
+        // replacement itself cannot be re-served; retiring it also kills any copy intercepted from
+        // the lost response.
+        const recovering =
+          refreshRequestId !== undefined &&
+          row.used_request_id === refreshRequestId &&
+          row.replaced_by !== null &&
+          row.live;
+        if (recovering) {
+          const [replacement] = await tx<{ id: string }[]>`
+            select id from private.child_refresh_tokens
+             where id = ${row.replaced_by} and used_at is null and expires_at > now()
+             for update`;
+          if (replacement) {
+            if (!(await consented())) return { kind: 'invalid' as const };
+            await enforceRateLimit(
+              deps.rateLimiter,
+              `refresh:${row.session_id}`,
+              RATE_RULES.childRefreshPerSession,
+              now,
+            );
+            const next = await issueRefreshToken(tx, deps, row.session_id);
+            // The retired replacement keeps this token's original used_at, so it never gets a
+            // recovery window of its own.
+            await tx`update private.child_refresh_tokens
+                        set used_at = ${row.used_at}, replaced_by = ${next.id},
+                            used_request_id = ${refreshRequestId}
+                      where id = ${replacement.id}`;
+            await tx`update private.child_refresh_tokens set replaced_by = ${next.id} where id = ${row.id}`;
+            deps.log({
+              level: 'info',
+              event: 'child_refresh_recovered',
+              code: 'LOST_RESPONSE',
+            });
+            return {
+              kind: 'ok' as const,
+              principal: {
+                kind: 'child',
+                childId: row.child_id,
+                familyId: row.family_id,
+                sessionId: row.session_id,
+              } as const,
+              refreshToken: next.token,
+              nickname: row.nickname,
+            };
+          }
+        }
         await tx`update public.child_sessions set revoked_at = ${now}, revoke_reason = 'refresh_token_reuse' where id = ${row.session_id} and revoked_at is null`;
         await tx`
           insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
@@ -272,7 +320,10 @@ export function childAuthRoutes(): Hono<AppEnv> {
         now,
       );
       const next = await issueRefreshToken(tx, deps, row.session_id);
-      await tx`update private.child_refresh_tokens set used_at = ${now}, replaced_by = ${next.id} where id = ${row.id}`;
+      await tx`update private.child_refresh_tokens
+                  set used_at = ${now}, replaced_by = ${next.id},
+                      used_request_id = ${refreshRequestId ?? null}
+                where id = ${row.id}`;
       return {
         kind: 'ok' as const,
         principal: {

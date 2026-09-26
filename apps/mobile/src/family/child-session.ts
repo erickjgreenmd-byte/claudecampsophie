@@ -1,4 +1,8 @@
-import { childTokenResponseSchema, familyOkResponseSchema } from '@pencillift/contracts';
+import {
+  childTokenResponseSchema,
+  familyOkResponseSchema,
+  uuidSchema,
+} from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient, type TokenSource } from '@pencillift/contracts/client';
 import { STORAGE_KEYS, unpairChildDevice, type SecureStorage } from '../lib/mode.ts';
 import { pairingErrorMessage, validatePairingCode } from './pairing-code.ts';
@@ -35,6 +39,13 @@ export interface ChildSessionDeps {
   /** Builds a client that sends the given bearer token (used for logout). */
   readonly authedApi: (token: TokenSource) => ApiClient;
   readonly now: () => Date;
+  /**
+   * One id per refresh, so the server can tell this device's own retry of a refresh from a replay of
+   * a stolen token (BUG-244). Required and injected rather than imported: expo-crypto reaches into
+   * react-native, which this module's vitest project cannot parse, and this module stays testable
+   * without it. The app passes expo-crypto's randomUUID (src/family/runtime.ts).
+   */
+  readonly newRequestId: () => string;
 }
 
 export type PairResult =
@@ -111,6 +122,12 @@ export function withChildTokenRetry(
 export function createChildSession(deps: ChildSessionDeps): ChildSession {
   let access: { token: string; expiresAtMs: number } | null = null;
   let inflight: Promise<string | null> | null = null;
+  /**
+   * The id of the refresh this device is still trying to finish (BUG-244); null between refreshes.
+   * Mirrored in secure storage, so an app the OS kills mid-refresh still finishes that refresh.
+   */
+  let pendingRequestId: string | null = null;
+  const newRequestId = deps.newRequestId;
   /** Bumped on every change to `access`, so a caller can tell a token apart from its successor. */
   let generation = 0;
 
@@ -136,25 +153,64 @@ export function createChildSession(deps: ChildSessionDeps): ChildSession {
     await unpairChildDevice(deps.storage);
   }
 
+  /** The id of the attempt in flight, minted once and then read back from storage on every retry. */
+  async function requestIdForThisRefresh(): Promise<string> {
+    if (pendingRequestId === null) {
+      const stored = await deps.storage
+        .getItem(STORAGE_KEYS.childRefreshRequestId)
+        .catch(() => null);
+      // A stored value that is not a uuid would be refused by the contract on every attempt, which
+      // would wedge this device out of refreshing entirely; mint a new id instead.
+      if (stored !== null && uuidSchema.safeParse(stored).success) {
+        pendingRequestId = stored;
+      } else {
+        pendingRequestId = newRequestId();
+        await deps.storage
+          .setItem(STORAGE_KEYS.childRefreshRequestId, pendingRequestId)
+          .catch(() => undefined);
+      }
+    }
+    return pendingRequestId;
+  }
+
+  /** This refresh is over, whichever way it ended: the next one is a new attempt with a new id. */
+  async function refreshFinished(): Promise<void> {
+    pendingRequestId = null;
+    await deps.storage.deleteItem(STORAGE_KEYS.childRefreshRequestId).catch(() => undefined);
+  }
+
   async function refresh(): Promise<string | null> {
     const refreshToken = await deps.storage.getItem(STORAGE_KEYS.childRefreshToken);
     if (!refreshToken) return null;
+    // BUG-244: one id per refresh, KEPT across this device's own retries of that refresh. The server
+    // commits the rotation before its response goes out, so a response lost on the way back leaves
+    // this device holding a token the server has marked used; presenting it again with the id that
+    // consumed it is how the server recognises the rightful holder finishing its attempt instead of a
+    // replay. A new id on the retry would be a new refresh, and would be treated as theft — so the id
+    // is only cleared when this refresh actually finished, either with tokens or with a refusal.
+    // The id is written BEFORE the request goes out, so it survives the process that sent it.
+    const refreshRequestId = await requestIdForThisRefresh();
     try {
       const response = await deps.publicApi.send(
         'POST',
         '/v1/child/refresh',
-        { refreshToken },
+        { refreshToken, refreshRequestId },
         childTokenResponseSchema,
       );
       // The device's clock at the moment the response arrived, not before the request went out.
       await persist(response, deps.now());
+      // Cleared only once the rotated token is stored: a process death in between must leave the id
+      // in place, or the next attempt would present the old token under a NEW id — which is theft.
+      await refreshFinished();
       return response.accessToken;
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === 'UNAUTHENTICATED') {
+        await refreshFinished();
         await forget();
         return null;
       }
-      // Offline or server trouble: keep the refresh token so the device reconnects later.
+      // Offline or server trouble: keep the refresh token AND the id, so the next attempt is the same
+      // refresh rather than a new one, and the server can serve it if this response was the lost one.
       throw error;
     }
   }

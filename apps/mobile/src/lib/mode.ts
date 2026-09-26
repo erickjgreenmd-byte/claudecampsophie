@@ -36,6 +36,14 @@ export const STORAGE_KEYS = {
   mode: 'pl.mode',
   childRefreshToken: 'pl.child.refresh',
   childProfile: 'pl.child.profile',
+  /**
+   * The id of the refresh this device has not finished yet (BUG-244). Persisted, not in memory only:
+   * the OS can kill a backgrounded tablet app while a refresh is in flight, which loses the response
+   * exactly as a dropped connection does, and the next attempt has to present the SAME id to be
+   * recognised as this device finishing its own refresh rather than a replay of a stolen token. It is
+   * not a credential — it opens nothing on its own, and only ever matches the one token it rotated.
+   */
+  childRefreshRequestId: 'pl.child.refresh.rid',
 } as const;
 
 /**
@@ -237,6 +245,8 @@ export async function unpairChildDevice(storage: SecureStorage): Promise<void> {
   forgetParentUnlock();
   await storage.deleteItem(STORAGE_KEYS.childRefreshToken);
   await storage.deleteItem(STORAGE_KEYS.childProfile);
+  // The unfinished refresh goes with the session it belonged to.
+  await storage.deleteItem(STORAGE_KEYS.childRefreshRequestId);
   await storage.setItem(STORAGE_KEYS.mode, 'signed_out');
 }
 

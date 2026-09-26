@@ -51,6 +51,20 @@ export const childTokenResponseSchema = z.strictObject({
 
 export const childRefreshRequestSchema = z.strictObject({
   refreshToken: z.string().min(20).max(200),
+  /**
+   * One id per refresh, kept by the device across its own retries of that refresh (BUG-244).
+   *
+   * Rotation treats a used refresh token presented again as theft, which is right for a replay and
+   * wrong for the tablet's own retry after a response was lost on the way back: one dropped HTTP
+   * response unpaired the device. A time window cannot separate those two cases — inside it a
+   * replayer looks exactly like the rightful holder — so the request identifies itself instead. The
+   * server records the id that consumed each token, and only a re-presentation carrying that exact
+   * id is read as the rightful holder finishing its attempt.
+   *
+   * Optional: a client that sends nothing keeps today's behaviour exactly, so an installed app is
+   * never worse off. A new id on a retry is not a recovery, it is a new refresh.
+   */
+  refreshRequestId: uuidSchema.optional(),
 });
 
 /** POST /v1/adult/pin/reset — only right after an account re-authentication (spec P3 recovery). */

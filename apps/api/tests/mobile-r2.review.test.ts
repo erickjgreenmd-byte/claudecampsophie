@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
@@ -210,8 +211,11 @@ async function auditActions(familyId: string): Promise<string[]> {
   return rows.map((r) => r.action);
 }
 
-const refresh = (refreshToken: string) =>
-  api.request('/v1/child/refresh', { method: 'POST', body: { refreshToken } });
+const refresh = (refreshToken: string, refreshRequestId?: string) =>
+  api.request('/v1/child/refresh', {
+    method: 'POST',
+    body: refreshRequestId === undefined ? { refreshToken } : { refreshToken, refreshRequestId },
+  });
 
 /** The session of the one device this test paired (seedFamily seeds its own 'Test tablet' too). */
 async function sessionRow(
@@ -260,6 +264,80 @@ describe('reuse of a rotated refresh token revokes the session at once (HUNT4-MO
     );
     // No grace window: the token the rotation issued stops working too, however new it is.
     expect((await refresh(rotated.refreshToken)).status).toBe(401);
+  });
+});
+
+/**
+ * BUG-244, closed: the tablet's own retry of a refresh whose response was lost is served, and every
+ * other re-presentation of a rotated token is still theft.
+ *
+ * The rejected alternative was a time window, which cannot separate the two cases — inside it a
+ * replayer looks exactly like the rightful holder. The request identifies itself instead: one id per
+ * refresh, kept by the device across its own retries of that refresh, recorded by the server as the id
+ * that consumed the token. A used token presented again WITH that id is the same attempt finishing;
+ * with another id, or none, it is theft and the session is revoked as before.
+ */
+describe('a refresh whose response was lost is recoverable by its own id (BUG-244)', () => {
+  it('[repro] the same token and the same request id issues tokens instead of revoking', async () => {
+    const device = await pairedDevice('Lost response tablet');
+    const rid = randomUUID();
+    const first = await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
+
+    // The tablet never saw that response. It retries the SAME refresh: same token, same id.
+    const retried = await refresh(device.refreshToken, rid);
+    expect(retried.status).toBe(200);
+    const second = await json<{ refreshToken: string }>(retried);
+    expect(second.refreshToken).not.toBe(first.refreshToken);
+    // The recovery itself is not a theft signal: the session survived it.
+    expect(await auditActions(device.fam.familyId)).not.toContain(
+      'child_session.revoked_token_reuse',
+    );
+    expect((await sessionRow(device.fam.familyId, 'Lost response tablet')).revoked_at).toBeNull();
+    // The token the lost response carried is retired. Only someone who intercepted that response
+    // holds it, so presenting it is a real theft signal and is treated as one.
+    expect((await refresh(first.refreshToken, randomUUID())).status).toBe(401);
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+  });
+
+  it('a second lost response in a row still recovers, through the same id', async () => {
+    const device = await pairedDevice('Twice lost tablet');
+    const rid = randomUUID();
+    await refresh(device.refreshToken, rid);
+    expect((await refresh(device.refreshToken, rid)).status).toBe(200);
+    const third = await refresh(device.refreshToken, rid);
+    expect(third.status).toBe(200);
+    const row = await sessionRow(device.fam.familyId, 'Twice lost tablet');
+    expect(row.revoked_at).toBeNull();
+  });
+
+  it('a replay with a different id is theft, and so is one with no id at all', async () => {
+    const other = await pairedDevice('Different id tablet');
+    await refresh(other.refreshToken, randomUUID());
+    expect((await refresh(other.refreshToken, randomUUID())).status).toBe(401);
+    expect(await auditActions(other.fam.familyId)).toContain('child_session.revoked_token_reuse');
+
+    const none = await pairedDevice('No id tablet');
+    await refresh(none.refreshToken, randomUUID());
+    expect((await refresh(none.refreshToken)).status).toBe(401);
+    expect(await auditActions(none.fam.familyId)).toContain('child_session.revoked_token_reuse');
+  });
+
+  it('once the replacement has been used, even the right id is theft', async () => {
+    const device = await pairedDevice('Claimed replacement tablet');
+    const rid = randomUUID();
+    const rotated = await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
+    // The response did arrive: the tablet used the replacement. A presentation of the old token now
+    // means two parties hold it, whatever id it carries.
+    expect((await refresh(rotated.refreshToken, randomUUID())).status).toBe(200);
+    expect((await refresh(device.refreshToken, rid)).status).toBe(401);
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+  });
+
+  it('a token rotated by a client that sent no id keeps today’s behaviour exactly', async () => {
+    const device = await pairedDevice('Old client tablet');
+    await refresh(device.refreshToken);
+    expect((await refresh(device.refreshToken, randomUUID())).status).toBe(401);
+    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
   });
 });
 
