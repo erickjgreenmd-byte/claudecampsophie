@@ -17,3 +17,17 @@ checker with mutation checks → one bounded re-fix).
 
 These files are evidence for `docs/ECC_Runs.md`; they are kept here because the analysis behind them
 cost more than the code it produced. They are not part of the build and nothing imports them.
+
+## Round 3 (the fix round): checker results and the lead's worklist
+
+`round3-checker-results.json` is the raw return of every agent in the fix workflow — seven fixers
+(what each reproduced, the regression test it wrote, what it could not do inside its own files) and
+the acceptance checkers that re-ran those tests, mutated each fix and classified what survived as
+`regression`, `listed` or `residual`. It is a record of the round, not a list of open defects: a
+checker's `ok: false` is what sent that area into its one bounded re-fix.
+
+`round3-lead-worklist.md` is what came out of reading all of it: the edits only the lead can make
+(the shared test files two areas both depend on, the pinned safety-template digest, the tick report
+field, the test-count floors), the cross-area residuals worth closing in the same round, and the
+items deliberately left open with the reason. Anything in section C of that file is a decision, not
+an oversight, and `docs/ECC_Runs.md` carries the same list.
