@@ -47,4 +47,14 @@ because a parent cannot resolve their own report — only staff can. Both are re
 reasoning, not quietly fixed: a fix round follows, and every finding is reproduced with a failing test
 before anything changes.
 
-As in round 3, these rows are reports, not confirmed defects, until a failing test reproduces one.
+As in round 3, these rows are reports, not confirmed defects, until a failing test reproduces one. The
+file now holds all nine areas: 44 findings (9 high, 15 medium, 20 low) and 120 entries the finders swept
+and found sound.
+
+`round4-fix-plan.json` is how they are routed: the same nine areas as disjoint file sets, every finding
+carrying the finder's mechanism, repro and proof, and the lead's decision on the eighteen where the fix
+was a judgement call rather than a mechanical change — among them that the family's report list is
+bounded per reporter kind (a parent cannot resolve their own report, so an oldest-first page of those
+never drains), that the family-data export carries the fact of a safety notice and not its wording,
+that no cancel-deletion endpoint is being invented to make a wrong notice true (the copy is corrected
+instead), and that migration 0870 revokes the sequence grants DB-R2-04's table sweep missed.
