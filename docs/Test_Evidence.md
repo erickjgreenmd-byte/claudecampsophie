@@ -35,6 +35,8 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | [#61](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36186014426) | `110ff0f` | **success** (20:28–20:36 UTC) | hardening round 2c (BUG-160..164): the tree had passed `scripts/verify.sh` in an isolated worktree: domain 3,656, ui-tokens 4, db 366, contracts 20, mobile 658, web 603, ai 59, api 997 (6,363 tests, 0 failed) |
 | #37 | `1de2803` | **success** (19:49–19:55 UTC) | every step (records and the restored ai floor) |
 | [#64](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36208130669) | `6d4a3a9` | **success** (2026-09-26 01:21–01:28 UTC) | docs-only commit keeping the round-3 checker results and the lead worklist; every step |
+| [#75](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36272272521) | `b802686` | **success** (2026-09-26 21:14–21:21 UTC) | hardening round 5 (BUG-248..BUG-293, migrations 0890/0900/0910): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it, so CI is the independent second run — every step, 6,835 tests |
+| [#72](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36240566534) | `61800cc` | **success** (2026-09-26 12:00–12:08 UTC) | records-only commit closing BUG-244 (lesson L-049, owner action #45 withdrawn); every step |
 | [#71](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36240171334) | `8201fa1` | **success** (2026-09-26 11:52–11:59 UTC) | BUG-244, the idempotent child refresh (migration 0880): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it, so CI is the independent second run, not the first — every step, 6,724 tests |
 | [#69](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36234873570) | `02964f9` | **success** (2026-09-26 10:08–10:16 UTC) | hardening round 4 (BUG-211..246, migration 0870): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,713 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#65](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36214301640) | `8bc022b` | **success** (03:16–03:24 UTC) | hardening round 3 (BUG-165..210, migration 0860): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,614 tests against real Postgres, finance, gate audit, release-artifact build and scan |
@@ -57,6 +59,20 @@ web 741, mobile 733, ai 65, contracts 20, ui-tokens 4 (6,713; 0 failed, 0 skippe
 release-artifact scan with negative control. New suites in this round include
 `apps/web/src/pages/app/PinResetPage.race.test.tsx` and `apps/mobile/src/family/child-session-r2.review.test.ts`
 additions; floors raised to ~95% (api 1,036, domain 3,473, db 382, web 703, mobile 696, ai 61, contracts 19).
+
+`scripts/verify.sh` + `node scripts/assert-test-count.mjs` in the same isolated worktree on the exact tree of
+`b802686` (hardening round 5, migrations 0890/0900/0910), 2026-09-26 20:20–20:52 UTC, exit 0: api 1,128,
+domain 3,656, db 422, web 780, mobile 760, ai 65, contracts 20, ui-tokens 4 (6,835; 0 failed, 0 skipped); gate
+audit; finance; release-artifact scan with negative control. The whole DB suite ran, not a subset, because the
+tree adds three migrations. Floors raised to ~95% of the new counts (api 1,071, db 400, web 741, mobile 722; the
+rest unchanged). `test-results/` was deleted before the run so no filtered run's report could be mistaken for a
+full one — a hazard a fixer reported this round, since `vitest -t …` overwrites the package's report.
+
+Mutation checks in round 5 are recorded per finding in `docs/Bug_Ledger.md` (BUG-248..BUG-293): each fixer named
+the one-line change that turns its test red, each acceptance checker ran that mutation independently and restored
+the file byte-for-byte with `sha256sum -c`, and the lead did the same for the seven items closed by hand. Where a
+finding was a test that could not fail, the mutation IS the evidence — a negative assertion passes on an empty
+page, so nothing but removing the fix proves it bites (lesson L-054).
 
 `scripts/verify.sh` + `node scripts/assert-test-count.mjs` in the same isolated worktree on the exact tree of
 `8201fa1` (BUG-244, migration 0880), 2026-09-26 11:35–11:51 UTC, exit 0: api 1,096, domain 3,656, db 404,

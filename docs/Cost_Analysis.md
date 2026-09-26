@@ -70,6 +70,26 @@ monthly ceiling, because the provider may still bill it. Recorded spend can ther
 during an outage; it never runs below it. After one timed-out extraction attempt at most one more fits the stage
 cap, so a slow provider fails a scan sooner rather than spending past the cap.
 
+Stage ceilings raised in round 5 (BUG-252): extraction and grading go from 150,000 to **216,816 micro-USD**
+(`EXTRACTION_GRADING_COST_MICROS`). The reason is not appetite but reachability — at 150,000 the one raised retry
+after a truncated answer did not FIT from 7 pages up, so a scan inside the product's own ten-page limit was cut off
+and failed with `SCAN_TOO_MANY_QUESTIONS` although every comment in the code promised a retry. 216,816 is the exact
+arithmetic for a full retry at ten pages (4E + 144,000 at E = 18,204 input tokens), not a round number.
+
+What this costs, precisely: **nothing per scan that succeeds.** The ceiling is a cap, and the per-scan spend HOLD it
+sizes (`scan-process.ts`'s `spending()`) settles to actual usage (`settleSpend`), so the raise moves a transient
+reservation, not money: extraction's hold goes 150,000 → 216,816 and grading+verification's 250,000 → 316,816
+micro-USD. The one real effect is at the monthly ceiling — a family within ~67,000 micro-USD (about 6.7 cents) of
+their remaining budget can now be told to wait for a scan they could in fact have afforded. Against that, a scan
+that used to die after one billed generation now finishes.
+
+Known gap, deliberate and owner-visible (owner action #46): grading is bounded by QUESTIONS, not pages, because it
+sends no image. On the same ceiling the full retry is reachable to about 85 questions of average length and to none
+past about 149 — and the count moves with question length, since the bound is in bytes. So a ten-page worksheet of
+dense questions can still be cut off in grading with no retry. Closing that needs a further ceiling raise, which is
+a cost decision, not a code change; `apps/api/tests/jobs-r2.review.test.ts` states the measured numbers and names
+the limit in the case that pins it, rather than implying coverage it does not have.
+
 ## 4. What measurement would change the conclusion
 
 | Measurement | Why it matters | How it will be captured |

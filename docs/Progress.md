@@ -102,18 +102,42 @@ then gate, push and record as the earlier rounds did.
    remedy: refresh is idempotent on a client `refreshRequestId` the device keeps across its own retries and
    across a cold start (migration 0880, owner action #45 withdrawn, 6,724 tests green). No round-4 finding
    is outstanding.
-   Next: a round-5 adversarial hunt over the round-4 tree. `git diff --shortstat 8bc022b 8201fa1 -- . ':!docs'`
-   is 76 files, 5,088 insertions, 321 deletions — code no finder has read. Brief the areas so their file
-   lists union to exactly that set (lesson L-048).
-3. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
+3. Round 5 is done, and it is the round that read the previous round's fixes. Nine read-only finders swept
+   the round-4 tree (76 files, 5,088 inserted lines that no reviewer had read) and returned 46 findings —
+   3 high, 19 medium, 24 low — plus 132 properties they tried to break and could not. The findings and the
+   lead's decision on each went in BEFORE any fixing (`c46b0c7`, `8f8b6e8`), then seven fixers with seven
+   adversarial checkers, one bounded re-fix round, one final round and a lead pass over the last
+   verifiers' observations. All 46 are closed: `docs/Bug_Ledger.md` BUG-248..BUG-293, lessons L-050..L-054,
+   ECC rows for `wf_b34b376a-83f`, `wf_d57712a9-b6a`, `wf_e1311d21-86a` and `wf_f903d86b-047`, migrations
+   0890, 0900 and 0910, code at `b802686`, 6,835 tests green.
+
+   Three of the 46 were defects in the BUG-244 change committed an hour before the hunt read it, and the
+   worst was a design error: the recovery checked that the replacement token was UNCLAIMED and treated that
+   as proof the response had been lost, which it is not (lesson L-050). It is now bounded to two minutes
+   from the rotation, ANDed with the id, and audited. Two more were defects in round-4 fixes: a parent
+   screen that handed the next parent the previous parent's children on a shared tablet, and mobile copy
+   promising a deletion could be cancelled.
+
+   The process defect this round earned is L-052, a sharpening of L-048: the area file lists were verified
+   to cover every file the FINDINGS named, and did — but the file holding the cost ceilings that one fix
+   had to change was named by no finding, so that fixer correctly reported "not my file" and the defect
+   shipped a red test instead of a fix. Four more fixes were built to the edge of a brief and left
+   unconnected. Verify the union against the files the FIXES will touch, which means reading every
+   suggested fix before dispatching.
+
+   Next: a round-6 hunt over the round-5 tree — `git diff --shortstat 8201fa1 b802686 -- . ':!docs'` is
+   73 files, 5,585 insertions, 440 deletions, and no finder has read any of it. The same rule applies, now
+   with L-052: brief the areas so their lists cover every file the fixes will need, not only the files the
+   findings cite.
+4. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
    failing test first and are fixed, every area's acceptance checker ends `ok`, and the lead closed the checkers'
    cross-area residuals in the same round (`docs/Bug_Ledger.md` BUG-165..210, `docs/ECC_Runs.md` `wf_56274b45-95e`,
    code at `8bc022b`, 6,614 tests green). What was not reproduced, and what was deliberately left open, is listed
    in that ECC row rather than dropped. Next: a third finder round over the round-3 tree, or store submission.
-4. Owner actions in `docs/Owner_Actions.md` (#1–#44; #45 is withdrawn — the defect it asked about is fixed) unblock everything else: accounts (Apple, Google Play, Amazon
+5. Owner actions in `docs/Owner_Actions.md` (#1–#44 and #46; #45 is withdrawn — the defect it asked about is fixed) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety
    policy, spend budget, hosted Supabase checks, database production mark, child-safety package approval,
    BUG-096 residual.
-5. Repeat the resume check in the next real session (AC_ECC_09).
+6. Repeat the resume check in the next real session (AC_ECC_09).
