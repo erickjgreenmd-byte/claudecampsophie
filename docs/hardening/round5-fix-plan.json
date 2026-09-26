@@ -1,0 +1,234 @@
+{
+ "round": 5,
+ "base": "8bc022b",
+ "hunt_head": "8201fa1",
+ "hunt_run": "wf_b34b376a-83f",
+ "findings_file": "docs/hardening/round5-hunt-findings.json",
+ "note": "Lead decisions taken BEFORE the fixers ran, committed so a decision cannot be back-fitted to whatever was convenient. Every one of the 46 findings is assigned to exactly one area; the seven file lists are disjoint and their union covers every file any fix needs (lesson L-048: a file carved OUT of one brief is named INTO another in the same breath). scripts/test-minimums.json is the LEAD's alone, raised at gate time. Migration numbers are the lead's: 0890 is reserved for FIX-B and no other area may add a migration.",
+ "global_rules": [
+  "Reproduce first: a failing test that fails for the stated reason BEFORE any production change. Paste the failure in your report.",
+  "Never weaken a test, an RLS policy, a consent/ZDR gate or a verification step to get a pass. If a finding's fix would do that, report it and stop.",
+  "Approved prices ($39.99 first child + $9.99 each additional, 1-4 paid slots) and the six subjects are settled and must not change.",
+  "Money is integer cents. Time is UTC instants plus IANA zones. Domain code takes `now` as input.",
+  "JSON into Postgres is ${JSON.stringify(x)}::text::jsonb or tx.json(x), never a bare ::jsonb (L-006).",
+  "Mobile token sources come only from apps/mobile/src/lib/app-session.ts; never add a second child token refresher (L-007).",
+  "Do NOT touch any file outside your list, do not run repo-wide formatters, do not run git commands that change state, and do not edit any file under docs/.",
+  "A fixture that bypasses the path a property depends on proves the wrong property (L-046). If a finding says a test cannot fail, prove your replacement CAN: state the one-line mutation to the production code that turns it red.",
+  "If you conclude a finding does not reproduce, say so with the evidence that refutes it rather than fixing something adjacent. A refuted finding is a valid outcome."
+ ],
+ "areas": {
+  "FIX-A-child-auth": {
+   "findings": [
+    "HUNT5-A-1",
+    "HUNT5-A-2",
+    "HUNT5-A-3",
+    "HUNT5-A-4",
+    "HUNT5-A-5"
+   ],
+   "files": [
+    "apps/api/src/routes/child-auth.ts",
+    "apps/api/tests/mobile-r2.review.test.ts"
+   ],
+   "lead_decisions": {
+    "HUNT5-A-1": "CONFIRMED by the lead on reading the code; this is a defect in the lead's own change from the same day. Implement EXACTLY this design, do not re-open it: (1) AND a freshness bound onto the existing recovery predicate - a new module constant RECOVERY_WINDOW_MS = 2 * 60_000 expressed in SQL as `row.used_at > now() - interval '2 minutes'` (compute it in the query or compare the selected used_at against the request's `now`, whichever keeps the existing `now` discipline). It is ANDed with the id check, never ORed: the id keeps out a replayer who holds only the token, and the bound keeps out a replay of a request body whose response actually arrived. This is NOT the grace window the lead refused in round 4 - that window was the whole gate and served a blind replayer; this one only shortens a window the id already narrows. (2) Write an AUDIT event on every recovery, not only the info log, so a replay is visible to the family and to ops instead of silent - use the same audit_events shape as the reuse branch with a distinct action. (3) State the residual honestly in the code comment: inside the window, a captured request body (which necessarily contains a live-at-capture refresh token) is still served once, and the device is then unpaired on its next refresh; outside it, behaviour is exactly the pre-BUG-244 unpairing. Keep the existing 'second lost response in a row' case green - it happens within seconds.",
+    "HUNT5-A-2": "CONFIRMED. Set `used_request_id = null` on the retired replacement so only the row the id originally consumed is ever recoverable, and correct the two comments (the 'kills any copy intercepted from the lost response' claim and the 'never gets a recovery window of its own' claim, which is leftover reasoning from the withdrawn design). Add a case: presenting the retired replacement WITH the same id is theft.",
+    "HUNT5-A-3": "CONFIRMED and URGENT - this is a CI time bomb that goes red on 2026-10-01, five days out (L-027). Fix the new fixture AND the pre-existing twin at lines 182-185 in the same pass: build both sessions with database-relative timestamps, since the guard under test compares with the database clock, not the pinned request instant.",
+    "HUNT5-A-4": "CONFIRMED. The docstring now contradicts the shipped code. Rewrite it to describe what the code does.",
+    "HUNT5-A-5": "CONFIRMED if you can show no API path produces that state; if you find one, say which and keep the justification. Either way the comment must match reality."
+   }
+  },
+  "FIX-B-family-privacy": {
+   "findings": [
+    "HUNT5-B-1",
+    "HUNT5-B-2",
+    "HUNT5-B-4",
+    "HUNT5-B-5",
+    "HUNT5-B-6",
+    "HUNT5-B-7"
+   ],
+   "files": [
+    "apps/api/src/routes/family.ts",
+    "apps/api/src/routes/privacy.ts",
+    "apps/api/tests/family-hardening-r4.review.test.ts",
+    "apps/api/tests/privacy-r2.review.test.ts",
+    "supabase/migrations/0890_deletion_slot_release.sql",
+    "supabase/tests/hardening_r5_db.test.ts"
+   ],
+   "carved_out": "packages/contracts/src/privacy.ts is NOT yours even though HUNT5-B-3 lives in it: that file belongs to FIX-F-web-pages, which changes the same copy for HUNT5-F-4 and adds strings for HUNT5-F-5. Do not edit it.",
+   "lead_decisions": {
+    "HUNT5-B-1": "CONFIRMED, and take option (a): keep the MOB-R4-LOCK-06 404 (client/server agreement matters more than the unreachable reconciliation) and make the prose and the test honest. Keep the release statement itself as idempotent defence in depth, but rewrite the comment to say there is NO production path that produces 'archived with an open slot assignment' once the 404 is in place, and rewrite the FL-R4-01 test so its name and comment say it covers that defensive path only - not the deletion-pending state, which its fixture does not create (this is L-046 again, in the lead's own test).",
+    "HUNT5-B-2": "CONFIRMED - this is the BUG-240 class: a write the Data API can reach that the database does not backstop. Add migration 0890 (the number is reserved for you; add no other migration) that releases the child's slot inside public.request_deletion itself, in the same transaction as the child archive. Keep the API-side statement as an idempotent belt-and-braces. Also fix the misleading SQLSTATE 42501 handling the finding names, which reports 'Enter your parent PIN to continue' for a condition no PIN can satisfy. Prove the database half with a new DB test file supabase/tests/hardening_r5_db.test.ts: call the function as the client role and assert the slot is released.",
+    "HUNT5-B-4": "CONFIRMED. Order the child branch oldest-first like the system branch, since a guardian can resolve a child-filed report, and update the rationale comment. VERIFY FIRST that PATCH /v1/safety-reports/:id really does let a guardian resolve a child-filed report - if only staff can, the finding is refuted and you must say so instead of changing the order.",
+    "HUNT5-B-5": "CONFIRMED, and fix both ends rather than deferring: keep the oldest-first window that drains AND always include the newest unresolved row of each kind, so the flag the email points the parent at is never absent from the page. Keep the total bounded.",
+    "HUNT5-B-6": "CONFIRMED. Narrow the sweep to the text columns it means, so the flake its own comment claims to have removed is actually removed.",
+    "HUNT5-B-7": "CONFIRMED. Rewrite the comment to justify the behaviour by something that exists."
+   }
+  },
+  "FIX-C-jobs-ai-billing": {
+   "findings": [
+    "HUNT5-C-1",
+    "HUNT5-C-2",
+    "HUNT5-C-3",
+    "HUNT5-C-4",
+    "HUNT5-C-5"
+   ],
+   "files": [
+    "packages/ai/src/run.ts",
+    "packages/ai/src/run-truncation.test.ts",
+    "apps/api/tests/jobs-r2.review.test.ts",
+    "apps/api/src/services/billing-sync.ts",
+    "apps/api/src/services/ops-metrics.ts",
+    "apps/api/tests/billing-r2.review.test.ts",
+    "apps/api/src/routes/webhooks.ts",
+    "apps/api/src/jobs/dispatcher.ts"
+   ],
+   "lead_decisions": {
+    "HUNT5-C-1": "CONFIRMED (the finder measured it with the production functions). Do these two things, and NOT the third: (1) rewrite both tests to build the input the caller actually builds - the data envelope PLUS one image part per page - and parameterise over 1..maxPages so the assertion is 'a retry is reachable at every supported page count', which will FAIL at 7-10 pages and is the reproduction. (2) Then make it reachable by raising ONLY the extraction and grading stage cost ceilings to the smallest value that admits a full retry at maxPages, and update docs/Cost_Analysis.md's numbers ONLY by reporting them to the lead - you may not edit docs/. Do NOT refuse a 7-10 page scan up front: rejecting a scan inside the product's own page limit is a product change and is not yours to make. If the raise you compute is more than 2x the current ceiling, stop and report the number instead of applying it.",
+    "HUNT5-C-2": "CONFIRMED - a money defect. Convert by the tax ratio only, never by the whole Charge, and leave lines that are not booked as revenue out of the denominator. Integer cents throughout. Add the proration+refund case beside the existing BILL-R4-3 case.",
+    "HUNT5-C-3": "CONFIRMED. Make the owner-facing note true, or make the code match the note - decide which by what the revenue query actually does, and say which you chose.",
+    "HUNT5-C-4": "CONFIRMED and check the code first: if the revenue query really does sum proration lines that the note calls 'never revenue', the QUERY is the defect and the note is right. Fix whichever is wrong and prove it with a test.",
+    "HUNT5-C-5": "CONFIRMED. The comment claims a guarantee the same file refutes. Rewrite it."
+   }
+  },
+  "FIX-D-database": {
+   "findings": [
+    "HUNT5-D-1",
+    "HUNT5-D-2",
+    "HUNT5-D-3",
+    "HUNT5-D-4"
+   ],
+   "files": [
+    "supabase/tests/hardening_r2_db.test.ts",
+    "supabase/tests/schema_invariants.test.ts",
+    "supabase/tests/core_identity.test.ts"
+   ],
+   "carved_out": "You add NO migration. If a finding can only be fixed by changing SQL in supabase/migrations, report it to the lead instead - migration 0890 belongs to FIX-B and numbering is the lead's.",
+   "lead_decisions": {
+    "HUNT5-D-1": "CONFIRMED. A case that runs as the one role the migration did not revoke cannot fail. Run it as a revoked client role, and state the mutation that turns it red.",
+    "HUNT5-D-2": "CONFIRMED. A guard that silently drops the rows it is meant to catch is worse than no guard. Include sequences that belong to no column.",
+    "HUNT5-D-3": "CONFIRMED. Model the sequence ACL invariants on the table cases properly, including a grant to PUBLIC.",
+    "HUNT5-D-4": "CONFIRMED. Either restore exactly the grant 0001 makes, or describe honestly what the test restores and why the extra column is needed."
+   }
+  },
+  "FIX-E-web-auth": {
+   "findings": [
+    "HUNT5-E-1",
+    "HUNT5-E-2",
+    "HUNT5-E-3",
+    "HUNT5-E-4"
+   ],
+   "files": [
+    "apps/web/src/pages/app/PinResetPage.tsx",
+    "apps/web/src/pages/app/PinResetPage.race.test.tsx",
+    "apps/web/src/pages/app/PinResetPage.test.tsx",
+    "apps/web/src/lib/supabase-auth.ts",
+    "apps/web/src/lib/auth.ts",
+    "apps/web/src/components/SignOutControl.tsx",
+    "apps/web/src/App.signout.test.tsx",
+    "apps/web/src/pages/auth/UpdatePasswordPage.tsx",
+    "apps/web/src/pages/auth/UpdatePasswordPage.reauth.test.tsx",
+    "apps/web/src/pages/auth/UpdatePasswordPage.test.tsx",
+    "apps/web/src/pages/admin/MfaPage.tsx"
+   ],
+   "carved_in": "apps/web/src/pages/admin/MfaPage.tsx is carved INTO your area (it was in nobody's hunt brief): HUNT5-E-1's fix changes the adapter methods that page also reads, so you own keeping it correct.",
+   "lead_decisions": {
+    "HUNT5-E-1": "CONFIRMED, and security-relevant: a failed two-step lookup must never be spendable as 'this account has no second factor'. Make the failure distinguishable at the adapter (a result type or an explicit 'unknown'), keep the page's refusal branch reachable, and make sure a wrong answer is not memoised for the life of the page. Update MfaPage.tsx to the new shape so it cannot offer a fresh enrollment when a factor already exists.",
+    "HUNT5-E-2": "CONFIRMED. If this browser's session is gone, the page must stop showing the family's data and stop advising a retry that cannot reach the server. Navigate away and carry an honest notice; keep the stay-put behaviour only for the case where the session really is still here.",
+    "HUNT5-E-3": "CONFIRMED. Fix the rationale and make the test fail if the refusal is not reported.",
+    "HUNT5-E-4": "CONFIRMED. Decide 'is the recovery grant still open?' at SUBMIT time, not at render time, so a form filled inside the window and submitted after it expires is refused."
+   }
+  },
+  "FIX-F-web-pages": {
+   "findings": [
+    "HUNT5-B-3",
+    "HUNT5-F-1",
+    "HUNT5-F-2",
+    "HUNT5-F-3",
+    "HUNT5-F-4",
+    "HUNT5-F-5",
+    "HUNT5-F-6",
+    "HUNT5-F-7",
+    "HUNT5-F-8",
+    "HUNT5-F-9",
+    "HUNT5-F-10",
+    "HUNT5-F-11"
+   ],
+   "files": [
+    "apps/web/src/pages/app/ChildrenPage.tsx",
+    "apps/web/src/pages/app/ChildrenPage.archive.test.tsx",
+    "apps/web/src/pages/app/ChildrenPage.profile.test.tsx",
+    "apps/web/src/pages/app/ArchivedChildCopy.test.tsx",
+    "apps/web/src/pages/app/HomeworkPage.tsx",
+    "apps/web/src/pages/app/HomeworkPage.test.tsx",
+    "apps/web/src/pages/app/LearningPlannerPage.tsx",
+    "apps/web/src/pages/app/PrivacyControlsPage.tsx",
+    "apps/web/src/pages/app/PrivacyControlsPage.test.tsx",
+    "apps/web/src/pages/app/PrivacyControlsPage.download.test.tsx",
+    "apps/web/src/pages/app/FamilyDashboardPage.tsx",
+    "apps/web/src/pages/app/FamilyDashboardPage.save.test.tsx",
+    "packages/contracts/src/privacy.ts"
+   ],
+   "carved_in": "packages/contracts/src/privacy.ts is carved INTO your area from FIX-B (HUNT5-B-3 lives there): you own both the one-line copy fix and the new strings HUNT5-F-5 needs, so the portal and the app say the same thing. FIX-B has been told not to touch it.",
+   "lead_decisions": {
+    "HUNT5-B-3": "CONFIRMED, same root as HUNT5-F-4. The copy must name the surface that actually has the consent control. Fix it once in the contract so both clients inherit it.",
+    "HUNT5-F-1": "CONFIRMED - BUG-222's defect was not actually closed. Snapshot the seed once and diff against that, and fix the identical shape on FamilyDashboardPage. A parent's concurrent edit must not be reverted by a sibling reload.",
+    "HUNT5-F-2": "CONFIRMED. Carry deletionPending through both pickers' local schemas and branch on it before the archived branch. A child whose data is being purged must not be told its history is kept, and must not be offered an activation the API refuses.",
+    "HUNT5-F-3": "CONFIRMED. Close the edit form when the status changes, from any source.",
+    "HUNT5-F-4": "CONFIRMED, fixed by the same contract change as HUNT5-B-3.",
+    "HUNT5-F-5": "CONFIRMED. Add honest copy for CHILD_ARCHIVED and CHILD_NOT_ACTIVE in the contract next to the consent string, and wire both. The page must not tell a parent to rescan when the API will refuse it.",
+    "HUNT5-F-6": "CONFIRMED. One voice per state.",
+    "HUNT5-F-7": "CONFIRMED. Make the claim true or drop it.",
+    "HUNT5-F-8": "CONFIRMED. Align with whatever FIX-E-web-auth makes true of a refused sign-out; if you cannot tell, state the assumption in your report so the lead can reconcile the two areas.",
+    "HUNT5-F-9": "CONFIRMED. The comment describes behaviour the same commit removed.",
+    "HUNT5-F-10": "CONFIRMED. The notice and the section below it must not contradict each other.",
+    "HUNT5-F-11": "CONFIRMED. A fake that resolves an unvalidated fixture hides exactly the defects the contract schema exists to catch. Parse through the real schema, as the production client does."
+   }
+  },
+  "FIX-MOBILE": {
+   "findings": [
+    "HUNT5-G-1",
+    "HUNT5-G-2",
+    "HUNT5-G-3",
+    "HUNT5-G-4",
+    "HUNT5-G-5",
+    "HUNT5-H-1",
+    "HUNT5-H-2",
+    "HUNT5-H-3",
+    "HUNT5-H-4",
+    "HUNT5-H-5"
+   ],
+   "files": [
+    "apps/mobile/src/family/child-session.ts",
+    "apps/mobile/src/family/child-session.test.ts",
+    "apps/mobile/src/family/child-session-r2.review.test.ts",
+    "apps/mobile/src/family/runtime.ts",
+    "apps/mobile/src/family/ui.tsx",
+    "apps/mobile/src/family/family-view.ts",
+    "apps/mobile/src/family/family-view.test.ts",
+    "apps/mobile/src/family/screens-r2.review.test.ts",
+    "apps/mobile/src/lib/mode.ts",
+    "apps/mobile/src/lib/mode-r2.review.test.ts",
+    "apps/mobile/src/lib/app-session.ts",
+    "apps/mobile/src/lib/app-session.test.ts",
+    "apps/mobile/app/(parent)/children.tsx",
+    "apps/mobile/app/(child)/scan.tsx",
+    "apps/mobile/src/homework/upload.ts",
+    "apps/mobile/src/homework/upload.test.ts",
+    "apps/mobile/src/homework/scan-screen.test.ts"
+   ],
+   "note": "G and H were separate hunt areas but are ONE fix area, because HUNT5-H-1's fix spans ui.tsx (H) and app-session.ts (G) and splitting it would leave the seam to nobody.",
+   "lead_decisions": {
+    "HUNT5-G-1": "CONFIRMED - a defect in the lead's own change from the same day. Clear the pending id when the session ends (forget) and when a new pairing starts, AND make the id's write to storage unconditional before the request goes out, so the documented invariant holds on every path rather than only when the id is minted.",
+    "HUNT5-G-2": "CONFIRMED. Make the test test its title, or retitle it and delete the unreachable mock branch that implies coverage it does not have. State the mutation that turns your version red.",
+    "HUNT5-G-3": "CONFIRMED. Sample the generation only once the token is resolved, so a call that triggered its own refresh cannot invalidate the token it just received.",
+    "HUNT5-G-4": "CONFIRMED. A lock into the child space must leave adult screen privacy in the state the next adult expects.",
+    "HUNT5-G-5": "CONFIRMED. The comment claims a fix the code does not implement - and HUNT5-H-1 is that same harm, still live. Fix the code (with H-1) and then the comment.",
+    "HUNT5-H-1": "CONFIRMED by the lead on reading the code, and the most serious finding in this area: one parent's children can stay on screen for the next parent on a handed-on tablet. Implement the identity-generation fix: record who the 'ready' state belongs to, compare on every re-check, and publish fresh state when the identity differs so the screen refetches. Keep the no-flash behaviour for an ordinary back-navigation by the SAME adult - that is all the branch was added for. The assertion and rationale in screens-r2.review.test.ts that claim the opposite must change with it.",
+    "HUNT5-H-2": "CONFIRMED. Take the web client's wording verbatim so the two surfaces agree, and add the assertion that the copy contains no promise of a cancel. A parent must never be told the app will undo a deletion it cannot undo.",
+    "HUNT5-H-3": "CONFIRMED. Say what is true on that screen. Match the web client.",
+    "HUNT5-H-4": "CONFIRMED. A cancel that never reached the server must not be reported as a successful stop. Keep the attempt so the retry stays idempotent, and tell the child something true.",
+    "HUNT5-H-5": "CONFIRMED. The contract doc describes the pre-widening behaviour."
+   }
+  }
+ }
+}
