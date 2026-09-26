@@ -92,20 +92,25 @@ then gate, push and record as the earlier rounds did.
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Round 4 is done: nine read-only finders swept the round-3 diff (112 files, ~11k inserted lines) and
-   returned 44 findings, of which 43 are fixed and closed (`docs/Bug_Ledger.md` BUG-211..246, ECC rows for
-   `wf_8f2c40ab-4dd` and `wf_b0dabd41-8b0`, code at `02964f9`, 6,713 tests green). Two of the 44 were
-   defects in round 3's own fixes, both written by the lead. ONE is deliberately open: BUG-244, a lost
-   `/v1/child/refresh` response still unpairs a child's tablet — the fix that would close it cheaply is a
-   grace window, which would hand a replayer a live session in the same conditions, so the theft gate stays
-   closed until an idempotent refresh keyed on a client request id can be designed. That is the next code
-   round's first item.
+2. Round 4 is done and now fully closed: nine read-only finders swept the round-3 diff (112 files, ~11k
+   inserted lines) and returned 44 findings, 43 of which were fixed in the round itself
+   (`docs/Bug_Ledger.md` BUG-211..246, ECC rows for `wf_8f2c40ab-4dd` and `wf_b0dabd41-8b0`, code at
+   `02964f9`, 6,713 tests green). Two of the 44 were defects in round 3's own fixes, both written by the
+   lead. The one held open — BUG-244, a lost `/v1/child/refresh` response unpairing a child's tablet — was
+   held open on purpose rather than closed with the cheap remedy (a grace window, which would hand a
+   replayer a live session in the same conditions, lesson L-047). It is now closed with the designed
+   remedy: refresh is idempotent on a client `refreshRequestId` the device keeps across its own retries and
+   across a cold start (migration 0880, owner action #45 withdrawn, 6,724 tests green). No round-4 finding
+   is outstanding.
+   Next: a round-5 adversarial hunt over the round-4 tree. `git diff --shortstat 8bc022b 8201fa1 -- . ':!docs'`
+   is 76 files, 5,088 insertions, 321 deletions — code no finder has read. Brief the areas so their file
+   lists union to exactly that set (lesson L-048).
 3. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
    failing test first and are fixed, every area's acceptance checker ends `ok`, and the lead closed the checkers'
    cross-area residuals in the same round (`docs/Bug_Ledger.md` BUG-165..210, `docs/ECC_Runs.md` `wf_56274b45-95e`,
    code at `8bc022b`, 6,614 tests green). What was not reproduced, and what was deliberately left open, is listed
    in that ECC row rather than dropped. Next: a third finder round over the round-3 tree, or store submission.
-4. Owner actions in `docs/Owner_Actions.md` (#1–#45) unblock everything else: accounts (Apple, Google Play, Amazon
+4. Owner actions in `docs/Owner_Actions.md` (#1–#44; #45 is withdrawn — the defect it asked about is fixed) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety

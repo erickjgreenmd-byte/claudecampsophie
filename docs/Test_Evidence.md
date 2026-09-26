@@ -35,6 +35,7 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | [#61](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36186014426) | `110ff0f` | **success** (20:28–20:36 UTC) | hardening round 2c (BUG-160..164): the tree had passed `scripts/verify.sh` in an isolated worktree: domain 3,656, ui-tokens 4, db 366, contracts 20, mobile 658, web 603, ai 59, api 997 (6,363 tests, 0 failed) |
 | #37 | `1de2803` | **success** (19:49–19:55 UTC) | every step (records and the restored ai floor) |
 | [#64](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36208130669) | `6d4a3a9` | **success** (2026-09-26 01:21–01:28 UTC) | docs-only commit keeping the round-3 checker results and the lead worklist; every step |
+| [#71](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36240171334) | `8201fa1` | **success** (2026-09-26 11:52–11:59 UTC) | BUG-244, the idempotent child refresh (migration 0880): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it, so CI is the independent second run, not the first — every step, 6,724 tests |
 | [#69](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36234873570) | `02964f9` | **success** (2026-09-26 10:08–10:16 UTC) | hardening round 4 (BUG-211..246, migration 0870): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,713 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#65](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36214301640) | `8bc022b` | **success** (03:16–03:24 UTC) | hardening round 3 (BUG-165..210, migration 0860): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,614 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#35](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36049019610) | `e123e5c` | **success** (19:34–19:40 UTC) | every step, after 15:00 UTC real time: confirms the BUG-090 clock fix (at 4a07ac9 the pinned-clock tests would fail after 15:00) |
@@ -56,6 +57,17 @@ web 741, mobile 733, ai 65, contracts 20, ui-tokens 4 (6,713; 0 failed, 0 skippe
 release-artifact scan with negative control. New suites in this round include
 `apps/web/src/pages/app/PinResetPage.race.test.tsx` and `apps/mobile/src/family/child-session-r2.review.test.ts`
 additions; floors raised to ~95% (api 1,036, domain 3,473, db 382, web 703, mobile 696, ai 61, contracts 19).
+
+`scripts/verify.sh` + `node scripts/assert-test-count.mjs` in the same isolated worktree on the exact tree of
+`8201fa1` (BUG-244, migration 0880), 2026-09-26 11:35–11:51 UTC, exit 0: api 1,096, domain 3,656, db 404,
+web 741, mobile 738, ai 65, contracts 20, ui-tokens 4 (6,724; 0 failed, 0 skipped); gate audit; finance;
+release-artifact scan with negative control. The whole DB suite ran, not a subset, because the tree adds
+migration 0880. Floors raised to ~95% of the new counts (api 1,041, db 383, mobile 701; the rest unchanged).
+Two mutation checks were run outside the gate and are recorded in `docs/Bug_Ledger.md` BUG-244: removing
+`row.used_request_id === refreshRequestId` from the server's recovery guard turns a replay with the wrong id
+into a 200 and fails the test that demands a 401; removing the `setItem` that persists the request id fails
+the cold-start case. Both files were restored byte-for-byte and re-checked with `sha256sum -c` before the
+gate ran.
 
 One flaky assertion was found and fixed rather than re-run: the CS-R4-02 export test searched
 `JSON.stringify(rows)` for the hotline digits, and a v4 UUID or a millisecond timestamp can contain '988'
