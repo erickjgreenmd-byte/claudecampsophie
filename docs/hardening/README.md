@@ -31,3 +31,20 @@ checker's `ok: false` is what sent that area into its one bounded re-fix.
 field, the test-count floors), the cross-area residuals worth closing in the same round, and the
 items deliberately left open with the reason. Anything in section C of that file is a decision, not
 an oversight, and `docs/ECC_Runs.md` carries the same list.
+
+## Round 4: the finder round over the round-3 tree
+
+`round4-hunt-findings.json` is the raw return of nine read-only finders over the `110ff0f..8bc022b`
+diff — 112 files and about 11,000 inserted lines written by seven different agents in one round, none
+of it reviewed by anyone but its own area's checker. Each finder had to give a mechanism, the input or
+state that triggers it, a repro, and a proof where one was cheap; each also reports what it swept and
+found sound, so a thin sweep is visible instead of reading as a clean bill of health.
+
+The round found defects in the previous round's own fixes, including two the lead wrote: the bounded
+password-recovery grant is bypassed on the mobile-link path by a local state flag ORed in front of it,
+and the oldest-end bound on the family's safety-report list does not drain for parent-filed reports,
+because a parent cannot resolve their own report — only staff can. Both are recorded here with the
+reasoning, not quietly fixed: a fix round follows, and every finding is reproduced with a failing test
+before anything changes.
+
+As in round 3, these rows are reports, not confirmed defects, until a failing test reproduces one.
