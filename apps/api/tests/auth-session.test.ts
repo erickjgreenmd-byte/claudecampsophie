@@ -299,6 +299,51 @@ describe('identity housekeeping for the scheduled tick', () => {
     expect(new Set(left.map((r) => r.id))).toEqual(new Set([live, recent]));
   });
 
+  it('prunes dead pairing codes past the horizon and spend holds expired over a day (DB-R2-08)', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const childId = fam.children[0]!.id;
+    // Each insert consumes the child's previous live code (migration 0720), so the state under test
+    // is stamped after the insert.
+    const code = async (
+      label: string,
+      parts: { expiresDaysAgo: number; consumedDaysAgo?: number },
+    ) => {
+      const hash = Buffer.from(label.padEnd(24, '.'));
+      await api.db.sql`
+        insert into private.child_pairing_codes (family_id, child_id, code_hash, created_by, expires_at)
+        values (${fam.familyId}, ${childId}, ${hash}, ${fam.ownerId}, now() + interval '10 minutes')`;
+      await api.db.sql`
+        update private.child_pairing_codes
+           set created_at = now() - interval '100 days',
+               expires_at = now() - make_interval(days => ${parts.expiresDaysAgo}),
+               consumed_at = ${parts.consumedDaysAgo === undefined ? null : api.db.sql`now() - make_interval(days => ${parts.consumedDaysAgo})`}
+         where code_hash = ${hash}`;
+    };
+    // A live code (expiry still ahead) is kept; so is one that died a day ago.
+    await code('hk-live', { expiresDaysAgo: -1 });
+    await code('hk-recent', { expiresDaysAgo: 1 });
+    await code('hk-old-expired', { expiresDaysAgo: 60 });
+    await code('hk-old-consumed', { expiresDaysAgo: -1, consumedDaysAgo: 60 });
+    await api.db.sql`
+      insert into private.ai_spend_holds (period_key, micros, expires_at, created_at)
+      values ('2026-09', 100, now() + interval '5 minutes', now()),
+             ('2026-09', 100, now() - interval '2 hours', now() - interval '3 hours'),
+             ('2026-08', 100, now() - interval '9 days', now() - interval '10 days')`;
+
+    // The tick clock is far ahead; every row here is aged by the database clock instead.
+    const result = await runIdentityHousekeeping(api.apiDb, new Date('2027-06-01T00:00:00Z'));
+    expect(result.endedCredentialRows).toBeGreaterThanOrEqual(3);
+    const codes = await api.db.sql<{ code_hash: Buffer }[]>`
+      select code_hash from private.child_pairing_codes where family_id = ${fam.familyId}`;
+    expect(codes.map((r) => r.code_hash.toString().replace(/\.+$/, '')).sort()).toEqual([
+      'hk-live',
+      'hk-recent',
+    ]);
+    const holds = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from private.ai_spend_holds`;
+    expect(holds[0]!.n).toBe(2);
+  });
+
   it('a tick clock far ahead of the database never purges a fresh sign-out record', async () => {
     const fam = await seedFamily(api.db);
     const KEPT = '5e551011-0000-4000-8000-0000000000c1';

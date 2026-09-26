@@ -60,7 +60,10 @@ describe('SecurityPage', () => {
 
   it('unlocks with the PIN, shows when the unlock ends and clears the field', async () => {
     const user = userEvent.setup();
-    const { api, sends } = fakeApi(() => ({ unlockedUntil: '2026-09-24T15:05:00.000Z' }));
+    const { api, sends } = fakeApi(() => ({
+      unlockedUntil: '2026-09-24T15:05:00.000Z',
+      unlockSeconds: 300,
+    }));
     renderPage(<SecurityPage />, { api });
     const input = await screen.findByLabelText('Parent PIN');
     await user.type(input, '482913');

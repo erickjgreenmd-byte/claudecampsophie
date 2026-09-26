@@ -79,9 +79,12 @@ describe('ChildrenPage', () => {
     expect(screen.getByRole('link', { name: 'subscription' }).getAttribute('href')).toBe(
       '/app/subscription',
     );
-    // Draft children cannot be paired and say why (no dead button).
+    // Draft children cannot be paired and say why (no dead button). WEB-R2-03 added Edit profile
+    // and Archive to every live profile, so this asks for no pairing/activation button in
+    // particular rather than for no button at all — the original blanket assertion would now
+    // forbid the very controls that finding required.
     const sam = screen.getByRole('heading', { name: 'Sam' }).closest('li')!;
-    expect(within(sam).queryByRole('button')).toBeNull();
+    expect(within(sam).queryByRole('button', { name: /pair|slot/i })).toBeNull();
     expect(within(sam).getByText(/once Sam has a paid slot/)).toBeTruthy();
     expect(
       within(sam).getByText(
@@ -103,7 +106,8 @@ describe('ChildrenPage', () => {
       }).api,
     });
     const sam = (await screen.findByRole('heading', { name: 'Sam' })).closest('li')!;
-    expect(within(sam).queryByRole('button')).toBeNull();
+    // As above (WEB-R2-03): no pairing or slot button, while Edit profile and Archive stay.
+    expect(within(sam).queryByRole('button', { name: /pair|slot/i })).toBeNull();
     expect(within(sam).getByText(/no paid child slots yet/)).toBeTruthy();
   });
 

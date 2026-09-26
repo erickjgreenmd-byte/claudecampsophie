@@ -3,6 +3,8 @@ import { isValidIanaZone } from '@pencillift/domain';
 import {
   createChildProfileRequestSchema,
   createFamilyRequestSchema,
+  updateChildProfileRequestSchema,
+  updateFamilyRequestSchema,
   uuidSchema,
 } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
@@ -22,6 +24,40 @@ import { toHex } from '../security/crypto.ts';
  * product limit (archiving keeps history and frees room, spec P11).
  */
 export const CHILD_PROFILE_LIMIT = 12;
+
+/**
+ * A child of the caller's family that is still visible, i.e. has no data deletion under way
+ * (API-AUTH-R2-02, the same rule the learning, rewards and export reads apply). Spec P4 asks for a
+ * deletion request to stop processing immediately, so activation, pairing and profile edits must all
+ * refuse a child whose deletion is `requested` or `processing`: before this, `activate` looked only
+ * at the status it had just set to `archived`, so a deletion-pending child could be made active
+ * again, paired with a new device and used to collect new homework until the purge ran — and the
+ * purge then removed the profile and everything added since, without warning.
+ *
+ * Returns undefined for an unknown id, another family's child and a child under deletion alike, so
+ * a caller learns nothing from the difference (NOT_FOUND on every one).
+ */
+async function visibleChild(
+  tx: Tx,
+  familyId: string,
+  childId: string,
+): Promise<
+  { status: string; nickname: string; grade_level: number; age_band: string } | undefined
+> {
+  const [row] = await tx<
+    { status: string; nickname: string; grade_level: number; age_band: string }[]
+  >`
+    select c.status, c.nickname, c.grade_level, c.age_band from public.child_profiles c
+      -- A whole-family deletion tombstones the family instead of the child row (migration 0600
+      -- request_deletion), so the join covers that scope the way ownedChild's does.
+      join public.families f on f.id = c.family_id and f.deleted_at is null
+     where c.id = ${childId} and c.family_id = ${familyId}
+       and not exists (
+         select 1 from public.deletion_requests d
+          where d.family_id = c.family_id and d.target_child_id = c.id
+            and d.status in ('requested', 'processing'))`;
+  return row;
+}
 
 /** Family, child profile and device management for signed-in parents. */
 export function familyRoutes(): Hono<AppEnv> {
@@ -63,10 +99,33 @@ export function familyRoutes(): Hono<AppEnv> {
       family: await tx<{ id: string; display_name: string; timezone: string }[]>`
         select id, display_name, timezone from public.families where id = ${familyId}`,
       children: await tx<
-        { id: string; nickname: string; grade_level: number; age_band: string; status: string }[]
+        {
+          id: string;
+          nickname: string;
+          grade_level: number;
+          age_band: string;
+          status: string;
+          deletion_pending: boolean;
+        }[]
       >`
-        select id, nickname, grade_level, age_band, status from public.child_profiles
-         where family_id = ${familyId} order by created_at`,
+        select c.id, c.nickname, c.grade_level, c.age_band, c.status,
+               -- A child whose data deletion is under way stays LISTED here and is flagged instead
+               -- (API-AUTH-R2-02). Dropping it broke the one thing this list is for on the privacy
+               -- screens: they resolve a nickname out of it for the pending-deletion list, that
+               -- child's export rows and any safety report about it, so a family with two children
+               -- could no longer tell which child a still-cancellable request covered. The rules
+               -- that matter are enforced where they act: activation, pairing and profile edits go
+               -- through visibleChild() and answer NOT_FOUND, with migration 0860's trigger as the
+               -- database backstop. The flag lets the parent screens label the row and offer no
+               -- control on it.
+               exists (
+                 select 1 from public.deletion_requests d
+                  where d.family_id = c.family_id
+                    and (d.scope = 'family' or d.target_child_id = c.id)
+                    and d.status in ('requested', 'processing')) as deletion_pending
+          from public.child_profiles c
+         where c.family_id = ${familyId}
+         order by c.created_at`,
       capacity: await tx<
         { paid_slots: number; conflict: string | null; managing_channel: string | null }[]
       >`
@@ -86,7 +145,41 @@ export function familyRoutes(): Hono<AppEnv> {
         gradeLevel: ch.grade_level,
         ageBand: ch.age_band,
         status: ch.status,
+        deletionPending: ch.deletion_pending,
       })),
+    });
+  });
+
+  /**
+   * Correcting the family's name and time zone (WEB-R2-03). The zone was set once from the
+   * browser's guess at creation and nothing could fix it afterwards, yet every schedule, review
+   * release and report is planned in it. Step-up guarded and audited like every other family write.
+   */
+  r.patch('/family', async (c) => {
+    const { deps, parent } = c.var;
+    const familyId = await currentFamilyId(c);
+    await assertRecentUnlock(c);
+    const body = await readJson(c, updateFamilyRequestSchema);
+    // The database check (families_timezone_iana, migration 0720) is the guarantee; this gives the
+    // parent a field-level message instead of a constraint violation.
+    if (body.timezone !== undefined && !isValidIanaZone(body.timezone))
+      throw new ApiError('VALIDATION_FAILED', 'Invalid time zone');
+    const row = await deps.db.asService(async (tx) => {
+      const [updated] = await tx<{ id: string; display_name: string; timezone: string }[]>`
+        update public.families
+           set display_name = coalesce(${body.displayName ?? null}, display_name),
+               timezone = coalesce(${body.timezone ?? null}, timezone)
+         where id = ${familyId} and deleted_at is null
+        returning id, display_name, timezone`;
+      if (!updated) return undefined;
+      await tx`
+        insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id)
+        values (${familyId}, ${parent.userId}, 'parent', 'family.profile_updated', 'family', ${familyId})`;
+      return updated;
+    });
+    if (!row) throw new ApiError('NOT_FOUND', 'Create your family first');
+    return c.json({
+      family: { id: row.id, displayName: row.display_name, timezone: row.timezone },
     });
   });
 
@@ -125,6 +218,60 @@ export function familyRoutes(): Hono<AppEnv> {
     return c.json({ childId: row.id, status: 'draft' }, 201);
   });
 
+  /**
+   * Correcting a child's nickname, grade and age band (WEB-R2-03). The grade is what practice
+   * generation is pitched at (bankGrade/bankCoverage), so with no edit route every family stayed on
+   * last year's grade once the school year rolled over, and the only workaround was deleting the
+   * child's whole history. Step-up guarded and audited; an archived profile stays history-only
+   * (spec P11), and a child under a data deletion is invisible (API-AUTH-R2-02).
+   */
+  r.patch('/children/:childId', async (c) => {
+    const { deps, parent } = c.var;
+    const childId = uuidSchema.safeParse(c.req.param('childId'));
+    if (!childId.success) throw new ApiError('NOT_FOUND', 'Child not found');
+    const familyId = await currentFamilyId(c);
+    await assertRecentUnlock(c);
+    const body = await readJson(c, updateChildProfileRequestSchema);
+    const row = await deps.db.asService(async (tx) => {
+      // Serialize with the family's other profile changes so a concurrent archive or activation
+      // cannot land between the check below and the update.
+      await tx`select 1 from public.families where id = ${familyId} for update`;
+      // Service role bypasses RLS, so ownership is checked explicitly (spec E4).
+      const child = await visibleChild(tx, familyId, childId.data);
+      if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
+      if (child.status === 'archived') {
+        throw businessRule(
+          'CHILD_ARCHIVED',
+          'This child’s profile is archived. Its history stays available, but nothing can be changed unless the profile is active again.',
+        );
+      }
+      const [updated] = await tx<
+        { id: string; nickname: string; grade_level: number; age_band: string; status: string }[]
+      >`
+        update public.child_profiles
+           set nickname = coalesce(${body.nickname ?? null}, nickname),
+               grade_level = coalesce(${body.gradeLevel ?? null}::int, grade_level),
+               age_band = coalesce(${body.ageBand ?? null}, age_band)
+         where id = ${childId.data} and family_id = ${familyId}
+        returning id, nickname, grade_level, age_band, status`;
+      if (!updated) throw new ApiError('NOT_FOUND', 'Child not found');
+      await tx`
+        insert into public.audit_events (family_id, actor_user_id, actor_kind, action, target_type, target_id, metadata)
+        values (${familyId}, ${parent.userId}, 'parent', 'child.profile_updated', 'child', ${childId.data},
+                ${JSON.stringify({ fields: Object.keys(body).sort() })}::text::jsonb)`;
+      return updated;
+    });
+    return c.json({
+      child: {
+        id: row.id,
+        nickname: row.nickname,
+        gradeLevel: row.grade_level,
+        ageBand: row.age_band,
+        status: row.status,
+      },
+    });
+  });
+
   r.post('/children/:childId/pairing-code', async (c) => {
     const { deps, parent } = c.var;
     const childId = uuidSchema.safeParse(c.req.param('childId'));
@@ -138,13 +285,9 @@ export function familyRoutes(): Hono<AppEnv> {
       RATE_RULES.pairingCreatePerFamily,
       now,
     );
-    const [child] = await deps.db.asParent(
-      parent,
-      (tx) =>
-        tx<
-          { status: string }[]
-        >`select status from public.child_profiles where id = ${childId.data} and family_id = ${familyId}`,
-    );
+    // A child under a data deletion is NOT_FOUND here too (API-AUTH-R2-02): spec P4 stops
+    // processing at the request, so no new device may be paired while the purge is pending.
+    const child = await deps.db.asParent(parent, (tx) => visibleChild(tx, familyId, childId.data));
     if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
     if (child.status !== 'active') {
       throw new ApiError(
@@ -199,9 +342,11 @@ export function familyRoutes(): Hono<AppEnv> {
     const result = await deps.db.asService(async (tx) => {
       // Serialize with other slot changes for this family (two guardians, two devices).
       await tx`select 1 from public.families where id = ${familyId} for update`;
-      // Service role bypasses RLS, so ownership is checked explicitly (spec E4).
-      const [child] = await tx<{ status: string }[]>`
-        select status from public.child_profiles where id = ${childId.data} and family_id = ${familyId}`;
+      // Service role bypasses RLS, so ownership is checked explicitly (spec E4). A child whose data
+      // deletion is `requested` or `processing` is NOT_FOUND, never re-activated (API-AUTH-R2-02):
+      // spec P4 stops processing at the request, and the purge would later remove the re-activated
+      // profile and every scan added since without warning.
+      const child = await visibleChild(tx, familyId, childId.data);
       if (!child) throw new ApiError('NOT_FOUND', 'Child not found');
       if (child.status === 'active') return slotSummary(tx, familyId, 'active');
       if (!(await hasVerifiedConsent(tx, familyId, { allowTestProvider }))) {

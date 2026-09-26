@@ -9,6 +9,7 @@ import {
   type ParentPracticeSet,
   type ReviewPdfExportRequest,
 } from '@pencillift/contracts';
+import { ApiRequestError } from '@pencillift/contracts/client';
 import { useApiQuery, useSession } from '../../lib/session.tsx';
 import { ErrorState, Loading } from '../states.tsx';
 import {
@@ -33,10 +34,18 @@ import {
   subjectName,
 } from './format.ts';
 
-/** The API returns at most this many sets (newest first). */
-const SET_LIMIT = 30;
-
 type KindFilter = 'all' | ParentPracticeSet['kind'];
+
+/**
+ * Older pages of the newest-first list (API-AUTH-R2-04). They stay attached only while the first
+ * page still ends at the set they were fetched after (`from`); a refresh that moves that set (a new
+ * daily set arrived) drops them and offers "Show older sets" again, so nothing is ever skipped.
+ */
+interface OlderPages {
+  from: string;
+  sets: ParentPracticeSet[];
+  nextCursor: string | null;
+}
 
 const FILTERS: readonly { value: KindFilter; label: string }[] = [
   { value: 'all', label: 'All practice' },
@@ -62,13 +71,42 @@ export function PracticeSetsSection({
   subjects: readonly ChildSubject[];
   zone: string;
 }) {
+  const { api } = useSession();
   const [filter, setFilter] = useState<KindFilter>('all');
   const path =
     `/v1/children/${encodeURIComponent(childId)}/practice-sets` +
     (filter === 'all' ? '' : `?kind=${filter}`);
   const query = useApiQuery((api) => api.get(path, practiceSetsResponseSchema), [path]);
+  const [older, setOlder] = useState<OlderPages | null>(null);
+  const [olderBusy, setOlderBusy] = useState(false);
+  const [olderError, setOlderError] = useState<string | null>(null);
   const headingId = useId();
   const filterId = useId();
+
+  // API-AUTH-R2-04: keyset paging, so a daily set from earlier in the term — and the answer key and
+  // review PDF reached through its id — stays reachable instead of dropping off a fixed 30.
+  const showOlder = (firstCursor: string, cursor: string) =>
+    void (async () => {
+      setOlderBusy(true);
+      setOlderError(null);
+      try {
+        const page = await api.get(
+          `${path}${path.includes('?') ? '&' : '?'}after=${encodeURIComponent(cursor)}`,
+          practiceSetsResponseSchema,
+        );
+        setOlder((prev) => ({
+          from: firstCursor,
+          sets: [...(prev?.from === firstCursor ? prev.sets : []), ...page.sets],
+          nextCursor: page.nextCursor ?? null,
+        }));
+      } catch (error) {
+        setOlderError(
+          error instanceof ApiRequestError ? error.message : 'Could not load older practice sets.',
+        );
+      } finally {
+        setOlderBusy(false);
+      }
+    })();
 
   return (
     <section className="card" style={sectionStyle} aria-labelledby={headingId}>
@@ -81,7 +119,12 @@ export function PracticeSetsSection({
       <select
         id={filterId}
         value={filter}
-        onChange={(e) => setFilter(e.target.value as KindFilter)}
+        onChange={(e) => {
+          setFilter(e.target.value as KindFilter);
+          // A different filter is a different list: paging starts again from its first page.
+          setOlder(null);
+          setOlderError(null);
+        }}
       >
         {FILTERS.map((f) => (
           <option key={f.value} value={f.value}>
@@ -94,28 +137,94 @@ export function PracticeSetsSection({
         <ErrorState message={query.error.message} onRetry={query.reload} />
       ) : null}
       {query.status === 'ready' ? (
-        query.data.sets.length === 0 ? (
-          <p>
-            No{' '}
-            {filter === 'all'
-              ? 'practice sets'
-              : FILTERS.find((f) => f.value === filter)?.label.toLowerCase()}{' '}
-            yet. They appear here once they are prepared for {childName}.
-          </p>
-        ) : (
-          <>
-            <ul style={listReset}>
-              {query.data.sets.map((set) => (
-                <SetCard key={set.id} set={set} subjects={subjects} zone={zone} />
-              ))}
-            </ul>
-            {query.data.sets.length >= SET_LIMIT ? (
-              <p style={hintStyle}>Showing the {SET_LIMIT} most recent sets.</p>
-            ) : null}
-          </>
-        )
+        <SetList
+          first={query.data.sets}
+          firstCursor={query.data.nextCursor ?? null}
+          older={older}
+          olderBusy={olderBusy}
+          olderError={olderError}
+          onShowOlder={showOlder}
+          childName={childName}
+          filter={filter}
+          subjects={subjects}
+          zone={zone}
+        />
       ) : null}
     </section>
+  );
+}
+
+/** The loaded pages as one list, newest first, with the "Show older sets" control below it. */
+function SetList({
+  first,
+  firstCursor,
+  older,
+  olderBusy,
+  olderError,
+  onShowOlder,
+  childName,
+  filter,
+  subjects,
+  zone,
+}: {
+  first: readonly ParentPracticeSet[];
+  firstCursor: string | null;
+  older: OlderPages | null;
+  olderBusy: boolean;
+  olderError: string | null;
+  onShowOlder: (firstCursor: string, cursor: string) => void;
+  childName: string;
+  filter: KindFilter;
+  subjects: readonly ChildSubject[];
+  zone: string;
+}) {
+  const attached = older !== null && older.from === firstCursor ? older : null;
+  const nextCursor = attached ? attached.nextCursor : firstCursor;
+  const seen = new Set<string>();
+  const sets = [...first, ...(attached?.sets ?? [])].filter((s) =>
+    seen.has(s.id) ? false : (seen.add(s.id), true),
+  );
+  if (sets.length === 0) {
+    return (
+      <p>
+        No{' '}
+        {filter === 'all'
+          ? 'practice sets'
+          : FILTERS.find((f) => f.value === filter)?.label.toLowerCase()}{' '}
+        yet. They appear here once they are prepared for {childName}.
+      </p>
+    );
+  }
+  return (
+    <>
+      <ul style={listReset}>
+        {sets.map((set) => (
+          <SetCard key={set.id} set={set} subjects={subjects} zone={zone} />
+        ))}
+      </ul>
+      {nextCursor !== null && firstCursor !== null ? (
+        <div style={buttonRow}>
+          <button
+            type="button"
+            className="btn secondary"
+            disabled={olderBusy}
+            onClick={() => onShowOlder(firstCursor, nextCursor)}
+          >
+            {olderBusy ? 'Loading older sets…' : 'Show older sets'}
+          </button>
+        </div>
+      ) : (
+        <p style={hintStyle}>
+          {sets.length === 1 ? 'This is the only set' : `All ${sets.length} sets are shown`} for{' '}
+          {childName}.
+        </p>
+      )}
+      {olderError ? (
+        <p role="alert" style={{ color: 'var(--danger)' }}>
+          {olderError}
+        </p>
+      ) : null}
+    </>
   );
 }
 

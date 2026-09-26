@@ -12,6 +12,7 @@ import {
   moderationFlagged,
   OPENAI_MODERATION_CATEGORIES,
   PROVIDER_CATEGORY_MAP,
+  PROVIDER_FALLBACK_CATEGORY,
   providerModerationCodes,
   providerSafetyCategories,
   providerSafetyScreen,
@@ -40,9 +41,13 @@ describe('mapping OpenAI categories to PencilLift categories', () => {
     'harassment/threatening': { child: ['abuse', 'violence'], model_output: ['violence'] },
     'hate/threatening': { child: ['abuse', 'violence'], model_output: ['violence'] },
     'illicit/violent': { child: ['abuse', 'violence'], model_output: ['violence'] },
-    harassment: { child: [], model_output: [] },
-    hate: { child: [], model_output: [] },
-    illicit: { child: [], model_output: [] },
+    // CS-R2-03: these three used to map to nothing, so a flagged answer was graded and coached and
+    // the parent was never told. They now map like their /threatening and /violent siblings (owner
+    // and lead decision, 2026-09-25: recall comes first on a child's own words, and the provider's
+    // threat sub-signal is not what decides whether a grown-up should look).
+    harassment: { child: ['abuse', 'violence'], model_output: ['violence'] },
+    hate: { child: ['abuse', 'violence'], model_output: ['violence'] },
+    illicit: { child: ['abuse', 'violence'], model_output: ['violence'] },
   };
 
   it('covers every OpenAI category exactly once', () => {
@@ -69,10 +74,30 @@ describe('mapping OpenAI categories to PencilLift categories', () => {
     expect(heldFromFamily(providerSafetyCategories(['sexual/minors'], 'child'))).toBe(false);
   });
 
-  it('joins several flags, sorted like the word-list screen, and ignores unknown names', () => {
-    expect(
-      providerSafetyCategories(['violence', 'self-harm/intent', 'sexual', 'made-up'], 'child'),
-    ).toEqual(['self_harm', 'abuse', 'violence', 'sexual']);
+  it('joins several flags, sorted like the word-list screen', () => {
+    expect(providerSafetyCategories(['violence', 'self-harm/intent', 'sexual'], 'child')).toEqual([
+      'self_harm',
+      'abuse',
+      'violence',
+      'sexual',
+    ]);
+  });
+
+  it('an unknown or newly added category name takes the fallback, never nothing (CS-R2-03)', () => {
+    // A category the provider adds after this code shipped used to be dropped ("ignores unknown
+    // names"), which let a flagged answer through unflagged. It now reads as the fallback category.
+    expect(providerSafetyCategories(['self-harm/new-subcategory'], 'child')).toEqual([
+      'abuse',
+      PROVIDER_FALLBACK_CATEGORY,
+    ]);
+    expect(providerSafetyCategories(['made-up'], 'model_output')).toEqual([
+      PROVIDER_FALLBACK_CATEGORY,
+    ]);
+    // A known name next to an unknown one still contributes its own mapping.
+    expect(providerSafetyCategories(['self-harm/intent', 'made-up'], 'model_output')).toEqual([
+      'self_harm',
+      PROVIDER_FALLBACK_CATEGORY,
+    ]);
   });
 
   it('a provider screen merges with the word-list screen: the most serious wins, codes join', () => {
@@ -95,16 +120,36 @@ describe('mapping OpenAI categories to PencilLift categories', () => {
     expect(merged.codes).toContain('PROVIDER_VIOLENCE');
   });
 
-  it('an unmapped flag on child input is a code only, never severe', () => {
+  // CS-R2-03: this test used to assert that a harassment flag on child input "is a code only, never
+  // severe". That assertion was the defect: the answer was then graded, verified, coached and never
+  // reached the parent. The screen now fails closed on the categories.
+  it('a flag with no mapped category is severe with the fallback category (CS-R2-03)', () => {
     expect(
       providerSafetyScreen({ flagged: true, categories: ['harassment'], maxScore: 0.8 }, 'child'),
     ).toEqual({
-      level: 'none',
-      categories: [],
+      level: 'severe',
+      categories: ['abuse', 'violence'],
       topics: [],
       codes: ['PROVIDER_HARASSMENT'],
       truncated: false,
     });
+    // Flagged with no category at all: the fallback, and the payload-free code says as much.
+    expect(providerSafetyScreen({ flagged: true, categories: [], maxScore: 0.8 }, 'child')).toEqual(
+      {
+        level: 'severe',
+        categories: ['abuse', 'violence'],
+        topics: [],
+        codes: ['PROVIDER_FLAGGED'],
+        truncated: false,
+      },
+    );
+    expect(
+      providerSafetyScreen({ flagged: true, categories: [], maxScore: 0.8 }, 'model_output'),
+    ).toMatchObject({ level: 'severe', categories: [PROVIDER_FALLBACK_CATEGORY] });
+    // Nothing reported is still nothing.
+    expect(
+      providerSafetyScreen({ flagged: false, categories: [], maxScore: 0.01 }, 'child'),
+    ).toEqual({ level: 'none', categories: [], topics: [], codes: [], truncated: false });
   });
 
   it('fails closed: reported categories count as flagged even without the flag', () => {

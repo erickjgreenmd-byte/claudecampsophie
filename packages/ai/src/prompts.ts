@@ -39,13 +39,17 @@ const DATA_RULE =
 export const PROMPTS = {
   extraction: {
     id: 'extraction',
-    version: 'extraction.v2',
+    version: 'extraction.v3',
     stage: 'extraction',
     outputName: 'homework_extraction',
     outputSchema: extractionOutputSchema,
     instructions: [
       'You transcribe photographed K-8 homework for a learning app.',
       "List each question with its printed prompt and the student's own written answer exactly as written (keep fraction bars, exponents, units, currency and remainders).",
+      // DB-R2-06: a page with two sections that both number from 1 used to lose a whole section,
+      // because the stored questions are unique per page and printed number. The API now keeps both
+      // under a disambiguated label, and this instruction gives the model the better label first.
+      'When one page has several sections or parts whose numbering restarts (Part A 1-5, then Part B 1-5), prefix the section in the question number ("A1", "B1") so no two questions on a page share a number. Never invent a section that is not printed.',
       "Never confuse teacher marks or printed answer keys with the student's answer. If a question, passage or answer is unreadable, cut off, rotated or missing, mark the page issue and set uncertainty to high instead of guessing.",
       'Do not grade or solve anything in this step.',
       // Defense in depth for LJA-F7: the child sees the transcription, and the child route blanks a

@@ -5,8 +5,10 @@
  *
  * JPEG: an ALLOW-list too: keeps SOI, the segments a decoder needs (frame headers SOFn, DHT, DAC,
  *       DQT, DRI, DHP, EXP, SOS with its scan data, RSTn, TEM, EOI), one JFIF header rewritten
- *       to its fixed 14 bytes (version, units, density; no thumbnail, no trailing bytes) and APP2
- *       segments that are ICC colour profiles. Everything else is dropped: APP1 (Exif, GPS, XMP),
+ *       to its fixed 14 bytes (version, units, density; no thumbnail, no trailing bytes), APP2
+ *       segments that are ICC colour profiles, and — from an Exif APP1 — the single Orientation tag,
+ *       re-emitted in a minimal APP1 of our own so the picture is not sent sideways (JOBS-R2-08).
+ *       Everything else is dropped: the rest of APP1 (Exif, GPS, XMP, thumbnails, maker notes),
  *       APP0 JFXX thumbnails and non-JFIF APP0, APP2 FlashPix/MPF, APP3–APP15, COM, the reserved
  *       JPG/JPGn and low markers, DNL (see below) and any bytes after EOI (RV-lead-jobs-ai-16).
  * PNG:  an ALLOW-list: keeps only the critical chunks (IHDR, PLTE, IDAT, IEND) and the rendering
@@ -83,6 +85,89 @@ const JPEG_MAX_COMPONENTS = 4;
 const JPEG_MAX_SCANS = 100;
 const JFIF_ID = [0x4a, 0x46, 0x49, 0x46, 0x00]; // "JFIF\0"
 const ICC_ID = Array.from('ICC_PROFILE\0', (c) => c.charCodeAt(0));
+const EXIF_ID = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]; // "Exif\0\0"
+/** Exif tag 0x0112: how the camera was held. 1 is "as stored"; 2-8 mean flip and/or rotate. */
+const EXIF_ORIENTATION_TAG = 0x0112;
+
+/**
+ * The Orientation value of an Exif APP1 payload, or null when there is none to keep (no valid TIFF
+ * header, no such tag, or the value is 1 = already upright). Nothing else in the payload is read:
+ * this is a single tag lookup, not an Exif parser, and every offset is bounds-checked.
+ *
+ * JOBS-R2-08: the whole APP1 segment used to be dropped, Orientation with it, and nothing rotated
+ * the pixels. Where the client's own re-encode had failed (both the app and the portal fall back to
+ * uploading the original file), extraction then saw the photo sideways, reported the page as
+ * "rotated" and sent the child back for a retake that failed the same way.
+ */
+function exifOrientation(payload: Uint8Array): number | null {
+  if (!startsWith(payload, EXIF_ID) || payload.length < 6 + 8) return null;
+  const tiff = payload.subarray(6);
+  const little = tiff[0] === 0x49 && tiff[1] === 0x49;
+  const big = tiff[0] === 0x4d && tiff[1] === 0x4d;
+  if (!little && !big) return null;
+  const u16 = (at: number) =>
+    little ? tiff[at]! | (tiff[at + 1]! << 8) : (tiff[at]! << 8) | tiff[at + 1]!;
+  const u32 = (at: number) =>
+    little
+      ? (tiff[at]! | (tiff[at + 1]! << 8) | (tiff[at + 2]! << 16) | (tiff[at + 3]! << 24)) >>> 0
+      : ((tiff[at]! << 24) | (tiff[at + 1]! << 16) | (tiff[at + 2]! << 8) | tiff[at + 3]!) >>> 0;
+  if (u16(2) !== 42) return null;
+  const ifd0 = u32(4);
+  if (ifd0 + 2 > tiff.length) return null;
+  const entries = u16(ifd0);
+  for (let n = 0; n < entries; n += 1) {
+    const entry = ifd0 + 2 + n * 12;
+    if (entry + 12 > tiff.length) return null;
+    // SHORT (type 3) only; the value sits in the first two bytes of the 4-byte value field.
+    if (u16(entry) === EXIF_ORIENTATION_TAG && u16(entry + 2) === 3) {
+      const value = u16(entry + 8);
+      return value >= 2 && value <= 8 ? value : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * A minimal big-endian Exif APP1 carrying nothing but Orientation: a TIFF header, one IFD0 entry and
+ * no further IFD. No GPS, no camera, no timestamp, no thumbnail, no maker note — spec P4's rule
+ * ("strip EXIF and location metadata") is kept: only how to turn the picture the right way up
+ * survives, which is not metadata about the child or the place.
+ */
+function orientationOnlyApp1(orientation: number): Uint8Array {
+  return new Uint8Array([
+    0xff,
+    0xe1,
+    0x00,
+    0x22, // 34 = 2 + the 32-byte payload below
+    ...EXIF_ID,
+    0x4d,
+    0x4d, // big-endian
+    0x00,
+    0x2a, // TIFF magic 42
+    0x00,
+    0x00,
+    0x00,
+    0x08, // IFD0 at offset 8
+    0x00,
+    0x01, // one entry
+    (EXIF_ORIENTATION_TAG >> 8) & 0xff,
+    EXIF_ORIENTATION_TAG & 0xff,
+    0x00,
+    0x03, // SHORT
+    0x00,
+    0x00,
+    0x00,
+    0x01, // count 1
+    0x00,
+    orientation,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00, // no IFD1
+  ]);
+}
 
 /** Frame headers SOF0–SOF15 (0xC0–0xCF without DHT 0xC4, JPG 0xC8 and DAC 0xCC). */
 function isFrameHeader(marker: number): boolean {
@@ -143,6 +228,7 @@ function stripJpeg(bytes: Uint8Array): Uint8Array {
   }
   const kept: Uint8Array[] = [bytes.subarray(0, 2)];
   let sawJfif = false;
+  let sawOrientation = false;
   let frames = 0;
   let scans = 0;
   let i = 2;
@@ -202,6 +288,14 @@ function stripJpeg(bytes: Uint8Array): Uint8Array {
       sawJfif = true;
     } else if (marker === 0xe2 && startsWith(payload, ICC_ID)) {
       kept.push(bytes.subarray(m - 1, segmentEnd));
+    } else if (marker === 0xe1 && !sawOrientation) {
+      // JOBS-R2-08: the Exif APP1 is still dropped; only the Orientation tag is re-emitted, in a
+      // minimal APP1 of our own, so the picture reaches the model the right way up.
+      const orientation = exifOrientation(payload);
+      if (orientation !== null) {
+        kept.push(orientationOnlyApp1(orientation));
+        sawOrientation = true;
+      }
     }
     // Everything else is dropped.
     i = segmentEnd;

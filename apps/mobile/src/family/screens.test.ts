@@ -21,7 +21,10 @@ describe('parent sign-out on the device (MOB-R1-01)', () => {
   it('the sign-out button runs the full device sign-out, not a bare Supabase signOut', () => {
     expect(ui).toMatch(/signOutParentOnDevice\(\)/);
     const runtime = readFileSync(join(import.meta.dirname, 'runtime.ts'), 'utf8');
-    expect(runtime).toMatch(/signOutParent\(secureStorage, modeEffects, parentAuth\)/);
+    // The effects became a parameter (defaulting to modeEffects) so account closure can reuse the
+    // whole device sign-out without the navigation reset (MOB-R2-06); the wiring is unchanged.
+    expect(runtime).toMatch(/signOutParentOnDevice\(\s*effects: ModeEffects = modeEffects,?\s*\)/);
+    expect(runtime).toMatch(/signOutParent\(secureStorage, effects, parentAuth\)/);
     expect(runtime).toMatch(/forgetStoreIdentity\(\)/);
   });
 });

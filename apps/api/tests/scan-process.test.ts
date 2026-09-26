@@ -142,6 +142,8 @@ interface Script {
   questions: ScriptedQuestion[];
   pageIssues?: Record<number, string[]>;
   failStages?: Set<string>;
+  /** Stages whose answer the provider cuts off at `max_output_tokens` (JOBS-R2-02). */
+  truncateStages?: Set<string>;
 }
 
 function scriptedModel(script: Script): ResponsesClient & { requests: ResponsesRequest[] } {
@@ -149,6 +151,15 @@ function scriptedModel(script: Script): ResponsesClient & { requests: ResponsesR
   return createMockResponsesClient((request) => {
     if (script.failStages?.has(request.outputName)) {
       return { kind: 'error', status: 503, retryable: true, latencyMs: 10, timedOut: false };
+    }
+    if (script.truncateStages?.has(request.outputName)) {
+      return {
+        kind: 'incomplete',
+        usage: { inputTokens: 1_200, cachedInputTokens: 0, outputTokens: request.maxOutputTokens },
+        modelId: 'gpt-5.6-terra',
+        latencyMs: 10,
+        reason: 'max_output_tokens',
+      };
     }
     const data = envelope(request).data;
     switch (request.outputName) {
@@ -2199,5 +2210,270 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
     );
     await expect(read('f/c/a/p.jpg')).rejects.toBeInstanceOf(StoredPageTooLarge);
     expect(pulled).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round-2 hardening: truncated answers, paused scans, duplicate printed numbers, flag privacy
+// ---------------------------------------------------------------------------------------------
+
+describe('an answer the provider cut off at its output budget (JOBS-R2-02)', () => {
+  /** Every call is cut off at max_output_tokens: a 50-problem facts sheet does not fit the budget. */
+  function truncatingModel(): ResponsesClient & { requests: ResponsesRequest[] } {
+    return createMockResponsesClient(() => ({
+      kind: 'incomplete',
+      usage: { inputTokens: 1_800, cachedInputTokens: 0, outputTokens: 4_000 },
+      modelId: 'gpt-5.6-terra',
+      latencyMs: 10,
+      reason: 'max_output_tokens',
+    }));
+  }
+
+  it('ends the scan at once with a parent-facing code, never five retries of the same request', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = truncatingModel();
+    const report = await runJobs(deps, handlerFor(client));
+    // Before: the truncation was reported as EXTRACTION_PROVIDER_FAILED, so the job retried the
+    // identical request up to max_attempts (5) and the owner paid for every truncated generation.
+    expect(report).toMatchObject({ succeeded: 1, retried: 0, deadLettered: 0 });
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'SCAN_TOO_MANY_QUESTIONS',
+    });
+    // The allowance is given back: the child's pages were never checked.
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+    // No two calls carried the same output budget: the identical request is never re-sent.
+    const budgets = client.requests.map((r) => r.maxOutputTokens);
+    expect(budgets.length).toBeGreaterThan(0);
+    expect(new Set(budgets).size).toBe(budgets.length);
+  });
+
+  it('a verification answer cut off at its own budget keeps the paid grading for a grown-up (LJA-F4)', async () => {
+    const scan = await queuedScan({ pages: 2 });
+    // Verification's budget is 2,000 tokens, half of grading's: its answer can be cut off on a
+    // scan whose extraction and grading both fitted. Ending the scan there would throw away
+    // grading the owner has already paid for, so this stage degrades exactly as a verification
+    // request too large for its cost cap does (LJA-F4) — nothing is accepted without an
+    // independent check, and the items go to a grown-up.
+    const client = scriptedModel({
+      questions: WORKSHEET,
+      truncateStages: new Set(['independent_verification']),
+    });
+    const report = await runJobs(deps, handlerFor(client));
+    expect(report).toMatchObject({ succeeded: 1, retried: 0, deadLettered: 0 });
+    // The verification stage tried twice (the raised budget is its second attempt) and no more.
+    const verifications = client.requests.filter(
+      (r) => r.outputName === 'independent_verification',
+    );
+    expect(verifications).toHaveLength(2);
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'needs_parent_review',
+      error_code: null,
+    });
+    const graded = await results(scan.assignmentId);
+    expect(graded).toHaveLength(WORKSHEET.length);
+    // Nothing the model alone proposed is accepted: every verdict is either decided by the
+    // model-free key (route 'deterministic', AC_GRADING_04) or sent to a grown-up.
+    for (const r of graded) {
+      if (r.route !== 'deterministic') expect(r.verdict).toBe('needs_parent_review');
+    }
+    expect(graded.some((r) => r.verdict === 'needs_parent_review')).toBe(true);
+    // The allowance stays spent because the pages were read, graded and shown to a grown-up.
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+  });
+});
+
+describe('a scan paused at the spend ceiling (JOBS-R2-06)', () => {
+  // The owner's budget is global, so it is removed again: later tests must not inherit a ceiling.
+  afterAll(async () => {
+    await api.db.sql`delete from public.spend_budgets`;
+  });
+
+  /** A budget so small that every stage estimate is refused. */
+  async function tinyBudget(fam: SeededFamily): Promise<void> {
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', ${api.now.value.toISOString().slice(0, 7)}, 1, ${fam.ownerId})
+      on conflict (scope, period_key) do update set budget_micros = 1`;
+  }
+
+  /** The scan handler with a counting page reader (labeled mock storage). */
+  function countingHandler(reads: { n: number; bytes: number }): Record<string, JobHandler> {
+    return {
+      scan_process: createScanProcessHandler({
+        ai: scriptedModel({ questions: WORKSHEET }),
+        moderation: createMockModerationClient(),
+        readObject: () => {
+          const bytes = syntheticJpeg();
+          reads.n += 1;
+          reads.bytes += bytes.length;
+          return Promise.resolve(bytes);
+        },
+        sleep: () => Promise.resolve(),
+      }),
+    };
+  }
+
+  it('reads no page before the spend hold is granted, and the pause interval grows', async () => {
+    const scan = await queuedScan({ pages: 4 });
+    await tinyBudget(scan.fam);
+    const reads = { n: 0, bytes: 0 };
+    const handlers = countingHandler(reads);
+    const runAfter = async () => {
+      const [row] = await api.db.sql<{ run_after: Date; last_error_code: string | null }[]>`
+        select run_after, last_error_code from public.jobs where id = ${scan.jobId}`;
+      return row!;
+    };
+
+    const first = api.now.value;
+    await runJobs(deps, handlers);
+    // Before: extract() read, hashed, stripped and base64-encoded all four pages before asking for
+    // the hold, so every hourly pause re-read the whole scan from storage.
+    expect(reads).toEqual({ n: 0, bytes: 0 });
+    const paused = await runAfter();
+    expect(paused.last_error_code).toBe('SPEND_CEILING');
+    expect(paused.run_after.getTime() - first.getTime()).toBe(3_600_000);
+
+    // The second pause waits twice as long, so a long ceiling does not mean an hourly poll forever.
+    api.now.value = new Date(first.getTime() + 2 * 3_600_000);
+    await runJobs(deps, handlers);
+    const second = await runAfter();
+    expect(second.run_after.getTime() - api.now.value.getTime()).toBe(2 * 3_600_000);
+    expect(reads).toEqual({ n: 0, bytes: 0 });
+  });
+
+  it('settles to a parent-visible state once it has waited long enough', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    await tinyBudget(scan.fam);
+    const reads = { n: 0, bytes: 0 };
+    const handlers = countingHandler(reads);
+    const start = api.now.value;
+    // Each tick is far enough apart that the job is always due again (and the pinned clock stays
+    // inside the month the tiny budget was written for, L-027).
+    for (let tick = 0; tick < 12; tick += 1) {
+      api.now.value = new Date(start.getTime() + tick * 7 * 3_600_000);
+      await runJobs(deps, handlers);
+    }
+    // Before: the scan stayed failed_retryable/SPEND_CEILING for ever and the child's scan kept
+    // saying "being checked" with no end.
+    expect(await assignment(scan.assignmentId)).toEqual({
+      status: 'failed_final',
+      error_code: 'AI_PAUSED_TOO_LONG',
+    });
+    expect(await reservation(scan.reservationId)).toEqual({
+      status: 'released',
+      release_reason: 'failed_final',
+    });
+    expect(reads.n).toBe(0);
+  });
+});
+
+describe('two questions with the same printed number on one page (DB-R2-06)', () => {
+  it('keeps both, with a disambiguated label and high uncertainty', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // A K-8 worksheet with two sections that both start at 1 (Part A, Part B).
+    const sections: ScriptedQuestion[] = [
+      {
+        page: 1,
+        number: '1',
+        prompt: 'Part A 1. 2 + 3 =',
+        answer: '5',
+        kind: 'numeric',
+        key: '5',
+        primary: { verdict: 'correct', confidence: 'high' },
+        verifier: { verdict: 'correct', confidence: 'high' },
+      },
+      {
+        page: 1,
+        number: '1',
+        prompt: 'Part B 1. 4 + 4 =',
+        answer: '8',
+        kind: 'numeric',
+        key: '8',
+        primary: { verdict: 'correct', confidence: 'high' },
+        verifier: { verdict: 'correct', confidence: 'high' },
+      },
+    ];
+    await runJobs(deps, handlerFor(scriptedModel({ questions: sections })));
+    const rows = await api.db.sql<
+      { question_number: string; prompt_text: string; uncertainty: string | null }[]
+    >`
+      select question_number, prompt_text, uncertainty from public.extracted_questions
+       where assignment_id = ${scan.assignmentId} order by prompt_text`;
+    // Before: the second question hit `seen.has(key)` and was dropped, so Part B was never stored,
+    // graded or shown, and nothing said so.
+    expect(rows.map((r) => r.prompt_text)).toEqual(['Part A 1. 2 + 3 =', 'Part B 1. 4 + 4 =']);
+    expect(rows[0]!.question_number).toBe('1');
+    expect(rows[1]!.question_number).not.toBe('1');
+    expect(rows[1]!.uncertainty).toBe('high');
+    expect(api.logs.map((l) => l.event)).toContain('scan_duplicate_question_label');
+    // Both are checked.
+    expect(await results(scan.assignmentId)).toHaveLength(2);
+  });
+});
+
+describe('the family never learns which kind of concern was flagged (CS-R2-02)', () => {
+  it('the audit row a family member can read carries no category and no provider code', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const disclosure: ScriptedQuestion[] = [
+      WORKSHEET[0]!,
+      {
+        page: 1,
+        number: '2',
+        prompt: 'How did the story make you feel?',
+        answer: 'not great [mock-moderation:self-harm/intent]',
+        kind: 'open_response',
+        subject: 'reading',
+        key: 'any answer about the story',
+        primary: { verdict: 'correct', confidence: 'high' },
+        verifier: { verdict: 'correct', confidence: 'high' },
+      },
+    ];
+    await runJobs(deps, handlerFor(scriptedModel({ questions: disclosure })));
+    const [report] = await api.db.sql<{ id: string; screen_categories: string[] }[]>`
+      select id, screen_categories from public.safety_reports
+       where family_id = ${scan.fam.familyId} and reporter_kind = 'system'`;
+    expect(report).toBeDefined();
+    expect(report!.screen_categories).toContain('self_harm');
+
+    // What a guardian's own token can read through the Data API.
+    const visible = await api.db.asParent(
+      scan.fam.ownerId,
+      (tx) => tx<{ action: string; metadata: Record<string, unknown> }[]>`
+        select action, metadata from public.audit_events where target_id = ${report!.id}`,
+    );
+    // Before: the `safety_report.created` row carried metadata.providerCodes
+    // (PROVIDER_SELF_HARM_INTENT), metadata.source and the screen's categories, and
+    // audit_member_read let any family member select them with their own JWT.
+    const leaked = JSON.stringify(visible);
+    expect(leaked).not.toMatch(/PROVIDER_/);
+    expect(leaked).not.toContain('self_harm');
+    expect(leaked).not.toContain('provider_moderation');
+    // The family still sees that a flag was filed, with the generic marker it already reads on the
+    // report itself (safety_reports.category is granted to `authenticated`).
+    expect(visible.map((r) => r.action)).toEqual(['safety_report.created']);
+
+    // The reviewer-only record keeps the codes, with no family id, so only the family's read closed.
+    const [reviewer] = await api.db.sql<
+      { family_id: string | null; metadata: Record<string, unknown> }[]
+    >`
+      select family_id, metadata from public.audit_events
+       where action = 'safety_screen.codes' and metadata->>'reportId' = ${report!.id}`;
+    expect(reviewer!.family_id).toBeNull();
+    expect(reviewer!.metadata).toMatchObject({
+      providerCodes: ['PROVIDER_SELF_HARM_INTENT'],
+      source: 'provider_moderation',
+      screenCategories: ['self_harm'],
+    });
+    // The family's own token cannot reach that row either.
+    const hidden = await api.db.asParent(
+      scan.fam.ownerId,
+      (tx) => tx<{ id: string }[]>`
+        select id from public.audit_events where action = 'safety_screen.codes'`,
+    );
+    expect(hidden).toEqual([]);
   });
 });

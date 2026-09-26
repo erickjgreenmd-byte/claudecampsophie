@@ -6,6 +6,7 @@ import {
   consentWithdrawResponseSchema,
   createFamilyResponseSchema,
   familyOverviewResponseSchema,
+  updateFamilyResponseSchema,
   type ConsentStatus,
   type FamilyOverview,
 } from '@pencillift/contracts';
@@ -52,7 +53,7 @@ function Dashboard() {
       ) : null}
       {data ? (
         <div aria-busy={family.status === 'loading'}>
-          <FamilySummary data={data} />
+          <FamilySummary data={data} onChanged={family.reload} />
           <ConsentSection />
           <nav aria-label="Family settings" className="card" style={sectionStyle}>
             <h2>Manage</h2>
@@ -83,8 +84,9 @@ function Dashboard() {
   );
 }
 
-function FamilySummary({ data }: { data: FamilyOverview }) {
+function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: () => void }) {
   const active = data.children.filter((c) => c.status === 'active').length;
+  const [editing, setEditing] = useState(false);
   return (
     <section className="card" aria-labelledby="family-title">
       <h2 id="family-title">{data.displayName}</h2>
@@ -92,6 +94,25 @@ function FamilySummary({ data }: { data: FamilyOverview }) {
       <p style={{ margin: '4px 0' }}>
         Paid child slots: <strong>{data.paidSlots}</strong> ({active} in use)
       </p>
+      <div style={buttonRow}>
+        <button
+          type="button"
+          className="btn secondary"
+          aria-expanded={editing}
+          onClick={() => setEditing((open) => !open)}
+        >
+          {editing ? 'Cancel' : 'Edit family name and time zone'}
+        </button>
+      </div>
+      {editing ? (
+        <EditFamilyForm
+          data={data}
+          onSaved={() => {
+            setEditing(false);
+            onChanged();
+          }}
+        />
+      ) : null}
       {data.billingConflict ? (
         <div className="notice" role="note" style={{ marginTop: 8 }}>
           Your subscription needs attention: more than one store reports a plan for this family.
@@ -114,6 +135,93 @@ function FamilySummary({ data }: { data: FamilyOverview }) {
         </ul>
       )}
     </section>
+  );
+}
+
+/**
+ * Correcting the family name and time zone (WEB-R2-03). The zone was taken once from the browser's
+ * guess when the family was created and nothing could change it afterwards, yet every daily release,
+ * weekly review and school report is planned in it. The server validates the zone as IANA, requires
+ * a recent PIN unlock and audits the change.
+ */
+function EditFamilyForm({ data, onSaved }: { data: FamilyOverview; onSaved: () => void }) {
+  const { api } = useSession();
+  const { busy, feedback, run } = useAction();
+  const [name, setName] = useState(data.displayName);
+  const [timezone, setTimezone] = useState(data.timezone);
+  const [fieldError, setFieldError] = useState<string | null>(null);
+  const nameId = useId();
+  const zoneId = useId();
+  const errorId = useId();
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const displayName = name.trim();
+    const zone = timezone.trim();
+    if (displayName.length < 1 || displayName.length > 80) {
+      setFieldError('Enter a family name of 1 to 80 characters.');
+      return;
+    }
+    if (zone.length < 1 || zone.length > 64) {
+      setFieldError('Enter a time zone such as America/Chicago.');
+      return;
+    }
+    setFieldError(null);
+    const ok = await run('save-family', async () => {
+      const result = await api.send(
+        'PATCH',
+        '/v1/family',
+        { displayName, timezone: zone },
+        updateFamilyResponseSchema,
+      );
+      return `Saved. Your family is “${result.family.displayName}” in ${result.family.timezone}.`;
+    });
+    if (ok) onSaved();
+  };
+
+  return (
+    <form onSubmit={(e) => void submit(e)} noValidate>
+      <label htmlFor={nameId}>Family name</label>
+      <input
+        id={nameId}
+        value={name}
+        maxLength={80}
+        autoComplete="off"
+        aria-describedby={fieldError ? errorId : undefined}
+        onChange={(e) => {
+          setName(e.target.value);
+          setFieldError(null);
+        }}
+      />
+      <label htmlFor={zoneId}>Time zone</label>
+      <input
+        id={zoneId}
+        value={timezone}
+        maxLength={64}
+        autoComplete="off"
+        aria-describedby={fieldError ? errorId : undefined}
+        onChange={(e) => {
+          setTimezone(e.target.value);
+          setFieldError(null);
+        }}
+      />
+      {fieldError ? (
+        <p id={errorId} role="alert" style={{ color: 'var(--danger)', margin: '4px 0 0' }}>
+          {fieldError}
+        </p>
+      ) : null}
+      <p style={{ margin: '8px 0 0', fontSize: '0.9rem' }}>
+        Use an IANA zone name such as <code>America/Chicago</code> or <code>Europe/Berlin</code>.
+        Practice release times, weekly reviews and reports all follow this zone. Changing it does
+        not move practice already released.
+      </p>
+      <div style={buttonRow}>
+        <button type="submit" className="btn" disabled={busy !== null}>
+          {busy === 'save-family' ? 'Saving…' : 'Save family details'}
+        </button>
+      </div>
+      <ActionFeedback feedback={feedback} stepUpAction="Saving your family details" />
+    </form>
   );
 }
 

@@ -8,10 +8,12 @@ import { createMobileApi } from '../lib/api.ts';
 import { signOutParent, type ModeEffects } from '../lib/mode.ts';
 import { parentAuth } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
-import { createChildSession } from './child-session.ts';
+import { createChildSession, withChildTokenRetry } from './child-session.ts';
 import { clearAdultCaches, parentTokenSource, stepUpTokenSource } from './parent-session.ts';
 import {
+  biometricOffer,
   BIOMETRIC_ENABLED_KEY,
+  BIOMETRIC_OWNER_KEY,
   BIOMETRIC_PIN_KEY,
   lockParentArea,
   type BiometricPinStore,
@@ -35,8 +37,15 @@ export const childSession = createChildSession({
   now: () => new Date(),
 });
 
-/** Child API client (bearer = the paired child's in-memory access token). */
-export const childApi: ApiClient = createMobileApi(childSession.accessToken);
+/**
+ * Child API client (bearer = the paired child's in-memory access token). A single UNAUTHENTICATED
+ * answer while a cached token was presented drops that token and retries once through the one
+ * refresher above (MOB-R2-02), so a device whose clock moved does not report itself unpaired.
+ */
+export const childApi: ApiClient = withChildTokenRetry(
+  createMobileApi(childSession.accessToken),
+  childSession,
+);
 
 /**
  * Parent API client for parent DATA, or null while parent sign-in is not connected on this device.
@@ -58,16 +67,42 @@ export function stepUpApi(): ApiClient | null {
  * WHEN_PASSCODE_SET_THIS_DEVICE_ONLY, so it never leaves this device, is not backed up, and is
  * readable only after the OS biometric prompt. The server still verifies the PIN on every unlock.
  */
+async function clearBiometricPin(): Promise<void> {
+  await SecureStore.deleteItemAsync(BIOMETRIC_PIN_KEY).catch(() => undefined);
+  await secureStorage.deleteItem(BIOMETRIC_ENABLED_KEY);
+  await secureStorage.deleteItem(BIOMETRIC_OWNER_KEY);
+}
+
 export const biometricPinStore: BiometricPinStore = {
+  /**
+   * The stored PIN belongs to one parent (MOB-R2-06): another signed-in adult, or a new account
+   * after a deletion, is never offered a Face ID unlock that would submit the previous parent's PIN
+   * (a failed attempt counted toward the lockout and read as "Your PIN has changed"). A PIN that
+   * belongs to someone else is removed here rather than left on the device.
+   */
   async isEnabled() {
-    return (await secureStorage.getItem(BIOMETRIC_ENABLED_KEY)) === '1';
+    const [enabled, ownerUserId, signedInUserId] = await Promise.all([
+      secureStorage.getItem(BIOMETRIC_ENABLED_KEY),
+      secureStorage.getItem(BIOMETRIC_OWNER_KEY),
+      parentAuth.userId().catch(() => null),
+    ]);
+    const offer = biometricOffer({ enabled: enabled === '1', ownerUserId }, signedInUserId);
+    if (offer === 'other_user') {
+      await clearBiometricPin();
+      return false;
+    }
+    return offer === 'offer';
   },
   async save(pin) {
+    const userId = await parentAuth.userId();
+    // Without a signed-in parent there is nobody to bind the PIN to, so it is not stored at all.
+    if (userId === null) throw new Error('No signed-in parent to store a biometric PIN for');
     await SecureStore.setItemAsync(BIOMETRIC_PIN_KEY, pin, {
       requireAuthentication: true,
       authenticationPrompt: 'Unlock the parent area',
       keychainAccessible: SecureStore.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
     });
+    await secureStorage.setItem(BIOMETRIC_OWNER_KEY, userId);
     await secureStorage.setItem(BIOMETRIC_ENABLED_KEY, '1');
   },
   async read() {
@@ -77,10 +112,7 @@ export const biometricPinStore: BiometricPinStore = {
       keychainAccessible: SecureStore.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
     });
   },
-  async clear() {
-    await SecureStore.deleteItemAsync(BIOMETRIC_PIN_KEY).catch(() => undefined);
-    await secureStorage.deleteItem(BIOMETRIC_ENABLED_KEY);
-  },
+  clear: clearBiometricPin,
 };
 
 /** Whether this device can offer biometric unlock at all. */
@@ -102,6 +134,12 @@ export const modeEffects: ModeEffects = {
   resetNavigationToWelcome() {
     if (router.canDismiss()) router.dismissAll();
     router.replace('/');
+  },
+  resetNavigationToUnlock() {
+    // The open parent screen goes with the lock (MOB-R2-01): nothing adult is left mounted with its
+    // data, and coming back needs the PIN.
+    if (router.canDismiss()) router.dismissAll();
+    router.replace('/(parent)/unlock');
   },
   async relockOnServer() {
     const api = stepUpApi();
@@ -125,11 +163,28 @@ export const modeEffects: ModeEffects = {
 
 /**
  * Parent sign-out on this device (MOB-R1-01): server relock, Supabase session ended, adult caches
- * cleared, store SDK identity forgotten, mode reset and navigation back to the welcome screen. The
+ * cleared, the biometric PIN removed, store SDK identity forgotten, mode reset and navigation back
+ * to the welcome screen (or, on a paired tablet, the child's space; MOB-R2-04). The
  * session watcher in src/lib/app-session.ts also reacts to the sign-out; this covers the device
  * being offline, when that watcher may see no change.
  */
-export async function signOutParentOnDevice(): Promise<void> {
-  await signOutParent(secureStorage, modeEffects, parentAuth);
+export async function signOutParentOnDevice(effects: ModeEffects = modeEffects): Promise<void> {
+  await signOutParent(secureStorage, effects, parentAuth);
+  // The parent's PIN must not stay on the device for the next adult to unlock with (MOB-R2-06).
+  await biometricPinStore.clear().catch(() => undefined);
   await forgetStoreIdentity().catch(() => undefined);
+}
+
+/**
+ * Account closure (MOB-R2-06): the same device sign-out, but the screen keeps its outcome. The
+ * closure path used to call parentAuth.signOut() directly, which left mode 'parent', the in-memory
+ * unlock and the biometric PIN of a deleted account on the device. Navigation is the only part left
+ * out, so the parent still reads what happened to their account before leaving the screen.
+ */
+export function signOutClosedAccountOnDevice(): Promise<void> {
+  return signOutParentOnDevice({
+    ...modeEffects,
+    resetNavigationToWelcome: () => undefined,
+    resetNavigationToChildHome: () => undefined,
+  });
 }

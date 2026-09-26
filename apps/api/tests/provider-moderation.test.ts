@@ -325,6 +325,18 @@ async function createdAudit(reportId: string) {
      where target_id = ${reportId} and action = 'safety_report.created'`;
 }
 
+/**
+ * The reviewer-only audit row carrying which layer flagged the answer and the provider's own
+ * category codes (CS-R2-02). It is written with `family_id` null, so audit_member_read (0001) never
+ * returns it to a family member; the family-readable 'safety_report.created' row says only that a
+ * flag was filed. Read here as the service role, which is what a reviewer's path uses.
+ */
+async function screenCodesAudit(reportId: string) {
+  return api.db.sql<{ family_id: string | null; metadata: Record<string, unknown> }[]>`
+    select family_id, metadata from public.audit_events
+     where action = 'safety_screen.codes' and metadata->>'reportId' = ${reportId}`;
+}
+
 async function assignment(scan: Scan) {
   const [row] = await api.db.sql<{ status: string; error_code: string | null }[]>`
     select status, error_code from public.assignments where id = ${scan.assignmentId}`;
@@ -409,8 +421,11 @@ describe('provider moderation of the child’s answers before grading', () => {
       family_visible: true,
       status: 'escalated',
     });
-    const [audit] = await createdAudit(report!.id);
-    expect(audit!.metadata).toMatchObject({
+    // CS-R2-02: the source layer and the provider's codes are reviewer-only now — the row the
+    // family can read carries neither, so this assertion moved to the 'safety_screen.codes' row.
+    const [codes] = await screenCodesAudit(report!.id);
+    expect(codes!.family_id).toBeNull();
+    expect(codes!.metadata).toMatchObject({
       source: 'provider_moderation',
       providerCodes: ['PROVIDER_SELF_HARM_INTENT'],
     });
@@ -455,7 +470,10 @@ describe('provider moderation of the child’s answers before grading', () => {
     // A visible report's audit row carries the family id (family members can read their audit log).
     const [audit] = await createdAudit(report!.id);
     expect(audit!.family_id).toBe(scan.fam.familyId);
-    expect(audit!.metadata).toMatchObject({ providerCodes: ['PROVIDER_VIOLENCE'] });
+    // CS-R2-02: which kind of concern the provider named is on the reviewer-only row, not this one.
+    const [codes] = await screenCodesAudit(report!.id);
+    expect(codes!.family_id).toBeNull();
+    expect(codes!.metadata).toMatchObject({ providerCodes: ['PROVIDER_VIOLENCE'] });
     expectNoChildTextInLogs(PROVIDER_VIOLENCE_ANSWER);
   });
 
@@ -481,7 +499,15 @@ describe('provider moderation of the child’s answers before grading', () => {
     });
   });
 
-  it('a flag without a PencilLift category on child input only logs a code; the answer is graded', async () => {
+  // CS-R2-03, a policy change and not a weakened test: this asserted 'only logs a code; the
+  // answer is graded'. That assertion WAS the defect — a provider flag whose category the map
+  // did not know (no category at all, a category added after the 2024 list, or
+  // harassment/hate/illicit) reached no one: the answer was graded and coached and the parent
+  // was never told. The child-input screen now fails closed (providerSafetyScreen and
+  // PROVIDER_FALLBACK_CATEGORY in packages/ai/src/moderation.ts), per the lead decision of
+  // 2026-09-26: every provider flag on the child's own words is severe, so the child gets the
+  // calm generic safety template and the parent gets a flag.
+  it('a flag with no mapped PencilLift category is answered and reported (CS-R2-03)', async () => {
     const answer = 'The fox ran home fast [mock-moderation:harassment]';
     const question: ScriptedQuestion = {
       ...PROVIDER_ONLY,
@@ -493,9 +519,11 @@ describe('provider moderation of the child’s answers before grading', () => {
     const scan = await queuedScan();
     const ai = scriptedModel([question]);
     await runJobs(deps, handlers(ai, createMockModerationClient()));
-    expect(stageRequests(ai, 'private_grading')).toHaveLength(1);
-    expect((await feedback(scan, question.prompt)).map((f) => f.kind)).not.toContain('safety');
-    expect(await reports(scan)).toEqual([]);
+    expect(stageRequests(ai, 'private_grading')).toEqual([]);
+    expect((await feedback(scan, question.prompt)).map((f) => f.kind)).toEqual(['safety']);
+    expect(await reports(scan)).toMatchObject([
+      { screen_categories: ['abuse', 'violence'], status: 'escalated', family_visible: true },
+    ]);
     expect(api.logs).toContainEqual({
       level: 'warn',
       event: 'moderation_flag_child_input',

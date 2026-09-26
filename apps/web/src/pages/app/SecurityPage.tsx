@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useState, type FormEvent } from 'react';
-import { Link } from 'react-router';
+import { Link, useLocation, useSearchParams } from 'react-router';
 import {
   adultUnlockResponseSchema,
   familyOkResponseSchema,
@@ -7,6 +7,8 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState } from '../../components/states.tsx';
+import { StepUpPrompt, type StepUpReturn } from '../../components/StepUpPrompt.tsx';
+import { safeNextPath } from '../../lib/auth.ts';
 import { RequireParent, useSession, type QueryState } from '../../lib/session.tsx';
 
 /**
@@ -59,15 +61,18 @@ export function useAction() {
   return { busy, feedback, run, setFeedback };
 }
 
-/** Explains the server-enforced step-up instead of failing silently. */
+/**
+ * Answers the server-enforced step-up where the parent already is (WEB-R2-05). Same export and the
+ * same single `action` prop as before, so every page that renders it — Children, Guardians, Devices,
+ * Family, Rewards, Homework, Support — now gets the inline PIN prompt instead of a link to
+ * /app/security that unmounted the half-filled form.
+ */
 export function StepUpNotice({ action }: { action: string }) {
   return (
-    <div className="notice" role="alert">
-      <p style={{ margin: 0 }}>
-        <strong>Enter your parent PIN to continue.</strong> {action} needs a recent PIN unlock.{' '}
-        <Link to="/app/security">Unlock on the Security page</Link>, then try again.
-      </p>
-    </div>
+    <StepUpPrompt
+      explanation={`${action} needs a recent PIN unlock.`}
+      retryHint={() => 'Press the same button again to continue.'}
+    />
   );
 }
 
@@ -203,6 +208,12 @@ function UnlockSection() {
   const [pin, setPin] = useState('');
   const [fieldError, setFieldError] = useState<string | null>(null);
   const errorId = useId();
+  const [params] = useSearchParams();
+  const state = useLocation().state as Partial<StepUpReturn> | null;
+  // WEB-R2-05: a parent sent here from a half-filled form gets a way back to it. The path arrives as
+  // router state (from StepUpPrompt) or as ?next=; either way safeNextPath keeps it same-origin.
+  const rawNext = state?.stepUpNext ?? params.get('next');
+  const back = rawNext ? safeNextPath(rawNext) : null;
 
   const unlock = async (event: FormEvent) => {
     event.preventDefault();
@@ -241,6 +252,11 @@ function UnlockSection() {
   return (
     <section className="card" style={sectionStyle} aria-labelledby="unlock-title">
       <h2 id="unlock-title">Unlock sensitive actions</h2>
+      {back ? (
+        <p style={{ marginTop: 0 }}>
+          Unlock below, then <Link to={back}>go back to what you were doing</Link>.
+        </p>
+      ) : null}
       <form onSubmit={(e) => void unlock(e)} noValidate>
         <PinInput
           id="unlock-pin"

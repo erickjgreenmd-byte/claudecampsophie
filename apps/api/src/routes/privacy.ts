@@ -113,6 +113,24 @@ const SCAN_STILL_CHECKING: readonly AssignmentStatus[] = [
  */
 const RECHECK_NOW: readonly AssignmentStatus[] = ['ready', 'needs_parent_review'];
 
+/**
+ * How many RESOLVED reports the family list returns (CS-R2-07). A resolved report is history, so
+ * the list keeps the older cap for those.
+ */
+const RESOLVED_REPORTS_PAGE_SIZE = 100;
+
+/**
+ * How many UNRESOLVED reports the family list returns. CS-R2-07's first fix lifted the cap on them
+ * entirely, which left one response unbounded: nothing resolves a report but a grown-up, a guardian
+ * may file 30 an hour with a 500-character note each, and system flags stay 'escalated'.
+ *
+ * The bound takes the OLDEST unresolved, not the newest, which is the whole point of CS-R2-07: a
+ * newest-first cap made an old open flag unreachable for good once newer reports filled the page,
+ * while an oldest-first bound drains — every report a grown-up acts on makes room for the next, so
+ * nothing is permanently out of reach. It is far above any honest family's queue.
+ */
+export const UNRESOLVED_REPORTS_PAGE_SIZE = 200;
+
 // ---------------------------------------------------------------------------------------------
 // Row types and DTO mapping (explicit columns only; storage paths are never selected)
 // ---------------------------------------------------------------------------------------------
@@ -410,8 +428,14 @@ async function queueClearanceRecheck(
     await tx`
       update public.assignments set status = 'checking'
        where id = ${scan.id} and family_id = ${report.family_id}`;
+    // The next version follows the HIGHEST kept one, never a count (CS-R2-01, L-033): job
+    // retention prunes terminal rows older than JOB_RETENTION_DAYS (BUG-139), so once v1 is gone
+    // while a later v2 is kept, a count re-derives v2 — the insert raised 23505, app.onError
+    // answered 409 "This was already done" and the whole clearance rolled back (the report stayed
+    // escalated and nothing was graded). Same form as homework.ts (the scan and correction routes).
     const [jobs] = await tx<{ n: number }[]>`
-      select count(*)::int as n from public.jobs
+      select coalesce(max(substring(idempotency_key from ':v([0-9]+)$')::int), 0) as n
+        from public.jobs
        where family_id = ${report.family_id} and idempotency_key like ${`scan:${scan.id}:v%`}`;
     await tx`
       insert into public.jobs (kind, idempotency_key, family_id, child_id, payload, run_after)
@@ -726,15 +750,31 @@ export function privacyRoutes(): Hono<AppEnv> {
   // `family_visible` itself is not granted, so this query cannot and does not name it (the API files
   // none since the owner decision). A flag cleared as a false match is marked so (round 3): its
   // summary would no longer be true; a guardian's own action is returned as `parentOutcome`.
+  //
+  // Order (CS-R2-07): every report still waiting on a grown-up comes first, then the newest resolved
+  // ones up to their cap. A flat `order by created_at desc limit 100` hid an older open flag once a
+  // hundred newer reports existed (word-list false matches, the child's own reports and the parent's
+  // own add up), so the guardian could no longer mark it looked into or clear it. The unresolved set
+  // is bounded too, but from the OLDEST end, so the bound drains instead of hiding: see
+  // UNRESOLVED_REPORTS_PAGE_SIZE. BUG-117's keyset paging is not needed while nothing unresolved can
+  // become permanently unreachable.
   r.get('/safety-reports', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     const rows = await deps.db.asParent(
       parent,
       (tx) => tx<ReportRow[]>`
-        select ${tx.unsafe(REPORT_COLUMNS)}
-          from public.safety_reports
-         where family_id = ${familyId} order by created_at desc limit 100`,
+        with unresolved as (
+          select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
+           where family_id = ${familyId} and status <> 'resolved'
+           order by created_at asc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
+        ), newest_resolved as (
+          select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
+           where family_id = ${familyId} and status = 'resolved'
+           order by created_at desc limit ${RESOLVED_REPORTS_PAGE_SIZE}
+        )
+        select * from (select * from unresolved union all select * from newest_resolved) listed
+         order by (status <> 'resolved') desc, created_at desc`,
     );
     return c.json({ reports: rows.map(toReport) });
   });

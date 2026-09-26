@@ -5,7 +5,12 @@ import { childSession, modeEffects } from '../family/runtime.ts';
 import { clearAdultCaches, registerParentTokenSource } from '../family/parent-session.ts';
 import { registerPrivacyTokenSources } from '../privacy/session.ts';
 import { registerRewardsTokenSources } from '../rewards/session.ts';
-import { currentMode, type AppMode } from './mode.ts';
+import {
+  currentMode,
+  lockParentAreaOnDevice,
+  storePurchaseInFlight,
+  type AppMode,
+} from './mode.ts';
 import { parentAuth } from './parent-auth.ts';
 import { secureStorage } from './secure-storage.ts';
 
@@ -38,7 +43,9 @@ export function parentSourceOutsideChildMode(
  *   source (family, privacy/exports, rewards approvals) is empty in child mode, so a parent data
  *   call made from child mode fails closed at the data layer. Only the step-up source (the PIN
  *   unlock that leads OUT of child mode, and the relock) keeps the raw session.
- * It also relocks the parent area whenever the app leaves the foreground in parent mode.
+ * It also locks the parent area whenever the app leaves the foreground in parent mode (MOB-R2-01):
+ * the server step-up is revoked, the client-side unlock is forgotten, the adult caches are cleared
+ * and the open parent screen is replaced by the unlock screen.
  */
 export function initAppSession(): () => void {
   registerRewardsTokenSources({ child: childSession.accessToken });
@@ -60,10 +67,14 @@ export function initAppSession(): () => void {
 
   const appState = AppState.addEventListener('change', (next) => {
     if (next !== 'background') return;
+    // The store's own purchase sheet backgrounds the activity on Android. Locking there would take
+    // the plan screen away in the middle of a purchase; the verify step that follows
+    // (POST /v1/billing/sync) needs no step-up, so skipping the lock costs nothing (MOB-R2-01).
+    if (storePurchaseInFlight()) return;
     void readMode().then(async (mode) => {
       if (mode !== 'parent') return;
-      clearAdultCaches();
-      await modeEffects.relockOnServer().catch(() => undefined);
+      // The whole lock, not only the server relock: the open parent screen and its data go too.
+      await lockParentAreaOnDevice(modeEffects);
     });
   });
 

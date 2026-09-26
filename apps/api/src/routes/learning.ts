@@ -1,11 +1,13 @@
 import { Hono, type Context } from 'hono';
 import {
+  PARENT_PRACTICE_SET_PAGE_SIZE,
   STUDY_MATERIAL_MAX_CHARS,
   SUBJECT_DISPLAY_NAMES,
   createChildSubjectRequestSchema,
   createStudyMaterialRequestSchema,
   createTestDateRequestSchema,
   practiceAnswerRequestSchema,
+  practiceSetCursorSchema,
   reviewPdfExportRequestSchema,
   updateChildSubjectRequestSchema,
   updateLearningScheduleRequestSchema,
@@ -20,6 +22,7 @@ import {
   type LearningScheduleResponse,
   type ParentPracticeSet,
   type PracticeAnswerResponse,
+  type PracticeSets,
   type SkillSummaryDto,
   type SkillsResponse,
   type TestDate,
@@ -106,7 +109,25 @@ const SUBJECT_ORDER = [
   'science',
   'social_studies',
 ] as const;
-const PARENT_SET_LIMIT = 30;
+const PARENT_SET_LIMIT = PARENT_PRACTICE_SET_PAGE_SIZE;
+
+/** Largest epoch-microsecond value Postgres can hold in a bigint. */
+const INT64_MAX = 9223372036854775807n;
+/** No stored row is timestamped this far past the request clock; anything beyond is a bad cursor. */
+const CURSOR_AHEAD_MICROS = 10n * 366n * 24n * 3600n * 1_000_000n;
+
+/**
+ * Parses the epoch-microseconds half of a keyset cursor with BigInt (API-AUTH-R1-03): a 19-digit
+ * value past int64, or one far in the future, would fail the bigint cast or overflow the interval
+ * in SQL and surface as a 500; here it is a 400 like any other malformed cursor.
+ */
+function cursorMicros(digits: string, now: Date): string {
+  const micros = BigInt(digits);
+  if (micros > INT64_MAX || micros > BigInt(now.getTime()) * 1000n + CURSOR_AHEAD_MICROS) {
+    throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+  }
+  return micros.toString();
+}
 
 const iso = (d: Date) => d.toISOString();
 const isoOrNull = (d: Date | null) => (d ? d.toISOString() : null);
@@ -953,6 +974,19 @@ export function learningRoutes(): Hono<AppEnv> {
     if (week !== undefined && !/^\d{4}-W\d{2}$/.test(week)) {
       throw new ApiError('VALIDATION_FAILED', 'Week must be YYYY-Www');
     }
+    // Keyset page, newest first (API-AUTH-R2-04): the list used to stop at a hard 30, so after about
+    // a month of daily sets the older ones — and the answer keys and review PDFs that need their ids
+    // — could not be reached at all. `after` is the previous page's `nextCursor`; the key is the
+    // highest kept (created_at, id) pair, never a row count (L-033), so a retention step that removes
+    // an older set cannot make the next page skip or repeat one.
+    const rawAfter = c.req.query('after');
+    let cursor: { micros: string; id: string } | null = null;
+    if (rawAfter !== undefined) {
+      const parsed = practiceSetCursorSchema.safeParse(rawAfter);
+      if (!parsed.success) throw new ApiError('VALIDATION_FAILED', 'Invalid request: after');
+      const [micros, id] = parsed.data.split('_') as [string, string];
+      cursor = { micros: cursorMicros(micros, c.var.deps.clock()), id };
+    }
     const data = await c.var.deps.db.asParent(c.var.parent, async (tx) => {
       const sets = await tx<
         {
@@ -967,29 +1001,36 @@ export function learningRoutes(): Hono<AppEnv> {
           release_at: Date | null;
           mix: Record<string, unknown>;
           notes: unknown;
+          cursor_micros: string;
         }[]
       >`
         select id, kind, status, subject_key, local_date::text as local_date, review_week, version, ready_at,
-               release_at, mix, notes
+               release_at, mix, notes,
+               ((extract(epoch from created_at) * 1000000)::bigint)::text as cursor_micros
           from public.practice_sets
          where child_id = ${owned.childId} and family_id = ${owned.familyId}
            and (${kind ?? null}::text is null or kind = ${kind ?? null}::text)
            and (${week ?? null}::text is null or review_week = ${week ?? null}::text)
-         order by created_at desc, id
-         limit ${PARENT_SET_LIMIT}`;
+           and (${cursor?.micros ?? null}::bigint is null
+                or (created_at, id) < (timestamptz 'epoch' + ${cursor?.micros ?? null}::bigint * interval '1 microsecond',
+                                       ${cursor?.id ?? null}::uuid))
+         order by created_at desc, id desc
+         limit ${PARENT_SET_LIMIT + 1}`;
+      // One row past the page tells us whether older sets exist; its questions are never fetched.
+      const page = sets.slice(0, PARENT_SET_LIMIT);
       const items =
-        sets.length === 0
+        page.length === 0
           ? []
           : await tx<(ChildItemRow & { category: string })[]>`
               select id, set_id, position, subject_key, skill, category, prompt from public.practice_items
-               where family_id = ${owned.familyId} and set_id = any(${sets.map((s) => s.id)}::uuid[])
+               where family_id = ${owned.familyId} and set_id = any(${page.map((s) => s.id)}::uuid[])
                order by set_id, position`;
       const progress = await loadProgress(
         tx,
         owned.childId,
         items.map((i) => i.id),
       );
-      return { sets, items, progress };
+      return { sets: page, hasMore: sets.length > PARENT_SET_LIMIT, items, progress };
     });
     const sets: ParentPracticeSet[] = data.sets.map((s) => ({
       id: s.id,
@@ -1033,7 +1074,12 @@ export function learningRoutes(): Hono<AppEnv> {
           };
         }),
     }));
-    return c.json({ sets });
+    const last = data.sets.at(-1);
+    const body: PracticeSets = {
+      sets,
+      nextCursor: data.hasMore && last !== undefined ? `${last.cursor_micros}_${last.id}` : null,
+    };
+    return c.json(body);
   });
 
   // ----- Protected answer key (separate route, recent step-up; spec P8) ---------------------------

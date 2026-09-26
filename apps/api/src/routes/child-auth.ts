@@ -52,6 +52,9 @@ async function tokenResponse(
   return {
     accessToken: access.token,
     accessTokenExpiresAt: access.expiresAt.toISOString(),
+    // The lifetime as well as the instant (MOB-R2-02): a device with a wrong clock cannot turn a
+    // server instant into a lifetime, so it measures expiry from its own clock at receipt.
+    accessTokenExpiresInSeconds: deps.config.childAccessTtlSeconds,
     refreshToken,
     child: { id: principal.childId, nickname },
   };
@@ -247,10 +250,22 @@ export function childAuthRoutes(): Hono<AppEnv> {
 
   r.post('/logout', requireChild, async (c) => {
     const { deps, child } = c.var;
-    await deps.db.asService(
-      (tx) =>
-        tx`update public.child_sessions set revoked_at = now(), revoke_reason = 'logout' where id = ${child.sessionId} and revoked_at is null`,
-    );
+    await deps.db.asService(async (tx) => {
+      await tx`update public.child_sessions set revoked_at = now(), revoke_reason = 'logout' where id = ${child.sessionId} and revoked_at is null`;
+      // A device that signed itself out is no longer connected (API-AUTH-R2-05). The parent's
+      // device list reads child_devices.revoked_at, so a logout that only revoked the session left
+      // the tablet listed as "Connected" for good. Only stamped when this device has no other live
+      // session, so a second session on a shared tablet keeps it connected.
+      await tx`
+        update public.child_devices d set revoked_at = now()
+         where d.id = (select device_id from public.child_sessions where id = ${child.sessionId})
+           and d.revoked_at is null
+           and not exists (
+             select 1 from public.child_sessions s
+              where s.device_id = d.id and s.revoked_at is null and s.expires_at > now()
+           )
+      `;
+    });
     return c.json({ ok: true });
   });
 

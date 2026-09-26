@@ -32,6 +32,9 @@ function tokenResponse(n: number, expiresInMs = 15 * 60_000) {
   return {
     accessToken: `access-${n}`,
     accessTokenExpiresAt: new Date(NOW.getTime() + expiresInMs).toISOString(),
+    // The lifetime the device measures on its own clock (MOB-R2-02); the instant above is the
+    // server's view of the same expiry.
+    accessTokenExpiresInSeconds: expiresInMs / 1000,
     refreshToken: `refresh-token-number-${n}-abcdefghijkl`,
     child: { id: RILEY, nickname: 'Riley' },
   };

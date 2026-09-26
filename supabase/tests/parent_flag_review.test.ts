@@ -126,8 +126,10 @@ describe('parent outcomes (0790)', () => {
 
   it("a parent's own report is closed by the reviewer, never marked addressed", async () => {
     const s = await scanned();
-    const [own] = await db.asParent(
-      s.fam.ownerId,
+    // Fixture written as the API writes it: routes/privacy.ts inserts a parent report with the
+    // service role, and since migration 0860 (API-AUTH-R2-01) `authenticated` holds no insert grant
+    // on safety_reports at all, so a Data-API insert is not the path any more.
+    const [own] = await db.asService(
       (tx) => tx<{ id: string }[]>`
         insert into public.safety_reports (family_id, reporter_kind, category, note)
         values (${s.fam.familyId}, 'parent', 'other', 'SYNTHETIC parent note') returning id`,

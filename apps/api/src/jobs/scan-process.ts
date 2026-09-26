@@ -147,8 +147,23 @@ const CONFIDENCE: Readonly<Record<'low' | 'medium' | 'high', number>> = {
 /** Page issues that mean "take the picture again" rather than guessing (spec P5). */
 const RESCAN_PAGE_ISSUES = new Set(['blurry', 'glare', 'rotated', 'cut_off', 'not_homework']);
 
-/** A scan paused by the spend ceiling is retried after this long (no attempt is spent). */
+/**
+ * A scan paused by the spend ceiling is retried after this long (no attempt is spent), doubling with
+ * every further pause up to SPEND_CEILING_MAX_RETRY_MS (JOBS-R2-06): a ceiling that holds for a day
+ * must not mean an hourly poll of the whole scan for ever.
+ */
 const SPEND_CEILING_RETRY_MS = 60 * 60_000;
+const SPEND_CEILING_MAX_RETRY_MS = 6 * 3600_000;
+/**
+ * How many times a scan waits for the ceiling before it settles (JOBS-R2-06). With the growing
+ * interval that is about a day and a half; after it the scan ends in a state the parent can see
+ * (AI_PAUSED_TOO_LONG) and its allowance is given back, instead of "being checked" with no end.
+ */
+const SPEND_CEILING_MAX_PAUSES = 8;
+/** `extracted_questions.question_number` holds at most this many characters (migration 0100). */
+const QUESTION_NUMBER_MAX_CHARS = 20;
+/** How many questions on one page may carry the same printed number before the rest are dropped. */
+const DUPLICATE_LABEL_LIMIT = 40;
 
 /** Reviewed fallback when a coaching packet fails validation (spec P6: never show unchecked output). */
 export const TEMPLATE_FALLBACK =
@@ -209,6 +224,8 @@ interface AssignmentCtx {
   status: string;
   readonly ageBand: AgeBand;
   readonly gradeLevel: number;
+  /** How many times processing has entered extraction, incl. spend-ceiling pauses (JOBS-R2-06). */
+  readonly processingAttempts: number;
 }
 
 interface QuestionRow {
@@ -776,9 +793,10 @@ async function loadAssignment(
         status: string;
         age_band: AgeBand;
         grade_level: number;
+        processing_attempts: number;
       }[]
     >`
-      select a.id, a.family_id, a.child_id, a.status, c.age_band, c.grade_level
+      select a.id, a.family_id, a.child_id, a.status, a.processing_attempts, c.age_band, c.grade_level
         from public.assignments a
         join public.child_profiles c on c.id = a.child_id and c.family_id = a.family_id
         join public.families f on f.id = a.family_id and f.deleted_at is null
@@ -797,6 +815,7 @@ async function loadAssignment(
         status: row.status,
         ageBand: row.age_band,
         gradeLevel: row.grade_level,
+        processingAttempts: row.processing_attempts,
       }
     : null;
 }
@@ -907,8 +926,19 @@ class ScanRun {
   /**
    * The owner's spend ceiling is reached: keep every result written so far and run again later
    * without spending an attempt. A retried initial run skips extraction (its questions are stored).
+   *
+   * JOBS-R2-06: the wait grows with every pause (1 h, 2 h, 4 h, then 6 h) and is bounded. Once the
+   * scan has waited SPEND_CEILING_MAX_PAUSES times it stops waiting and settles in a state the
+   * parent can see, giving the allowance back, instead of sitting in "being checked" for ever.
+   * `processing_attempts` is the durable count: the initial run's own transition to `extracting`
+   * adds one per cycle, and a paused recheck (which never re-enters extracting) adds one here.
    */
-  async pause(): Promise<JobDeferral> {
+  async pause(): Promise<JobDeferral | void> {
+    const pauses = await this.countPause();
+    if (pauses > SPEND_CEILING_MAX_PAUSES) {
+      await this.fail(new PermanentFailure('AI_PAUSED_TOO_LONG'));
+      return;
+    }
     try {
       if (
         this.mode === 'initial' &&
@@ -919,11 +949,33 @@ class ScanRun {
       if (!(error instanceof Superseded)) throw error;
     }
     this.deps.log({ level: 'warn', event: 'scan_paused', code: 'SPEND_CEILING' });
+    const wait = Math.min(
+      SPEND_CEILING_MAX_RETRY_MS,
+      SPEND_CEILING_RETRY_MS * 2 ** Math.max(0, pauses - 1),
+    );
     return {
       kind: 'defer',
-      runAfter: new Date(this.deps.clock().getTime() + SPEND_CEILING_RETRY_MS),
+      runAfter: new Date(this.deps.clock().getTime() + wait),
       code: 'SPEND_CEILING',
     };
+  }
+
+  /**
+   * How many times this scan has been paused (JOBS-R2-06). An initial run already counted this cycle
+   * when it entered `extracting`; a recheck counts it here, since it never re-enters extracting.
+   */
+  private async countPause(): Promise<number> {
+    // The initial run's own `enterExtracting` already incremented the stored counter for this cycle,
+    // but the context was read before that, so this cycle is the stored value plus one.
+    if (this.mode === 'initial') return this.ctx.processingAttempts + 1;
+    const [row] = await this.deps.db.asService(
+      (tx) => tx<{ n: number }[]>`
+        update public.assignments set processing_attempts = processing_attempts + 1
+         where id = ${this.ctx.id} and family_id = ${this.ctx.familyId}
+        returning processing_attempts as n
+      `,
+    );
+    return row?.n ?? 1;
   }
 
   /**
@@ -1154,6 +1206,18 @@ class ScanRun {
     if (code === 'PROVIDER_REJECTED') {
       throw new PermanentFailure(`${prompt.stage.toUpperCase()}_REQUEST_REJECTED`);
     }
+    // The answer did not fit the stage's output budget, and runStage already tried once with the
+    // budget raised as far as the cost cap allows (JOBS-R2-02). Re-sending the same pages or the
+    // same question batch cannot produce a shorter answer, so the scan ends now with a code the
+    // parent can act on instead of spending five job attempts (and five billed generations) on it.
+    if (code === 'OUTPUT_TRUNCATED') {
+      const truncation =
+        prompt.stage === 'extraction' || prompt.stage === 'grading'
+          ? 'SCAN_TOO_MANY_QUESTIONS'
+          : `${prompt.stage.toUpperCase()}_OUTPUT_TRUNCATED`;
+      this.deps.log({ level: 'warn', event: 'scan_output_truncated', code: truncation });
+      throw new PermanentFailure(truncation);
+    }
     throw new RetryableFailure(`${prompt.stage.toUpperCase()}_${code}`);
   }
 
@@ -1225,9 +1289,53 @@ class ScanRun {
       this.deps.log({ level: 'warn', event: 'scan_too_large', code: 'SCAN_TOO_LARGE' });
       throw new PermanentFailure('SCAN_TOO_LARGE');
     }
-    // Pages are handled one at a time and each is held once: its stored bytes until they are
-    // checked and stripped, then only its data URL (JOBS-R1-02: no digest copy, no whole-page
-    // binary string, the raw bytes dropped before the next page is read).
+    // JOBS-R2-06: the spend hold comes FIRST, so a scan refused at the owner's ceiling (or in a
+    // month with no budget row) is deferred without reading, hashing and base64-encoding every page
+    // from storage. Before this, one paused 12 MiB scan re-read itself every hour for as long as the
+    // ceiling held. The pages are read inside the admitted window, which the 20-minute hold covers.
+    const extraction = await this.spending(['extraction'], async () => {
+      const images = await this.readPages(pages);
+      if (images === null) return null;
+      return await this.stage<typeof PROMPTS.extraction.outputSchema>(PROMPTS.extraction, [
+        dataEnvelope({
+          pageNumbers: pages.map((p) => p.page_number),
+          gradeLevel: this.ctx.gradeLevel,
+        }),
+        ...images,
+      ]);
+    });
+    if (extraction === null) return null; // a retake was asked for while the pages were read
+
+    if (this.needsRescan(extraction, pages.length)) {
+      await this.transition('needs_rescan', 'RETAKE_REQUESTED');
+      // An unreadable scan never permanently consumes allowance (spec P11).
+      await this.settleReservation('unreadable');
+      return null;
+    }
+    const pageIds = new Map(pages.map((p) => [p.page_number, p.id]));
+    const missingPassage = new Set(
+      extraction.pages.filter((p) => p.issues.includes('missing_passage')).map((p) => p.pageNumber),
+    );
+    await this.guardedWrite((tx) => this.storeQuestions(tx, extraction, pageIds, missingPassage));
+    return missingPassage;
+  }
+
+  /**
+   * The pages as image parts for one extraction request, or null when the scan was sent back for a
+   * retake (an object that no longer matches its registration, or bytes that are not the declared
+   * image type). Pages are handled one at a time and each is held once: its stored bytes until they
+   * are checked and stripped, then only its data URL (JOBS-R1-02: no digest copy, no whole-page
+   * binary string, the raw bytes dropped before the next page is read).
+   */
+  private async readPages(
+    pages: readonly {
+      page_number: number;
+      storage_path: string;
+      mime_type: string;
+      byte_size: number;
+      sha256: string;
+    }[],
+  ): Promise<InputPart[] | null> {
     const images: InputPart[] = [];
     for (const page of pages) {
       // The page's bytes live only in this holder, so they can be let go of mid-page.
@@ -1263,29 +1371,7 @@ class ScanRun {
       }
       images.push(part);
     }
-
-    const extraction = await this.spending(['extraction'], () =>
-      this.stage<typeof PROMPTS.extraction.outputSchema>(PROMPTS.extraction, [
-        dataEnvelope({
-          pageNumbers: pages.map((p) => p.page_number),
-          gradeLevel: this.ctx.gradeLevel,
-        }),
-        ...images,
-      ]),
-    );
-
-    if (this.needsRescan(extraction, pages.length)) {
-      await this.transition('needs_rescan', 'RETAKE_REQUESTED');
-      // An unreadable scan never permanently consumes allowance (spec P11).
-      await this.settleReservation('unreadable');
-      return null;
-    }
-    const pageIds = new Map(pages.map((p) => [p.page_number, p.id]));
-    const missingPassage = new Set(
-      extraction.pages.filter((p) => p.issues.includes('missing_passage')).map((p) => p.pageNumber),
-    );
-    await this.guardedWrite((tx) => this.storeQuestions(tx, extraction, pageIds, missingPassage));
-    return missingPassage;
+    return images;
   }
 
   private needsRescan(extraction: ExtractionOutput, pageCount: number): boolean {
@@ -1305,17 +1391,25 @@ class ScanRun {
     const seen = new Set<string>();
     for (const q of extraction.questions) {
       const pageId = pageIds.get(q.pageNumber);
-      const key = `${q.pageNumber}:${q.questionNumber}`;
-      if (!pageId || seen.has(key)) continue; // unknown page or duplicate label: keep the first
-      seen.add(key);
+      if (!pageId) continue; // a page the model invented
+      // DB-R2-06: K-8 worksheets restart their numbering per section on one page (Part A 1-5,
+      // Part B 1-5), and `extracted_questions` is unique on (assignment, page, question_number).
+      // Dropping the later question would silently lose the child's answers to a whole section, so
+      // a repeated printed label is kept under a disambiguated one and marked uncertain instead.
+      const label = this.disambiguate(q.pageNumber, q.questionNumber, seen);
+      if (label === null) continue; // the same label more than DUPLICATE_LABEL_LIMIT times
+      seen.add(`${q.pageNumber}:${label}`);
+      const duplicateLabel = label !== q.questionNumber;
       // A missing source passage is stored as high uncertainty, so a retry that grades the stored
-      // questions (without re-extracting) still refuses to decide them.
-      const uncertainty = missingPassage.has(q.pageNumber) ? 'high' : q.uncertainty;
+      // questions (without re-extracting) still refuses to decide them. A question whose printed
+      // number repeats on its page is uncertain for the same reason: a grown-up should look.
+      const uncertainty =
+        missingPassage.has(q.pageNumber) || duplicateLabel ? 'high' : q.uncertainty;
       await tx`
         insert into public.extracted_questions
           (assignment_id, family_id, child_id, page_id, question_number, bounding_box, prompt_text,
            student_answer_text, answer_kind, subject_key, skill, grade_estimate, uncertainty)
-        values (${this.ctx.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${pageId}, ${q.questionNumber},
+        values (${this.ctx.id}, ${this.ctx.familyId}, ${this.ctx.childId}, ${pageId}, ${label},
                 ${q.boundingBox ? JSON.stringify(q.boundingBox) : null}::text::jsonb, ${q.promptText},
                 ${q.studentAnswerText}, ${q.answerKind}, ${q.subject}, ${q.skill}, ${q.gradeEstimate},
                 ${uncertainty})
@@ -1327,6 +1421,40 @@ class ScanRun {
           where public.extracted_questions.corrected_at is null
       `;
     }
+  }
+
+  /**
+   * The label to store for a question whose printed number may already be taken on its page
+   * (DB-R2-06). The first question keeps the printed number; a later one with the same number gets
+   * `<number>#2`, `#3`, … (trimmed to the column's 20 characters), so both sections of a page are
+   * kept, graded and shown. Returns null once even that is exhausted, which no real worksheet
+   * reaches. Grading already addresses questions by synthetic refs, so the stored label is display
+   * text only.
+   */
+  private disambiguate(
+    pageNumber: number,
+    questionNumber: string,
+    seen: ReadonlySet<string>,
+  ): string | null {
+    if (!seen.has(`${pageNumber}:${questionNumber}`)) return questionNumber;
+    for (let n = 2; n <= DUPLICATE_LABEL_LIMIT; n += 1) {
+      const suffix = `#${n}`;
+      const candidate = `${questionNumber.slice(0, QUESTION_NUMBER_MAX_CHARS - suffix.length)}${suffix}`;
+      if (!seen.has(`${pageNumber}:${candidate}`)) {
+        this.deps.log({
+          level: 'warn',
+          event: 'scan_duplicate_question_label',
+          code: 'DUPLICATE_LABEL',
+        });
+        return candidate;
+      }
+    }
+    this.deps.log({
+      level: 'warn',
+      event: 'scan_duplicate_question_label',
+      code: 'DUPLICATE_LABEL_EXHAUSTED',
+    });
+    return null;
   }
 
   private async loadQuestions(ids?: readonly string[]): Promise<QuestionRow[]> {
@@ -1433,10 +1561,15 @@ class ScanRun {
             );
           } catch (error) {
             // Without an independent check nothing is accepted: those items go to a grown-up. That
-            // includes a verification request too large for its stage budget (LJA-F4): the paid
-            // grading is kept for review instead of failing the scan.
-            const tooLarge = error instanceof PermanentFailure && error.code === 'STAGE_LIMIT';
-            if (!(error instanceof RetryableFailure) && !tooLarge) throw error;
+            // includes a verification request too large for its stage budget (LJA-F4) and a
+            // verification answer the provider cut off at this stage's own output budget
+            // (JOBS-R2-02: 2,000 tokens, half of grading's, so it can be reached on a scan whose
+            // extraction and grading both fitted). Either way the paid grading is kept for review
+            // instead of failing the whole scan and releasing the allowance.
+            const degrades =
+              error instanceof PermanentFailure &&
+              (error.code === 'STAGE_LIMIT' || error.code.endsWith('_OUTPUT_TRUNCATED'));
+            if (!(error instanceof RetryableFailure) && !degrades) throw error;
             verification = null;
           }
         }
@@ -1960,8 +2093,9 @@ class ScanRun {
         flags.get(question.id) ?? null,
       );
       this.inputScreens.set(question.id, input);
-      // Every provider flag on the child's words is logged as a code, including those without a
-      // PencilLift category (harassment, hate, illicit), which only log.
+      // Every provider flag on the child's words is logged as a code. A flag whose category maps to
+      // nothing (an unknown or new category, or none at all) no longer only logs: since CS-R2-03 the
+      // screen fails closed on the fallback category, so it is reported to the parent like any other.
       for (const code of input.providerCodes) {
         this.deps.log({ level: 'warn', event: 'moderation_flag_child_input', code });
       }
@@ -2085,16 +2219,43 @@ class ScanRun {
         on conflict (question_id, transcription_at) where reporter_kind = 'system' do nothing
         returning id`;
       if (!report) return false;
+      // The family's own audit row for the flag. CS-R2-02: it says a flag was filed and nothing
+      // about WHICH KIND of concern. `category` is 'severe_risk', the same generic marker the family
+      // already reads on the report itself (0760 grants `category` to `authenticated`); the screen's
+      // categories and the provider's codes (PROVIDER_SELF_HARM_INTENT, PROVIDER_SEXUAL_MINORS, ...)
+      // are reviewer-only and go in the row below. Before this, audit_member_read (0001) let any
+      // family member select them with their own JWT through the Data API, which defeats the design
+      // that hides the kind of concern — most of all when the adult reading it is the subject of the
+      // child's disclosure.
+      //
+      // The row follows the SAME `held` decision as safety_reports.family_visible above: a report
+      // held from the family carries no family_id, so no family member can read even its existence
+      // through audit_member_read. FAMILY_HOLD_CATEGORIES is empty under the owner decision of
+      // 2026-09-25, so `held` is false everywhere today and this cannot be reproduced from the
+      // outside; it is written this way so that repopulating that set can never make a held report
+      // visible by the back door (the round-3 checker's residual on CS-R2-02).
       await tx`
         insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
         values (${held ? null : this.ctx.familyId}, 'system', 'safety_report.created', 'safety_report', ${report.id},
                 ${JSON.stringify({
                   category: 'severe_risk',
-                  // Which layer flagged it, so reviewers see the source (PROVIDER_* codes).
+                  screenVersion: SAFETY_SCREEN_VERSION,
+                  ...(moderationUnavailable ? { providerModeration: 'unavailable' } : {}),
+                })}::text::jsonb)`;
+      // REVIEWER-ONLY (CS-R2-02): which layer flagged it and the provider's own category codes.
+      // `family_id` is null, as the held path already wrote its row, so audit_member_read never
+      // returns it to a family member; an owner admin reads every audit row whatever its family.
+      // It hangs off the question, not the report, so a family read of the report's audit rows finds
+      // nothing extra. No child text, only codes and ids.
+      await tx`
+        insert into public.audit_events (family_id, actor_kind, action, target_type, target_id, metadata)
+        values (null, 'system', 'safety_screen.codes', 'extracted_question', ${question.id},
+                ${JSON.stringify({
+                  reportId: report.id,
                   source: input.source ?? 'safety_screen',
+                  screenCategories: categories,
                   screenVersion: SAFETY_SCREEN_VERSION,
                   ...(input.providerCodes.length > 0 ? { providerCodes: input.providerCodes } : {}),
-                  ...(moderationUnavailable ? { providerModeration: 'unavailable' } : {}),
                 })}::text::jsonb)`;
       // Owner decision (2026-09-25): the parent is the only person PencilLift sends a safety
       // message to. A report in the family's list is announced to the active guardians by email,

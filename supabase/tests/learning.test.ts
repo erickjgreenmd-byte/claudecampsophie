@@ -370,7 +370,10 @@ describe('parent-managed settings', () => {
         ) => tx`insert into public.child_subjects (family_id, child_id, subject_key, display_name)
                    values (${fam.familyId}, ${other.children[0]!.id}, 'math', 'Math')`,
       ),
-    ).rejects.toThrow(/foreign key|row-level security/);
+      // DB-R2-05 (migration 0860): the Data-API guard now refuses it before the composite foreign
+      // key does — the child is not one of the caller's family's children — so 'child not found' is
+      // the earlier of the two refusals, not a weaker one.
+    ).rejects.toThrow(/foreign key|row-level security|child not found/);
     await expect(
       db.asParent(
         fam.ownerId,
@@ -379,6 +382,8 @@ describe('parent-managed settings', () => {
         ) => tx`insert into public.child_subjects (family_id, child_id, subject_key, display_name)
                    values (${other.familyId}, ${other.children[0]!.id}, 'math', 'Math')`,
       ),
-    ).rejects.toThrow(/row-level security/);
+      // As above: the Data-API guard (migration 0860) checks membership in a BEFORE trigger, which
+      // runs before the policy's WITH CHECK, so a foreign family is 'family not found' here.
+    ).rejects.toThrow(/row-level security|family not found/);
   });
 });

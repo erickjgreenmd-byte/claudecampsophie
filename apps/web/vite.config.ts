@@ -12,6 +12,24 @@ export default defineConfig(({ command, mode }) => {
   }
   return {
     plugins: [react()],
+    build: {
+      rollupOptions: {
+        output: {
+          /**
+           * WEB-R2-09: the single entry chunk was 643 kB (gzip 187 kB), over Vite's 500 kB warning,
+           * because the auth SDK and the schema library sat in it. Splitting them keeps the entry
+           * small and lets the browser cache them across deploys of the app code.
+           */
+          manualChunks: (id: string): string | undefined => {
+            if (!id.includes('node_modules')) return undefined;
+            if (id.includes('@supabase')) return 'supabase-auth';
+            if (id.includes('/zod/')) return 'schema';
+            if (/\/(react|react-dom|react-router|scheduler)\//.test(id)) return 'react';
+            return undefined;
+          },
+        },
+      },
+    },
     test: {
       reporters: ['default', ['json', { outputFile: '../../test-results/web.json' }]],
       include: ['src/**/*.test.tsx', 'src/**/*.test.ts'],

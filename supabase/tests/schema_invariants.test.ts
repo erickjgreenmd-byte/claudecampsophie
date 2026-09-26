@@ -81,6 +81,35 @@ describe('schema invariants', () => {
     expect(rows.filter((r) => !allowlisted.has(r.table_name))).toEqual([]);
   });
 
+  it('[DB-R2-04] no client role holds TRUNCATE, TRIGGER or REFERENCES on a public table', async () => {
+    // TRUNCATE ignores RLS and fires no row trigger, so it is the one write app.prevent_mutation()
+    // on the append-only ledgers cannot see; TRIGGER and REFERENCES let a client attach its own
+    // code to, or key its own table against, a family table. None of the three is a client
+    // privilege, and the Supabase default privileges hand out ALL, so a new table needs no
+    // migration line to be exposed again — this invariant is the guard (migration 0860).
+    const rows = await db.sql<{ grantee: string; table_name: string; privilege_type: string }[]>`
+      select grantee, table_name, privilege_type
+        from information_schema.role_table_grants
+       where table_schema = 'public'
+         and grantee in ('anon', 'authenticated', 'pl_child', 'PUBLIC')
+         and privilege_type in ('TRUNCATE', 'TRIGGER', 'REFERENCES')
+       order by table_name, grantee, privilege_type`;
+    expect(rows).toEqual([]);
+  });
+
+  it('[DB-R2-04] the default privileges for new public tables grant no client role those three', async () => {
+    // ACL letters: D = TRUNCATE, x = REFERENCES, t = TRIGGER.
+    const rows = await db.sql<{ acl: string }[]>`
+      select unnest(d.defaclacl)::text as acl
+        from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+       where n.nspname = 'public' and d.defaclobjtype = 'r'`;
+    const offenders = rows
+      .map((r) => r.acl)
+      .filter((acl) => /^(anon|authenticated|pl_child)=/.test(acl))
+      .filter((acl) => /[tDx]/.test(acl.split('=')[1]!.split('/')[0]!));
+    expect(offenders).toEqual([]);
+  });
+
   it('[BUG-008] every jsonb column rejects scalar JSON (double-encoded strings fail loudly)', async () => {
     const unchecked = await db.sql<{ col: string }[]>`
       select c.table_schema || '.' || c.table_name || '.' || c.column_name as col

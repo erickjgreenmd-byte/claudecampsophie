@@ -839,6 +839,30 @@ describe('honest follow-up states (RV-homework-6, 7, 8)', () => {
     expect(within(scans).queryByText(/could not be processed after several tries/)).toBeNull();
   });
 
+  /**
+   * JOBS-R2-02 / JOBS-R2-06 (lead follow-up to the round-3 checker's residual): the scan pipeline
+   * gained two parent-facing codes and this page rendered the generic "several tries" line for both,
+   * which tells the parent nothing they can act on. A worksheet with more questions than one check
+   * can hold has to be split; a scan the spend pause held too long just needs sending again.
+   */
+  it.each([
+    ['SCAN_TOO_MANY_QUESTIONS', /more questions than one check can handle/],
+    ['AI_PAUSED_TOO_LONG', /could not check this scan in time/],
+  ])('a %s scan says what to do instead of the generic failure line', async (code, copy) => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path.startsWith('/v1/assignments?')
+          ? { ...list(), assignments: [{ ...summary(FINAL, 'failed_final'), errorCode: code }] }
+          : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getByText(copy)).toBeTruthy();
+    expect(within(scans).queryByText(/could not be processed after several tries/)).toBeNull();
+    // The parent never sees the raw code.
+    expect(within(scans).queryByText(new RegExp(code))).toBeNull();
+  });
+
   it('the transcription-fix confirmation survives the refresh that follows it', async () => {
     const { api, gets } = fakeApi({
       latencyMs: 20,

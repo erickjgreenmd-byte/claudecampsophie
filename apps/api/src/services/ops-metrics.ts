@@ -11,6 +11,13 @@ import {
 } from '@pencillift/contracts';
 import { MAX_ACCESS_AFTER_PERIOD_END_MS } from '@pencillift/domain/entitlements';
 import {
+  revenueSummary,
+  type MonetizationProvider,
+  type Placement,
+  type RevenueAdjustmentKind,
+  type RevenueCategory,
+} from '@pencillift/domain/monetization';
+import {
   DELETION_OVERDUE_AFTER_DAYS,
   DELETION_TARGET_DAYS,
   FAILED_JOBS_WINDOW_DAYS,
@@ -232,33 +239,76 @@ export async function loadRevenueMonths(
 // ---------------------------------------------------------------------------------------------
 
 const ENTITLEMENTS = 'public.family_entitlements';
-const ACTIVE_DEFINITION = `Ledger rows granting paid access at the request instant: status active or grace_period with period_end less than ${MAX_ACCESS_AFTER_PERIOD_END_MS / 86_400_000} days ago, or cancelled_active before period_end (the domain entitlement rule).`;
+const ACTIVE_DEFINITION = `Ledger rows granting paid access at the request instant: status active or grace_period with period_end less than ${MAX_ACCESS_AFTER_PERIOD_END_MS / 86_400_000} days ago, or cancelled_active before period_end (the domain entitlement rule); rows of a deleted family (families.deleted_at set) never grant, because the tombstone ends the service.`;
 
 export async function loadSubscriptions(tx: Tx, now: Date): Promise<SubscriptionsSummary> {
   const month = utcMonthKey(now);
   const { start, end } = utcMonthBounds(month);
   const accessBoundSeconds = MAX_ACCESS_AFTER_PERIOD_END_MS / 1000;
+  // BILL-R2-2: a tombstoned family's ledger row is frozen in its last state (its webhooks are
+  // ignored as FAMILY_DELETED and the stale-entitlement sweep skips it), so a deleted family used
+  // to keep counting as an active, subscribed family. The tombstone is the end of the service: the
+  // join excludes it here and every movement figure below does the same.
   const active = await tx<{ channel: string; paid_slots: number; family_id: string }[]>`
-    select channel, paid_slots, family_id
-      from public.family_entitlements
-     where (status in ('active', 'grace_period')
-              and period_end is not null
-              and period_end + make_interval(secs => ${accessBoundSeconds}) > ${now})
-        or (status = 'cancelled_active' and period_end is not null and period_end > ${now})
+    select e.channel, e.paid_slots, e.family_id
+      from public.family_entitlements e
+      join public.families f on f.id = e.family_id and f.deleted_at is null
+     where (e.status in ('active', 'grace_period')
+              and e.period_end is not null
+              and e.period_end + make_interval(secs => ${accessBoundSeconds}) > ${now})
+        or (e.status = 'cancelled_active' and e.period_end is not null and e.period_end > ${now})
   `;
   const byStatus = await tx<{ status: string; count: number }[]>`
     select status, count(*)::int as count from public.family_entitlements group by status order by status
   `;
-  const [movement] = await tx<
-    { new_this_month: number; lapsed_this_month: number; active_at_start: number }[]
-  >`
-    select (select count(*)::int from public.family_entitlements
-             where created_at >= ${start} and created_at < ${end}) as new_this_month,
-           (select count(*)::int from public.family_entitlements
-             where status in ('expired', 'revoked', 'refunded')
-               and period_end >= ${start} and period_end < ${end}) as lapsed_this_month,
-           (select count(*)::int from public.family_entitlements
-             where created_at < ${start} and period_end >= ${start} and status <> 'pending') as active_at_start
+  // BILL-R2-1: movement is measured per FAMILY, not per ledger row. RevenueCat keys a ledger row by
+  // product (`rc:<ref>:<channel>:<productId>`), so a tier change or a transfer between a family's
+  // own identities ends one row and creates another; counted per row that read as one new
+  // subscription plus one lapse for a family that never left. Rows that start and lapse inside the
+  // same month also used to inflate the numerator without ever entering the base, which made the
+  // rate exceed 100%. The base is families granting access at the month start, the lapsed set is
+  // the subset of those whose access ENDED during the month, so the rate can never exceed 100% and
+  // a family that left once is counted once, in the month it left (BILL-R2-1-a: a family whose
+  // access ended in an earlier month must not re-enter this month's numerator).
+  const newFamilies = await tx<{ family_id: string }[]>`
+    select e.family_id
+      from public.family_entitlements e
+     group by e.family_id
+    having min(e.created_at) >= ${start} and min(e.created_at) < ${end}
+  `;
+  // BILL-R2-1-a: each ledger row carries the instant its paid access ends (`ended_at`), because
+  // `status` alone says only that a row grants nothing NOW, not when it stopped. RevenueCat leaves
+  // `expires_date` untouched on a refund (providers/billing.ts), so a row refunded on 20 August can
+  // still carry period_end 1 December: keyed on status alone that family re-entered the base and the
+  // lapsed set every month until December, and the owner saw a fresh 100% churn month after month
+  // for one family that left once. Per row:
+  //   active / grace_period  -> period_end + the access bound (the domain grant rule)
+  //   cancelled_active       -> period_end (exclusive)
+  //   expired / revoked / refunded / billing_retry -> least(period_end, provider_updated_at): an
+  //     expiry is observed at or after the nominal period end, while a refund or revocation mid
+  //     period is dated by the provider's own update instant.
+  // `pending` never granted and rows without a period_end cannot be dated, so both are left out.
+  // A family's access ends when its last row ends, or at its tombstone if that comes first
+  // (BILL-R2-2: deletion is the end of the service).
+  const baseFamilies = await tx<{ family_id: string; ended_at: Date | null }[]>`
+    with ledger as (
+      select e.family_id,
+             e.created_at,
+             case
+               when e.status in ('active', 'grace_period')
+                 then e.period_end + make_interval(secs => ${accessBoundSeconds})
+               when e.status = 'cancelled_active' then e.period_end
+               else least(e.period_end, e.provider_updated_at)
+             end as ended_at
+        from public.family_entitlements e
+       where e.status <> 'pending' and e.period_end is not null
+    )
+    select l.family_id, least(f.deleted_at, max(l.ended_at)) as ended_at
+      from ledger l
+      join public.families f on f.id = l.family_id
+     where f.deleted_at is null or f.deleted_at >= ${start}
+     group by l.family_id, f.deleted_at
+    having bool_or(l.created_at < ${start} and l.ended_at >= ${start})
   `;
   const channelCounts = new Map<string, number>(CHANNELS.map((c) => [c, 0]));
   const slotCounts = new Map<number, number>();
@@ -268,8 +318,19 @@ export async function loadSubscriptions(tx: Tx, now: Date): Promise<Subscription
     slotCounts.set(row.paid_slots, (slotCounts.get(row.paid_slots) ?? 0) + 1);
     families.add(row.family_id);
   }
-  const lapsed = movement?.lapsed_this_month ?? 0;
-  const activeAtStart = movement?.active_at_start ?? 0;
+  // A base family that grants nothing any more has lapsed, whatever ended it: an expired, revoked
+  // or refunded subscription, or the account deletion (BILL-R2-2) that takes it out of `active`.
+  // The ending must fall inside the reported month (BILL-R2-1-a), so a family that left in an
+  // earlier month is counted in that month only and never again.
+  const startMs = start.getTime();
+  const nowMs = now.getTime();
+  const lapsed = baseFamilies.filter((r) => {
+    if (families.has(r.family_id)) return false;
+    if (r.ended_at === null) return false;
+    const endedMs = r.ended_at.getTime();
+    return endedMs >= startMs && endedMs <= nowMs;
+  }).length;
+  const activeAtStart = baseFamilies.length;
   return {
     asOf: now.toISOString(),
     month,
@@ -291,27 +352,74 @@ export async function loadSubscriptions(tx: Tx, now: Date): Promise<Subscription
       count: r.count,
     })),
     newThisMonth: {
-      value: movement?.new_this_month ?? 0,
+      value: newFamilies.length,
       source: ENTITLEMENTS,
-      definition: `Rows first recorded (created_at) in ${month} UTC.`,
+      definition: `Families whose FIRST subscription row was recorded (created_at) in ${month} UTC; a tier change of a family that already subscribed is not a new subscription. A family that has since deleted its account still counts: it did subscribe this month.`,
     },
     lapsedThisMonth: {
       value: lapsed,
       source: ENTITLEMENTS,
-      definition: `Rows now expired, revoked or refunded whose provider period_end falls in ${month} UTC.`,
+      definition: `Families in activeAtMonthStart that grant no paid access at the request instant AND whose access ended inside ${month} UTC: the last subscription ended (its period ran out, or it was revoked or refunded) or the account was deleted, in this month. A family that left in an earlier month is counted in that month only, never again. A change of product or tier inside one family is not a lapse.`,
     },
     activeAtMonthStart: {
       value: activeAtStart,
       source: ENTITLEMENTS,
-      definition: `Rows recorded before ${month} whose provider period had not ended at the start of the month (status not pending).`,
+      definition: `Families with a subscription row recorded before ${month} whose paid access had not yet ended when the month began (status not pending; a refund, revocation or expiry dated before the month counts as ended, as does an account deleted before the month).`,
     },
     churn: {
       basisPoints: churnBasisPoints(lapsed, activeAtStart),
       source: ENTITLEMENTS,
       definition:
-        'lapsedThisMonth ÷ activeAtMonthStart in basis points, rounded down; null when nothing was active at the start of the month.',
+        'lapsedThisMonth ÷ activeAtMonthStart in basis points, rounded down; null when no family was active at the start of the month. Both figures count families and the lapsed families are a subset of the base, so the rate can never exceed 10000 (100%).',
     },
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recognized P16 revenue (public.revenue_entries + public.revenue_adjustments)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * BILL-R2-3: recognized revenue for a month under the SAME domain rule as
+ * GET /v1/admin/monetization/revenue/summary (packages/domain monetization revenueSummary): a
+ * fixed sponsor fee replaces network revenue on the inventory it bought, so an ad_network entry on
+ * a (category, placement, month) cell that also has a sponsor_direct entry is excluded as a double
+ * count. A plain SUM over recognized rows counted that money twice, and the owner's overview then
+ * contradicted the monetization page for the same month. Cohorts are not needed here (only
+ * recognizedCents is read), so the per-capita figures of the summary are deliberately not computed.
+ */
+export async function loadRecognizedRevenue(tx: Tx, month: string): Promise<number> {
+  const entries = await tx<
+    {
+      id: string;
+      category: RevenueCategory;
+      provider: MonetizationProvider;
+      placement: Placement | null;
+      period_month: string;
+      amount_cents: number;
+    }[]
+  >`
+    select id, category, provider, placement, period_month, amount_cents
+      from public.revenue_entries where period_month = ${month}
+  `;
+  const adjustments = await tx<
+    { entry_id: string; kind: RevenueAdjustmentKind; amount_cents: number }[]
+  >`
+    select a.entry_id, a.kind, a.amount_cents from public.revenue_adjustments a
+      join public.revenue_entries e on e.id = a.entry_id where e.period_month = ${month}
+  `;
+  return revenueSummary(
+    entries.map((e) => ({
+      id: e.id,
+      category: e.category,
+      provider: e.provider,
+      placement: e.placement,
+      periodMonth: e.period_month,
+      amountCents: e.amount_cents,
+    })),
+    adjustments.map((a) => ({ entryId: a.entry_id, kind: a.kind, amountCents: a.amount_cents })),
+    { activeFamilies: 0, adEligibleAdults: 0 },
+  ).recognizedCents;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -362,13 +470,7 @@ export async function loadOverview(
            coalesce((select sum(total_cents) from public.donation_payout_batches where status = 'paid'), 0)::text as paid
   `;
 
-  const [recognized] = await tx<{ entries: string; adjustments: string }[]>`
-    select coalesce((select sum(amount_cents) from public.revenue_entries
-                      where category = 'recognized' and period_month = ${month}), 0)::text as entries,
-           coalesce((select sum(j.amount_cents) from public.revenue_adjustments j
-                       join public.revenue_entries e on e.id = j.entry_id
-                      where e.category = 'recognized' and e.period_month = ${month}), 0)::text as adjustments
-  `;
+  const recognizedCents = await loadRecognizedRevenue(tx, month);
 
   const [spend] = await tx<{ spent: string; budget: string | null }[]>`
     select coalesce((select sum(cost_micros) from public.ai_usage_events
@@ -474,9 +576,9 @@ export async function loadOverview(
     },
     monetization: {
       recognizedThisMonthCents: {
-        cents: int(recognized?.entries) + int(recognized?.adjustments),
+        cents: recognizedCents,
         source: 'public.revenue_entries + public.revenue_adjustments',
-        definition: `P16 entries with category recognized for period_month ${month}, plus their signed adjustments.`,
+        definition: `P16 entries with category recognized for period_month ${month}, plus their signed adjustments, under the domain revenue rule: an ad_network entry on a (category, placement, month) cell already sold as a fixed sponsor fee is excluded as a double count, exactly as GET /v1/admin/monetization/revenue/summary reports it.`,
       },
     },
     aiSpend: {
@@ -500,7 +602,7 @@ export async function loadOverview(
         'billing_events_failed',
         billingEvents,
         'public.billing_provider_events',
-        'Provider events (RevenueCat, Stripe) whose processing failed, all time.',
+        'Provider events (RevenueCat, Stripe) whose processing failed, all time, including bodies the request schema refused (error_code UNEXPECTED_SHAPE): the provider retries them, and a retry after a fix is reprocessed (BILL-R2-6).',
       ),
       item(
         'safety_reports_open',

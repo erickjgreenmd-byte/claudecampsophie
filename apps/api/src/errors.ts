@@ -71,11 +71,23 @@ const KNOWN_CONSTRAINTS: Readonly<Record<string, () => ApiError>> = {
  * Text Postgres cannot store (22021 invalid byte sequence, e.g. U+0000; 22P05 untranslatable
  * character) is an input problem too: the contracts refuse control characters first
  * (API-AUTH-R1-01) and this keeps any other unstorable text a 400 instead of an unhandled 500.
+ * Dates Postgres cannot represent (22008 datetime field overflow, e.g. year 0 on a `::date` cast;
+ * 22007 invalid datetime format) are the same kind of problem: the contracts bound calendar years
+ * first (API-AUTH-R2-03) and this keeps anything that still reaches a cast a 400 rather than an
+ * unhandled 500 and an error log.
+ *
+ * 22003 (numeric value out of range) is deliberately NOT here (ACC-FAM-05). Money is integer cents
+ * and every caller-supplied number is bounded by its contract, so a numeric value the database
+ * cannot represent is our own arithmetic overflowing. Calling that a 400 would blame the parent and
+ * lose the error log; it stays a 500 so we see it and fix it.
  */
 export function knownConstraintError(error: unknown): ApiError | undefined {
   const code = pgErrorCode(error);
   if (code === '22021' || code === '22P05') {
     return new ApiError('VALIDATION_FAILED', 'Some text contains characters that can’t be saved');
+  }
+  if (code === '22008' || code === '22007') {
+    return new ApiError('VALIDATION_FAILED', 'Some values are outside the range we can save');
   }
   if (code !== '23505' && code !== '23514') return undefined;
   const constraint = pgConstraint(error);

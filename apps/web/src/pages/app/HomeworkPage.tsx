@@ -44,6 +44,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
+import { StepUpPrompt } from '../../components/StepUpPrompt.tsx';
 import { downscaleForUpload } from '../../lib/image-downscale.ts';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 
@@ -117,13 +118,27 @@ const STATUS_COPY: Record<AssignmentStatus, { label: string; explain: (name: str
     deleted: { label: 'Deleted', explain: () => 'Deleted.' },
   };
 
-/** Error codes whose meaning is more specific than the generic copy of their state. */
+/**
+ * Error codes whose meaning is more specific than the generic copy of their state. Each line says
+ * what the parent can do next; the code itself is never shown, and a code with no line here falls
+ * back to the state's own copy (JOBS-R2-02, JOBS-R2-06).
+ */
+const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
+  FORMAT_NEEDS_CONVERSION:
+    'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back. Scan the pages again as JPEG or PNG photos.',
+  SCAN_TOO_MANY_QUESTIONS:
+    'This worksheet has more questions than one check can handle, so its pages were given back. Split it into two scans with fewer pages each.',
+  AI_PAUSED_TOO_LONG:
+    'PencilLift could not check this scan in time and its pages were given back. Send the pages again.',
+};
+
 function explainStatus(
   assignment: { status: AssignmentStatus; errorCode: string | null },
   name: string,
 ): string {
-  if (assignment.status === 'failed_final' && assignment.errorCode === 'FORMAT_NEEDS_CONVERSION') {
-    return 'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back. Scan the pages again as JPEG or PNG photos.';
+  if (assignment.status === 'failed_final' && assignment.errorCode !== null) {
+    const copy = FAILED_FINAL_COPY[assignment.errorCode];
+    if (copy !== undefined) return copy;
   }
   return STATUS_COPY[assignment.status].explain(name);
 }
@@ -227,14 +242,16 @@ function useAction() {
   return { busy, feedback, run, setFeedback };
 }
 
+/**
+ * WEB-R2-05: the shared inline prompt, so a step-up refusal on a scan is answered here instead of
+ * sending the parent to /app/security and unmounting the panel they had open.
+ */
 function StepUpNotice({ what }: { what: string }) {
   return (
-    <div className="notice" role="alert">
-      <p style={{ margin: 0 }}>
-        <strong>Enter your parent PIN to continue.</strong> {what} needs a recent PIN unlock.{' '}
-        <Link to="/app/security">Unlock on the Security page</Link>, then try again.
-      </p>
-    </div>
+    <StepUpPrompt
+      explanation={`${what} needs a recent PIN unlock.`}
+      retryHint={() => 'Press the same button again to continue.'}
+    />
   );
 }
 

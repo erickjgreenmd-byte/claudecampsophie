@@ -4,8 +4,10 @@ import { MIN_PASSWORD_LENGTH } from '../../lib/auth.ts';
 import { useParentSession, useSession } from '../../lib/session.tsx';
 import {
   maskEmail,
+  passwordProofAuth,
   readRecoveryLinkTokens,
   recoveryLinkAuth,
+  recoverySessionAuth,
   type RecoveryLinkOutcome,
 } from '../../lib/supabase-auth.ts';
 import { AuthLinkNotice, readAuthLinkProblem } from '../../components/AuthLinkNotice.tsx';
@@ -30,8 +32,11 @@ export default function UpdatePasswordPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const [password, setPassword] = useState('');
+  const [current, setCurrent] = useState('');
   const account = auth.account;
   const capability = recoveryLinkAuth(account);
+  const proof = passwordProofAuth(account);
+  const recoverySession = recoverySessionAuth(account);
   // Read once, on the first render: the hash is cleared right after.
   const [tokens] = useState(() => (capability ? readRecoveryLinkTokens(location.hash) : null));
   const [recovery, setRecovery] = useState<Recovery>(
@@ -80,18 +85,43 @@ export default function UpdatePasswordPage() {
       );
     }
   }
+  // WEB-R2-04: only a session that came from the emailed recovery link may set a new password with
+  // nothing else. In any other signed-in session the current password is proved first, so an
+  // unattended signed-in browser is no longer enough to take over the account (and the weaker
+  // secret, the 6-digit PIN, is no longer the better-protected one).
+  const fromRecoveryLink =
+    recovery.status === 'ready' || recoverySession?.recoveryActive() === true;
+  const currentEmail = state.status === 'signed_in' ? state.session.email : null;
+  const mustProve = !fromRecoveryLink;
+  if (mustProve && (!proof || !currentEmail)) {
+    // No way to prove the old password here (an adapter without the capability): refuse rather than
+    // offer a change that would need no proof.
+    return (
+      <Notice>
+        To change your password, open the reset link in your email.{' '}
+        <Link to="/reset-password">Send me a reset link</Link>.
+      </Notice>
+    );
+  }
   return (
     <AccountForm
       title="Choose a new password"
       submitLabel="Save password"
-      onSubmit={() =>
-        password.length < MIN_PASSWORD_LENGTH
-          ? Promise.resolve({
-              ok: false,
-              message: `Use at least ${MIN_PASSWORD_LENGTH} characters.`,
-            })
-          : account.updatePassword(password)
-      }
+      onSubmit={async () => {
+        if (password.length < MIN_PASSWORD_LENGTH) {
+          return { ok: false, message: `Use at least ${MIN_PASSWORD_LENGTH} characters.` };
+        }
+        if (mustProve) {
+          if (current.length === 0) {
+            return { ok: false, message: 'Enter your current password.' };
+          }
+          // Proved on a second, non-persisting client: this browser's session (and an owner's
+          // two-step aal2 session) is left exactly as it was.
+          const proved = await proof!.verifyPassword(currentEmail!, current);
+          if (!proved.ok) return proved;
+        }
+        return account.updatePassword(password);
+      }}
       done={() => (
         <Notice>
           Your password is changed. <Link to="/app">Go to your family</Link>.
@@ -108,6 +138,22 @@ export default function UpdatePasswordPage() {
             Not your account? Don’t save anything here;{' '}
             <Link to="/reset-password">request a reset link for your own email</Link>.
           </p>
+        </>
+      ) : null}
+      {mustProve ? (
+        <>
+          <p>
+            {`You are signed in as ${maskEmail(currentEmail!)}. Enter your current password to change it.`}{' '}
+            Forgotten it? <Link to="/reset-password">Send a reset link to your email</Link>.
+          </p>
+          <Field
+            id="current-password"
+            label="Current password"
+            type="password"
+            value={current}
+            onChange={setCurrent}
+            autoComplete="current-password"
+          />
         </>
       ) : null}
       <Field

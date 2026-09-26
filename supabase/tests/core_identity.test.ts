@@ -125,7 +125,12 @@ describe('adult limit', () => {
 });
 
 describe('adult step-up (spec P3)', () => {
-  it('child creation requires a recent unlock bound to the same auth session', async () => {
+  it('child creation is no Data-API write at all, and the step-up stays session-bound', async () => {
+    // API-AUTH-R2-01 (migration 0860): routes/family.ts creates a child with the service role, after
+    // taking the family row lock for the CHILD_PROFILE_LIMIT cap and parsing the body with the K-8 /
+    // under-13 contract, so `authenticated` holds no insert or update grant on child_profiles. The
+    // write is refused whether or not the session carries a step-up — this test used to show the
+    // policy refusing it, which was the weaker of the two refusals.
     const insertChild = (sessionId?: string) =>
       db.asParent(
         familyA.ownerId,
@@ -136,14 +141,40 @@ describe('adult step-up (spec P3)', () => {
         sessionId ? { sessionId } : {},
       );
 
-    await expect(insertChild()).rejects.toThrow(/row-level security/);
-
+    await expect(insertChild()).rejects.toThrow(/permission denied/);
     await grantAdultUnlock(db, familyA.ownerId, '00000000-0000-4000-8000-00000000abcd');
-    // Unlock on a different auth session does not transfer.
-    await expect(insertChild()).rejects.toThrow(/row-level security/);
+    await expect(insertChild()).rejects.toThrow(/permission denied/);
+    await expect(insertChild('00000000-0000-4000-8000-00000000abcd')).rejects.toThrow(
+      /permission denied/,
+    );
 
-    const rows = await insertChild('00000000-0000-4000-8000-00000000abcd');
-    expect(rows[0]!.status).toBe('draft');
+    // The step-up itself is unchanged and still bound to the auth session the unlock names: an
+    // unlock on another session does not transfer, which is what the (still present) insert and
+    // update policies on child_profiles require.
+    const unlocked = async (sessionId?: string) => {
+      const rows = await db.asParent(
+        familyA.ownerId,
+        (tx) => tx<{ ok: boolean }[]>`select app.has_recent_adult_unlock() as ok`,
+        sessionId ? { sessionId } : {},
+      );
+      return rows[0]!.ok;
+    };
+    expect(await unlocked()).toBe(false);
+    expect(await unlocked('00000000-0000-4000-8000-00000000abcd')).toBe(true);
+    const policies = await db.sql<{ policyname: string; with_check: string }[]>`
+      select policyname, with_check from pg_policies
+       where schemaname = 'public' and tablename = 'child_profiles'
+         and policyname in ('child_profiles_member_insert', 'child_profiles_member_update')`;
+    expect(policies).toHaveLength(2);
+    for (const p of policies) expect(p.with_check ?? '').not.toBe('');
+
+    // The API's own path (service role) still creates an uncharged draft.
+    const [created] = await db.asService(
+      (tx) => tx<{ status: string }[]>`
+        insert into public.child_profiles (family_id, nickname, grade_level, age_band)
+        values (${familyA.familyId}, 'Avery', 2, '5-7') returning status`,
+    );
+    expect(created!.status).toBe('draft');
   });
 
   it('an expired unlock is not honoured', async () => {

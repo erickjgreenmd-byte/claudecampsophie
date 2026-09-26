@@ -128,7 +128,8 @@ beforeAll(async () => {
       .sql`insert into public.child_slot_assignments (family_id, child_id) values (${famA.familyId}, ${c.id})`;
   }
   // Subscriptions: A app_store active (new this month, 2 slots); B play_store active since August
-  // (1 slot, period ended 15 Sep, inside the 30-day access bound); B stripe expired 10 Sep (lapsed).
+  // (1 slot, period ended 15 Sep, inside the 30-day access bound); B stripe expired 10 Sep. B is one
+  // family with two rows, so it is one base family and not a churned one (BILL-R2-1).
   await entitlement(
     famA,
     'app_store',
@@ -383,9 +384,16 @@ describe('company overview', () => {
       { status: 'expired', count: 1 },
     ]);
     expect(s.newThisMonth.value).toBe(1);
-    expect(s.lapsedThisMonth.value).toBe(1);
-    expect(s.activeAtMonthStart.value).toBe(2);
-    expect(s.churn.basisPoints).toBe(5000);
+    // BILL-R2-1/BILL-R2-2: movement is per FAMILY, not per ledger row. This fixture is exactly the
+    // case the finding is about: family B holds two rows from before September (play_store active,
+    // stripe expired), so the old per-row counts put it in the base twice and read its ended stripe
+    // row as a lapse — 50% churn for a family that is still paying on play_store. The earlier
+    // expectations (base 2, lapsed 1, churn 5000) asserted that double count; the base is now the
+    // one family granting access at the month start and it has not lapsed.
+    expect(s.activeAtMonthStart.value).toBe(1);
+    expect(s.lapsedThisMonth.value).toBe(0);
+    expect(s.churn.basisPoints).toBe(0);
+    expect(s.churn.basisPoints).toBeLessThanOrEqual(10_000);
     expect(s.churn.definition).toMatch(/rounded down/);
     expect(s.active.source).toBe('public.family_entitlements');
   });
@@ -569,7 +577,15 @@ describe('revenue and subscriptions routes', () => {
       expect(later.month).toBe('2026-11');
       expect(later.active.value).toBe(0);
       expect(later.byChannel.every((c) => c.count === 0)).toBe(true);
-      expect(later.churn.basisPoints).toBeNull();
+      // BILL-R2-1-a: the earlier expectation here was `churn.basisPoints === null`, i.e. no family
+      // in the November base. That asserted the old base rule (`period_end >= month start`), which
+      // ignored the 30-day access bound. Family A's app_store period ended 5 October but its access
+      // ran out only on 4 November, so on 1 November it was still a paying family and it lost access
+      // during November: base 1, lapsed 1. Family B's rows ended in October (15 Sep + the bound) and
+      // July, so neither is in November's base and neither is counted again here.
+      expect(later.activeAtMonthStart.value).toBe(1);
+      expect(later.lapsedThisMonth.value).toBe(1);
+      expect(later.churn.basisPoints).toBe(10_000);
     } finally {
       api.now.value = new Date('2026-09-24T15:00:00Z');
     }

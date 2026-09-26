@@ -12,6 +12,25 @@ import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 export const BIOMETRIC_PIN_KEY = 'pl.parent.biometricPin';
 /** Non-secret flag so the screen can offer biometrics without triggering a prompt. */
 export const BIOMETRIC_ENABLED_KEY = 'pl.parent.biometricEnabled';
+/**
+ * The user id the stored PIN belongs to (MOB-R2-06). A stored PIN survived sign-out and account
+ * closure, so the next parent on a shared device was offered Face ID that submitted the previous
+ * parent's PIN, used up a lockout attempt and said "Your PIN has changed".
+ */
+export const BIOMETRIC_OWNER_KEY = 'pl.parent.biometricOwner';
+
+/** Whether biometric unlock may be offered: for the owner only, and never for an unknown owner. */
+export type BiometricOffer = 'offer' | 'off' | 'other_user';
+
+export function biometricOffer(
+  stored: { readonly enabled: boolean; readonly ownerUserId: string | null },
+  signedInUserId: string | null,
+): BiometricOffer {
+  if (!stored.enabled) return 'off';
+  // Fails closed: nobody signed in, a different parent, or a PIN stored before owners were recorded.
+  if (signedInUserId === null || stored.ownerUserId === null) return 'other_user';
+  return stored.ownerUserId === signedInUserId ? 'offer' : 'other_user';
+}
 
 export interface BiometricPinStore {
   isEnabled(): Promise<boolean>;
@@ -23,7 +42,12 @@ export interface BiometricPinStore {
 }
 
 export type UnlockOutcome =
-  | { readonly kind: 'unlocked'; readonly unlockedUntil: string }
+  | {
+      readonly kind: 'unlocked';
+      readonly unlockedUntil: string;
+      /** The window's length in seconds, so the device holds it on its own clock (MOB-R2-03). */
+      readonly unlockSeconds: number | undefined;
+    }
   | { readonly kind: 'error'; readonly message: string; readonly wrongPin: boolean }
   /** The stored PIN no longer matches (it was changed): biometrics are turned off. */
   | { readonly kind: 'pin_changed'; readonly message: string }
@@ -53,7 +77,11 @@ export async function unlockWithPin(api: ApiClient, pin: string): Promise<Unlock
       { method: 'pin', pin },
       adultUnlockResponseSchema,
     );
-    return { kind: 'unlocked', unlockedUntil: result.unlockedUntil };
+    return {
+      kind: 'unlocked',
+      unlockedUntil: result.unlockedUntil,
+      unlockSeconds: result.unlockSeconds,
+    };
   } catch (error) {
     return {
       kind: 'error',

@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react';
-import { Link } from 'react-router';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState } from '../states.tsx';
+import { StepUpPrompt } from '../StepUpPrompt.tsx';
 
 /** Shared action feedback for the learning planner sections (one mutation at a time per section). */
 
@@ -33,14 +33,24 @@ export function useAction() {
   return { busy, feedback, run, setFeedback };
 }
 
+/**
+ * WEB-R2-05: the learning planner answers a step-up refusal where the parent already is.
+ *
+ * Every planner section (schedule, subjects, practice sets, study material, test dates) refuses
+ * through here, and this used to be a link to /app/security. Following it unmounted the section and
+ * lost the half-filled schedule slot, study-material note or test date, and the Security page had no
+ * way back. The shared inline prompt keeps the same link — with the same name and href, which
+ * LearningPlannerPage.test.tsx (another area's file) pins — but adds the PIN field in place and
+ * carries the return path as router state.
+ *
+ * The prop and the export are unchanged, so PracticeSetsSection (another area's file) still works.
+ */
 export function StepUpNotice({ what }: { what: string }) {
   return (
-    <div className="notice" role="alert">
-      <p style={{ margin: 0 }}>
-        <strong>Enter your parent PIN to continue.</strong> {what} needs a recent PIN unlock.{' '}
-        <Link to="/app/security">Unlock on the Security page</Link>, then try again.
-      </p>
-    </div>
+    <StepUpPrompt
+      explanation={`${what} needs a recent PIN unlock.`}
+      retryHint={() => 'Press the same button again to continue.'}
+    />
   );
 }
 

@@ -3,7 +3,6 @@ import { Link, useNavigate } from 'react-router';
 import {
   ACCOUNT_CLOSE_COPY,
   ACCOUNT_CLOSE_RULES,
-  adultUnlockResponseSchema,
   closeAccountResponseSchema,
   exportDownloadResponseSchema,
   dataExportResponseSchema,
@@ -33,6 +32,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState, Loading, Notice } from '../../components/states.tsx';
+import { StepUpPrompt as SharedStepUpPrompt } from '../../components/StepUpPrompt.tsx';
 import { STORE_THAT_BILLS_YOU } from '../../components/stores.ts';
 import { RequireParent, useApiQuery, useSession, type QueryState } from '../../lib/session.tsx';
 
@@ -186,87 +186,16 @@ function useAction() {
  * Inline step-up (spec P3): the API refused because this session has no recent PIN unlock. The
  * parent enters the PIN here; nothing sensitive is retried automatically — they press the action
  * button again, which is a second, deliberate confirmation.
+ *
+ * WEB-R2-05: the prompt itself now lives in components/StepUpPrompt.tsx, so every other family page
+ * answers a step-up refusal in place too instead of sending the parent to /app/security.
  */
 function StepUpPrompt({ actionLabel }: { actionLabel: string }) {
-  const { api } = useSession();
-  const [pin, setPin] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [unlockedUntil, setUnlockedUntil] = useState<string | null>(null);
-  const pinId = useId();
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!/^\d{6}$/.test(pin)) {
-      setMessage('Enter your 6-digit parent PIN.');
-      return;
-    }
-    const entered = pin;
-    setPin('');
-    setMessage(null);
-    setBusy(true);
-    try {
-      const result = await api.send(
-        'POST',
-        '/v1/adult/unlock',
-        { method: 'pin', pin: entered },
-        adultUnlockResponseSchema,
-      );
-      setUnlockedUntil(result.unlockedUntil);
-    } catch (error) {
-      const e = toApiError(error);
-      setMessage(
-        e.code === 'FORBIDDEN'
-          ? 'That PIN is not correct.'
-          : e.code === 'NOT_FOUND'
-            ? 'Set a parent PIN on the Security page first.'
-            : errorMessage(e),
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (unlockedUntil) {
-    return (
-      <p role="status" style={{ color: 'var(--success)', fontWeight: 700 }}>
-        {`Unlocked until ${formatTime(unlockedUntil)}. Press “${actionLabel}” again to continue.`}
-      </p>
-    );
-  }
   return (
-    <fieldset className="notice" style={{ ...fieldsetStyle, borderColor: 'var(--gold)' }}>
-      <legend style={legendStyle}>Enter your parent PIN to continue</legend>
-      <p style={{ marginTop: 0 }}>
-        This needs a recent PIN unlock, checked by PencilLift’s servers. You can also unlock on the{' '}
-        <Link to="/app/security">Security page</Link>.
-      </p>
-      <form onSubmit={(e) => void submit(e)} noValidate>
-        <label htmlFor={pinId}>Parent PIN</label>
-        <input
-          id={pinId}
-          type="password"
-          inputMode="numeric"
-          autoComplete="off"
-          maxLength={6}
-          value={pin}
-          onChange={(e) => {
-            setPin(e.target.value.replace(/\D/g, '').slice(0, 6));
-            setMessage(null);
-          }}
-        />
-        {message ? (
-          <p role="alert" style={fieldError}>
-            {message}
-          </p>
-        ) : null}
-        <div style={buttonRow}>
-          <button type="submit" className="btn" disabled={busy}>
-            {busy ? 'Checking…' : 'Unlock'}
-          </button>
-        </div>
-      </form>
-    </fieldset>
+    <SharedStepUpPrompt
+      explanation="This action needs a recent PIN unlock."
+      retryHint={() => `Press “${actionLabel}” again to continue.`}
+    />
   );
 }
 
@@ -666,8 +595,35 @@ function ExportDownload({ exportId }: { exportId: string }) {
   const { api } = useSession();
   const action = useAction();
   const [link, setLink] = useState<{ url: string; expiresAt: string } | null>(null);
-  const label = 'Get download link';
+  const [expired, setExpired] = useState(false);
+  // WEB-R2-07: once a link has been asked for, the button stays available as "Get a new link", so a
+  // parent never has to reload the portal to replace one that ran out.
+  const [fetched, setFetched] = useState(false);
+  const label = fetched ? 'Get a new link' : 'Get download link';
+
+  /**
+   * The API signs the link for one minute (DOWNLOAD_URL_SECONDS). At that instant the link is
+   * dropped, so the page can never offer a URL that would answer with the storage service's error
+   * document. The parent is told it expired and asks for another.
+   */
+  useEffect(() => {
+    if (!link) return;
+    const remaining = new Date(link.expiresAt).getTime() - Date.now();
+    const done = () => {
+      setLink(null);
+      setExpired(true);
+    };
+    if (!Number.isFinite(remaining) || remaining <= 0) {
+      done();
+      return;
+    }
+    const timer = setTimeout(done, remaining);
+    return () => clearTimeout(timer);
+  }, [link]);
+
   const fetchLink = async () => {
+    setExpired(false);
+    setFetched(true);
     const ok = await action.run(async () => {
       setLink(await api.get(`/v1/exports/${exportId}/download`, exportDownloadResponseSchema));
       return 'Your download link is ready.';
@@ -683,16 +639,20 @@ function ExportDownload({ exportId }: { exportId: string }) {
           </a>
           {` (link valid until ${formatTime(link.expiresAt)})`}
         </p>
-      ) : (
-        <button
-          type="button"
-          className="btn secondary"
-          disabled={action.busy}
-          onClick={() => void fetchLink()}
-        >
-          {action.busy ? 'Preparing…' : label}
-        </button>
-      )}
+      ) : null}
+      {expired ? (
+        <p role="status" style={{ margin: 0 }}>
+          That download link expired for your safety. Ask for a new one to download the file.
+        </p>
+      ) : null}
+      <button
+        type="button"
+        className="btn secondary"
+        disabled={action.busy}
+        onClick={() => void fetchLink()}
+      >
+        {action.busy ? 'Preparing…' : label}
+      </button>
       {link ? null : <ActionOutcome outcome={action.outcome} actionLabel={label} />}
     </div>
   );

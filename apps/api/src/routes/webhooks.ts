@@ -135,9 +135,15 @@ async function recordEvent(
 /**
  * BILL-R1-4: a well-formed JSON body whose shape the schema refuses still leaves a trace, so a
  * provider event the code does not understand is visible in the admin attention list instead of
- * vanishing behind a 400. Recorded once (no lease reopening: a retry of the same body is refused
- * again and keeps the single row); never the body, only its digest, id and type. A body without
- * even an id and a type is logged by count only.
+ * vanishing behind a 400. Recorded once (a retry of the same body is refused again and keeps the
+ * single row); never the body, only its digest, id and type. A body without even an id and a type
+ * is logged by count only.
+ *
+ * BILL-R2-6: the row is stored as 'failed' with error_code UNEXPECTED_SHAPE, not 'ignored'. A
+ * refused shape is not an event PencilLift chose to ignore: it is a charge, refund or state change
+ * the code could not read, so (1) the overview's billing_events_failed attention rule counts it and
+ * the owner is told, and (2) recordEvent re-opens the row when the provider retries the same event
+ * id after the schema is fixed, instead of answering 'duplicate' and losing the event for good.
  */
 async function traceRejectedEvent(
   c: Ctx,
@@ -161,7 +167,7 @@ async function traceRejectedEvent(
     (tx) => tx`
       insert into public.billing_provider_events
         (provider, provider_event_id, event_type, payload_sha256, status, processed_at, error_code)
-      values (${provider}, ${id}, ${type}, ${digest}, 'ignored', now(), 'UNEXPECTED_SHAPE')
+      values (${provider}, ${id}, ${type}, ${digest}, 'failed', now(), 'UNEXPECTED_SHAPE')
       on conflict (provider, provider_event_id) do nothing
     `,
   );

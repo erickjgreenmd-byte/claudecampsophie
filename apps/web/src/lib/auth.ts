@@ -34,10 +34,18 @@ export interface AccountAuth {
   verifiedTotpFactorId(): Promise<string | null>;
 }
 
+/**
+ * WEB-R2-01: how far a sign-out reaches. `local` ends this browser's session only; `global` ends
+ * every session of the account. The portal's own "Sign out" is always `local`, so a parent ending
+ * a session on a shared computer never signs their phone out (the mirror of MOB-R1-01).
+ */
+export type SignOutScope = 'local' | 'global';
+
 export interface AuthAdapter {
   readonly configured: boolean;
   currentSession(): Promise<ParentSession | null>;
-  signOut(): Promise<void>;
+  /** Defaults to `local`: a sign-out here never reaches the parent's other devices. */
+  signOut(scope?: SignOutScope): Promise<void>;
   /** Present when real sign-in is available. */
   readonly account?: AccountAuth;
   /** Subscribes to sign-in/sign-out changes; returns an unsubscribe function. */
@@ -52,6 +60,18 @@ export const unconfiguredAuth: AuthAdapter = {
 
 /** Minimum parent password length (spec P3: adult accounts protect child data). */
 export const MIN_PASSWORD_LENGTH = 12;
+
+/**
+ * `pat.parent@example.test` → `p•••@example.test`: enough for a parent to notice the portal is
+ * showing someone else's session, without printing the address on a shared screen. Lives here
+ * (not in the Supabase adapter) so the shell can show it without pulling in the auth SDK.
+ */
+export function maskEmail(email: string): string {
+  const at = email.lastIndexOf('@');
+  const local = at >= 0 ? email.slice(0, at) : email;
+  const domain = at >= 0 ? email.slice(at) : '';
+  return `${local.slice(0, 1)}•••${domain}`;
+}
 
 /** Only same-origin relative paths may be used as a post-sign-in destination (no open redirect). */
 export function safeNextPath(next: string | null | undefined): string {

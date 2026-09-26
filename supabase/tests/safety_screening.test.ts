@@ -180,7 +180,10 @@ describe('system safety reports (0760)', () => {
         (tx) => tx`insert into public.safety_reports (family_id, reporter_kind, category)
                    values (${s.fam.familyId}, 'parent', 'severe_risk')`,
       ),
-    ).rejects.toThrow(/safety_reports_system_shape|row-level security/);
+    ).rejects.toThrow(/safety_reports_system_shape|row-level security|permission denied/);
+    // API-AUTH-R2-01 (migration 0860): `authenticated` lost its insert grant on safety_reports
+    // altogether, so the refusal now comes from the privilege, before the shape check. The check
+    // constraint and the parent-insert policy both stay in place underneath.
     await expect(
       db.asChild(
         childClaims(s.fam),

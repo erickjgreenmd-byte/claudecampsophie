@@ -9,7 +9,14 @@ import {
   reverifyFormerHolders,
   syncFamilyFromProvider,
 } from '../services/billing-sync.ts';
-import { createExportBuildHandler, storageUploader, type ExportUploader } from './export-build.ts';
+import {
+  createExportBuildHandler,
+  EXPORT_EXTENSIONS,
+  exportPath,
+  settleDeadLetteredExport,
+  storageUploader,
+  type ExportUploader,
+} from './export-build.ts';
 import { enqueueDueLearningJobs } from './learning-jobs.ts';
 import { purgeExpiredServes } from '../services/monetization-retention.ts';
 import { runDonationAccrual, runGeneration } from '../services/p17-jobs.ts';
@@ -68,6 +75,21 @@ export const JOB_LEASE_MINUTES = 20;
 /** A tick stops claiming new jobs after this long; the next tick continues. */
 const TICK_CLAIM_BUDGET_MS = 10 * 60_000;
 /**
+ * How long a Cron Trigger invocation lives in wall time. Measured against the TICK's start, not
+ * runJobs' own (JOBS-R2-07): every earlier step of the tick is unbounded in time (an inactivity
+ * sweep sends up to 50 emails with a 10 s timeout each, entitlement syncs call the store), so the
+ * ledger can start late and must not claim work it has no time to finish.
+ */
+const TICK_WALL_LIMIT_MS = 15 * 60_000;
+/**
+ * The worst case, in wall time, a job of this kind may need. A job is not claimed unless that much
+ * of the invocation is left, so a kill mid-run (which spends an attempt and leaves the job invisible
+ * until its 20-minute lease expires) is not how a long job usually ends. A scan is the longest:
+ * extraction, grading and verification plus up to two 45-second coaching calls per wrong answer.
+ */
+const JOB_WORST_CASE_MS: Readonly<Record<string, number>> = { scan_process: 7 * 60_000 };
+const DEFAULT_JOB_WORST_CASE_MS = 60_000;
+/**
  * Signed upload URLs are honoured for two hours (Supabase fixes the lifetime server-side); one more
  * hour covers an upload still in flight. An object removed less than this long after its scan stopped
  * accepting uploads is removed a second time once the window has passed. Equals the database's
@@ -78,7 +100,6 @@ export const LATE_UPLOAD_WINDOW_MS = 3 * 3600_000;
 export const INACTIVITY_SWEEP_HOUR_UTC = 3;
 const RESERVATION_TIMEOUT_MINUTES = 30;
 const GENERATION_LEAD_DAYS = 5;
-const EXPORT_EXTENSIONS = ['json', 'pdf', 'csv'] as const;
 
 // ---------------------------------------------------------------------------------------------
 // Failure codes and dead-letter successors
@@ -237,11 +258,21 @@ async function runDeletionPurge(deps: JobDeps, job: JobRow): Promise<void> {
   // An export still being built may upload its file after the purge: its path is deterministic.
   const pendingExportPaths = exports
     .filter((e) => e.status === 'queued')
-    .flatMap((e) => EXPORT_EXTENSIONS.map((ext) => `exports/${familyId}/${e.id}.${ext}`));
+    .flatMap((e) => EXPORT_EXTENSIONS.map((ext) => exportPath(familyId, e.id, ext)));
+  // JOBS-R2-01: a row that is not `ready` may still have its file in storage — an attempt whose
+  // answer was lost stored the bytes without ever recording `storage_path`, and the row then became
+  // `failed`. Nothing else ever removes such an object (the 7-day sweep only reads `ready` rows), so
+  // a family deletion would otherwise leave a whole-family JSON, or an answer key, behind for ever.
+  const unreadyExportPaths = exports
+    .filter((e) => e.status !== 'ready')
+    .flatMap((e) => EXPORT_EXTENSIONS.map((ext) => exportPath(familyId, e.id, ext)));
   const paths = [
-    ...pages.map((p) => p.storage_path),
-    ...exports.flatMap((e) => (e.storage_path ? [e.storage_path] : [])),
-    ...pendingExportPaths,
+    ...new Set([
+      ...pages.map((p) => p.storage_path),
+      ...exports.flatMap((e) => (e.storage_path ? [e.storage_path] : [])),
+      ...unreadyExportPaths,
+      ...pendingExportPaths,
+    ]),
   ];
   if (paths.length > 0) {
     try {
@@ -417,16 +448,27 @@ function isMemoryStorageMock(
 }
 
 /** `export_build`: one job per data_exports row (payload: export id, optional set id). */
-export const exportBuildHandler: JobHandler = (deps, job) => {
-  const storage = deps.providers.storage;
-  const upload: ExportUploader = isMemoryStorageMock(storage)
-    ? (path, bytes) => {
-        storage.put(path, bytes);
-        return Promise.resolve();
-      }
-    : storageUploader(storage);
-  return createExportBuildHandler({ upload })(deps, job);
-};
+export const exportBuildHandler: JobHandler = Object.assign(
+  (deps: JobDeps, job: JobRow): Promise<void | JobDeferral> => {
+    const storage = deps.providers.storage;
+    const upload: ExportUploader = isMemoryStorageMock(storage)
+      ? (path, bytes) => {
+          storage.put(path, bytes);
+          return Promise.resolve();
+        }
+      : storageUploader(storage);
+    return createExportBuildHandler({ upload })(deps, job);
+  },
+  {
+    /**
+     * JOBS-R2-05: the worker died on the final attempt (or an error outside build/upload ended it),
+     * so the handler never settled the row. Without this the parent's export list said "preparing"
+     * for ever, and any file the lost attempt stored was never removed.
+     */
+    onDeadLetter: (deps: JobDeps, job: JobRow): Promise<void> =>
+      settleDeadLetteredExport(deps, job),
+  },
+);
 
 // ---------------------------------------------------------------------------------------------
 // Account closure (Apple 5.1.1(v), Google Play account deletion; migration 0830)
@@ -554,6 +596,8 @@ export interface TickReport {
     rateLimitBuckets: number;
     endedAuthSessions: number;
     endedSessionRows: number;
+    /** Consumed or expired pairing codes and lapsed spend holds pruned this tick (DB-R2-08). */
+    endedCredentialRows: number;
   };
   /** Daily, Thursday and top-up jobs queued this tick (0 when learning handlers are not registered). */
   learningJobsEnqueued: number;
@@ -635,8 +679,15 @@ export async function runJobs(
   deps: JobDeps,
   handlers: Readonly<Record<string, JobHandler>> = DEFAULT_HANDLERS,
   limit = 25,
+  /**
+   * When this invocation started (JOBS-R2-07). The claim budget and the remaining wall time are
+   * measured from it, so steps that ran before the ledger count against it. Defaults to now, which
+   * is right for a caller that runs the ledger on its own.
+   */
+  tickStartedAt?: Date,
 ): Promise<TickReport['jobs']> {
   const started = deps.clock();
+  const tickStart = tickStartedAt ?? started;
   const report = { succeeded: 0, retried: 0, deadLettered: 0 };
   // Recover jobs whose worker died mid-run (lease expired while still "running"). A final attempt
   // lost this way is dead-lettered AND compensated (RV-lead-jobs-ai-2).
@@ -667,10 +718,17 @@ export async function runJobs(
   // One job per claim: a job's lease starts when it starts, so a long job never lets the next
   // tick "recover" (and run again) jobs that are claimed but still waiting (RV-lead-jobs-ai-1).
   for (let n = 0; n < limit; n += 1) {
-    if (deps.clock().getTime() - started.getTime() > TICK_CLAIM_BUDGET_MS) break;
+    const elapsed = deps.clock().getTime() - tickStart.getTime();
+    if (elapsed > TICK_CLAIM_BUDGET_MS) break;
+    // Only kinds whose worst case still fits the rest of the invocation (JOBS-R2-07).
+    const remaining = TICK_WALL_LIMIT_MS - elapsed;
+    const claimable = kinds.filter(
+      (kind) => (JOB_WORST_CASE_MS[kind] ?? DEFAULT_JOB_WORST_CASE_MS) <= remaining,
+    );
+    if (claimable.length === 0) break;
     let job: JobRow | null;
     try {
-      job = await claimNext(deps, kinds);
+      job = await claimNext(deps, claimable);
     } catch {
       // e.g. the family was tombstoned between the filter and the guard; the next tick cancels it.
       deps.log({ level: 'warn', event: 'job_claim_failed' });
@@ -1191,9 +1249,6 @@ export async function runScheduledTick(
     0,
     async () => (await purgeExpiredServes(deps.db, now)).deleted,
   );
-  const entitlementsReconciled = await step('entitlements', 0, () =>
-    reconcileStaleEntitlements(deps),
-  );
   // The inactivity scan aggregates activity across tables, so it runs once per UTC day: on the first
   // tick at or after 03:00 UTC (a durable marker, not a five-minute window).
   const inactivity = await step('inactivity', { notified: 0, deleted: 0 }, async () => {
@@ -1209,15 +1264,16 @@ export async function runScheduledTick(
   });
   const identityHousekeeping = await step(
     'identity_housekeeping',
-    { rateLimitBuckets: 0, endedAuthSessions: 0, endedSessionRows: 0 },
+    { rateLimitBuckets: 0, endedAuthSessions: 0, endedSessionRows: 0, endedCredentialRows: 0 },
     () => runIdentityHousekeeping(deps.db, now),
   );
   // Learning jobs are queued only where a worker will run them, and before the job ledger so a due
   // set is built in the same tick.
   // Job ledger retention (BUG-139): terminal rows older than the horizon go; the deletion_purge and
   // account_close kinds stay as the audit trail of a deletion. The horizon must exceed the raw scan
-  // retention (30 days): homework.ts derives the next scan version key from the assignment's job
-  // count, so a kept failed_final row and a pruned earlier one could otherwise collide.
+  // retention (30 days). Every next-scan-version key (homework.ts scan and correction routes,
+  // privacy.ts queueClearanceRecheck) is the HIGHEST kept version + 1, never a count (L-033,
+  // CS-R2-01), so pruning an earlier row cannot re-derive a key a kept later row still holds.
   const prunedJobs = await step(
     'job_retention',
     0,
@@ -1234,8 +1290,18 @@ export async function runScheduledTick(
     const r = await enqueueDueLearningJobs(deps, now);
     return r.dailyJobs + r.reviewJobs + r.topUpJobs;
   });
+  // The claim budget is measured from the tick's own start, not from when the ledger begins
+  // (JOBS-R2-07): the steps above are unbounded in time.
   const jobs = await step('jobs', { succeeded: 0, retried: 0, deadLettered: 0 }, () =>
-    runJobs(deps, handlers),
+    runJobs(deps, handlers, 25, now),
+  );
+  // The provider sweep runs AFTER the ledger (JOBS-R2-04, second round). Each request is bounded at
+  // BILLING_REQUEST_TIMEOUT_MS, but the sweep makes up to 25 of them one after another, and the work
+  // a family is actually waiting on — a scan, a safety email, an export — is in the ledger. A store
+  // that answers slowly now delays only itself; entitlement staleness is measured in days, so a sweep
+  // that misses the end of a tick loses nothing.
+  const entitlementsReconciled = await step('entitlements', 0, () =>
+    reconcileStaleEntitlements(deps),
   );
   const report: TickReport = {
     generatedCampaigns,

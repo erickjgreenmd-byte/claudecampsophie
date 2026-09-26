@@ -144,9 +144,14 @@ export function statusView(status: AssignmentStatus): StatusView {
         inProgress: false,
       };
     case 'failed_final':
+      // True whatever ended the scan. A scan can now end because the worksheet held more questions
+      // than one check can handle, or because the spend pause held it too long (JOBS-R2-02,
+      // JOBS-R2-06) — both were read perfectly well, so naming reading was untrue and sent the child
+      // to retake photos that were never the problem. The grown-up gets the specific advice on the
+      // portal; the child's screen carries no code.
       return {
         title: 'Let’s try a new scan',
-        body: 'We couldn’t read this one. Ask a grown-up for help, or scan it again.',
+        body: 'We couldn’t finish checking this one. Ask a grown-up for help, or try a new scan.',
         showResults: false,
         inProgress: false,
       };

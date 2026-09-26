@@ -42,7 +42,7 @@ import {
   useLoad,
   useParentAccess,
 } from '../../src/family/ui.tsx';
-import { currentMode } from '../../src/lib/mode.ts';
+import { currentMode, whileStorePurchaseOpen } from '../../src/lib/mode.ts';
 import { secureStorage } from '../../src/lib/secure-storage.ts';
 
 /**
@@ -220,7 +220,9 @@ function Plans({
   };
 
   const confirm = async (keepChildIds: readonly string[] | undefined) => {
-    const final = await runPlanChange(deps, flow, keepChildIds);
+    // The store's own sheet backgrounds the activity on Android, which would otherwise lock the
+    // parent area mid-purchase and take this screen away before the verify step (MOB-R2-01).
+    const final = await whileStorePurchaseOpen(() => runPlanChange(deps, flow, keepChildIds));
     setFlow(final);
     onChanged();
   };

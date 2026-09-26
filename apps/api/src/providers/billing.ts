@@ -129,9 +129,22 @@ export function mapRevenueCatSubscription(
   };
 }
 
+/**
+ * Per-request timeout for the billing providers (spec P12: every external request has a timeout),
+ * the same default the storage, email and auth-admin adapters use.
+ *
+ * JOBS-R2-04: without one, a stalled RevenueCat or Stripe connection never returns. The scheduled
+ * tick runs its steps one after another, so a single hung request in the stale-entitlement sweep
+ * held the whole invocation and the job ledger behind it never ran: no deletion purge, no account
+ * closure, no scan, no safety-flag email for as long as the network stall lasted. The sweep orders
+ * families by oldest fetched_at, so every following tick stalled on the same family first.
+ */
+export const BILLING_REQUEST_TIMEOUT_MS = 10_000;
+
 export function createRevenueCatProvider(
   secretApiKey: string,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = BILLING_REQUEST_TIMEOUT_MS,
 ): SubscriberStateProvider {
   return {
     name: 'revenuecat',
@@ -141,6 +154,7 @@ export function createRevenueCatProvider(
         `https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(billingRef)}`,
         {
           headers: { authorization: `Bearer ${secretApiKey}`, accept: 'application/json' },
+          signal: AbortSignal.timeout(timeoutMs),
         },
       );
       if (!response.ok)
@@ -171,6 +185,7 @@ const stripeInvoicePaymentsSchema = z.object({
 export function createStripeClient(
   secretKey: string,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = BILLING_REQUEST_TIMEOUT_MS,
 ): StripeBillingClient {
   return {
     name: 'stripe',
@@ -186,6 +201,8 @@ export function createStripeClient(
             'idempotency-key': `discount:${invoiceId}:${couponId}`,
           },
           body: new URLSearchParams({ 'discounts[0][coupon]': couponId }).toString(),
+          // JOBS-R2-04: the idempotency key makes the retry after a timeout safe.
+          signal: AbortSignal.timeout(timeoutMs),
         },
       );
       if (!response.ok) throw new Error(`Stripe invoice discount failed with ${response.status}`);
@@ -195,7 +212,7 @@ export function createStripeClient(
       // Older API versions expose charge.invoice directly.
       const charge = await fetchImpl(
         `https://api.stripe.com/v1/charges/${encodeURIComponent(chargeId)}`,
-        { headers },
+        { headers, signal: AbortSignal.timeout(timeoutMs) },
       );
       if (!charge.ok) throw new Error(`Stripe charge lookup failed with ${charge.status}`);
       const body = stripeChargeSchema.safeParse(await charge.json());
@@ -206,7 +223,7 @@ export function createStripeClient(
       if (!intent) return null;
       const payments = await fetchImpl(
         `https://api.stripe.com/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=${encodeURIComponent(intent)}`,
-        { headers },
+        { headers, signal: AbortSignal.timeout(timeoutMs) },
       );
       if (!payments.ok)
         throw new Error(`Stripe invoice payment lookup failed with ${payments.status}`);

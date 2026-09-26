@@ -35,6 +35,7 @@ function effects(overrides: Partial<ModeEffects> = {}): ModeEffects & { calls: s
     clearAdultCaches: () => calls.push('clear'),
     resetNavigationToChildHome: () => calls.push('reset-nav'),
     resetNavigationToWelcome: () => calls.push('reset-welcome'),
+    resetNavigationToUnlock: () => calls.push('reset-unlock'),
     relockOnServer: () => {
       calls.push('relock');
       return Promise.resolve();
@@ -70,11 +71,13 @@ describe('mode switching (AC_ACCESS_07)', () => {
     const storage = memoryStorage();
     await enterChildMode(storage, effects());
     expect(
-      await enterParentMode(storage, effects(), { unlocked: false, unlockedUntil: UNTIL }),
+      await enterParentMode(storage, effects(), { unlocked: false, unlockedUntil: UNTIL }, NOW),
     ).toBe('step_up_required');
     expect(await currentMode(storage)).toBe('child');
+    // The pinned clock is passed in (L-027): UNTIL is five minutes after NOW, so leaving `now` to
+    // the real wall clock would read the window as long lapsed (MOB-R2-03 reports that, correctly).
     expect(
-      await enterParentMode(storage, effects(), { unlocked: true, unlockedUntil: UNTIL }),
+      await enterParentMode(storage, effects(), { unlocked: true, unlockedUntil: UNTIL }, NOW),
     ).toBe('parent');
   });
 

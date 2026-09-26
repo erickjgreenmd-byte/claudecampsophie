@@ -56,19 +56,25 @@ function memoryBiometricStore(pin: string | null): BiometricPinStore & { cleared
 }
 
 const UNTIL = '2026-09-24T15:05:00.000Z';
+// The API always states the window's length (MOB-R2-03); the contract requires it.
+const UNLOCK_SECONDS = 300;
 
 describe('parent unlock', () => {
   it('validates PIN entry before calling the server', async () => {
     expect(pinEntryError('12345')).toBe('Enter your 6-digit parent PIN.');
     expect(pinEntryError('482913')).toBeNull();
-    const api = fakeApi(() => ({ unlockedUntil: UNTIL }));
+    const api = fakeApi(() => ({ unlockedUntil: UNTIL, unlockSeconds: UNLOCK_SECONDS }));
     expect(await unlockWithPin(api, '12a456')).toMatchObject({ kind: 'error' });
     expect(api.calls).toHaveLength(0);
   });
 
   it('unlocks with a server-verified PIN', async () => {
-    const api = fakeApi(() => ({ unlockedUntil: UNTIL }));
-    expect(await unlockWithPin(api, '482913')).toEqual({ kind: 'unlocked', unlockedUntil: UNTIL });
+    const api = fakeApi(() => ({ unlockedUntil: UNTIL, unlockSeconds: UNLOCK_SECONDS }));
+    expect(await unlockWithPin(api, '482913')).toEqual({
+      kind: 'unlocked',
+      unlockedUntil: UNTIL,
+      unlockSeconds: UNLOCK_SECONDS,
+    });
     expect(api.calls).toEqual([
       { method: 'POST', path: '/v1/adult/unlock', body: { method: 'pin', pin: '482913' } },
     ]);
@@ -91,17 +97,18 @@ describe('parent unlock', () => {
   });
 
   it('biometric unlock still sends the PIN to the server for verification', async () => {
-    const api = fakeApi(() => ({ unlockedUntil: UNTIL }));
+    const api = fakeApi(() => ({ unlockedUntil: UNTIL, unlockSeconds: UNLOCK_SECONDS }));
     const store = memoryBiometricStore('482913');
     expect(await unlockWithBiometrics(api, store)).toEqual({
       kind: 'unlocked',
       unlockedUntil: UNTIL,
+      unlockSeconds: UNLOCK_SECONDS,
     });
     expect(api.calls[0]?.body).toEqual({ method: 'pin', pin: '482913' });
   });
 
   it('a cancelled biometric prompt sends nothing', async () => {
-    const api = fakeApi(() => ({ unlockedUntil: UNTIL }));
+    const api = fakeApi(() => ({ unlockedUntil: UNTIL, unlockSeconds: UNLOCK_SECONDS }));
     expect(await unlockWithBiometrics(api, memoryBiometricStore(null))).toEqual({
       kind: 'cancelled',
     });

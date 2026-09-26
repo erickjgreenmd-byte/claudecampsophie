@@ -22,7 +22,7 @@ import { STORE_LABEL } from '../../src/billing/store.ts';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { ParentAccessState, useParentAccess } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
-import { parentAuth } from '../../src/lib/parent-auth.ts';
+import { signOutClosedAccountOnDevice } from '../../src/family/runtime.ts';
 import {
   closeAccountAction,
   confirmationPhrase,
@@ -140,10 +140,11 @@ export default function ParentPrivacyScreen() {
       setFeedback({ area: 'account', result, id: feedbackCount + 1 });
       return;
     }
-    // The API's signOut flag: the app's normal sign-out path clears the parent session; the
-    // outcome stays on screen until the parent leaves.
+    // The API's signOut flag: the app's normal sign-out path clears the parent session. It goes
+    // through the whole device sign-out (MOB-R2-06), so the closed account leaves no biometric PIN,
+    // no parent mode and no live unlock behind; the outcome stays on screen until the parent leaves.
     setState({ status: 'account_closed', message: result.message });
-    await parentAuth.signOut().catch(() => undefined);
+    await signOutClosedAccountOnDevice().catch(() => undefined);
   };
 
   const requestDeletion = async () => {

@@ -28,22 +28,78 @@ export type ExportUploader = (
   contentType: string,
 ) => Promise<void>;
 
-/** Uploads through the storage provider's signed upload URL (no provider interface changes). */
+/**
+ * A retryable export failure with a pipeline code, so the job ledger records `UPLOAD_FAILED` or
+ * `BUILD_FAILED` in `last_error_code` instead of the class name `Error` (JOBS-R2-01; the same rule
+ * as JobFailure, without importing the dispatcher into the module the dispatcher imports).
+ */
+class RetryableExportFailure extends Error {
+  constructor(
+    readonly code: string,
+    options?: { cause?: unknown },
+  ) {
+    super(code, options);
+    this.name = 'RetryableExportFailure';
+  }
+}
+
+/** Supabase answers a signed upload to an existing object with 400 "Duplicate", or 409. */
+async function isDuplicateObject(response: Response): Promise<boolean> {
+  if (response.status === 409) return true;
+  if (response.status !== 400) return false;
+  const body = await response.text().catch(() => '');
+  return /duplicate|already exists/i.test(body);
+}
+
+/**
+ * Uploads through the storage provider's signed upload URL (no provider interface changes).
+ *
+ * JOBS-R2-01: Supabase signs uploads with `x-upsert: false`, so a retry after a lost answer (our own
+ * 20-second timeout on a large family JSON, a connection reset, the worker killed) finds its own
+ * bytes already stored and is refused as a duplicate. The path `exports/{family}/{id}.{ext}` belongs
+ * to this one job, so a duplicate whose stored size matches the bytes just built IS this job's
+ * earlier success and is treated as one; any other stored object at that path is replaced (remove,
+ * then upload again), never left as an orphan. Storage that cannot say the size is not a match: the
+ * job retries instead of guessing.
+ */
 export function storageUploader(
   storage: StorageProvider,
   fetchImpl: typeof fetch = fetch,
   timeoutMs = 20_000,
 ): ExportUploader {
-  return async (path, bytes, contentType) => {
+  const put = async (path: string, bytes: Uint8Array, contentType: string): Promise<Response> => {
     const { url } = await storage.createSignedUploadUrl(path, 300);
-    const response = await fetchImpl(url, {
+    return await fetchImpl(url, {
       method: 'PUT',
       headers: { 'content-type': contentType },
       // A fresh ArrayBuffer-backed copy satisfies both the Workers and DOM `BodyInit` types.
       body: bytes.slice(),
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!response.ok) throw new Error(`export upload failed with HTTP ${response.status}`);
+  };
+  const upload = async (path: string, bytes: Uint8Array, contentType: string): Promise<void> => {
+    const response = await put(path, bytes, contentType);
+    if (response.ok) return;
+    if (!(await isDuplicateObject(response))) {
+      throw new RetryableExportFailure('UPLOAD_FAILED');
+    }
+    // Storage that cannot say the size rejects here, so the outer catch retries the job: an
+    // unknown object is never counted as a match and never blindly overwritten.
+    const stored = await storage.stat(path);
+    if (stored !== null && stored.byteSize === bytes.length) return; // this job's own earlier upload
+    await storage.remove([path]);
+    const retry = await put(path, bytes, contentType);
+    if (!retry.ok) throw new RetryableExportFailure('UPLOAD_FAILED');
+  };
+  return async (path, bytes, contentType) => {
+    try {
+      await upload(path, bytes, contentType);
+    } catch (error) {
+      // Every upload failure carries the pipeline code, so the ledger records UPLOAD_FAILED and not
+      // the class name of a timeout or a fetch error (JOBS-R2-01; the rule of JOBS-R1-04).
+      if (error instanceof RetryableExportFailure) throw error;
+      throw new RetryableExportFailure('UPLOAD_FAILED', { cause: error });
+    }
   };
 }
 
@@ -394,7 +450,8 @@ async function familyData(tx: Tx, row: ExportRow, now: Date): Promise<Uint8Array
     family:
       await tx`select id, display_name, timezone, created_at from public.families where id = ${fam}`,
     children: await tx`
-      select id, nickname, grade_level, age_band, status, created_at from public.child_profiles
+      select id, nickname, grade_level, age_band, status, accessibility, curriculum_notes, created_at
+        from public.child_profiles
        where family_id = ${fam} and not (id = any(${skip}::uuid[]))`,
     subjects: await tx`
       select id, child_id, subject_key, display_name, enabled from public.child_subjects
@@ -428,6 +485,55 @@ async function familyData(tx: Tx, row: ExportRow, now: Date): Promise<Uint8Array
     pointsLedger: await tx`
       select id, child_id, kind, points, reason, created_at from public.points_ledger
        where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    // CS-R2-05: the homework records this export used to leave out, although the portal calls it
+    // "All family data" and the policy promises "the answers your child submits" and "reward
+    // requests". Parent-only content stays out: no row here reads private.question_solutions or
+    // private.practice_item_keys, and no raw homework image bytes or storage paths are exported.
+    assignments: await tx`
+      select id, child_id, subject_id, status, page_count, error_code, created_at, updated_at
+        from public.assignments
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    questions: await tx`
+      select q.id, q.assignment_id, q.child_id, p.page_number, q.question_number, q.prompt_text,
+             q.student_answer_text, q.corrected_prompt_text, q.corrected_student_answer_text,
+             q.corrected_at, q.answer_kind, q.subject_key, q.skill, q.subskill, q.grade_estimate,
+             q.uncertainty, q.transcription_version, q.created_at
+        from public.extracted_questions q
+        join public.source_pages p on p.id = q.page_id
+       where q.family_id = ${fam} and not (q.child_id = any(${skip}::uuid[]))`,
+    questionResults: await tx`
+      select question_id, child_id, verdict, route, disagreement, graded_at,
+             parent_override_verdict, overridden_at, override_reason
+        from public.question_results
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    childFeedback: await tx`
+      select id, question_id, child_id, kind, body, created_at from public.child_feedback
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    targetAnswerAttempts: await tx`
+      select question_instance_id, child_id, count, updated_at from public.target_answer_attempts
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    rewards: await tx`
+      select id, child_id, title, point_cost, instructions, active, created_at, updated_at
+        from public.rewards
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    rewardRedemptions: await tx`
+      select id, child_id, reward_id, point_cost, state, requested_at, decided_at, fulfilled_at,
+             cancelled_by
+        from public.reward_redemptions
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    pointBalances: await tx`
+      select child_id, balance, updated_at from public.point_balances
+       where family_id = ${fam} and not (child_id = any(${skip}::uuid[]))`,
+    // The flags the family can already see in its report list, WITHOUT the reviewer-only columns:
+    // no category, no screen_categories, no screen_version and no provider codes, so the export
+    // cannot say which kind of concern was flagged (CS-R2-02).
+    safetyFlags: await tx`
+      select id, child_id, reporter_kind, question_id, feedback_id, note, status, resolution,
+             created_at, triaged_at, resolved_at, transcription_at, parent_email_status,
+             parent_emailed_at
+        from public.safety_reports
+       where family_id = ${fam} and family_visible
+         and not (child_id = any(${skip}::uuid[]))`,
   };
   return new TextEncoder().encode(JSON.stringify(data, null, 2));
 }
@@ -491,12 +597,70 @@ async function build(tx: Tx, row: ExportRow, setId: string | undefined, now: Dat
   }
 }
 
-async function markFailed(deps: JobDeps, row: ExportRow, code: string): Promise<void> {
-  await deps.db.asService(
-    (tx) =>
-      tx`update public.data_exports set status = 'failed' where id = ${row.id} and family_id = ${row.family_id} and status = 'queued'`,
+/** Where an export's file goes: deterministic, so a lost answer can always find it again. */
+export function exportPath(familyId: string, exportId: string, ext: string): string {
+  return `exports/${familyId}/${exportId}.${ext}`;
+}
+
+/** Every extension an export kind can produce (the row does not say which until it is built). */
+export const EXPORT_EXTENSIONS = ['json', 'pdf', 'csv'] as const;
+
+/**
+ * Removes whatever an export may have left in storage at its deterministic paths (JOBS-R2-01): the
+ * row's own `storage_path` is not enough, because an attempt whose answer was lost stored bytes
+ * without ever recording the path. Never throws: it runs where the outcome is already settled.
+ */
+export async function removeExportObjects(
+  deps: JobDeps,
+  familyId: string,
+  exportId: string,
+): Promise<void> {
+  try {
+    await deps.providers.storage.remove(
+      EXPORT_EXTENSIONS.map((ext) => exportPath(familyId, exportId, ext)),
+    );
+  } catch {
+    deps.log({
+      level: 'warn',
+      event: 'export_orphan_remove_failed',
+      code: 'STORAGE_REMOVE_FAILED',
+    });
+  }
+}
+
+/**
+ * JOBS-R2-05: compensation for an `export_build` job that dead-lettered without its handler settling
+ * the row (the worker died on the final attempt, so the lease expired, or `markFailed` itself threw).
+ * Without it the row stayed `queued` for ever — `purgeExpiredExports` only reads `ready` rows — and
+ * the parent's export list said "preparing" indefinitely. Idempotent; a built or expired row is left
+ * alone.
+ */
+export async function settleDeadLetteredExport(deps: JobDeps, job: JobRow): Promise<void> {
+  const parsed = payloadSchema.safeParse(job.payload);
+  if (!parsed.success || !job.family_id) return;
+  const familyId = job.family_id;
+  const rows = await deps.db.asService(
+    (tx) => tx<{ id: string }[]>`
+      update public.data_exports set status = 'failed'
+       where id = ${parsed.data.exportId} and family_id = ${familyId} and status = 'queued'
+      returning id`,
   );
+  if (rows.length === 0) return;
+  deps.log({ level: 'error', event: 'export_failed', code: 'DEAD_LETTER' });
+  await removeExportObjects(deps, familyId, parsed.data.exportId);
+}
+
+/** Marks a still-queued export failed. Returns false when the row moved on (another worker built it). */
+async function markFailed(deps: JobDeps, row: ExportRow, code: string): Promise<boolean> {
+  const rows = await deps.db.asService(
+    (tx) => tx<{ id: string }[]>`
+      update public.data_exports set status = 'failed'
+       where id = ${row.id} and family_id = ${row.family_id} and status = 'queued'
+      returning id`,
+  );
+  if (rows.length === 0) return false;
   deps.log({ level: 'error', event: 'export_failed', code });
+  return true;
 }
 
 export function createExportBuildHandler(options: ExportBuildOptions = {}): JobHandler {
@@ -519,17 +683,32 @@ export function createExportBuildHandler(options: ExportBuildOptions = {}): JobH
     try {
       built = await deps.db.asService((tx) => build(tx, row, setId, now));
     } catch (error) {
-      if (error instanceof PermanentExportFailure) return markFailed(deps, row, error.code);
-      if (job.attempts >= job.max_attempts) return markFailed(deps, row, 'BUILD_FAILED');
-      throw error;
+      if (error instanceof PermanentExportFailure) {
+        await markFailed(deps, row, error.code);
+        return;
+      }
+      if (job.attempts >= job.max_attempts) {
+        await markFailed(deps, row, 'BUILD_FAILED');
+        return;
+      }
+      throw new RetryableExportFailure('BUILD_FAILED', { cause: error });
     }
-    const path = `exports/${row.family_id}/${row.id}.${built.ext}`;
+    const path = exportPath(row.family_id, row.id, built.ext);
     const upload = options.upload ?? storageUploader(deps.providers.storage);
     try {
       await upload(path, built.bytes, built.contentType);
     } catch (error) {
-      if (job.attempts >= job.max_attempts) return markFailed(deps, row, 'UPLOAD_FAILED');
-      throw error instanceof Error ? error : new Error('UPLOAD_FAILED');
+      if (job.attempts >= job.max_attempts) {
+        // Only when this call is the one that failed the row: a row another worker built meanwhile
+        // is 'ready' and its file must stay.
+        if (await markFailed(deps, row, 'UPLOAD_FAILED')) {
+          // The bytes may be in storage from an attempt whose answer was lost: no orphan is left
+          // behind for a row that will never be downloaded (JOBS-R2-01).
+          await removeExportObjects(deps, row.family_id, row.id);
+        }
+        return;
+      }
+      throw error instanceof Error ? error : new RetryableExportFailure('UPLOAD_FAILED');
     }
     await deps.db.asService(
       (tx) => tx`

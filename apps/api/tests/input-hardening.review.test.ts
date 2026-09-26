@@ -181,6 +181,23 @@ describe('[API-AUTH-R1-01] free text with control characters is a 400, never a 5
     }
     expect(knownConstraintError({ code: '22P02' })).toBeUndefined();
   });
+
+  /**
+   * ACC-FAM-05: API-AUTH-R2-03 needed the date-cast overflows (a four-digit year the contract now
+   * bounds, but that a stored row or a new cast could still carry) to answer 400 instead of 500.
+   * The numeric overflow 22003 was mapped with them, which is wrong in this codebase: money is
+   * integer cents and every caller-supplied number is bounded by its contract first, so a numeric
+   * value Postgres cannot represent is our arithmetic overflowing, not the parent's input. Blaming
+   * the caller would hide it — it has to stay a 500 with the error log a 500 carries.
+   */
+  it('maps only the datetime overflows, so a numeric overflow of ours stays a 500', () => {
+    for (const code of ['22008', '22007']) {
+      const mapped = knownConstraintError({ code, message: 'date/time field value out of range' });
+      expect(mapped?.code).toBe('VALIDATION_FAILED');
+      expect(mapped?.status).toBe(400);
+    }
+    expect(knownConstraintError({ code: '22003', message: 'value out of range' })).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -389,8 +389,23 @@ export const parentPracticeSetSchema = z.strictObject({
 });
 export type ParentPracticeSet = z.infer<typeof parentPracticeSetSchema>;
 
+/** `<created_at in epoch microseconds>_<id>` of the last set on a page (…/practice-sets?after=). */
+export const practiceSetCursorSchema = z
+  .string()
+  .regex(/^[0-9]{1,19}_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+export const PARENT_PRACTICE_SET_PAGE_SIZE = 30;
+
+/**
+ * GET /v1/children/:childId/practice-sets[?kind=][&week=][&after=<nextCursor>]. Newest first, at
+ * most 30 per page. `nextCursor` is set while older sets exist (API-AUTH-R2-04): the list used to be
+ * a hard cap of 30, so after about a month of daily sets the older ones — and the answer keys and
+ * review PDFs reached through their ids — could not be listed at all. The API always sends it;
+ * optional so payloads from before it existed still parse.
+ */
 export const practiceSetsResponseSchema = z.strictObject({
-  sets: z.array(parentPracticeSetSchema),
+  sets: z.array(parentPracticeSetSchema).max(PARENT_PRACTICE_SET_PAGE_SIZE),
+  nextCursor: practiceSetCursorSchema.nullable().optional(),
 });
 export type PracticeSets = z.infer<typeof practiceSetsResponseSchema>;
 

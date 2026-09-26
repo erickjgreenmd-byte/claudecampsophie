@@ -46,8 +46,22 @@ export type RunStageErrorCode =
   | 'PROVIDER_FAILED'
   /** The provider refused the request itself (400/413/415/422): sending it again cannot succeed. */
   | 'PROVIDER_REJECTED'
+  /**
+   * The provider cut the answer off at `max_output_tokens` (JOBS-R2-02). Not an outage: the same
+   * request would be cut off again, so the caller must not treat it as retryable work. The loop
+   * already tried once with a raised output budget (see OUTPUT_TRUNCATED_BUDGET_MULTIPLE) where the
+   * stage's cost cap admitted it; this code means the work does not fit this stage at all.
+   */
+  | 'OUTPUT_TRUNCATED'
   | 'OUTPUT_INVALID'
   | 'UNKNOWN_MODEL';
+
+/**
+ * How much of the stage's output budget a truncated answer is retried with (JOBS-R2-02): once, at
+ * this multiple of the configured `maxOutputTokens`, and only while the stage's cost cap still
+ * admits the raised estimate — the owner's ceiling is never exceeded to fit a longer answer.
+ */
+export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE = 2;
 
 /** Statuses by which the provider refuses the request body itself (size, image, schema). */
 const REJECTED_REQUEST_STATUSES: ReadonlySet<number> = new Set([400, 413, 415, 422]);
@@ -98,12 +112,17 @@ export async function runStage<S extends z.ZodType>(
   const sleep = options.sleep ?? defaultSleep;
   let spent = 0;
   let lastError: RunStageErrorCode = 'PROVIDER_FAILED';
+  // JOBS-R2-02: the output budget this attempt is sent with. A `max_output_tokens` incomplete raises
+  // it once (never twice, and never past the stage's cost cap), so the identical request is never
+  // sent again.
+  let maxOutputTokens = limits.maxOutputTokens;
+  let budgetRaised = false;
 
   for (let attempt = 1; ; attempt += 1) {
     const estimate = estimateUpperBoundCostMicros(rates, {
       modelId,
       inputTokens: options.estimatedInputTokens,
-      maxOutputTokens: limits.maxOutputTokens,
+      maxOutputTokens,
     });
     if (!estimate.ok) return { result: err('UNKNOWN_MODEL', estimate.error.message), attempts };
     const decision = canAttempt(limits, {
@@ -125,7 +144,7 @@ export async function runStage<S extends z.ZodType>(
       input: options.input,
       outputName: prompt.outputName,
       jsonSchema,
-      maxOutputTokens: limits.maxOutputTokens,
+      maxOutputTokens,
       timeoutMs: limits.timeoutMs,
       metadata: { ...options.metadata, prompt_version: prompt.version },
     });
@@ -140,7 +159,7 @@ export async function runStage<S extends z.ZodType>(
           ? {
               inputTokens: options.estimatedInputTokens,
               cachedInputTokens: 0,
-              outputTokens: limits.maxOutputTokens,
+              outputTokens: maxOutputTokens,
             }
           : { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
     let costMicros: number;
@@ -183,7 +202,29 @@ export async function runStage<S extends z.ZodType>(
       }
     } else if (response.kind === 'incomplete') {
       attempts.push(record('failed'));
-      lastError = 'PROVIDER_FAILED';
+      if (response.reason === 'max_output_tokens') {
+        // JOBS-R2-02: the answer did not fit the budget. Re-sending the identical request would be
+        // cut off at the same place, so the stage raises the budget once and, if that answer is cut
+        // off too (or the cost cap refuses the raise), ends with its own code. The caller turns that
+        // into a parent-facing outcome instead of spending every job attempt on truncated answers.
+        lastError = 'OUTPUT_TRUNCATED';
+        if (budgetRaised) {
+          return {
+            result: err(
+              'OUTPUT_TRUNCATED',
+              'The provider cut the answer off at its output budget',
+              {
+                maxOutputTokens,
+              },
+            ),
+            attempts,
+          };
+        }
+        budgetRaised = true;
+        maxOutputTokens = limits.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE;
+      } else {
+        lastError = 'PROVIDER_FAILED';
+      }
     } else {
       let parsedJson: unknown;
       try {

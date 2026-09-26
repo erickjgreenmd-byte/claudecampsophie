@@ -2,11 +2,16 @@ import { useCallback, useState } from 'react';
 import { Text, TextInput } from 'react-native';
 import { router } from 'expo-router';
 import {
-  AGE_BANDS,
+  GRADE_LEVEL_MAX,
+  ageBandSchema,
   childActivationResponseSchema,
+  childArchiveResponseSchema,
   createChildProfileResponseSchema,
   familyOverviewResponseSchema,
+  updateChildProfileResponseSchema,
   type AgeBand,
+  type FamilyChild,
+  type UpdateChildProfileRequest,
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { colors } from '@pencillift/ui-tokens';
@@ -27,6 +32,7 @@ import {
   ErrorBox,
   Heading,
   Loading,
+  Notice,
   ParentAccessState,
   Screen,
   styles,
@@ -82,13 +88,30 @@ function ChildrenContent({ api }: { api: ApiClient }) {
       {family.children.length === 0 ? (
         <Body>No children yet. Add your first child below.</Body>
       ) : null}
-      {childRows(family).map((row) => (
-        <ChildCard key={row.id} api={api} row={row} onChanged={() => void reload()} />
+      {childRows(family).map((row, index) => (
+        <ChildCard
+          key={row.id}
+          api={api}
+          row={row}
+          child={family.children[index]!}
+          onChanged={() => void reload()}
+        />
       ))}
       <AddChild api={api} onAdded={() => void reload()} />
     </>
   );
 }
+
+/**
+ * The grades and age bands the contract allows, read from the contract itself (L-036): the bands
+ * come from the enum's `.options` and the grades from GRADE_LEVEL_MAX, so widening the launch scope
+ * in packages/contracts/src/family.ts reaches these menus without a second edit here.
+ */
+const GRADE_OPTIONS = Array.from({ length: GRADE_LEVEL_MAX + 1 }, (_, g) => ({
+  value: String(g),
+  label: g === 0 ? 'K' : String(g),
+}));
+const AGE_OPTIONS = ageBandSchema.options.map((band) => ({ value: band, label: band }));
 
 /**
  * One child. A draft with an unused paid slot available can take it here (no purchase; the server
@@ -97,16 +120,23 @@ function ChildrenContent({ api }: { api: ApiClient }) {
 function ChildCard({
   api,
   row,
+  child,
   onChanged,
 }: {
   api: ApiClient;
   row: ChildRow;
+  /** The same profile as `row`, for the fields the row view model doesn't carry. */
+  child: FamilyChild;
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; needsPin: boolean; text: string } | null>(
     null,
   );
+  const [editing, setEditing] = useState(false);
+  const [confirmArchive, setConfirmArchive] = useState(false);
+  /** A child whose data deletion is open is read-only here (API-AUTH-R2-02); see the notice below. */
+  const deletionPending = child.deletionPending === true;
 
   const activate = async () => {
     if (busy) return;
@@ -129,12 +159,82 @@ function ChildCard({
     }
   };
 
+  /**
+   * WEB-R2-03: archiving frees the paid slot and signs the child's devices out while every scan,
+   * point and reward is kept (spec P11, AC_CAPACITY_08). The route existed with no caller anywhere,
+   * yet the Plan screen tells parents to "archive them in Children".
+   */
+  const archive = async () => {
+    if (busy) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const archived = await api.send(
+        'POST',
+        `/v1/children/${row.id}/archive`,
+        undefined,
+        childArchiveResponseSchema,
+      );
+      setConfirmArchive(false);
+      setResult({
+        ok: true,
+        needsPin: false,
+        text: `${row.nickname} is archived. Their history is kept, and ${archived.assignedSlots} of ${archived.paidSlots} paid slots are now in use. ${archived.note}`,
+      });
+      onChanged();
+    } catch (error) {
+      const mapped = parentActionError(error);
+      setResult({ ok: false, needsPin: mapped.needsPin, text: mapped.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** WEB-R2-03: the saved grade is what new practice is built for, so it must be correctable. */
+  const saveProfile = async (body: UpdateChildProfileRequest) => {
+    if (busy) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const saved = await api.send(
+        'PATCH',
+        `/v1/children/${row.id}`,
+        body,
+        updateChildProfileResponseSchema,
+      );
+      setEditing(false);
+      setResult({
+        ok: true,
+        needsPin: false,
+        text: `Saved. ${saved.child.nickname} is in ${gradeText(saved.child.gradeLevel).toLowerCase()}, ages ${saved.child.ageBand}.`,
+      });
+      onChanged();
+    } catch (error) {
+      const mapped = parentActionError(error);
+      setResult({ ok: false, needsPin: mapped.needsPin, text: mapped.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <Card>
       <Heading>{row.nickname}</Heading>
       <Body>{row.detail}</Body>
       <Body muted>Status: {row.statusText}</Body>
-      {row.canPair ? (
+      {deletionPending ? (
+        // API-AUTH-R2-02: a child under an open deletion request stays listed so the parent can see
+        // who the request covers, but the server refuses pairing, activation and edits for them, so
+        // this screen offers no control either.
+        <Notice>
+          <Body>
+            Data deletion under way. You asked for {row.nickname}’s data to be deleted, so nothing
+            can be changed, paired or activated for them. Cancel the request under Privacy if you
+            did not mean it.
+          </Body>
+        </Notice>
+      ) : null}
+      {deletionPending ? null : row.canPair ? (
         <Button
           label="Pair a device"
           accessibilityLabel={`Pair a device for ${row.nickname}`}
@@ -148,7 +248,7 @@ function ChildCard({
       ) : row.pairingNote ? (
         <Body muted>{row.pairingNote}</Body>
       ) : null}
-      {row.canActivate ? (
+      {deletionPending ? null : row.canActivate ? (
         <Button
           label={busy ? 'Assigning…' : 'Assign an unused paid slot'}
           accessibilityLabel={`Assign an unused paid slot to ${row.nickname}`}
@@ -158,6 +258,52 @@ function ChildCard({
       ) : row.activationNote ? (
         <Body muted>{row.activationNote}</Body>
       ) : null}
+      {child.status === 'archived' || deletionPending ? null : (
+        <>
+          <Button
+            label={editing ? 'Cancel edit' : 'Edit profile'}
+            accessibilityLabel={`Edit ${row.nickname}’s details`}
+            secondary
+            disabled={busy}
+            onPress={() => setEditing((open) => !open)}
+          />
+          {editing ? (
+            <EditChild child={child} busy={busy} onSave={(body) => void saveProfile(body)} />
+          ) : null}
+          {confirmArchive ? (
+            <Notice>
+              <Body>
+                Archive {row.nickname}? Their homework, practice, points and rewards are all kept
+                and stay readable.{' '}
+                {child.status === 'active'
+                  ? 'Their paid slot is freed for another child, and their paired devices are signed out.'
+                  : 'Their paired devices are signed out.'}{' '}
+                You can activate them again later while a paid slot is free. Your store subscription
+                is unchanged — change the plan in the store to lower the price.
+              </Body>
+              <Button
+                label={busy ? 'Archiving…' : `Yes, archive ${row.nickname}`}
+                busy={busy}
+                onPress={() => void archive()}
+              />
+              <Button
+                label={`Keep ${row.nickname} as they are`}
+                secondary
+                disabled={busy}
+                onPress={() => setConfirmArchive(false)}
+              />
+            </Notice>
+          ) : (
+            <Button
+              label="Archive (keeps history, frees the slot)"
+              accessibilityLabel={`Archive ${row.nickname}`}
+              secondary
+              disabled={busy}
+              onPress={() => setConfirmArchive(true)}
+            />
+          )}
+        </>
+      )}
       {result ? (
         result.ok ? (
           <Body>{result.text}</Body>
@@ -169,11 +315,72 @@ function ChildCard({
   );
 }
 
-const GRADE_OPTIONS = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((g) => ({
-  value: String(g),
-  label: g === 0 ? 'K' : String(g),
-}));
-const AGE_OPTIONS = AGE_BANDS.map((band) => ({ value: band, label: band }));
+/**
+ * Correcting one child's nickname, grade and age band (WEB-R2-03). The menus come from the contract
+ * (L-036), so widening the launch scope in packages/contracts reaches this screen with no second
+ * edit. The server re-checks the recent PIN unlock, the contract bounds and the archived rule.
+ */
+function EditChild({
+  child,
+  busy,
+  onSave,
+}: {
+  child: FamilyChild;
+  busy: boolean;
+  onSave: (body: UpdateChildProfileRequest) => void;
+}) {
+  const [nickname, setNickname] = useState(child.nickname);
+  const [grade, setGrade] = useState(String(child.gradeLevel));
+  const [ageBand, setAgeBand] = useState<AgeBand>(child.ageBand);
+  const [fieldError, setFieldError] = useState<string | null>(null);
+
+  const submit = () => {
+    const name = nickname.trim();
+    if (name.length < 1 || name.length > 40) {
+      setFieldError('Enter a nickname of 1 to 40 characters.');
+      return;
+    }
+    setFieldError(null);
+    onSave({ nickname: name, gradeLevel: Number(grade), ageBand });
+  };
+
+  return (
+    <>
+      <Text style={styles.label} nativeID={`editNickname-${child.id}`}>
+        Nickname
+      </Text>
+      <TextInput
+        accessibilityLabel={`Nickname for ${child.nickname}`}
+        accessibilityLabelledBy={`editNickname-${child.id}`}
+        style={styles.input}
+        value={nickname}
+        maxLength={40}
+        autoCorrect={false}
+        onChangeText={(text) => {
+          setNickname(text);
+          setFieldError(null);
+        }}
+        placeholderTextColor={colors.muted}
+      />
+      <Choice
+        label={`Grade (${gradeText(Number(grade))})`}
+        options={GRADE_OPTIONS}
+        value={grade}
+        onChange={setGrade}
+      />
+      <Choice label="Age band" options={AGE_OPTIONS} value={ageBand} onChange={setAgeBand} />
+      <Body muted>
+        New practice is built for the grade saved here, so update it each school year.
+      </Body>
+      {fieldError ? <ErrorBox message={fieldError} /> : null}
+      <Button
+        label={busy ? 'Saving…' : `Save ${child.nickname}’s details`}
+        busy={busy}
+        onPress={submit}
+      />
+    </>
+  );
+}
 
 function AddChild({ api, onAdded }: { api: ApiClient; onAdded: () => void }) {
   const [nickname, setNickname] = useState('');

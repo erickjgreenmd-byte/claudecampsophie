@@ -624,12 +624,21 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
         select id, donation_month, amount_cents from public.donation_accruals
          where school_id = ${input.schoolId} and payout_batch_id is null and donation_month <= ${input.throughMonth}
       `;
+      // BILL-R2-5: only the reversals this batch is allowed to net. The domain rule
+      // (donations/adjustments planAdjustment, carriedForward) is that an adjustment of an UNPAID
+      // accrual nets against that accrual in ITS OWN batch, and only an adjustment of an accrual
+      // already paid out is carried forward into a later batch. Taking every unbatched adjustment of
+      // the school let a September refund reduce (or withhold) the August payout, and the September
+      // batch then paid that accrual without its reversal. So: adjustments of the accruals in this
+      // batch, plus carried-forward adjustments of accruals that were already batched.
+      const batchedAccrualIds = accruals.map((a) => a.id);
       const adjustments = await tx<
         { idempotency_key: string; accrual_id: string; amount_cents: number }[]
       >`
         select j.idempotency_key, j.accrual_id, j.amount_cents from public.donation_adjustments j
           join public.donation_accruals a on a.id = j.accrual_id
          where a.school_id = ${input.schoolId} and j.payout_batch_id is null
+           and (a.id = any(${batchedAccrualIds}::uuid[]) or a.payout_batch_id is not null)
       `;
       const plan = buildPayoutBatch({
         schoolId: input.schoolId,
@@ -666,8 +675,9 @@ export function adminPromotionsRoutes(): Hono<AppEnv> {
         values (${input.schoolId}, ${batchKey}, ${plan.value.totalCents})
         returning id, school_id, batch_key, total_cents, status, external_transfer_ref, created_at
       `;
-      await tx`update public.donation_accruals set payout_batch_id = ${batch!.id} where id = any(${accruals.map((a) => a.id)})`;
-      await tx`update public.donation_adjustments set payout_batch_id = ${batch!.id} where idempotency_key = any(${adjustments.map((j) => j.idempotency_key)})`;
+      await tx`update public.donation_accruals set payout_batch_id = ${batch!.id} where id = any(${batchedAccrualIds}::uuid[])`;
+      await tx`update public.donation_adjustments set payout_batch_id = ${batch!.id}
+                where idempotency_key = any(${adjustments.map((j) => j.idempotency_key)}::text[])`;
       await audit(tx, c, 'payout.prepared', 'payout_batch', batch!.id, {
         totalCents: plan.value.totalCents,
       });

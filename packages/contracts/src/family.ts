@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { freeTextSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
+import { freeTextSchema, ianaZoneSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 /**
  * Family vertical contracts (spec P1 guardians, P3 identity/consent/authorization, P14 parent
@@ -37,12 +37,46 @@ export type CreateFamilyRequest = z.infer<typeof createFamilyRequestSchema>;
 
 export const createFamilyResponseSchema = z.strictObject({ familyId: uuidSchema });
 
+/**
+ * PATCH /v1/family (parent + step-up, audited). Corrects the family's name and time zone after
+ * creation (WEB-R2-03): the zone defaults to whatever the browser reported when the family was
+ * created, and nothing could fix it or a typo in the name afterwards. Every field is optional but
+ * at least one must be present, so an empty body is a 400 rather than a silent no-op.
+ */
+export const updateFamilyRequestSchema = z
+  .strictObject({
+    displayName: freeTextSchema({ max: 80 }).optional(),
+    timezone: ianaZoneSchema.optional(),
+  })
+  .refine(
+    (body) => body.displayName !== undefined || body.timezone !== undefined,
+    'Change the family name or the time zone',
+  );
+export type UpdateFamilyRequest = z.infer<typeof updateFamilyRequestSchema>;
+
+export const updateFamilyResponseSchema = z.strictObject({
+  family: z.strictObject({
+    id: uuidSchema,
+    displayName: z.string(),
+    timezone: z.string(),
+  }),
+});
+export type UpdateFamilyResponse = z.infer<typeof updateFamilyResponseSchema>;
+
 export const familyChildSchema = z.strictObject({
   id: uuidSchema,
   nickname: z.string(),
   gradeLevel: gradeLevelSchema,
   ageBand: ageBandSchema,
   status: childProfileStatusSchema,
+  /**
+   * True while a data deletion covering this child is `requested` or `processing` (API-AUTH-R2-02).
+   * The row stays in GET /v1/family so the privacy screens can still name the child a pending
+   * request, an export or a safety report refers to; activation, pairing and profile edits refuse
+   * it server-side, so the parent screens label such a child and offer no control on it. Additive
+   * and optional so a client (and a fixture) written before the flag still parses this response.
+   */
+  deletionPending: z.boolean().optional(),
 });
 export type FamilyChild = z.infer<typeof familyChildSchema>;
 
@@ -72,6 +106,28 @@ export const createChildProfileResponseSchema = z.strictObject({
 });
 
 /**
+ * PATCH /v1/children/:childId (parent + step-up, audited). Corrects a child's nickname, grade and
+ * age band (WEB-R2-03): no client or route could change them, so every family stayed on last
+ * year's grade once the school year rolled over, and the grade is what practice generation is
+ * pitched at. Every field is optional but at least one must be present.
+ */
+export const updateChildProfileRequestSchema = z
+  .strictObject({
+    nickname: freeTextSchema({ max: 40 }).optional(),
+    gradeLevel: gradeLevelSchema.optional(),
+    ageBand: ageBandSchema.optional(),
+  })
+  .refine(
+    (body) =>
+      body.nickname !== undefined || body.gradeLevel !== undefined || body.ageBand !== undefined,
+    'Change the nickname, grade or age band',
+  );
+export type UpdateChildProfileRequest = z.infer<typeof updateChildProfileRequestSchema>;
+
+export const updateChildProfileResponseSchema = z.strictObject({ child: familyChildSchema });
+export type UpdateChildProfileResponse = z.infer<typeof updateChildProfileResponseSchema>;
+
+/**
  * POST /v1/children/:id/activate (parent + step-up). Assigns one of the family's verified, unused
  * paid slots to a draft child (spec P11: "If an existing paid slot is unused, assigning it requires
  * no new purchase"). It never buys capacity: with no unused slot the API answers BUSINESS_RULE
@@ -84,6 +140,20 @@ export const childActivationResponseSchema = z.strictObject({
   assignedSlots: z.number().int().min(0),
 });
 export type ChildActivationResponse = z.infer<typeof childActivationResponseSchema>;
+
+/**
+ * POST /v1/children/:id/archive (parent + step-up). Frees the child's paid slot, signs its devices
+ * out and keeps the history (spec P11, AC_CAPACITY_08). It never cancels or lowers a store
+ * subscription, which `note` says in the parent's own words.
+ */
+export const childArchiveResponseSchema = z.strictObject({
+  childId: uuidSchema,
+  status: z.literal('archived'),
+  paidSlots: z.number().int().min(0),
+  assignedSlots: z.number().int().min(0),
+  note: z.string(),
+});
+export type ChildArchiveResponse = z.infer<typeof childArchiveResponseSchema>;
 
 /** Stable BUSINESS_RULE codes from child activation that the parent screens branch on. */
 export const CHILD_ACTIVATION_RULES = {

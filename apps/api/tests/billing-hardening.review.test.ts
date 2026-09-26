@@ -826,9 +826,13 @@ describe('BILL-R1-4: RevenueCat TRANSFER shape and refused shapes', () => {
     >`
       select status, error_code, event_type from public.billing_provider_events
        where provider = 'revenuecat' and provider_event_id in (${noTo}, ${noUser}) order by event_type`;
+    // BILL-R2-6: the trace is recorded as 'failed', not 'ignored'. A body the schema refuses is not
+    // an event PencilLift chose to ignore: only 'failed' reaches the owner's attention list, and
+    // only a 'failed' row is re-opened when the provider retries the same event id after a fix.
+    // (The earlier 'ignored' expectation is what made the refusal invisible and unrecoverable.)
     expect(traces).toEqual([
-      { status: 'ignored', error_code: 'UNEXPECTED_SHAPE', event_type: 'RENEWAL' },
-      { status: 'ignored', error_code: 'UNEXPECTED_SHAPE', event_type: 'TRANSFER' },
+      { status: 'failed', error_code: 'UNEXPECTED_SHAPE', event_type: 'RENEWAL' },
+      { status: 'failed', error_code: 'UNEXPECTED_SHAPE', event_type: 'TRANSFER' },
     ]);
     // A retry of the same body is refused again; the trace stays a single row.
     expect((await postRc(renewal)).status).toBe(400);

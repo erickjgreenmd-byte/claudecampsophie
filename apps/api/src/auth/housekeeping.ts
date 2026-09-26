@@ -11,10 +11,22 @@ export interface IdentityHousekeepingResult {
    * SESSION_ROW_RETENTION_DAYS ago (migration 0850 `app.prune_session_rows`, DB-R1-07).
    */
   readonly endedSessionRows: number;
+  /**
+   * Pairing codes that stopped being usable more than PAIRING_CODE_RETENTION_DAYS ago, plus spend
+   * holds whose expiry passed over a day ago (migration 0860 `app.prune_credential_rows`, DB-R2-08).
+   */
+  readonly endedCredentialRows: number;
 }
 
 /** Ended child sessions, refresh tokens and adult step-ups are kept this long (DB-R1-07). */
 export const SESSION_ROW_RETENTION_DAYS = 30;
+
+/**
+ * Consumed and expired pairing codes are kept this long (DB-R2-08). A code stops being usable after
+ * ten minutes, so this is only a margin: a redemption attempt on a code that just died still finds
+ * it, and support can see that a code was issued. The row is a short-code hash, nothing else.
+ */
+export const PAIRING_CODE_RETENTION_DAYS = 30;
 
 /**
  * Bulk cleanup for the identity/access tables that grow with traffic (migration 0720), for the
@@ -39,9 +51,16 @@ export async function runIdentityHousekeeping(
     (tx) => tx<{ removed: number }[]>`
       select app.prune_session_rows(make_interval(days => ${SESSION_ROW_RETENTION_DAYS})) as removed`,
   );
+  // Same shape and the same database clock: consumed or expired pairing codes (short-code hashes)
+  // and spend holds a dead worker left behind, neither of which any other step deleted (DB-R2-08).
+  const [credentials] = await db.asService(
+    (tx) => tx<{ removed: number }[]>`
+      select app.prune_credential_rows(make_interval(days => ${PAIRING_CODE_RETENTION_DAYS})) as removed`,
+  );
   return {
     rateLimitBuckets,
     endedAuthSessions: row?.removed ?? 0,
     endedSessionRows: sessions?.removed ?? 0,
+    endedCredentialRows: credentials?.removed ?? 0,
   };
 }

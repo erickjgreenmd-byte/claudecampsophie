@@ -101,6 +101,23 @@ describe('verdict copy for children (spec P6)', () => {
     expect(statusView('ready').showResults).toBe(true);
     expect(statusView('checking').showResults).toBe(false);
   });
+
+  /**
+   * JOBS-R2-02 / JOBS-R2-06 (lead follow-up to the round-3 checker's residual): a scan can now end
+   * because the worksheet held more questions than one check can handle, or because the spend pause
+   * held it too long. Both were read perfectly well, so "We couldn’t read this one" was untrue for
+   * them — and it sent the child to do the one thing that cannot help, retaking the same photos. The
+   * child's line says what is true for every ending (the check did not finish) and points at the
+   * grown-up, who gets the specific advice on the portal. The child's screen never carries the code.
+   */
+  it('the ended-scan line is true whatever ended the scan', () => {
+    const view = statusView('failed_final');
+    expect(view.body).not.toMatch(/couldn’t read|could not read/);
+    expect(view.body).toMatch(/grown-up/);
+    expect(`${view.title} ${view.body}`).not.toMatch(/fail|error|wrong|bad/i);
+    expect(view.showResults).toBe(false);
+    expect(view.inProgress).toBe(false);
+  });
 });
 
 describe('result view (AC_GRADING_06)', () => {

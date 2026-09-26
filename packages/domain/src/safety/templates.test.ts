@@ -162,6 +162,10 @@ describe('template version', () => {
       // v4 (owner decision, 2026-09-25): the child messages are the same as v3; the hold list is
       // empty (no flag is held from the family) and the parent wording changed (email, actions).
       'safety-templates.v4': 'c18b6f3df516e3f58ea6eb3208a740348286ad1dba40bbc3925853bd30f68c33',
+      // v5 (CS-R2-06): the child messages, the (empty) hold list and the resources are the same as
+      // v4 — only the parent wording changed (`emailSent` no longer claims every guardian was
+      // emailed; the API test pins that copy). The digest is therefore v4's, re-derived here.
+      'safety-templates.v5': 'c18b6f3df516e3f58ea6eb3208a740348286ad1dba40bbc3925853bd30f68c33',
     };
     expect({ version: SAFETY_TEMPLATES_VERSION, digest }).toEqual({
       version: SAFETY_TEMPLATES_VERSION,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -13,16 +13,21 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView, type Edge } from 'react-native-safe-area-context';
-import { router } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { BrandRow } from '../brand/BrandMark.tsx';
 import { legalLinks } from '../lib/legal-links.ts';
-import { currentMode, parentUnlockActive } from '../lib/mode.ts';
+import {
+  currentMode,
+  enterChildMode,
+  lockParentAreaOnDevice,
+  parentUnlockActive,
+} from '../lib/mode.ts';
 import { parentAuth, portalUrl } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { answerGate, gateLock, openGate, type GateState } from './parental-gate.ts';
-import { parentApi, signOutParentOnDevice } from './runtime.ts';
+import { modeEffects, parentApi, signOutParentOnDevice } from './runtime.ts';
 import { lockParentArea } from './unlock.ts';
 
 /**
@@ -257,7 +262,12 @@ export type ParentAccess =
  */
 export function useParentAccess(): ParentAccess {
   const [access, setAccess] = useState<ParentAccess>({ status: 'checking' });
-  useEffect(() => {
+  // Each check supersedes the one before it. Without this, a check started by a foreground event
+  // could still be in flight when the next one starts, and the slower of the two would win the race
+  // to setAccess — a screen could go back to 'ready' after a lock (the round-3 checker's residual).
+  const cancelPrevious = useRef<(() => void) | null>(null);
+  const check = useCallback(() => {
+    cancelPrevious.current?.();
     let active = true;
     void currentMode(secureStorage).then((mode) => {
       if (!active) return;
@@ -277,12 +287,96 @@ export function useParentAccess(): ParentAccess {
       }
       setAccess({ status: 'ready', api });
     });
-    return () => {
+    const cancel = () => {
       active = false;
+      if (cancelPrevious.current === cancel) cancelPrevious.current = null;
     };
+    cancelPrevious.current = cancel;
+    return cancel;
   }, []);
-  useRelockOnBackground(access.status === 'ready' ? access.api : null);
+  useEffect(() => check(), [check]);
+  /**
+   * The check runs again every time the app comes back to the foreground (MOB-R2-01): leaving the
+   * app locks the parent area, so a screen that was already mounted must not keep serving its data
+   * (or its Refresh button) to whoever is holding the device now.
+   */
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      if (next === 'active') check();
+    });
+    return () => subscription.remove();
+  }, [check]);
   return access;
+}
+
+/**
+ * Locks the parent area on this device (MOB-R2-01): the one action behind both "Lock parent area"
+ * buttons and the backgrounding handler in src/lib/app-session.ts. The server step-up is revoked,
+ * the client-side unlock forgotten, the adult caches cleared and the parent screen replaced by the
+ * unlock screen, so nothing adult is left on screen for a child who takes the device next.
+ */
+export function LockParentAreaButton() {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Button
+      label={busy ? 'Locking…' : 'Lock parent area'}
+      secondary
+      busy={busy}
+      accessibilityLabel="Lock the parent area on this device"
+      onPress={() => {
+        setBusy(true);
+        void lockParentAreaOnDevice(modeEffects).finally(() => setBusy(false));
+      }}
+    />
+  );
+}
+
+/**
+ * A child screen in view means the device is the child's again (MOB-R2-05). The parent's natural way
+ * back from the parent area is the header back arrow or the Android/Fire Back button, which returns
+ * to the child screen underneath without going through the mode switch: the keychain kept mode
+ * 'parent', the unlock stayed live, screen privacy stayed on, and the next cold start showed the
+ * welcome chooser instead of the child's space.
+ */
+export function useChildModeOnFocus(): void {
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      void currentMode(secureStorage).then(async (mode) => {
+        if (!active || mode !== 'parent') return;
+        await enterChildMode(secureStorage, modeEffects);
+      });
+      return () => {
+        active = false;
+      };
+    }, []),
+  );
+}
+
+/**
+ * The view an expo-router ErrorBoundary shows (MOB-R2-07): a render error in one screen shows this
+ * instead of closing the app. Calm words, no stack trace and no raw error text.
+ */
+export function ErrorScreen({
+  title,
+  message,
+  retryLabel = 'Try again',
+  onRetry,
+}: {
+  title: string;
+  message: string;
+  retryLabel?: string | undefined;
+  onRetry: () => void;
+}) {
+  return (
+    <Screen edges={['top', 'left', 'right', 'bottom']}>
+      <Title>{title}</Title>
+      <Notice alert>
+        <Body>{message}</Body>
+        <Button label={retryLabel} onPress={onRetry} />
+      </Notice>
+    </Screen>
+  );
 }
 
 /**

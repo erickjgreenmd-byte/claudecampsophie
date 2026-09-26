@@ -8,6 +8,14 @@
  * (src/family/runtime.ts `childSession`, single-flight refresh), and every child client uses it.
  */
 import { createMobileApi } from '../lib/api.ts';
+import { withChildTokenRetry } from '../family/child-session.ts';
 import { childSession } from '../family/runtime.ts';
 
-export const childApi = createMobileApi(childSession.accessToken);
+/**
+ * MOB-R2-02: a refusal with a cached token retries once through that one refresher, so a device
+ * whose clock moved recovers instead of reporting itself unpaired. Still no second refresher.
+ */
+export const childApi = withChildTokenRetry(
+  createMobileApi(childSession.accessToken),
+  childSession,
+);

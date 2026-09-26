@@ -222,9 +222,16 @@ export const PARENT_SAFETY_FLAG_COPY = {
   reporter: 'Flagged by PencilLift',
   summary:
     'PencilLift flagged an answer for a grown-up to look at. For that question, your child’s results show a calm message about talking with a grown-up they trust instead of a hint, and PencilLift gives no hints on it. Please check in with your child.',
-  /** The recorded delivery: at least one active guardian's address accepted the flag email. */
+  /**
+   * The recorded delivery: at least one active guardian's address accepted the flag email. CS-R2-06:
+   * it says exactly that, because `sent` is recorded as soon as ONE verified address accepts. It used
+   * to read "emailed the guardians on this account ... when it was filed", which told a guardian
+   * whose address bounced, and an unverified co-guardian who was skipped without any record, that
+   * they had been emailed, and claimed a filing-time delivery for an email that may have gone out on
+   * a later retry.
+   */
   emailSent:
-    'PencilLift emailed the guardians on this account about this flag when it was filed, so they know to look here. The email names no child, no question and no kind of concern.',
+    'PencilLift emailed at least one verified guardian address on this account about this flag, so a grown-up knows to look here. An address that is not verified, or that the email provider refused, was not reached: check your own email address in this account if you did not receive it. The email names no child, no question and no kind of concern.',
   /**
    * No email left PencilLift for this report (a flag's email has not been sent yet or no guardian
    * address exists; nothing is sent for a child's or a parent's report).

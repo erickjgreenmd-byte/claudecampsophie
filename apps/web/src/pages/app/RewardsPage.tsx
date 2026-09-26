@@ -29,6 +29,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState, Loading } from '../../components/states.tsx';
+import { StepUpPrompt } from '../../components/StepUpPrompt.tsx';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
 
 /**
@@ -88,14 +89,16 @@ function ActionFeedback({ feedback }: { feedback: Feedback | null }) {
     );
   }
   if (feedback.error.code === 'STEP_UP_REQUIRED') {
+    // WEB-R2-05: the PIN is entered here, inside the rewards form the parent was filling in. The
+    // old link to /app/security unmounted the page, so a typed reward name, point cost or points
+    // reason was lost and there was no way back. The link is still offered by the shared prompt,
+    // with the same name and href (RewardsPage.review/rules tests pin both) and now carrying the
+    // return path as router state.
     return (
-      <div className="notice" role="alert">
-        <p style={{ margin: 0 }}>
-          <strong>Enter your parent PIN to continue.</strong> Changes to rewards and points need a
-          recent PIN unlock. <Link to="/app/security">Unlock on the Security page</Link>, then try
-          again.
-        </p>
-      </div>
+      <StepUpPrompt
+        explanation="Changes to rewards and points need a recent PIN unlock."
+        retryHint={() => 'Press the same button again to continue.'}
+      />
     );
   }
   return <ErrorState message={feedback.error.message} />;

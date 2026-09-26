@@ -23,7 +23,12 @@ import type { SafetyAgeBand, SevereSafetyCategory } from './types.ts';
 // person PencilLift sends a safety message to, and the parent addresses the concern: no flag is
 // held from the family (FAMILY_HOLD_CATEGORIES is empty), every flag is emailed to the active
 // guardians and listed at once, and the parent can act on it (parent wording in contracts).
-export const SAFETY_TEMPLATES_VERSION = 'safety-templates.v4';
+// v5 (CS-R2-06): the child messages are unchanged again. The parent wording's `emailSent` no longer
+// claims that every guardian on the account was emailed, nor that it happened "when it was filed":
+// the flag email is recorded 'sent' once at least ONE verified address accepted it, so the honest
+// wording says that, names the unverified and refused addresses as not reached, and tells the reader
+// to check their own address (parent wording in contracts, packages/contracts/src/privacy.ts).
+export const SAFETY_TEMPLATES_VERSION = 'safety-templates.v5';
 
 /** Release-readiness flag: the templates below are drafts until approved. */
 export const SAFETY_TEMPLATES_STATUS = 'draft_pending_owner_and_educator_approval' as const;

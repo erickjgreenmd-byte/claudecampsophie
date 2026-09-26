@@ -1,5 +1,4 @@
 import { useEffect, useId, useRef, useState, type RefObject } from 'react';
-import { Link } from 'react-router';
 import { z } from 'zod';
 import {
   placementClickResponseSchema,
@@ -12,6 +11,7 @@ import {
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { DEFAULT_PLACEMENT_RULE } from '@pencillift/domain/monetization';
 import { useSession } from '../lib/session.tsx';
+import { StepUpPrompt } from './StepUpPrompt.tsx';
 
 /**
  * One first-party sponsor card for an adult surface (spec P16.1, P16.5; AC_MON_03/05/08/16).
@@ -375,16 +375,22 @@ export function SponsorCard({
           </div>
         </fieldset>
       ) : null}
-      {problem ? (
+      {problem && !problem.stepUp ? (
         <p role="alert" style={{ color: 'var(--danger)', margin: '8px 0 0' }}>
           {problem.message}
-          {problem.stepUp ? (
-            <>
-              {' '}
-              <Link to="/app/security">Unlock on the Security page</Link>, then try again.
-            </>
-          ) : null}
         </p>
+      ) : null}
+      {problem?.stepUp ? (
+        /*
+          WEB-R2-05: the fifth copy of the link-only step-up notice. Following the link to
+          /app/security unmounted this card, so the report category the adult had chosen was lost and
+          the card itself was gone when they came back. The shared prompt keeps the same link (same
+          name and href) but takes the PIN here and carries the return path as router state.
+        */
+        <StepUpPrompt
+          explanation="Reporting a sponsored card needs a recent PIN unlock."
+          retryHint={() => 'Press “Send report” again to continue.'}
+        />
       ) : null}
     </aside>
   );

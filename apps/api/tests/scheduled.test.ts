@@ -672,6 +672,47 @@ describe('job ledger hardening (RV-lead-jobs-ai-1, -2, -15)', () => {
     ).toBe(true);
     await purgeExpiredScans(deps); // healthy storage again: the page is removed on the next tick
   });
+
+  /**
+   * JOBS-R2-04, second round (the acceptance checker's residual): bounding each provider REQUEST at
+   * ten seconds still let the entitlement sweep — up to 25 families, one fetch each, sequential —
+   * push the job ledger to the end of the tick, and the ledger is what the families are waiting on
+   * (a scan, a safety email, an export). The ledger now runs before the provider sweep, so a store
+   * that answers slowly delays only itself.
+   */
+  it('runs the job ledger before the provider sweep, so a slow store cannot starve it', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const now = api.now.value.getTime();
+    // A live entitlement last fetched two days ago: stale, so the sweep really fetches it.
+    await api.db.sql`
+      insert into public.family_entitlements (family_id, channel, provider_subscription_id, product_id,
+        paid_slots, status, environment, period_start, period_end, auto_renew, provider_updated_at, fetched_at)
+      values (${fam.familyId}, 'app_store', ${'rc:' + randomUUID()}, 'pl_family_1', 1, 'active', 'sandbox',
+              ${new Date(now - 10 * 86_400_000)}, ${new Date(now + 20 * 86_400_000)}, true,
+              ${new Date(now - 2 * 86_400_000)}, ${new Date(now - 2 * 86_400_000)})`;
+    const order: string[] = [];
+    const watched = {
+      ...api.providers.subscriptions,
+      fetchSubscriptions: (ref: string, at: Date) => {
+        order.push('provider');
+        return api.providers.subscriptions.fetchSubscriptions(ref, at);
+      },
+    };
+    const id = await queueJob('payout_prepare', null);
+    await runScheduledTick(
+      { ...deps, providers: { ...api.providers, subscriptions: watched } },
+      {
+        payout_prepare: () => {
+          order.push('job');
+          return Promise.resolve();
+        },
+      },
+    );
+    expect((await jobState(id)).status).toBe('succeeded');
+    expect(order).toContain('provider');
+    expect(order.indexOf('job')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('job')).toBeLessThan(order.indexOf('provider'));
+  });
 });
 
 describe('retention hardening (RV-lead-jobs-ai-5, -6, -20)', () => {

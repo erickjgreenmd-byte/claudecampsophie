@@ -20,6 +20,7 @@ import {
   Heading,
   LegalLinks,
   Loading,
+  LockParentAreaButton,
   Notice,
   ParentAccessState,
   Screen,
@@ -28,7 +29,6 @@ import {
   useLoad,
   useParentAccess,
 } from '../../src/family/ui.tsx';
-import { lockParentArea } from '../../src/family/unlock.ts';
 
 /**
  * Parent home (spec P14 parent area; AC_ACCESS_01/02, AC_UX_02): family, children and paid slots,
@@ -142,7 +142,7 @@ function FamilyHome({ api }: { api: ApiClient }) {
         from it and locks it. Coming back needs your parent PIN.
       </Body>
       <Button label="Connect as a child device" secondary onPress={() => router.push('/pair')} />
-      <LockButton api={api} />
+      <LockParentAreaButton />
       <Body muted>
         Signing out ends your parent session on this device. You’ll need your email and password to
         come back.
@@ -227,27 +227,5 @@ function ConsentCard({
       ) : null}
       {message ? <Body>{message}</Body> : null}
     </Wrapper>
-  );
-}
-
-function LockButton({ api }: { api: ApiClient }) {
-  const [message, setMessage] = useState<string | null>(null);
-  return (
-    <>
-      <Button
-        label="Lock parent area"
-        secondary
-        onPress={() =>
-          void lockParentArea(api).then((ok) =>
-            setMessage(
-              ok
-                ? 'Locked. Sensitive actions need your PIN again.'
-                : 'We couldn’t reach PencilLift to lock. Try again when you’re online.',
-            ),
-          )
-        }
-      />
-      {message ? <Body>{message}</Body> : null}
-    </>
   );
 }

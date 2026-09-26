@@ -168,19 +168,37 @@ describe('safety reports (AC_SECURITY_01)', () => {
     ).rejects.toThrow(/question not found/);
   });
 
-  it('a parent can file a parent report for their family but not as a child', async () => {
-    await db.asParent(
-      fam.ownerId,
+  it('a parent files a report through the API, never through the Data API (API-AUTH-R2-01)', async () => {
+    // Migration 0860 revoked `authenticated`'s insert grant: routes/privacy.ts inserts with the
+    // service role after checking the family, the question and the child (it has to set child_id,
+    // which the grant never covered), so the per-user limit and the child link cannot be skipped and
+    // one statement can no longer write hundreds of rows into the owner's safety queue. Both parent
+    // and child reporter kinds are refused before RLS is even consulted.
+    for (const kind of ['parent', 'child']) {
+      await expect(
+        db.asParent(
+          fam.ownerId,
+          (tx) =>
+            tx`insert into public.safety_reports (family_id, reporter_kind, category) values (${fam.familyId}, ${kind}, 'other')`,
+        ),
+      ).rejects.toThrow(/permission denied/);
+    }
+    // The parent-insert policy stays as the second layer, and still admits only a parent report.
+    const [policy] = await db.sql<{ qual: string }[]>`
+      select with_check as qual from pg_policies
+       where schemaname = 'public' and tablename = 'safety_reports'
+         and policyname = 'safety_reports_parent_insert'`;
+    expect(policy!.qual).toMatch(/reporter_kind = 'parent'/);
+    // The API's own path still works and is visible to the family.
+    await db.asService(
       (tx) =>
         tx`insert into public.safety_reports (family_id, reporter_kind, category) values (${fam.familyId}, 'parent', 'wrong_or_confusing')`,
     );
-    await expect(
-      db.asParent(
-        fam.ownerId,
-        (tx) =>
-          tx`insert into public.safety_reports (family_id, reporter_kind, category) values (${fam.familyId}, 'child', 'other')`,
-      ),
-    ).rejects.toThrow(/row-level security/);
+    const mine = await db.asParent(
+      fam.ownerId,
+      (tx) => tx`select id from public.safety_reports where family_id = ${fam.familyId}`,
+    );
+    expect(mine.length).toBeGreaterThanOrEqual(1);
   });
 });
 

@@ -210,7 +210,9 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
   });
 
   it('unlocks with a 6-digit PIN only and explains a wrong PIN', async () => {
-    const good = fakeApi({ send: () => ({ unlockedUntil: '2026-09-24T15:05:00.000Z' }) });
+    const good = fakeApi({
+      send: () => ({ unlockedUntil: '2026-09-24T15:05:00.000Z', unlockSeconds: 300 }),
+    });
     expect(await unlockAction(good.api, '12')).toMatchObject({ ok: false });
     expect(good.calls).toHaveLength(0);
     expect(await unlockAction(good.api, '482913')).toMatchObject({ ok: true });

@@ -82,7 +82,9 @@ the owner against the live docs before the first production webhook (Owner actio
 - `IMAGE_INPUT_TOKEN_BOUND` = 1,500 input tokens per page image (`apps/api/src/jobs/spend-ceiling.ts`) bounds the
   admitted spend estimate (BUG-094). It is unverified (no provider key): check it against the chosen model's
   high-detail image accounting and raise it if a page can cost more.
-- Prompt versions in use: extraction.v2, grading.v3, verification.v2, coaching.v1 (`packages/ai/src/prompts.ts`).
+- Prompt versions in use: extraction.v3, grading.v3, verification.v2, coaching.v1 (`packages/ai/src/prompts.ts`).
+  extraction.v3 (round 3, DB-R2-06) asks for one row per printed question number and says what to do
+  with a repeated number, which the unique (assignment, page, question number) constraint used to drop.
 
 ## 4. Sandbox evidence still required (blocked on account access)
 

@@ -168,6 +168,10 @@ export interface StripeInvoice {
   readonly status?: string | null;
   readonly amount_paid?: number;
   readonly subtotal?: number;
+  /** Sales tax Stripe added on top of the subscription price; never PencilLift revenue. */
+  readonly tax?: number | null;
+  /** Stripe's own pre-tax total (total − tax, i.e. after discounts). */
+  readonly total_excluding_tax?: number | null;
   readonly currency?: string;
   readonly total_discount_amounts?: { amount: number }[] | null;
   readonly period_start?: number;
@@ -177,6 +181,10 @@ export interface StripeInvoice {
       period?: { start: number; end: number };
       price?: { id?: string } | null;
       proration?: boolean | null;
+      /** The line's own pre-tax amount in cents. */
+      amount?: number | null;
+      /** Discounts applied to this line only. */
+      discount_amounts?: { amount: number }[] | null;
     }[];
   } | null;
   readonly metadata?: Record<string, string> | null;
@@ -204,6 +212,49 @@ function subscriptionLine(invoice: StripeInvoice) {
   );
 }
 
+type StripeLine = NonNullable<NonNullable<StripeInvoice['lines']>['data']>[number];
+
+const sumAmounts = (list: readonly { amount: number }[] | null | undefined): number =>
+  (list ?? []).reduce((sum, d) => sum + d.amount, 0);
+
+const cents = (value: number | null | undefined): number | null =>
+  typeof value === 'number' && Number.isSafeInteger(value) ? value : null;
+
+/**
+ * BILL-R2-4: what the family was charged FOR THE SUBSCRIPTION, which is what the $1 school donation
+ * rule compares with the regular tier price (donations eligibility regular_tier_price) and what the
+ * owner's revenue view books as gross. It is not `amount_paid`: that total also carries US sales tax
+ * (tax is a state's money, never PencilLift revenue) and any pending proration items a mid-cycle
+ * plan change added to the renewal invoice. Booking those made a full-price $39.99 renewal in a
+ * taxing state read as 4329 against a regular 3999, so the month was skipped as
+ * NOT_REGULAR_TIER_PRICE and the school never got its $1 for a full-price month.
+ *
+ * In order: the subscription line's own amount net of that line's discounts; Stripe's pre-tax total
+ * (`total_excluding_tax`, already net of discounts); the pre-tax `subtotal` less invoice-level
+ * discounts; finally what was paid less the reported tax. The last two invoice-level figures still
+ * include other lines, so any proration line that states its own amount is taken back off.
+ */
+function subscriptionChargeCents(
+  invoice: StripeInvoice,
+  line: StripeLine,
+  invoiceDiscountCents: number,
+): number {
+  const lineAmount = cents(line.amount);
+  if (lineAmount !== null) return Math.max(0, lineAmount - sumAmounts(line.discount_amounts));
+  const prorationCents = (invoice.lines?.data ?? [])
+    .filter((l) => l !== line && l.proration === true)
+    .reduce((sum, l) => sum + (cents(l.amount) ?? 0), 0);
+  const excludingTax = cents(invoice.total_excluding_tax);
+  const subtotal = cents(invoice.subtotal);
+  const preTax =
+    excludingTax !== null
+      ? excludingTax
+      : subtotal !== null
+        ? subtotal - invoiceDiscountCents
+        : (cents(invoice.amount_paid) ?? 0) - (cents(invoice.tax) ?? 0);
+  return Math.max(0, preTax - prorationCents);
+}
+
 export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeriod | null {
   const line = subscriptionLine(invoice);
   const period = line?.period;
@@ -215,7 +266,7 @@ export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeri
       : invoice.billing_reason === 'subscription_update'
         ? 'proration'
         : 'addon';
-  const discount = (invoice.total_discount_amounts ?? []).reduce((sum, d) => sum + d.amount, 0);
+  const discount = sumAmounts(invoice.total_discount_amounts);
   return {
     channel: 'stripe',
     providerPeriodId: invoice.id,
@@ -223,7 +274,7 @@ export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeri
     kind,
     periodStart: new Date(period.start * 1000),
     periodEnd: new Date(period.end * 1000),
-    chargedCents: invoice.amount_paid ?? 0,
+    chargedCents: subscriptionChargeCents(invoice, line, discount),
     reportedDiscountCents: discount,
     discountSources: discount > 0 ? ['promo_code'] : [],
     currency: (invoice.currency ?? 'usd').toUpperCase(),
@@ -665,6 +716,10 @@ export async function applyRefund(
   // dispute (chargeback_reversed) gives the reversed amount back: with Stripe's dispute `amount`
   // (always present on a Dispute object) an earlier genuine partial refund survives the win as
   // 'partially_refunded'; without an amount the whole charge is treated as disputed and restored.
+  // BILL-R2-4: every refunded/disputed figure is capped at charged_amount_cents. A provider reports
+  // what the family paid INCLUDING sales tax, while the charge recorded here is the pre-tax
+  // subscription amount; without the cap a fully refunded taxed renewal would book a refund larger
+  // than the revenue it reverses and the owner's net revenue would go negative.
   const [period] = await tx<
     {
       id: string;
@@ -687,13 +742,15 @@ export async function applyRefund(
              when ${effective} = 'chargeback_reversed' then
                case when settlement <> 'chargeback' then refunded_cents
                     else greatest(0, refunded_cents - coalesce(${refundedCents}::int, charged_amount_cents)) end
-             when ${effective} = 'refund' then greatest(refunded_cents, ${refundedCents ?? 0}, charged_amount_cents)
+             when ${effective} = 'refund'
+               then least(charged_amount_cents, greatest(refunded_cents, ${refundedCents ?? 0}, charged_amount_cents))
              when ${effective} = 'chargeback' then
                case when settlement = 'chargeback'
-                      then greatest(refunded_cents, coalesce(${refundedCents}::int, charged_amount_cents))
+                      then least(charged_amount_cents,
+                                 greatest(refunded_cents, coalesce(${refundedCents}::int, charged_amount_cents)))
                     else least(charged_amount_cents,
                                refunded_cents + coalesce(${refundedCents}::int, charged_amount_cents)) end
-             else greatest(refunded_cents, ${refundedCents ?? 0}) end
+             else least(charged_amount_cents, greatest(refunded_cents, ${refundedCents ?? 0})) end
      where id = ${current.id}
      returning id, settlement, refunded_cents
   `;

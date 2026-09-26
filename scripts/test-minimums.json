@@ -1,10 +1,10 @@
 {
   "@pencillift/domain": 3473,
-  "@pencillift/api": 947,
-  "@pencillift/db": 347,
-  "@pencillift/web": 572,
-  "@pencillift/mobile": 625,
-  "@pencillift/ai": 56,
+  "@pencillift/api": 1011,
+  "@pencillift/db": 373,
+  "@pencillift/web": 669,
+  "@pencillift/mobile": 671,
+  "@pencillift/ai": 60,
   "@pencillift/contracts": 19,
   "@pencillift/ui-tokens": 4
 }

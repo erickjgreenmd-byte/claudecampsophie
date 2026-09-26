@@ -14,13 +14,41 @@ export interface SessionValue {
 
 const SessionContext = createContext<SessionValue | null>(null);
 
+/**
+ * WEB-R2-02: a parent call the API answers UNAUTHENTICATED means the server has already ended this
+ * session (the parent signed out of the phone app, changed the password elsewhere, or closed the
+ * account). `auth.getSession()` keeps handing out the stored access token until roughly 90 s before
+ * it expires, so without this the portal believed it was signed in for up to an hour and every page
+ * showed "Sign in again to continue" with only a "Try again" button and no sign-in link.
+ *
+ * Ending the local session lets RequireParent render the sign-in prompt, which keeps `?next=`. The
+ * scope is local: the session the server ended is only cleared from this browser. The error is
+ * rethrown unchanged, so each screen still shows its own state.
+ */
+export function signOutOnUnauthenticated(api: ApiClient, auth: AuthAdapter): ApiClient {
+  const guard = (error: unknown): never => {
+    if (error instanceof ApiRequestError && error.code === 'UNAUTHENTICATED') {
+      void auth.signOut('local').catch(() => undefined);
+    }
+    throw error;
+  };
+  return {
+    get: (path, schema, options) => api.get(path, schema, options).catch(guard),
+    send: (method, path, body, schema, options) =>
+      api.send(method, path, body, schema, options).catch(guard),
+  };
+}
+
 export function createDefaultSession(
   config = readWebConfig(),
   auth: AuthAdapter = unconfiguredAuth,
 ): SessionValue {
-  const api = createApiClient(
-    config.apiBaseUrl,
-    async () => (await auth.currentSession())?.accessToken ?? null,
+  const api = signOutOnUnauthenticated(
+    createApiClient(
+      config.apiBaseUrl,
+      async () => (await auth.currentSession())?.accessToken ?? null,
+    ),
+    auth,
   );
   return { config, auth, api };
 }
@@ -73,6 +101,9 @@ function SignInPrompt() {
   const next = encodeURIComponent(`${location.pathname}${location.search}${location.hash}`);
   return (
     <>
+      {/* WEB-R2-06: a signed-out portal page is a page in its own right and needs its own h1
+          (WCAG 2.4.6), or a screen-reader user lands on a headless document. */}
+      <h1>Sign in to see your family</h1>
       {/* WEB-R1-07: an email link that could not sign the adult in here says why. */}
       <AuthLinkNotice requestHref="/sign-in" purpose="sign_in" />
       <Notice>

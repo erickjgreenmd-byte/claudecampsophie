@@ -1070,7 +1070,12 @@ describe('parent-facing wording (contracts PARENT_SAFETY_FLAG_COPY)', () => {
     ].join(' ');
     expect(noDeliveryClaim).not.toMatch(DELIVERY_CLAIM);
     // The recorded-delivery wording says an email went out and what it does not carry.
-    expect(PARENT_SAFETY_FLAG_COPY.emailSent).toMatch(/PencilLift emailed the guardians/);
+    // CS-R2-06: the claim is now about what was actually delivered — at least one verified address
+    // accepted the email — not about "the guardians on this account", only one of whom may have been
+    // reached. Matching /PencilLift emailed/ keeps the delivery claim asserted without pinning the
+    // overclaim this finding removed.
+    expect(PARENT_SAFETY_FLAG_COPY.emailSent).toMatch(/PencilLift emailed/);
+    expect(PARENT_SAFETY_FLAG_COPY.emailSent).toMatch(/at least one verified guardian address/);
     expect(PARENT_SAFETY_FLAG_COPY.emailSent).toMatch(
       /names no child, no question and no kind of concern/,
     );
@@ -1119,6 +1124,14 @@ describe('parent-facing wording (contracts PARENT_SAFETY_FLAG_COPY)', () => {
       // `actionsNeedUnlock` (both actions need a recent parent PIN unlock) were added with the
       // parent actions. Pinned over the settled contracts copy (packages/contracts/src/privacy.ts).
       'safety-templates.v4': '25af2aa5bcbb74f5ba3eaed6119fc07f66122b097090a1b91d814be8c4b492bb',
+      // v5 (CS-R2-06): `emailSent` no longer claims that PencilLift emailed "the guardians on this
+      // account" nor that it happened "when it was filed". The flag email is recorded 'sent' once at
+      // least ONE verified address accepted it (dispatcher.ts safetyFlagEmailHandler), so an owner
+      // whose address bounced, and an unverified co-guardian who was skipped, were being told they
+      // had been emailed. The wording now says at least one verified address accepted it, that an
+      // unverified or refused address was not reached, and to check your own address. Still a draft
+      // under Owner action #24.
+      'safety-templates.v5': '7e19d12e9a62803e7ad492eda83c574d92f6bae60dd65fed9afb3ffbb4cac4a8',
     };
     expect({ version: SAFETY_TEMPLATES_VERSION, digest }).toEqual({
       version: SAFETY_TEMPLATES_VERSION,

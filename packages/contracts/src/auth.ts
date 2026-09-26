@@ -13,6 +13,14 @@ export const adultUnlockRequestSchema = z.strictObject({
 
 export const adultUnlockResponseSchema = z.strictObject({
   unlockedUntil: isoDateTimeSchema,
+  /**
+   * How long the window lasts, in seconds (MOB-R2-03). `unlockedUntil` is a database instant, so a
+   * client whose own clock is ahead of the server's sees the window as already over and bounces the
+   * parent straight back to the PIN screen. A client measures the window from its own clock with
+   * this value instead. Required: an API that silently stopped sending it would put the mobile client
+   * back on the server instant with no contract failure to catch it (the round-3 checker's residual).
+   */
+  unlockSeconds: z.number().int().positive(),
 });
 
 export const createPairingCodeResponseSchema = z.strictObject({
@@ -30,6 +38,13 @@ export const childPairRequestSchema = z.strictObject({
 export const childTokenResponseSchema = z.strictObject({
   accessToken: z.string(),
   accessTokenExpiresAt: isoDateTimeSchema,
+  /**
+   * The access token's lifetime in seconds (MOB-R2-02). `accessTokenExpiresAt` is a server instant;
+   * a tablet with a wrong clock that compares it with its own clock either presents a token the
+   * server has already rejected or refreshes on every call. The device measures expiry as its own
+   * clock at receipt plus this lifetime.
+   */
+  accessTokenExpiresInSeconds: z.number().int().positive(),
   refreshToken: z.string(),
   child: z.strictObject({ id: uuidSchema, nickname: z.string() }),
 });

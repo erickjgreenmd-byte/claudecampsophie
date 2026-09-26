@@ -311,7 +311,7 @@ describe('PrivacyControlsPage', () => {
       send: (call) => {
         if (call.path === '/v1/adult/unlock') {
           unlocked = true;
-          return { unlockedUntil: '2026-09-24T15:05:00.000Z' };
+          return { unlockedUntil: '2026-09-24T15:05:00.000Z', unlockSeconds: 300 };
         }
         return unlocked ? queuedExport('progress_pdf') : stepUp();
       },
@@ -671,7 +671,9 @@ describe('PrivacyControlsPage', () => {
     const { api, sends } = fakeApi({
       reports: { reports: [flag()] },
       send: (call) =>
-        call.path === '/v1/adult/unlock' ? { unlockedUntil: '2026-09-24T15:05:00.000Z' } : stepUp(),
+        call.path === '/v1/adult/unlock'
+          ? { unlockedUntil: '2026-09-24T15:05:00.000Z', unlockSeconds: 300 }
+          : stepUp(),
     });
     renderPage(<PrivacyControlsPage />, { api });
     const list = await screen.findByRole('list', { name: /family safety reports/i });
@@ -877,7 +879,11 @@ describe('PrivacyControlsPage', () => {
         return Promise.resolve(
           schema.parse({
             url: 'https://storage.example.test/signed/progress.csv?token=abc',
-            expiresAt: '2026-09-24T15:01:00.000Z',
+            // WEB-R2-07: the signed link now disappears once it has expired, so this fixture's
+            // expiry has to be a live one-minute window rather than a fixed past instant (the fixed
+            // instant was already in the past whenever the suite ran, which is the L-027 trap).
+            // The assertion below is unchanged: a ready export offers a one-minute download link.
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
           }),
         );
       }

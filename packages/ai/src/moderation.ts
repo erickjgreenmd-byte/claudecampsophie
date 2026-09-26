@@ -86,12 +86,21 @@ export interface ModerationClient {
 // Mapping to PencilLift safety categories (pure; exported for tests)
 // ---------------------------------------------------------------------------------------------
 
+/** A PencilLift category a provider flag can carry; every one is a system-report category (0760). */
+export type ProviderMappedCategory = 'self_harm' | 'sexual' | 'violence';
+
 /**
- * Which PencilLift severe category an OpenAI category means (null: no PencilLift category). The
- * CHILD'S OWN WORDS turn a violence flag into abuse AND violence (see providerSafetyCategories).
+ * Which PencilLift severe category an OpenAI category means. The CHILD'S OWN WORDS turn a violence
+ * flag into abuse AND violence (see providerSafetyCategories).
+ *
+ * Owner/lead decision (2026-09-25; CS-R2-03): `harassment`, `hate` and `illicit` map like their
+ * `/threatening` and `/violent` siblings instead of to nothing. Recall comes first on a child's own
+ * answer, and the provider's threat sub-signal is not what decides whether a grown-up should look:
+ * these used to be logged and nothing else, so the answer was graded and coached and the parent was
+ * never told.
  */
 export const PROVIDER_CATEGORY_MAP: Readonly<
-  Record<OpenAiModerationCategory, 'self_harm' | 'sexual' | 'violence' | null>
+  Record<OpenAiModerationCategory, ProviderMappedCategory>
 > = {
   'self-harm': 'self_harm',
   'self-harm/intent': 'self_harm',
@@ -103,10 +112,20 @@ export const PROVIDER_CATEGORY_MAP: Readonly<
   'harassment/threatening': 'violence',
   'hate/threatening': 'violence',
   'illicit/violent': 'violence',
-  harassment: null,
-  hate: null,
-  illicit: null,
+  harassment: 'violence',
+  hate: 'violence',
+  illicit: 'violence',
 };
+
+/**
+ * The PencilLift category a provider flag falls back to when its own category name means nothing
+ * here: a category the provider added after this code shipped, or a result flagged with no category
+ * at all (CS-R2-03). PencilLift has no "other" severe category and migration 0760 allows a system
+ * report only the six screen codes, so the fallback is a real one; `violence` is where every
+ * hostility-type provider category already maps, and on a child's own words it adds `abuse` like
+ * the rest, which gives the calm child message (no anger line) and a flag for the parent.
+ */
+export const PROVIDER_FALLBACK_CATEGORY: ProviderMappedCategory = 'violence';
 
 /** Who wrote the moderated text: the child (answers) or a model (child-facing output). */
 export type ModeratedSource = 'child' | 'model_output';
@@ -119,12 +138,23 @@ function isOpenAiCategory(category: string): category is OpenAiModerationCategor
   return (OPENAI_MODERATION_CATEGORIES as readonly string[]).includes(category);
 }
 
+function addMapped(
+  out: Set<SevereSafetyCategory>,
+  mapped: ProviderMappedCategory,
+  source: ModeratedSource,
+): void {
+  if (mapped === 'violence' && source === 'child') out.add('abuse');
+  out.add(mapped);
+}
+
 /**
  * PencilLift severe categories for the OpenAI categories reported on one input, sorted like the
  * word-list screen's. For the child's own words a violence-type flag maps to abuse AND violence: a
  * model cannot tell a victim's report ("he beats me") from a threat, so the parent sees both codes'
  * message and can clear a false match (runbook 5.1; owner decision 2026-09-25: no report is held).
- * Unknown and unmapped categories (harassment, hate, illicit) yield nothing.
+ * An unknown category name — one the provider added after this code shipped — takes
+ * PROVIDER_FALLBACK_CATEGORY instead of being dropped (CS-R2-03): a new category name is not a
+ * reason to grade a flagged answer and tell the parent nothing.
  */
 export function providerSafetyCategories(
   categories: readonly string[],
@@ -132,11 +162,11 @@ export function providerSafetyCategories(
 ): SevereSafetyCategory[] {
   const out = new Set<SevereSafetyCategory>();
   for (const category of categories) {
-    if (!isOpenAiCategory(category)) continue;
-    const mapped = PROVIDER_CATEGORY_MAP[category];
-    if (mapped === null) continue;
-    if (mapped === 'violence' && source === 'child') out.add('abuse');
-    out.add(mapped);
+    addMapped(
+      out,
+      isOpenAiCategory(category) ? PROVIDER_CATEGORY_MAP[category] : PROVIDER_FALLBACK_CATEGORY,
+      source,
+    );
   }
   return [...out].sort((a, b) => CATEGORY_ORDER.get(a)! - CATEGORY_ORDER.get(b)!);
 }
@@ -168,19 +198,28 @@ export function providerModerationCodes(item: ModerationResultItem): string[] {
 
 /**
  * One input's provider result as a safety screen, to merge with the word-list screen
- * (mergeScreens: the most serious level wins, categories and codes join). `severe` exactly when a
- * category maps to a PencilLift one; codes are reported either way, so a flag without a PencilLift
- * category (harassment on a child's answer) is still logged.
+ * (mergeScreens: the most serious level wins, categories and codes join).
+ *
+ * FAILS CLOSED on the categories (CS-R2-03): `severe` whenever moderationFlagged() is true, and a
+ * flag that maps to no PencilLift category — flagged with no category at all, or only with names
+ * this code does not know — carries PROVIDER_FALLBACK_CATEGORY, so the child gets the safety
+ * template and the parent gets a flag instead of the answer being graded on a warn log alone. The
+ * screen is used for the child's own answers (scan-process.ts childInputScreen); model output fails
+ * closed on moderationFlagged() directly.
  */
 export function providerSafetyScreen(
   item: ModerationResultItem,
   source: ModeratedSource,
 ): SafetyScreen {
-  const categories = moderationFlagged(item)
-    ? providerSafetyCategories(item.categories, source)
-    : [];
+  const flagged = moderationFlagged(item);
+  let categories = flagged ? providerSafetyCategories(item.categories, source) : [];
+  if (flagged && categories.length === 0) {
+    const fallback = new Set<SevereSafetyCategory>();
+    addMapped(fallback, PROVIDER_FALLBACK_CATEGORY, source);
+    categories = [...fallback].sort((a, b) => CATEGORY_ORDER.get(a)! - CATEGORY_ORDER.get(b)!);
+  }
   return {
-    level: categories.length > 0 ? 'severe' : 'none',
+    level: flagged ? 'severe' : 'none',
     categories,
     topics: [],
     codes: providerModerationCodes(item),

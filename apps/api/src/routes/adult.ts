@@ -192,7 +192,12 @@ export function adultRoutes(): Hono<AppEnv> {
         }
         throw new ApiError('FORBIDDEN', 'Incorrect PIN');
       case 'unlocked':
-        return c.json({ unlockedUntil: outcome.until.toISOString() });
+        // The window length as well as its end (MOB-R2-03): a device clock ahead of the database
+        // clock would read `unlockedUntil` as already past and send the parent back to the PIN.
+        return c.json({
+          unlockedUntil: outcome.until.toISOString(),
+          unlockSeconds: deps.config.adultUnlockTtlSeconds,
+        });
     }
   });
 

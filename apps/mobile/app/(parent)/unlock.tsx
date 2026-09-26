@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Switch, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
 import { colors } from '@pencillift/ui-tokens';
-import { enterParentMode } from '../../src/lib/mode.ts';
+import { enterParentMode, parentUnlockActive } from '../../src/lib/mode.ts';
 import { parentAuth, portalUrl } from '../../src/lib/parent-auth.ts';
 import { secureStorage } from '../../src/lib/secure-storage.ts';
 import {
@@ -17,6 +17,7 @@ import {
   Card,
   ErrorBox,
   Heading,
+  LockParentAreaButton,
   Notice,
   Screen,
   SignInPrompt,
@@ -28,7 +29,6 @@ import {
   openExternalUrl,
 } from '../../src/family/ui.tsx';
 import {
-  lockParentArea,
   pinResetGuidance,
   unlockWithBiometrics,
   unlockWithPin,
@@ -51,6 +51,11 @@ export default function UnlockScreen() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [biometricOn, setBiometricOn] = useState(false);
+  /**
+   * Whether a live unlock brought the parent here (from a parent screen), rather than the child's
+   * "Grown-ups" button, which opens this screen with no PIN at all (MOB-R2-04).
+   */
+  const [unlockActive] = useState(() => parentUnlockActive(new Date()));
   const [rememberBiometric, setRememberBiometric] = useState(false);
   const canBiometric = biometricsSupported();
   useRelockOnBackground(api);
@@ -90,8 +95,18 @@ export default function UnlockScreen() {
       const mode = await enterParentMode(secureStorage, modeEffects, {
         unlocked: true,
         unlockedUntil: outcome.unlockedUntil,
+        unlockSeconds: outcome.unlockSeconds,
       });
-      if (mode === 'parent') router.replace('/(parent)/home');
+      if (mode === 'parent') {
+        router.replace('/(parent)/home');
+        return;
+      }
+      if (mode === 'window_lapsed') {
+        // Never a silent bounce back to this screen (MOB-R2-03): say what happened.
+        setError(
+          'Your PIN was correct, but the unlock had already run out. Check this device’s date and time, then try again.',
+        );
+      }
       return;
     }
     if (outcome.kind === 'pin_changed') {
@@ -186,20 +201,15 @@ export default function UnlockScreen() {
       </Card>
       {error ? <ErrorBox message={error} /> : null}
       {info ? <Body>{info}</Body> : null}
-      <Heading>Done for now?</Heading>
-      <Button
-        label="Lock parent area"
-        secondary
-        disabled={busy}
-        onPress={() =>
-          void lockParentArea(api).then((ok) =>
-            setInfo(
-              ok ? 'Locked.' : 'We couldn’t reach PencilLift to lock. Try again when online.',
-            ),
-          )
-        }
-      />
-      <SignOutButton />
+      {/* Locking and signing out are grown-up actions, so they appear only while the parent area is
+          actually unlocked — never beside the PIN field, where a child could reach them. */}
+      {unlockActive ? (
+        <>
+          <Heading>Done for now?</Heading>
+          <LockParentAreaButton />
+          <SignOutButton />
+        </>
+      ) : null}
       <PinResetHelp />
     </Screen>
   );

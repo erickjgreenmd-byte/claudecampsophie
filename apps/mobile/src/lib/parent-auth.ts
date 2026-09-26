@@ -103,14 +103,26 @@ export const parentAuth = {
     }
   },
 
+  /**
+   * Ends the session on THIS device only (WEB-R2-02). Signing out of the phone must not silently
+   * end the parent's web portal session, so the scope is 'local' rather than Supabase's default
+   * 'global'. Ending every session is the portal's own "sign out everywhere".
+   */
   async signOut(): Promise<void> {
-    await client?.auth.signOut();
+    await client?.auth.signOut({ scope: 'local' });
   },
 
   async email(): Promise<string | null> {
     if (!client) return null;
     const { data } = await client.auth.getSession();
     return data.session?.user.email ?? null;
+  },
+
+  /** The signed-in parent's user id, so device-local secrets can be bound to them (MOB-R2-06). */
+  async userId(): Promise<string | null> {
+    if (!client) return null;
+    const { data } = await client.auth.getSession();
+    return data.session?.user.id ?? null;
   },
 
   /** Bearer token for parent API calls (auto-refreshed by supabase-js). */

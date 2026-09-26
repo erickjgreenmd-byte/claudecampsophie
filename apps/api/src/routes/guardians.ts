@@ -67,6 +67,61 @@ const JOBS_KEPT_ON_CONSENT_WITHDRAWAL = [
   'safety_flag_email',
 ] as const;
 
+/**
+ * Settles the scans behind the scan_process jobs a withdrawal just cancelled (CS-R2-04 =
+ * JOBS-R2-03). Cancelling the job alone left the assignment where it was for good: a re-check
+ * queued by a parent's correction or a false-alarm clearance sat in `checking`, which is in neither
+ * CANCELLABLE_ASSIGNMENT_STATUSES nor CORRECTABLE_ASSIGNMENT_STATUSES and hides the child's results
+ * for the whole scan, and a queued initial scan sat in `queued` with its page allowance still
+ * reserved. Nothing re-queued either when consent was given again.
+ *
+ * The same settlement the running path reaches (scan-process.ts assertActive throws
+ * CONSENT_REQUIRED) and the same shape as settleDeadLetteredScan: a re-check goes back to
+ * `needs_parent_review`, which keeps the results the child and the parent already had, and an
+ * initial scan ends `failed_final` with its reservation released. `queued` may only move to
+ * `extracting` first (the 0100 transition guard), so it is stepped through like there.
+ */
+async function settleScansAfterConsentWithdrawal(
+  tx: Tx,
+  familyId: string,
+  cancelled: readonly { kind: string; payload: unknown }[],
+): Promise<number> {
+  const CODE = 'CONSENT_REQUIRED';
+  let settled = 0;
+  for (const job of cancelled) {
+    if (job.kind !== 'scan_process') continue;
+    const payload = (job.payload ?? {}) as { assignmentId?: unknown; mode?: unknown };
+    const assignmentId = payload.assignmentId;
+    if (typeof assignmentId !== 'string') continue;
+    const [row] = await tx<{ status: string }[]>`
+      select status from public.assignments
+       where id = ${assignmentId} and family_id = ${familyId} for update`;
+    if (!row) continue;
+    const move = (to: string) => tx`
+      update public.assignments set status = ${to}, error_code = ${CODE}
+       where id = ${assignmentId} and family_id = ${familyId}`;
+    if (payload.mode === 'recheck') {
+      if (row.status !== 'checking' && row.status !== 'verifying') continue;
+      await move('needs_parent_review');
+      settled += 1;
+      continue;
+    }
+    let status = row.status;
+    if (status === 'queued') {
+      await move('extracting');
+      status = 'extracting';
+    }
+    if (!['extracting', 'checking', 'verifying', 'failed_retryable'].includes(status)) continue;
+    await move('failed_final');
+    await tx`
+      update public.usage_reservations set status = 'released', release_reason = 'failed_final'
+       where family_id = ${familyId} and status = 'reserved'
+         and idempotency_key like ${`scan-usage:${assignmentId}:v%`}`;
+    settled += 1;
+  }
+  return settled;
+}
+
 interface Membership {
   familyId: string;
   role: 'owner' | 'guardian';
@@ -646,12 +701,19 @@ export function guardiansRoutes(): Hono<AppEnv> {
          where id = ${latest.id} and family_id = ${membership.familyId} and status <> 'withdrawn'
         returning id`;
       if (updated.length !== 1) throw new Error('consent state changed during withdrawal');
-      const cancelled = await tx<{ id: string }[]>`
+      const cancelled = await tx<{ id: string; kind: string; payload: unknown }[]>`
         update public.jobs set status = 'cancelled', last_error_code = 'consent_withdrawn'
          where family_id = ${membership.familyId}
            and status in ('queued', 'failed_retryable')
            and kind <> all(${JOBS_KEPT_ON_CONSENT_WITHDRAWAL})
-        returning id`;
+        returning id, kind, payload`;
+      // A cancelled job leaves its scan behind, so the scans are settled in the same transaction
+      // (CS-R2-04 = JOBS-R2-03): nothing may sit in `queued` or `checking` with no live job.
+      const settledScans = await settleScansAfterConsentWithdrawal(
+        tx,
+        membership.familyId,
+        cancelled,
+      );
       // Withdrawal stops the children's own traffic, not only server-side processing (CS-R1-01):
       // the same statements as archiving (routes/family.ts) sign every paired device out, and
       // unredeemed pairing codes stop working. Profiles keep their status and paid slots (releasing
@@ -675,6 +737,7 @@ export function guardiansRoutes(): Hono<AppEnv> {
         targetId: latest.id,
         metadata: {
           cancelledJobs: cancelled.length,
+          settledScans,
           revokedSessions: revokedSessions.length,
           revokedDevices: revokedDevices.length,
         },
