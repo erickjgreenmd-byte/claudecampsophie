@@ -35,6 +35,7 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | [#61](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36186014426) | `110ff0f` | **success** (20:28–20:36 UTC) | hardening round 2c (BUG-160..164): the tree had passed `scripts/verify.sh` in an isolated worktree: domain 3,656, ui-tokens 4, db 366, contracts 20, mobile 658, web 603, ai 59, api 997 (6,363 tests, 0 failed) |
 | #37 | `1de2803` | **success** (19:49–19:55 UTC) | every step (records and the restored ai floor) |
 | [#64](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36208130669) | `6d4a3a9` | **success** (2026-09-26 01:21–01:28 UTC) | docs-only commit keeping the round-3 checker results and the lead worklist; every step |
+| [#69](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36234873570) | `02964f9` | **success** (2026-09-26 10:08–10:16 UTC) | hardening round 4 (BUG-211..246, migration 0870): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,713 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#65](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36214301640) | `8bc022b` | **success** (03:16–03:24 UTC) | hardening round 3 (BUG-165..210, migration 0860): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,614 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#35](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36049019610) | `e123e5c` | **success** (19:34–19:40 UTC) | every step, after 15:00 UTC real time: confirms the BUG-090 clock fix (at 4a07ac9 the pinned-clock tests would fail after 15:00) |
 | [#34](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35999435932) | `4a07ac9` | **success** (12:30–12:36 UTC) | every step |
@@ -48,6 +49,19 @@ CI first ran on this branch at `e067f32`, when pushes to `claude/**` were added 
 had never executed (it triggered only on pull requests and `main`).
 
 ## Local full gate
+
+`scripts/verify.sh` + `node scripts/assert-test-count.mjs` in an isolated worktree on the exact tree of the
+hardening round-4 commit `02964f9`, 2026-09-26 09:58–10:07 UTC, exit 0: api 1,091, domain 3,656, db 403,
+web 741, mobile 733, ai 65, contracts 20, ui-tokens 4 (6,713; 0 failed, 0 skipped); gate audit; finance;
+release-artifact scan with negative control. New suites in this round include
+`apps/web/src/pages/app/PinResetPage.race.test.tsx` and `apps/mobile/src/family/child-session-r2.review.test.ts`
+additions; floors raised to ~95% (api 1,036, domain 3,473, db 382, web 703, mobile 696, ai 61, contracts 19).
+
+One flaky assertion was found and fixed rather than re-run: the CS-R4-02 export test searched
+`JSON.stringify(rows)` for the hotline digits, and a v4 UUID or a millisecond timestamp can contain '988'
+by chance — the round-4 checker measured about one failure in fifty over 20 consecutive runs. The
+identifiers and the instant are now dropped before the search, which leaves the assertion's strength
+unchanged. A test that fails at random is a defect in the test, not a reason to re-run it.
 
 `scripts/verify.sh` + `node scripts/assert-test-count.mjs` in an isolated worktree on the exact tree of the
 hardening round-3 commit `8bc022b`, 2026-09-26 03:09–03:15 UTC, exit 0: api 1,065, domain 3,656, db 393, web 705,

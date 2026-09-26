@@ -47,8 +47,8 @@ Acceptance coverage (153 criteria; `docs/Requirement_Coverage.md`, each row with
 unit_tested 16, db_tested 1, verified_by_inspection 22, mock_only 16, blocked_external 27, in_progress 37,
 not_tested 1 (AC_GRADING_11, the frozen 200-question evaluation, needs real AI and labelled data).
 
-Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `8bc022b`:
-api 1,065, domain 3,656, db 393, web 705, mobile 707, ai 64, contracts 20, ui-tokens 4 (6,614 tests, 0 failed,
+Last local full gate (`scripts/verify.sh`, exit 0), run in an isolated worktree on the exact tree of `02964f9`:
+api 1,091, domain 3,656, db 403, web 741, mobile 733, ai 65, contracts 20, ui-tokens 4 (6,713 tests, 0 failed,
 0 skipped), gate audit, finance, release-artifact scan with negative control. The gate earned its keep again in
 round 3: its first run on that tree failed on three mobile fixtures that a tightened contract had made invalid,
 which every package's typecheck had passed. Earlier gates caught BUG-114 (a
@@ -92,15 +92,23 @@ then gate, push and record as the earlier rounds did.
 ## Next exact steps
 
 1. Confirm CI green on the latest SHA; record it in `docs/Test_Evidence.md`.
-2. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
+2. Round 4 is done: nine read-only finders swept the round-3 diff (112 files, ~11k inserted lines) and
+   returned 44 findings, of which 43 are fixed and closed (`docs/Bug_Ledger.md` BUG-211..246, ECC rows for
+   `wf_8f2c40ab-4dd` and `wf_b0dabd41-8b0`, code at `02964f9`, 6,713 tests green). Two of the 44 were
+   defects in round 3's own fixes, both written by the lead. ONE is deliberately open: BUG-244, a lost
+   `/v1/child/refresh` response still unpairs a child's tablet — the fix that would close it cheaply is a
+   grace window, which would hand a replayer a live session in the same conditions, so the theft gate stays
+   closed until an idempotent refresh keyed on a client request id can be designed. That is the next code
+   round's first item.
+3. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
    failing test first and are fixed, every area's acceptance checker ends `ok`, and the lead closed the checkers'
    cross-area residuals in the same round (`docs/Bug_Ledger.md` BUG-165..210, `docs/ECC_Runs.md` `wf_56274b45-95e`,
    code at `8bc022b`, 6,614 tests green). What was not reproduced, and what was deliberately left open, is listed
    in that ECC row rather than dropped. Next: a third finder round over the round-3 tree, or store submission.
-3. Owner actions in `docs/Owner_Actions.md` (#1–#44) unblock everything else: accounts (Apple, Google Play, Amazon
+4. Owner actions in `docs/Owner_Actions.md` (#1–#45) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety
    policy, spend budget, hosted Supabase checks, database production mark, child-safety package approval,
    BUG-096 residual.
-4. Repeat the resume check in the next real session (AC_ECC_09).
+5. Repeat the resume check in the next real session (AC_ECC_09).
