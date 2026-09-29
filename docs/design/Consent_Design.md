@@ -92,13 +92,13 @@ Removes a grey area at no cost:
 3. Show the price          $39.99 + $9.99 × (n-1)
 4. Take first payment      Apple / Google / Stripe
 5. Verify the adult        vendor; store reference + method + verifiedAt
-6. Capture the attestation "I am the parent or legal guardian…" + version + instant
-7. NOW collect child detail nickname, grade, age band
-8. Issue pairing codes     one per child
-9. Child pairs a device    the first moment child data can flow
+6. Per child, ONE submission  nickname + grade + age band + the ticked attestation,
+                           with its wording version and instant, scoped to that child
+7. Issue pairing codes     one per child
+8. Child pairs a device    the first moment child data can flow
 ```
 
-Steps 2 and 7 are the split that matters. `POST /v1/children` takes `nickname`, `gradeLevel` and `ageBand`,
+Steps 2 and 6 are the split that matters. `POST /v1/children` takes `nickname`, `gradeLevel` and `ageBand`,
 so "list the children" before consent would collect information about identifiable children. Whether that
 counts as collection *from a child* is arguable; asking for a count first makes the question moot, which is
 cheaper than winning the argument. Step 9 is the unambiguous line and the gate that matters most.
@@ -107,6 +107,50 @@ Four corrections to the flow as first proposed: no typed date of birth (a self-d
 nothing and adds sensitive data); never store the licence image; PencilLift does not do the looking; and
 verification comes *after* payment, so the per-check fee is not paid for everyone who abandons at the
 paywall.
+
+## Scope: per adult, or per child?
+
+The owner proposed (2026-09-29) confirming the adult, then adding each child with a checkbox carrying the
+legal statement after each one, then payment, then a code per child. That instinct catches something this
+design had wrong, and it splits into two scopes rather than one:
+
+| | Scope | Repeats? |
+|---|---|---|
+| Adult verification | Per **adult** | Once. A fourth child a year later does not re-verify |
+| Attestation + consent scope | Per **child** | Yes — the consent is to the processing of THAT child's data |
+
+`public.consent_records` is family-scoped today (`family_id`, `adult_user_id`), and both
+`hasVerifiedConsent` and `consentAllowsChildAccess` read the family's LATEST record. `scope jsonb` exists
+and nothing populates it. So as the code stands, a child added a year after signup is covered by an
+attestation made when only the earlier children existed — that child was never named in anything the parent
+agreed to. **Lead decision: the attestation is per child, and `scope` records which children it covers.**
+That is what the column was for.
+
+One refinement on the owner's wording: the child form and its checkbox are **one submission**, not two
+steps. Nickname, grade, age band and the ticked statement arrive together, so child details never exist
+without an attestation covering them, even momentarily.
+
+## Ordering: verify before payment, or after? — a correction
+
+An earlier note in this project said verify AFTER payment, on the ground that verifying first pays $1–3 for
+everyone who then abandons at the paywall. **That reasoning over-weighted the per-check fee and is
+withdrawn.** Even at 50% abandonment the cost is $2–6 per converted customer against $40–70 a month in
+revenue: recovered inside the first month, and noise.
+
+The real trade-off is different and it has no clean winner:
+
+- **Verify first** — never charge someone you then reject, so no refunds, no chargebacks, no customer who
+  was charged and then refused. But asking for a driver's licence before any commitment is a cold ask, and
+  a parent who has not yet decided to pay is still browsing. This is where signups are lost.
+- **Pay first** — the parent is invested by the time the licence is asked for, so completion is higher. But
+  every verification failure becomes a refund, a support ticket and a bad experience.
+
+Which one wins turns on a number PencilLift does not have: **the vendor's verification pass rate.** Ask for
+it as part of #7. Above roughly 95%, pay-first is better. Below that, verify-first avoids refund churn.
+
+A hybrid gets both on the Stripe path only: authorise the card, verify, then capture — no charge until
+verified. IAP cannot authorise without capturing, so this is web-signup only and does not help an in-app
+signup.
 
 ## The gap in the schema — needs a forward migration
 
@@ -137,6 +181,7 @@ The cases where the attestation is doing all the work, and which no ID check tou
 | Is homework sent to OpenAI under ZDR a third-party disclosure, or support for internal operations? (decides whether "email plus" is available) | #15 |
 | Attestation wording | #15 |
 | Contract, DPA, per-verification pricing if a vendor is used | #7 |
+| **The vendor's verification PASS RATE** — it decides whether verification runs before or after payment | #7 |
 | One verification per **adult** rather than per child, so a fourth child next year does not re-verify | #7 |
 | What a **revoked** consent does — re-verify, or simply stop | #7 |
 | Does a second guardian owe their own attestation? | #7 |
