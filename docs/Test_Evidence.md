@@ -41,6 +41,11 @@ blocked (`docs/Connections.md`), so nothing here is sandbox, device or productio
 | [#69](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36234873570) | `02964f9` | **success** (2026-09-26 10:08–10:16 UTC) | hardening round 4 (BUG-211..246, migration 0870): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,713 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#65](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36214301640) | `8bc022b` | **success** (03:16–03:24 UTC) | hardening round 3 (BUG-165..210, migration 0860): the tree had already passed `scripts/verify.sh` + the test-count audit in an isolated worktree before the branch moved to it; CI re-ran every step — format, secret scan, lint, typecheck, 6,614 tests against real Postgres, finance, gate audit, release-artifact build and scan |
 | [#35](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36049019610) | `e123e5c` | **success** (19:34–19:40 UTC) | every step, after 15:00 UTC real time: confirms the BUG-090 clock fix (at 4a07ac9 the pinned-clock tests would fail after 15:00) |
+| [#79](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36542395434) | `5ba16c3` | **success** (2026-09-29 08:23–08:31 UTC) | every step on the hardening round-6 code; the same tree passed `scripts/verify.sh` in an isolated worktree first (below) |
+| [#78](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36505398163) | `f560d15` | **success** (2026-09-29 00:55–01:02 UTC) | records-only commit: the round-6 fix plan, including the lead's decision to REMOVE the BUG-244 recovery |
+| [#77](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36278532523) | `2a76985` | **success** (2026-09-26 23:09–23:16 UTC) | records-only commit: the 52 round-6 hunt findings, committed before any fixing |
+| [#76](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36272731668) | `3801940` | **success** (2026-09-26 21:22–21:30 UTC) | records-only commit on the round-5 code |
+| [#75](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/36272272521) | `b802686` | **success** (2026-09-26 21:14–21:21 UTC) | every step on the hardening round-5 code (6,835 tests) |
 | [#34](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35999435932) | `4a07ac9` | **success** (12:30–12:36 UTC) | every step |
 | [#24](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35988504627) | `13bb3dc` | **success** (10:39–10:45 UTC) | every step above plus the new release-artifact secret scan (web build, Worker dry run, Expo web export, native public config; negative control) |
 | [#18](https://github.com/erickjgreenmd-byte/claudecampsophie/actions/runs/35983581731) | `b6e9998` | **failure** — web: one sponsor-card viewability test (BUG-083, a test race reproduced locally 1 in 12 under load; fixed in `48430c5`) | all other steps passed up to the web tests |
@@ -52,6 +57,35 @@ CI first ran on this branch at `e067f32`, when pushes to `claude/**` were added 
 had never executed (it triggered only on pull requests and `main`).
 
 ## Local full gate
+
+`scripts/verify.sh` + `node scripts/assert-test-count.mjs` in an isolated worktree on the exact tree of the
+hardening round-6 commit `5ba16c3`, 2026-09-29, reports written 08:18–08:22 UTC, exit 0: api 1,156, domain 3,656,
+db 429, web 835, mobile 786, ai 80, contracts 20, ui-tokens 4 (**6,966**; 0 failed, 0 skipped); gate audit;
+finance; release-artifact build and secret scan with its negative control (94 files, 13.0 MiB in 5 directories;
+the planted Stripe secret, service-role JWT, Supabase secret key and password-bearing database URL were all
+found, as the control requires). Floors raised to ~95% of these counts: api 1,098, domain 3,473, db 407, web 793,
+mobile 746, ai 76, contracts 19, ui-tokens 4.
+
+This round added no new test FILE; the 52 findings were pinned inside the existing suites, which is the right
+place for a regression on code those suites already cover. The three new migrations (0920, 0930, 0940) and the
+deletion of 0880 mean the whole database suite ran, not a filtered subset.
+
+Two pieces of evidence in this round are worth naming because they are the reason the round is trustworthy:
+
+- **The gate caught my own regression before it shipped.** Raising five AI stage caps to make the truncation
+  retry affordable broke `LJA-F4` — an oversized personalization request was sent instead of refused — because
+  one number was serving as both the admission bound and the retry budget. The failing test is the product's
+  own, not one written to notice the mistake. The fix splits the number in two and `defineStageCostBudgets`
+  now throws at IMPORT if the pair is ever mis-ordered, so the worker refuses to start rather than admitting a
+  request it cannot pay for (L-055, `docs/Cost_Analysis.md` §3 carries the full table).
+- **A checker graded a fixer's stated PREMISE as not holding**, separately from its behaviour, which is exactly
+  what that new field exists for. The behaviour was right; the sentence justifying it was not, and it was
+  rewritten rather than left standing (L-056). Three consecutive rounds had shipped a guard establishing a fact
+  ADJACENT to the one its comment claimed; grading the premise is how that stops being invisible.
+
+Every fix in this round was checked by mutation: the production line was reverted, the pinning test was shown to
+go red for the finding's own reason, and the file was restored byte-for-byte with `sha256sum -c` before the gate
+ran. The per-finding mutation is recorded in that finding's `docs/Bug_Ledger.md` row.
 
 `scripts/verify.sh` + `node scripts/assert-test-count.mjs` in an isolated worktree on the exact tree of the
 hardening round-4 commit `02964f9`, 2026-09-26 09:58–10:07 UTC, exit 0: api 1,091, domain 3,656, db 403,

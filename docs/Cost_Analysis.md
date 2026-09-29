@@ -83,6 +83,56 @@ micro-USD. The one real effect is at the monthly ceiling — a family within ~67
 their remaining budget can now be told to wait for a scan they could in fact have afforded. Against that, a scan
 that used to die after one billed generation now finishes.
 
+Round 6 split the one number into two (L-055, `5ba16c3`). Raising five more caps so the truncation retry
+would fit for the astra stages widened ADMISSION with them, and an oversized personalization request that
+`LJA-F4` exists to prove is refused was sent instead. A stage now carries two numbers, and the distinction is
+the whole point:
+
+- **Admission cap** — `PROPOSED_STAGE_LIMITS[stage].maxCostMicros`. The largest SINGLE request the stage may
+  send. It is the owner's recorded number and is never raised to make a retry fit.
+- **Stage budget** — `PROPOSED_STAGE_COST_BUDGET_MICROS[stage]`. What every attempt TOGETHER may cost,
+  including the one raised retry after an answer cut off at `max_output_tokens`. It is what a spend HOLD
+  reserves.
+- **Full-raise ceiling** — `fullRaiseCeiling(stage, maxOutputTokens)`, computed from the two production
+  pricing functions, not re-derived. `defineStageCostBudgets` THROWS at import if any budget is below its own
+  admission cap or below this ceiling, so a new stage or a raised `maxOutputTokens` fails the worker at
+  startup rather than promising a retry it cannot pay for.
+
+| Stage | Admission cap | Stage budget | Full-raise ceiling |
+|---|---:|---:|---:|
+| extraction | 216,816 | 216,816 | 155,972 |
+| grading | 216,816 | 216,816 | 153,264 |
+| verification | 100,000 | 100,000 | 76,796 |
+| coaching | 300,000 | 407,520 | 407,520 |
+| followup | 150,000 | 240,000 | 240,000 |
+| daily_set | 350,000 | 483,240 | 483,240 |
+| thursday_bundle | 700,000 | 933,600 | 933,600 |
+| semantic_check | 40,000 | 40,800 | 40,800 |
+| escalation | 500,000 | 500,000 | 660,000 |
+| adult_summary | 20,000 | 20,000 | 5,861 |
+
+`escalation` is the ONE stage excused from the ceiling, by name inside the check itself and for a stated
+reason: it has `maxAttempts: 1`, so it never retries and no budget makes a raise reachable for it. Give it a
+second attempt and the worker refuses to start until the owner sets both of its numbers. The comment this
+replaced claimed the invariant held for every stage while `escalation` sat 160,000 micros below its own
+ceiling, silently excused (HUNT6-D-ESCALATION).
+
+Worst-case spend HOLDS, which is where the budget column is actually spent (and every one of them settles to
+metered usage, so these are reservations and not money):
+
+| Hold | Stages summed | Micro-USD | USD |
+|---|---|---:|---:|
+| Extraction | extraction | 216,816 | $0.216816 |
+| Grading group | grading + verification | 316,816 | $0.316816 |
+| Coaching, per question | coaching | 407,520 | $0.407520 |
+| Practice personalization | daily_set | 483,240 | $0.483240 |
+
+The largest single hold a family can hit is the personalization stage at 483,240 micro-USD ($0.48). Reserving
+the admission cap instead — which the personalization hold still did after the split, until `F-HOLD` caught
+it — left that hold 133,240 micros short of what the stage may spend, so the hold stopped bounding the spend,
+which is the only thing a hold is for. `runStage` now throws a `RangeError` if it is handed a budget below the
+admission bound, so no caller can reintroduce that ordering for a single call.
+
 Known gap, deliberate and owner-visible (owner action #46): grading is bounded by QUESTIONS, not pages, because it
 sends no image. On the same ceiling the full retry is reachable to about 85 questions of average length and to none
 past about 149 — and the count moves with question length, since the bound is in bytes. So a ten-page worksheet of

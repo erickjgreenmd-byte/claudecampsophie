@@ -101,7 +101,8 @@ then gate, push and record as the earlier rounds did.
    replayer a live session in the same conditions, lesson L-047). It is now closed with the designed
    remedy: refresh is idempotent on a client `refreshRequestId` the device keeps across its own retries and
    across a cold start (migration 0880, owner action #45 withdrawn, 6,724 tests green). No round-4 finding
-   is outstanding.
+   is outstanding. **REVERSED in round 6 (item 4): that remedy was removed, migration 0880 deleted,
+   BUG-244 reopened and owner action #45 restored. Read this paragraph as history, not as current state.**
 3. Round 5 is done, and it is the round that read the previous round's fixes. Nine read-only finders swept
    the round-4 tree (76 files, 5,088 inserted lines that no reviewer had read) and returned 46 findings —
    3 high, 19 medium, 24 low — plus 132 properties they tried to break and could not. The findings and the
@@ -113,8 +114,9 @@ then gate, push and record as the earlier rounds did.
 
    Three of the 46 were defects in the BUG-244 change committed an hour before the hunt read it, and the
    worst was a design error: the recovery checked that the replacement token was UNCLAIMED and treated that
-   as proof the response had been lost, which it is not (lesson L-050). It is now bounded to two minutes
-   from the rotation, ANDed with the id, and audited. Two more were defects in round-4 fixes: a parent
+   as proof the response had been lost, which it is not (lesson L-050). It was then bounded to two minutes
+   from the rotation, ANDed with the id, and audited — and round 6 removed the whole recovery instead (item
+   4), because the bound limited when a replay could start and not how long it lasted. Two more were defects in round-4 fixes: a parent
    screen that handed the next parent the previous parent's children on a shared tablet, and mobile copy
    promising a deletion could be cancelled.
 
@@ -125,19 +127,48 @@ then gate, push and record as the earlier rounds did.
    unconnected. Verify the union against the files the FIXES will touch, which means reading every
    suggested fix before dispatching.
 
-   Next: a round-6 hunt over the round-5 tree — `git diff --shortstat 8201fa1 b802686 -- . ':!docs'` is
-   73 files, 5,585 insertions, 440 deletions, and no finder has read any of it. The same rule applies, now
-   with L-052: brief the areas so their lists cover every file the fixes will need, not only the files the
-   findings cite.
-4. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
+4. Round 6 is done, and it is the round that reversed a decision. Ten read-only finders swept the round-5
+   tree (73 files, 5,585 insertions — the round whose own job was fixing round 4, plus three fixes the lead
+   made by hand with no independent review) and returned 52 findings: 2 high, 16 medium, 34 low, plus 147
+   properties they tried to break and could not. All 52 are closed: `docs/Bug_Ledger.md` BUG-294..BUG-345,
+   lessons L-055..L-058, ECC rows for `wf_69a04f5f-f6d`, `wf_18050cd1-c16`, `wf_9091459c-825` and
+   `wf_791985a7-1d6`, migrations 0920/0930/0940 added and 0880 DELETED.
+
+   **The headline is a reversal.** The idempotent child-refresh recovery built in round 5 was REMOVED. Its
+   recorded residual said a captured request body was "served once"; in fact a recovery never marked the
+   row it recovered, so the same body was served repeatedly for the whole window and each serving returned
+   a full-lifetime rotating refresh token that then rotated on with no id, no window and no audit row —
+   a self-renewing child session until the tablet's next refresh. Against a feature that only avoids an
+   occasional re-pairing, that is the wrong trade for a children's product, so BUG-244 is REOPENED as an
+   accepted, documented defect and owner action #45 is restored. Lesson L-058: count the repairs — a
+   feature on its third fix in a week is telling you its premise is wrong.
+
+   The round also found the lead's own cap raise had broken the oversize-request guard, because one
+   constant was serving as both an admission bound and a stage budget (L-055). The two numbers are now
+   separate and both properties hold.
+
+   The process change that earned its place: every fixer states the fix's PREMISE and the observable fact
+   establishing it, and every checker grades that premise separately from the behaviour. Five premises did
+   not hold this round, including two the lead wrote. That is L-056, and it is the single most useful
+   thing in this project's review loop.
+
+   Next: the stopping rule, and it is now settled. Rounds 4, 5 and 6 found 9, 3 and 2 high-severity
+   findings over trees of comparable size. A round-7 hunt would read about 8,600 inserted lines no finder
+   has seen and, on that curve, return one or two high findings — worth doing, but no longer the binding
+   constraint. The binding constraint is the owner-side list, so it is written down as its own record:
+   `docs/Beta_Readiness.md` gives the ordered path to a first real family, the three gates that are
+   absolute (consent provider, documented ZDR approval, legal and educator sign-off), the parent-only
+   walkthrough that is available before them, and the honest list of what has never run — no device, no
+   real provider call, no measured AI cost, no backup rehearsal, no real photograph of real homework.
+5. Round 3 is done: all 50 round-2 reports were routed to seven fixers with disjoint files, 45 reproduced with a
    failing test first and are fixed, every area's acceptance checker ends `ok`, and the lead closed the checkers'
    cross-area residuals in the same round (`docs/Bug_Ledger.md` BUG-165..210, `docs/ECC_Runs.md` `wf_56274b45-95e`,
    code at `8bc022b`, 6,614 tests green). What was not reproduced, and what was deliberately left open, is listed
    in that ECC row rather than dropped. Next: a third finder round over the round-3 tree, or store submission.
-5. Owner actions in `docs/Owner_Actions.md` (#1–#44 and #46; #45 is withdrawn — the defect it asked about is fixed) unblock everything else: accounts (Apple, Google Play, Amazon
+6. Owner actions in `docs/Owner_Actions.md` (#1–#46, all open; #45 was withdrawn in round 4 and RESTORED in round 6 when the recovery that closed it was removed) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety
    policy, spend budget, hosted Supabase checks, database production mark, child-safety package approval,
    BUG-096 residual.
-6. Repeat the resume check in the next real session (AC_ECC_09).
+7. Repeat the resume check in the next real session (AC_ECC_09).
