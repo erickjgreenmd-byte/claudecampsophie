@@ -1,0 +1,330 @@
+{
+  "round": 7,
+  "base": "b802686",
+  "hunt_head": "5ba16c3",
+  "hunt_run": "wf_c15e0470-08d",
+  "findings_file": "docs/hardening/round7-hunt-findings.json",
+  "headline_decision": "Two findings are against claims the LEAD wrote in the round-6 commit, hours earlier. HUNT7-A-3: 'a captured refresh body is worthless once its token has been rotated' is false \u2014 presenting a rotated token revokes the child's session, so a captured body is a repeatable remote unpair, and I recorded that residual smaller than it is in the owner's own sign-off record (owner action #45). That is the exact failure BUG-294 and L-058 exist to correct, committed inside the change that corrected it. HUNT7-B-2: my worst-case-hold figure in docs/Cost_Analysis.md is understated by 93%, because personalizeItems takes two stages and I checked one. Both are fixed in this round, both are recorded as mine, and neither is softened.",
+  "second_decision": "HUNT7-F-1 puts the web sign-out area on its THIRD consecutive round with a high finding. By L-058 that is the feature telling us its premise is wrong, so this is not patched a third time: the adapter takes ownership of the session store and learns to say 'unreadable' as distinct from 'absent'. Same reasoning that removed the BUG-244 recovery rather than repairing it again.",
+  "third_decision": "HUNT7-C-2 is round 6's two money fixes each right alone and wrong together \u2014 a new failure mode this project has not recorded before, and the candidate for this round's first lesson.",
+  "process_change": "The round's largest single shape is a fix that reached the web and not the phone (7 findings). Those are NOT split across a web fixer and a mobile fixer, because that split is how they diverged. They are one stage, one agent, owning both sides of each shared sentence \u2014 plus a structural guard so the next divergence is caught by a test rather than a hunt.",
+  "structure": "Four SEQUENTIAL stages. Within a stage the areas' file lists are disjoint and verified so; across stages files may repeat, which is why the stages are sequential rather than parallel. Stage 1: five areas in parallel. Stage 2: the database and API privacy route. Stage 3: the web pages (needs the privacy contract stage 2 also touches). Stage 4: the parity fixes, one agent.",
+  "lead_assigned_migrations": {
+    "0950": "billing period chargeback_cents column (HUNT7-C-2/C-1)",
+    "0960": "deletion export withdrawal re-open window (HUNT7-D-1)"
+  },
+  "global_rules": [
+    "Write the FAILING test first, for the finding's own reason, and show it red before the production change.",
+    "State the fix's PREMISE in one sentence plus the observable fact that establishes it. A checker grades the premise separately from the behaviour.",
+    "Mutation-check every test you claim pins something: revert the production line, show that test red, restore the file byte-for-byte and verify with sha256sum -c.",
+    "Never weaken a test, an RLS policy, a consent/ZDR gate or a verification step to get a pass.",
+    "Touch only the files listed for your area. If a fix needs a file outside it, STOP and report it rather than editing it \u2014 and say which finding needs it.",
+    "Docs (Bug_Ledger, Lessons_Learned, Threat_Model, Requirement_Coverage, Cost_Analysis, Owner_Actions), scripts/test-minimums.json, supabase/tests/schema_invariants.test.ts and the shared registration points are LEAD-ONLY: report the exact sentence or row you need and the lead writes it.",
+    "Money is integer cents; time is UTC instants plus IANA zones; domain code takes now as input; JSON into Postgres via ::text::jsonb or tx.json(x).",
+    "Mobile token sources come only from apps/mobile/src/lib/app-session.ts; never add a second child token refresher (L-007)."
+  ],
+  "stages": {
+    "stage1": {
+      "F7-1-mobile": {
+        "findings": [
+          "HUNT7-A-1",
+          "HUNT7-A-2",
+          "HUNT7-K-1",
+          "HUNT7-K-2",
+          "HUNT7-K-3",
+          "HUNT7-K-4",
+          "HUNT7-J-2",
+          "HUNT7-J-3",
+          "HUNT7-J-4",
+          "HUNT7-J-5",
+          "HUNT7-J-6",
+          "HUNT7-J-7"
+        ],
+        "files": [
+          "apps/mobile/app/(child)/scan.tsx",
+          "apps/mobile/app/(parent)/planner.tsx",
+          "apps/mobile/app/(parent)/privacy.tsx",
+          "apps/mobile/app/(parent)/resources.tsx",
+          "apps/mobile/app/(parent)/rewards.tsx",
+          "apps/mobile/src/billing/revenuecat.ts",
+          "apps/mobile/src/billing/store.test.ts",
+          "apps/mobile/src/family/family-view.ts",
+          "apps/mobile/src/family/runtime.ts",
+          "apps/mobile/src/family/screens-r2.review.test.ts",
+          "apps/mobile/src/family/screens.test.ts",
+          "apps/mobile/src/family/ui.tsx",
+          "apps/mobile/src/homework/scan-screen.test.ts",
+          "apps/mobile/src/homework/upload.test.ts",
+          "apps/mobile/src/homework/upload.ts",
+          "apps/mobile/src/learning/planner-form.test.ts",
+          "apps/mobile/src/learning/planner-form.ts",
+          "apps/mobile/src/lib/app-session.test.ts",
+          "apps/mobile/src/lib/app-session.ts",
+          "apps/mobile/src/lib/mode-r2.review.test.ts",
+          "apps/mobile/src/lib/mode.ts",
+          "apps/mobile/src/lib/parent-auth.ts",
+          "apps/mobile/src/privacy/parent-privacy.test.ts",
+          "apps/mobile/src/privacy/parent-privacy.ts",
+          "apps/mobile/src/rewards/review.test.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-A-1": "CONFIRMED. A module-level debt flag settled by an event that may already have passed is L-051 (cached state has an owner) plus a race. Do not make the child space's privacy change depend on an event that may have gone by: settle it where the caller knows the app is foreground, or re-check after recording the debt.",
+          "HUNT7-A-2": "CONFIRMED and worse than A-1: an unscoped debt turns ADULT screen privacy off while the parent area is on screen. Make the debt name what it is owed for and re-read the mode at settle time.",
+          "HUNT7-K-1": "CONFIRMED and it is the SAME defect as round 6's inert close-flow fix, one level in: `secretsCleared` reports that neither secret was removed because both clears still swallow the failure that matters. Make the helpers answer; keep best-effort at the caller.",
+          "HUNT7-K-2": "CONFIRMED. The child sees 'Sending page N of M' with a live Stop for the whole cancel round trip. Acknowledge the tap before the network call, in child words.",
+          "HUNT7-K-3": "CONFIRMED as prose: the JSDoc states the opposite of what auth-js does and of what its own test says.",
+          "HUNT7-K-4": "CONFIRMED. A message nothing reads any more, pinned by a test as if it were rendered. Delete both.",
+          "HUNT7-J-2": "CONFIRMED. The mobile planner has no deletion-pending branch and calls a child being purged read-only 'history'. Branch before either load, with the same notice the other surfaces use.",
+          "HUNT7-J-3": "CONFIRMED. The archived read-only view keeps 'Coming up', telling the parent an archived child's practice is available today.",
+          "HUNT7-J-4": "CONFIRMED and it is half a fix shipped: rows dropped before the fetch but no run ticket, so an older in-flight answer publishes over a newer one. Give it the ticket its sibling screens got.",
+          "HUNT7-J-5": "CONFIRMED. The keying guard says no parent screen can opt out silently while inspecting only two hook shapes and one identifier. A guard that a useMemo loader walks past is not a guard \u2014 and a useMemo loader is exactly what HUNT6-I-1 missed.",
+          "HUNT7-J-6": "CONFIRMED. A reload that changes nothing on screen because the editor captured `initial` once. Key it.",
+          "HUNT7-J-7": "CONFIRMED. The ticket is taken after the early return, so a load that finds no client does not supersede an in-flight one."
+        }
+      },
+      "F7-2-bug244": {
+        "findings": [
+          "HUNT7-A-3",
+          "HUNT7-A-4"
+        ],
+        "files": [
+          "apps/api/src/routes/child-auth.ts",
+          "apps/api/tests/mobile-r2.review.test.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-A-3": "CONFIRMED, and this one is MINE. The claim I wrote in five places \u2014 code comment, BUG-244 ledger row, owner action #45, Requirement_Coverage and the round-6 commit message \u2014 is false: presenting a rotated token is an ACTION, not an inert no-op. It revokes the child's live session, writes an audit row and un-lists the device, with nothing authenticating the presenter. So a captured body is a repeatable remote unpair for that child's tablet, for the life of the session plus 30 days of token retention, bounded only by 240/hour per network. I recorded the residual SMALLER than it is, in the record the owner signs off from \u2014 which is precisely the failure BUG-294 and L-058 exist to correct, committed in the very change that corrected it. FIX THE PROSE, KEEP THE CODE: the revoke is correct and is the theft signal; do not weaken it. Say in all five places what a captured body can and cannot do. ALSO take the one code change the finder proposes and I agree with: write the audit row only when the revoke UPDATE actually affected a row, so a replay loop cannot append indefinitely to a table nothing prunes. That is a bound on an attacker's write amplification, not a weakening of detection.",
+          "HUNT7-A-4": "CONFIRMED as prose. Say what the guard establishes rather than what would be nice: a second presentation means the token was presented twice, and the code three lines down already states the race honestly. Make the two sentences agree."
+        }
+      },
+      "F7-3-ai-cost": {
+        "findings": [
+          "HUNT7-B-1",
+          "HUNT7-B-2",
+          "HUNT7-B-3",
+          "HUNT7-B-4",
+          "HUNT7-B-5",
+          "HUNT7-B-6",
+          "HUNT7-B-7",
+          "HUNT7-B-8"
+        ],
+        "files": [
+          "apps/api/src/jobs/dispatcher.ts",
+          "apps/api/src/jobs/learning-jobs.ts",
+          "apps/api/src/jobs/scan-process.ts",
+          "apps/api/tests/jobs-r2.review.test.ts",
+          "apps/api/tests/learning-jobs.test.ts",
+          "apps/api/tests/scan-process.test.ts",
+          "packages/ai/src/routing.ts",
+          "packages/ai/src/run-metering.test.ts",
+          "packages/ai/src/run-truncation.test.ts",
+          "packages/ai/src/run.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-B-1": "CONFIRMED. Decide which is true (L-053) and I decide the CODE is right and the PROSE is wrong: the budget SHOULD bound every later attempt cumulatively, because that is what a spend hold reserves and what the owner is quoted. Rewrite the prose to say so. Do NOT narrow the code to the truncation retry only \u2014 that would make the hold larger than what it bounds, which is the defect we just fixed from the other direction.",
+          "HUNT7-B-2": "CONFIRMED, and this one is MINE too. `personalizeItems` takes `stage: 'daily_set' | 'thursday_bundle'`, the thursday arm is a live registered handler, and thursday_bundle's budget is 933,600 \u2014 so my 'largest single hold is 483,240' is understated by 93%. I wrote it from a fixer's one-stage example without checking the parameter's other arm. Add the missing table row, correct the sentence, fix both source comments that say 'the personalization stage' singular, and PIN the thursday hold with a test so the number cannot be re-derived from a one-stage example again.",
+          "HUNT7-B-3": "CONFIRMED. Raise JOB_WORST_CASE_MS.scan_process to a number the pipeline's own timeouts and attempt counts justify, and DERIVE it in the docstring from PROPOSED_STAGE_LIMITS rather than asserting it. A worst case that the code can exceed is not a bound.",
+          "HUNT7-B-4": "CONFIRMED as prose. The admission bound is enforced on attempt 1 only; say that, and say what bounds later attempts.",
+          "HUNT7-B-5": "CONFIRMED and it matters more than 'low': the startup check prices against a hardcoded rate table while run.ts spends at the caller's rates, so the guard cannot see a caller with different rates. Make the check take the rates it will be judged against, or state precisely that it guarantees the ceiling only for the default table and fail closed for any other.",
+          "HUNT7-B-6": "CONFIRMED as prose, and it is the wrong noun after the split: 'the stage's cost cap' is now the admission bound. Say 'budget'.",
+          "HUNT7-B-7": "CONFIRMED. A line-by-line prose guard that the formatter can defeat by wrapping a sentence is not a guard. Make it read the whole file, normalising whitespace.",
+          "HUNT7-B-8": "CONFIRMED. Three spend-ceiling cases still size the owner's budget from the ADMISSION caps after production moved its holds to the budgets, so they are green for the wrong reason. Re-derive them from PROPOSED_STAGE_COST_BUDGET_MICROS."
+        }
+      },
+      "F7-4-money": {
+        "findings": [
+          "HUNT7-C-1",
+          "HUNT7-C-2",
+          "HUNT7-C-3",
+          "HUNT7-C-4",
+          "HUNT7-C-5"
+        ],
+        "files": [
+          "apps/api/src/routes/support.ts",
+          "apps/api/src/services/billing-sync.ts",
+          "apps/api/src/services/ops-metrics.ts",
+          "apps/api/tests/billing-hardening.review.test.ts",
+          "apps/api/tests/billing-r2.review.test.ts",
+          "apps/api/tests/support.test.ts",
+          "apps/mobile/app/(parent)/support.tsx",
+          "apps/mobile/src/support/actions.test.ts",
+          "apps/mobile/src/support/view-model.test.ts",
+          "apps/mobile/src/support/view-model.ts",
+          "apps/web/src/pages/app/SupportPage.test.tsx",
+          "apps/web/src/pages/app/SupportPage.tsx",
+          "packages/contracts/src/support.ts",
+          "packages/domain/src/donations/adjustments.ts",
+          "supabase/tests/billing_tax.test.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-C-1": "CONFIRMED and fixed with C-2 as one change: the walk must spill on what the bucket has LEFT, not its size, so add refunded_cents to the FOR UPDATE select and give each period only what it can still absorb.",
+          "HUNT7-C-2": "CONFIRMED, HIGH, and it is the two round-6 money fixes being each right alone and wrong together \u2014 which is a lesson in itself. A chargeback ADDS and caps at the primary period's size while a won dispute SUBTRACTS the whole converted amount, so the round trip holds only while refunded + inCharge <= charged, and HUNT6-C-1's new ':proration' row is exactly the invoice shape that breaks it. A family's real refund is erased from the record, their own support case tells them the store reported no refund, and the school's $1 is reinstated for a month they were partly refunded. TAKE THE SCHEMA FIX: migration number is 0950 (lead-assigned), adding `chargeback_cents integer not null default 0` beside refunded_cents, so a chargeback stores what it added and its reversal subtracts exactly that. Fix it TOGETHER with C-1, which is the same walk. Do not weaken the cap or any BILL-R1-1 assertion.",
+          "HUNT7-C-3": "CONFIRMED. The parent's refund picker now shows a derived row as a second unlabelled charge for the same dates. Add `kind` to the support billing-period contract (it is already in the admin one) and label it. A parent must never have to guess which of two identical-looking charges is theirs.",
+          "HUNT7-C-4": "CONFIRMED. Giving the ':proration' row taxCents 0 writes the tax-inclusive leftover straight into a field the rest of the system reads as tax-exclusive. Store the proration row's own tax or state in the row why it cannot be known; do not leave the unit ambiguous.",
+          "HUNT7-C-5": "CONFIRMED as prose: BUG-305's residual records the pre-fix behaviour as current. Lead writes the ledger; the fixer reports the exact sentence."
+        }
+      },
+      "F7-5-web-auth": {
+        "findings": [
+          "HUNT7-F-1",
+          "HUNT7-F-2",
+          "HUNT7-F-3",
+          "HUNT7-F-4",
+          "HUNT7-F-5",
+          "HUNT7-I-4",
+          "HUNT7-I-5"
+        ],
+        "files": [
+          "apps/web/src/App.signout.test.tsx",
+          "apps/web/src/components/SignOutControl.tsx",
+          "apps/web/src/lib/auth.ts",
+          "apps/web/src/lib/supabase-auth.ts",
+          "apps/web/src/pages/app/PrivacyControlsPage.test.tsx",
+          "apps/web/src/pages/app/PrivacyControlsPage.tsx",
+          "apps/web/src/pages/auth/UpdatePasswordPage.reauth.test.tsx"
+        ],
+        "lead_decisions": {
+          "HUNT7-F-1": "CONFIRMED, HIGH, and this area is now on its THIRD consecutive round with a high finding \u2014 which by L-058 is the feature telling us its premise is wrong. Round 6's defect was a recovery inside a `catch` the real adapter never enters; the remedy moved that hole one level down into the read. So do NOT patch it a third time. TAKE THE DESIGN CHANGE: the adapter OWNS the session store (pass `storage` to the client \u2014 localStorage when readable AND writable, else the adapter's own map), so a refused sign-out can clear whatever auth-js actually used and can say whether it did; and `currentSession()` keeps the `error` so 'unreadable' is distinguishable from 'absent', with both stillSignedIn helpers treating unreadable as STILL SIGNED IN, which is what their own comments already say they intend. Only then may either surface print SIGN_OUT_NOT_TOLD copy.",
+          "HUNT7-F-2": "CONFIRMED and fixed with F-1: report the refusal from the fact that the server was not reached, not from 'auth-js returned something'. An error proving the service had ALREADY ended the session is the opposite of serverNotTold.",
+          "HUNT7-F-3": "CONFIRMED and fixed with F-1: a hand-removal that raises no SIGNED_OUT leaves a second portal tab showing the family. Once the adapter owns the store, let auth-js do its own teardown so the event and the cross-tab broadcast go out.",
+          "HUNT7-F-4": "CONFIRMED as prose: the claim round 6 deleted from auth.ts as false survives verbatim in SignOutControl. Delete it there too.",
+          "HUNT7-F-5": "CONFIRMED as prose: 'exactly one path' is wrong once the storage-changed case is counted. Say how many and which.",
+          "HUNT7-I-4": "CONFIRMED as prose: it cites a constant the same round removed. Fix the citation.",
+          "HUNT7-I-5": "CONFIRMED. The justification rests on a Back that cannot happen and the test measures history depth in a one-entry router. Either justify it from something real or drop it; and make the test measure the portal's router."
+        }
+      }
+    },
+    "stage2": {
+      "F7-6-db-privacy": {
+        "findings": [
+          "HUNT7-D-1",
+          "HUNT7-D-2",
+          "HUNT7-D-3",
+          "HUNT7-D-4",
+          "HUNT7-E-4",
+          "HUNT7-E-5"
+        ],
+        "files": [
+          "apps/api/src/jobs/dispatcher.ts",
+          "apps/api/src/jobs/export-build.ts",
+          "apps/api/src/routes/privacy.ts",
+          "apps/api/tests/privacy-r2.review.test.ts",
+          "packages/contracts/src/privacy.ts",
+          "supabase/migrations/0840_hardening_r1_db.sql",
+          "supabase/migrations/0920_deletion_export_withdraw.sql",
+          "supabase/migrations/0930_deletion_lock_order.sql",
+          "supabase/tests/hardening_r2_db.test.ts",
+          "supabase/tests/hardening_r5_db.test.ts",
+          "supabase/tests/jobs_hardening.test.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-D-1": "CONFIRMED and this is the L-037 shape again: the withdrawal only catches exports already 'ready', so one that becomes ready after the request re-opens the window the migration exists to close. Migration number is 0960 (lead-assigned). Put the check in the FUNCTION as well as the builder \u2014 the Data API can reach the function, which is the whole reason 0890 moved the slot release inside it.",
+          "HUNT7-D-2": "CONFIRMED as prose. 0930 claims the other writers 'now agree statement for statement' and they do not. Either make them agree or say which differ and why it is safe. Do not leave the claim standing.",
+          "HUNT7-D-3": "CONFIRMED. The invariant's column arm has an unplanted privilege \u2014 the very grant the case's own example names. Plant it, so the arm can fail.",
+          "HUNT7-D-4": "CONFIRMED as prose: the stated reason for running the withdrawal on family scope is false. The behaviour is right; give it the true reason.",
+          "HUNT7-E-4": "CONFIRMED. Every 'still bounded' assertion is satisfied by ~200 rows against a 400 bound, so the widening is unpinned. Make each assertion bite at the bound.",
+          "HUNT7-E-5": "CONFIRMED. 'For every kind, with no exception' is quantified over reporter kinds while the third window pair covers a SET of kinds. Say what is quantified, or quantify what is said."
+        }
+      }
+    },
+    "stage3": {
+      "F7-7-web-pages": {
+        "findings": [
+          "HUNT7-G-1",
+          "HUNT7-G-2",
+          "HUNT7-G-5",
+          "HUNT7-G-6",
+          "HUNT7-G-7",
+          "HUNT7-H-2",
+          "HUNT7-H-3",
+          "HUNT7-H-4",
+          "HUNT7-I-1",
+          "HUNT7-I-2",
+          "HUNT7-I-3",
+          "HUNT7-I-6",
+          "HUNT7-E-2"
+        ],
+        "files": [
+          "apps/web/src/components/learning/ArchivedChildSections.test.tsx",
+          "apps/web/src/components/learning/ScheduleSection.tsx",
+          "apps/web/src/components/learning/TestDatesSection.tsx",
+          "apps/web/src/pages/app/ArchivedChildCopy.test.tsx",
+          "apps/web/src/pages/app/ChildrenPage.archive.test.tsx",
+          "apps/web/src/pages/app/ChildrenPage.tsx",
+          "apps/web/src/pages/app/FamilyDashboardPage.save.test.tsx",
+          "apps/web/src/pages/app/FamilyDashboardPage.tsx",
+          "apps/web/src/pages/app/HomeworkPage.test.tsx",
+          "apps/web/src/pages/app/HomeworkPage.tsx",
+          "packages/contracts/src/privacy.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-G-1": "CONFIRMED. A panel that replaces the card's only ActionFeedback swallows a STEP_UP_REQUIRED refusal, so the parent presses Activate and is told nothing. Render feedback unconditionally and make the panel a sibling.",
+          "HUNT7-G-2": "CONFIRMED. 'Another guardian changed\u2026' is asserted for any difference including the reader's own change in another tab. Drop the actor, keep what the data supports.",
+          "HUNT7-G-5": "CONFIRMED as prose: the comment claims a sufficient condition the guard cannot establish. State the necessary condition it does.",
+          "HUNT7-G-6": "CONFIRMED. A sweep that detects one literal phrase, with an anti-vacuity floor a status label satisfies, is not a sweep. Make it detect the property.",
+          "HUNT7-G-7": "CONFIRMED. The effect cannot touch a code that arrives after the status change, so the panel the fix exists to close can still be open. Close it on arrival too.",
+          "HUNT7-H-2": "CONFIRMED as prose: the file docstring states the round-5 design as current.",
+          "HUNT7-H-3": "CONFIRMED. An archived child's test dates must not promise practice the profile can never receive.",
+          "HUNT7-H-4": "CONFIRMED. One section tells the parent to turn on a subject while the section that would do it is disabled. Two sections on one page must not contradict each other \u2014 this is the third time that shape has been filed.",
+          "HUNT7-I-1": "CONFIRMED. The blocker line promises the pages will go through after activation for three outcomes where the pages are already gone. Split the string: state the blocker and the action, then re-append each code's own true remedy.",
+          "HUNT7-I-2": "CONFIRMED and it is L-057 exactly: the status was passed in 'so the panel does not ask for a refused rescan' and Fix transcription still offers one. Pass the status into the correctable decision.",
+          "HUNT7-I-3": "CONFIRMED. The test pins 'start a new scan with clear photos' as the right answer for failures that are not about the photos \u2014 the same blame-the-parent defect this project has filed three times. Give the operator-side codes their own honest lines.",
+          "HUNT7-I-6": "CONFIRMED. One unhedged draft sentence left on the page the round hedged everywhere else.",
+          "HUNT7-E-2": "CONFIRMED. The composition strips each outcome's own requirement, so the advice loses the condition that makes it true. Trim only the imperative, never the condition."
+        }
+      }
+    },
+    "stage4": {
+      "F7-8-parity": {
+        "findings": [
+          "HUNT7-G-3",
+          "HUNT7-G-4",
+          "HUNT7-G-8",
+          "HUNT7-J-1",
+          "HUNT7-H-1",
+          "HUNT7-E-1",
+          "HUNT7-E-3"
+        ],
+        "files": [
+          "apps/api/src/routes/account.ts",
+          "apps/api/tests/account-close.test.ts",
+          "apps/mobile/app/(parent)/children.tsx",
+          "apps/mobile/app/(parent)/home.tsx",
+          "apps/mobile/app/(parent)/planner.tsx",
+          "apps/mobile/src/family/children-screen.test.ts",
+          "apps/mobile/src/family/family-view.test.ts",
+          "apps/mobile/src/family/family-view.ts",
+          "apps/mobile/src/homework/child-api.ts",
+          "apps/mobile/src/homework/result-view.test.ts",
+          "apps/mobile/src/homework/result-view.ts",
+          "apps/mobile/src/homework/results-screen.test.ts",
+          "apps/mobile/src/learning/planner-form.test.ts",
+          "apps/mobile/src/learning/planner-form.ts",
+          "apps/mobile/src/privacy/parent-privacy.test.ts",
+          "apps/mobile/src/privacy/parent-privacy.ts",
+          "apps/web/src/components/learning/ArchivedChildSections.test.tsx",
+          "apps/web/src/components/learning/ScheduleSection.tsx",
+          "apps/web/src/components/learning/format.ts",
+          "apps/web/src/pages/app/ArchivedChildCopy.test.tsx",
+          "apps/web/src/pages/app/ChildrenPage.archive.test.tsx",
+          "apps/web/src/pages/app/ChildrenPage.tsx",
+          "apps/web/src/pages/app/LearningPlannerPage.test.tsx",
+          "apps/web/src/pages/app/PrivacyControlsPage.test.tsx",
+          "apps/web/src/pages/app/PrivacyControlsPage.tsx",
+          "apps/web/src/pages/public/AccountDeletionPage.tsx",
+          "packages/contracts/src/account.ts",
+          "packages/contracts/src/homework.ts",
+          "packages/contracts/src/privacy.ts"
+        ],
+        "lead_decisions": {
+          "HUNT7-G-3": "CONFIRMED, and this is the round's HEADLINE SHAPE: HUNT6-G-2's fix claims 'one helper decides the sentence for every surface' and stopped at the web. Both mobile parent screens still print the older, wrong sentence. Fix it in the parity stage, by ONE agent owning both sides, because a two-agent fix is how it diverged in the first place.",
+          "HUNT7-G-4": "CONFIRMED, same shape: three rounds gave the web 'send only the fields the parent edited' and the phone still PATCHes all three from a mount-time snapshot, which silently overwrites another guardian's concurrent change.",
+          "HUNT7-G-8": "CONFIRMED, same shape: the exact word this diff removed from the planner survives on the Children page, web and mobile.",
+          "HUNT7-J-1": "CONFIRMED, same shape and the same helper as G-3.",
+          "HUNT7-H-1": "CONFIRMED, same shape: three of the four daily-state strings are told to a parent whose child cannot receive practice, on web AND in the mobile planner.",
+          "HUNT7-E-1": "CONFIRMED. ACCOUNT_CLOSE_COPY.pending blames a family purge for every pending closure, including a guardian whose auth call was merely refused. Have the route say WHY it is pending and let both clients print the true reason \u2014 one contract, both surfaces, one agent.",
+          "HUNT7-E-3": "CONFIRMED. 'Here rather than in a page so the portal and the app say the same thing' is false: the app never imports them. Either make it true or delete the claim \u2014 and this is the claim the parity stage exists to make honest."
+        }
+      }
+    }
+  }
+}
