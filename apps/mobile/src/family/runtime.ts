@@ -1,4 +1,3 @@
-import { randomUUID } from 'expo-crypto';
 import { Platform } from 'react-native';
 import { router } from 'expo-router';
 import * as ScreenCapture from 'expo-screen-capture';
@@ -6,7 +5,12 @@ import * as SecureStore from 'expo-secure-store';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { forgetStoreIdentity } from '../billing/revenuecat.ts';
 import { createMobileApi } from '../lib/api.ts';
-import { signOutClosedAccount, signOutParent, type ModeEffects } from '../lib/mode.ts';
+import {
+  signOutClosedAccount,
+  signOutParent,
+  type DeviceSignOutOutcome,
+  type ModeEffects,
+} from '../lib/mode.ts';
 import { parentAuth } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
 import { createChildSession, withChildTokenRetry } from './child-session.ts';
@@ -36,11 +40,6 @@ export const childSession = createChildSession({
   publicApi: createMobileApi(() => Promise.resolve(null)),
   authedApi: (token) => createMobileApi(token),
   now: () => new Date(),
-  // BUG-244: the refresh request's own id. It is wired here rather than imported inside
-  // child-session.ts because expo-crypto reaches into react-native, which that module's test project
-  // cannot parse — and an unguessable id matters: it is what separates this device's retry from a
-  // replay of a stolen token.
-  newRequestId: () => randomUUID(),
 });
 
 /**
@@ -178,9 +177,11 @@ export const modeEffects: ModeEffects = {
  * session watcher in src/lib/app-session.ts also reacts to the sign-out; this covers the device
  * being offline, when that watcher may see no change.
  */
-export async function signOutParentOnDevice(effects: ModeEffects = modeEffects): Promise<void> {
-  await signOutParent(secureStorage, effects, parentAuth);
-  await clearDeviceAdultSecrets();
+export async function signOutParentOnDevice(
+  effects: ModeEffects = modeEffects,
+): Promise<DeviceSignOutOutcome> {
+  const { sessionEndConfirmed } = await signOutParent(secureStorage, effects, parentAuth);
+  return { sessionEndConfirmed, secretsCleared: await clearDeviceAdultSecrets() };
 }
 
 /**
@@ -193,9 +194,14 @@ export async function signOutParentOnDevice(effects: ModeEffects = modeEffects):
  * rule and its reasoning, and is unit-tested there. It takes no argument, so the one call site
  * (app/(parent)/privacy.tsx) cannot leave the forget switched off — which is exactly what the first
  * round-4 attempt did with a `familyDeleted` flag no caller passed.
+ *
+ * It answers what it managed to do (HUNT6-J-1). The screen prints "and this device is signed out",
+ * which is this app's claim about the device the parent is holding, so it may not rest on "the promise
+ * resolved": every step that could leave the device signed in swallowed its own failure, so a
+ * resolved promise only ever meant no keychain write threw.
  */
-export async function signOutClosedAccountOnDevice(): Promise<void> {
-  await signOutClosedAccount(
+export async function signOutClosedAccountOnDevice(): Promise<DeviceSignOutOutcome> {
+  const { sessionEndConfirmed } = await signOutClosedAccount(
     secureStorage,
     {
       ...modeEffects,
@@ -204,15 +210,24 @@ export async function signOutClosedAccountOnDevice(): Promise<void> {
     },
     parentAuth,
   );
-  await clearDeviceAdultSecrets();
+  return { sessionEndConfirmed, secretsCleared: await clearDeviceAdultSecrets() };
 }
 
 /**
  * What a signed-out device must not keep whichever way the adult left: the parent's PIN must not stay
  * for the next adult to unlock with (MOB-R2-06), and the store SDK must forget the identity it was
- * bound to. Both are best effort; neither may stop the sign-out.
+ * bound to. Both are best effort; neither may stop the sign-out — and both are now REPORTED rather
+ * than discarded (HUNT6-J-1), so the closure screen can say what happened to this device instead of
+ * inferring it from nothing having thrown. Answers whether both succeeded.
  */
-async function clearDeviceAdultSecrets(): Promise<void> {
-  await biometricPinStore.clear().catch(() => undefined);
-  await forgetStoreIdentity().catch(() => undefined);
+async function clearDeviceAdultSecrets(): Promise<boolean> {
+  const pinCleared = await biometricPinStore.clear().then(
+    () => true,
+    () => false,
+  );
+  const storeForgotten = await forgetStoreIdentity().then(
+    () => true,
+    () => false,
+  );
+  return pinCleared && storeForgotten;
 }

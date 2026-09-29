@@ -774,14 +774,14 @@ function AccountCloseSection() {
     // already closed by this point, so the navigation must not depend on the sign-out — otherwise the
     // parent is left on a page that needs the session they just gave up (WEB-R4-AUTH-2).
     //
-    // HUNT5-F-8: a sign-out the auth server refuses is REPORTED as a refusal, not thrown, and this
-    // browser's stored session is cleared either way (ACC-WEB-AUTH-A: the adapter removes the stored
-    // session and resolves with `{ serverNotTold: true }`, exactly so this flow can carry on — see
-    // apps/web/src/lib/auth.ts and lib/supabase-auth.ts's signOut). So both halves are true at once:
-    // this computer IS signed out, and the auth service was never told, so the session may still be
-    // usable on the parent's phone — on the `pending` path the sign-in is not closed yet either. That
-    // is the one case WEB-R4-AUTH-2 exists for, and the report used to be dropped here, on a screen
-    // that then tells the parent the device is signed out and nothing more.
+    // HUNT5-F-8: a sign-out the auth server refuses is REPORTED as a refusal, not thrown, so this flow
+    // can carry on (ACC-WEB-AUTH-A — see apps/web/src/lib/auth.ts and lib/supabase-auth.ts's signOut).
+    // The auth service was never told, so the session may still be usable on the parent's phone — on
+    // the `pending` path the sign-in is not closed yet either. That is the one case WEB-R4-AUTH-2
+    // exists for, and the report used to be dropped here, on a screen that then tells the parent the
+    // device is signed out and nothing more. What this round's wording added — that the report also
+    // means this browser's stored session was cleared, so "this computer IS signed out" comes free —
+    // is the over-claim HUNT6-G-1 below takes back.
     //
     // The report now travels in the router state and /account-deletion says that sentence beside the
     // closure notice (AccountDeletionPage's SERVER_NOT_TOLD, word for word SignOutControl's, which
@@ -789,36 +789,55 @@ function AccountCloseSection() {
     // way; what such a throw can honestly be reported as is the paragraph below.
     //
     // HUNT5-N6: "reported the same way" held for the SERVER's session — an adapter that threw did not
-    // end that either — but the sentence the public page then says is about THIS COMPUTER, and on the
-    // catch branch nothing had checked it. A REPORTED refusal has: the adapter removes this origin's
-    // stored session before it returns `{ serverNotTold: true }` (supabase-auth.ts's
-    // forgetStoredSession, pinned in App.signout.test.tsx), so "this computer is signed out" is the
-    // adapter's own guarantee and is not re-derived here — re-reading `currentSession()` there would
-    // only ask supabase-js about its in-memory copy and could talk the flow out of a true sentence. A
-    // THROW carries no such guarantee: it may have come from anywhere, including before that removal,
-    // leaving the stored session exactly where it was while the parent walks away from a shared
-    // computer having read that it was signed out. So that one path re-reads the session the way
-    // SignOutControl does, and the two cases are told apart by that read: a session really gone
-    // travels to the public page with the refusal report, a session still here keeps the parent on
-    // this page — where the portal's own Sign out is — and is said out loud. The account is closed
-    // either way, so that fact travels with both.
+    // end that either — but the sentence the public page then says is about THIS COMPUTER, and
+    // nothing had checked it. So both cases are told apart by reading the session, and by nothing
+    // else: a session really gone travels to the public page with the refusal report, a session still
+    // here keeps the parent on this page — where the portal's own Sign out is — and is said out loud.
+    // The account is closed either way, so that fact travels with both.
+    //
+    // HUNT6-G-1: the read is on BOTH refusal paths, not only on the catch. It used to be gated on
+    // `unverified`, which only the catch sets, while the real adapter RESOLVES with
+    // `{ serverNotTold: true }` — so on the one path production actually takes, the read never ran and
+    // the public page said "This computer is signed out" on the strength of a report that is only
+    // about the server. SignOutControl has never trusted the report for this: it reads the session on
+    // every path (L-037, the same pre-check on every surface).
+    //
+    // HUNT6-F-PREMISE: the paragraph that licensed skipping the read argued that the adapter removes
+    // this origin's stored session first, so re-reading would "only ask supabase-js about its
+    // in-memory copy". The pinned @supabase/auth-js 2.116.0 has no in-memory copy to ask —
+    // `getSession()` re-reads storage on every call — and its two refusal paths leave different things
+    // behind: a /logout failure is returned AFTER auth-js's own removeCurrentSession(), while a failed
+    // pre-flight refresh is returned before any removal, leaving the stored token for the adapter's
+    // best-effort forgetStoredSession to take out. With this library the read therefore finds nothing
+    // on either path, which is a STRONGER guarantee than the sentence it replaces claimed — but it is a
+    // guarantee about one pinned version's internals, and what is said here is said to a parent, so the
+    // read is what establishes it. Nothing has been narrowed to suit that: the branch still fires for
+    // an adapter that throws (below), a `currentSession()` that throws (stillSignedIn returns true),
+    // a storage adapter other than the two auth-js picks for itself, and the next auth-js. Both paths
+    // are run against the real library in App.signout.test.tsx's [HUNT6-F-PREMISE] cases.
     let signOutRefused: boolean;
-    // Set only by the catch: the one path on which no removal was promised.
-    let unverified = false;
     try {
       signOutRefused = (await auth.signOut())?.serverNotTold === true;
     } catch {
+      // Off the adapter's contract, so nothing at all is known about it — least of all that this
+      // browser's session is gone.
       signOutRefused = true;
-      unverified = true;
     }
-    if (unverified && (await stillSignedIn())) {
+    if (signOutRefused && (await stillSignedIn())) {
       // The closure line belongs to this message now: the outcome's own copy ends "this device is
       // signed out", which is the half that failed.
       action.setOutcome(null);
       setSessionStillOpen(stillSignedInCopy(status));
       return;
     }
-    void navigate('/account-deletion', { state: { accountClosed: status, signOutRefused } });
+    // Replaced, not pushed: this page needs a signed-in parent and re-reads the session to render
+    // (RequireParent), and on the `pending` path that session is deliberately still valid until the
+    // family purge finishes — so one Back used to put the next person at a shared computer back inside
+    // the parent portal, on the account that was just closed (HUNT6-G-1).
+    void navigate('/account-deletion', {
+      replace: true,
+      state: { accountClosed: status, signOutRefused },
+    });
   };
 
   const rule = (error: ApiRequestError): string | null =>

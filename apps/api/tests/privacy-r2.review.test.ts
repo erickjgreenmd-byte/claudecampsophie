@@ -608,10 +608,15 @@ describe('CS-R2-07 the family’s report list never drops an unresolved flag', (
    * reintroduced from the other end (see the CS-R4-01 case below, where the flag is NEWER than the
    * filler rows). The bound is now per reporter kind, so this test keeps what was true — the response
    * is bounded and the old flag is in it — and proves the drain through the guardian's own action.
+   *
+   * The filler ROSE from one page + 5 to TWO pages + 5, and the counts with it, when the catch-all
+   * branch got its oldest-first second window (B-ABSENCE-CLAIM): the per-kind bound is two pages, so a
+   * one-page filler no longer reaches it and would leave nothing here bounded. The assertions stay
+   * exact counts against that bound rather than an inequality.
    */
   it('bounds the unresolved rows per reporter kind, and the flag still drains', async () => {
     const { fam, reportId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
-    const extra = UNRESOLVED_REPORTS_PAGE_SIZE + 5;
+    const extra = 2 * UNRESOLVED_REPORTS_PAGE_SIZE + 5;
     // `extra` open parent reports, all NEWER than the flag. Timestamps derive from the flag's own
     // row, never from a second clock (L-027).
     await api.db.sql`
@@ -625,18 +630,18 @@ describe('CS-R2-07 the family’s report list never drops an unresolved flag', (
     const first = safetyReportsResponseSchema.parse(
       await (await api.request('/v1/safety-reports', { token: parent })).json(),
     ).reports;
-    // Bounded on the family's own branch: 205 open parent reports, 200 listed.
+    // Bounded on the family's own branch: 405 open parent reports, its two pages listed.
     expect(
       first.filter((r) => r.reporterKind === 'parent' && r.status !== 'resolved'),
-    ).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE);
+    ).toHaveLength(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
     // And the oldest report — the flag a grown-up still has to answer — is in the response.
     expect(first.map((r) => r.id)).toContain(reportId);
     expect(first.filter((r) => r.status !== 'resolved')).toHaveLength(
-      UNRESOLVED_REPORTS_PAGE_SIZE + 1,
+      2 * UNRESOLVED_REPORTS_PAGE_SIZE + 1,
     );
 
     // The drain, through the product's own path and not raw SQL: the guardian acts on the flag while
-    // all 205 of their own reports are still open, and the flag leaves the unresolved set.
+    // all 405 of their own reports are still open, and the flag leaves the unresolved set.
     const patched = await api.request(`/v1/safety-reports/${reportId}`, {
       method: 'PATCH',
       token: parent,
@@ -651,7 +656,7 @@ describe('CS-R2-07 the family’s report list never drops an unresolved flag', (
       parentOutcome: 'addressed',
     });
     expect(second.filter((r) => r.status !== 'resolved')).toHaveLength(
-      UNRESOLVED_REPORTS_PAGE_SIZE,
+      2 * UNRESOLVED_REPORTS_PAGE_SIZE,
     );
   });
 });
@@ -675,10 +680,12 @@ describe('CS-R2-07 the family’s report list never drops an unresolved flag', (
 describe('CS-R4-01 a new flag while the family already filed 200+ reports of its own', () => {
   it('lists a newer flag and a newer child report behind 200+ older open parent reports', async () => {
     const { fam, reportId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
-    const filler = UNRESOLVED_REPORTS_PAGE_SIZE + 5;
-    // `filler` open parent reports, every one OLDER than the flag — what a guardian reaches in under
-    // seven hours at the 30/hour limit, and what an adult who is the subject of a child's disclosure
-    // can pre-fill on purpose. Timestamps derive from the flag's own row, never from a second clock
+    // Two pages + 5, so the per-kind bound still bites after the catch-all branch got its
+    // oldest-first second window (B-ABSENCE-CLAIM); it was one page + 5 while that branch held one.
+    const filler = 2 * UNRESOLVED_REPORTS_PAGE_SIZE + 5;
+    // `filler` open parent reports, every one OLDER than the flag — what a guardian reaches in a long
+    // day at the 30/hour limit, and what an adult who is the subject of a child's disclosure can
+    // pre-fill on purpose. Timestamps derive from the flag's own row, never from a second clock
     // (L-027). No note is stored.
     await api.db.sql`
       insert into public.safety_reports (family_id, reporter_kind, category, status, created_at)
@@ -705,14 +712,14 @@ describe('CS-R4-01 a new flag while the family already filed 200+ reports of its
     expect(reports.map((r) => r.id)).toContain(childReport!.id);
     // The flag is still first: unresolved before resolved, newest first inside that.
     expect(reports[0]).toMatchObject({ id: reportId, status: 'escalated' });
-    // The family's own pending reports stay bounded on their own branch.
+    // The family's own pending reports stay bounded on their own branch: two pages, not all 405.
     const pendingParent = reports.filter(
       (r) => r.reporterKind === 'parent' && r.status !== 'resolved',
     );
-    expect(pendingParent).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE);
+    expect(pendingParent).toHaveLength(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
 
     // Drain proved through the product's own path, not raw SQL: the guardian acts on both rows they
-    // are meant to act on while all 205 parent reports are still open.
+    // are meant to act on while all 405 parent reports are still open.
     for (const id of [reportId, childReport!.id]) {
       const patched = await api.request(`/v1/safety-reports/${id}`, {
         method: 'PATCH',
@@ -808,15 +815,24 @@ describe('CS-R4-02 the family_data export and the child’s safety notice', () =
     // rest-spread (HUNT5-B-6). A v4 UUID group or a millisecond timestamp can contain '988' by
     // chance: dropping `id` and `created_at` and searching the REST left `question_id` and `child_id`
     // — two more random UUIDs per row — in the string, so the flake this sweep's comment claimed to
-    // have removed was still there at about the same rate. Naming the fields also means a column
-    // added to the export cannot slip into the sweep unnoticed; the row-level assertions above are
-    // what prove nothing else leaked.
+    // have removed was still there at about the same rate. The row-level assertions above are what
+    // prove nothing else leaked.
+    //
+    // Because the sweep is narrow, it has to be told when the export gains a column. HUNT6-B-5: the
+    // check that claimed to do that read `Object.keys` of the `wording` literal the test itself
+    // builds two lines below, so no production change could redden it and a new column stayed
+    // silently outside the searched string. These are the keys of a REAL exported row, minus the four
+    // random UUID/instant fields deliberately left out of the string, so a column added to
+    // jobs/export-build.ts's childFeedback select appears here and reds this case.
+    const searched = Object.keys(safetyRows[0]!).filter(
+      (k) => !['id', 'question_id', 'child_id', 'created_at'].includes(k),
+    );
+    expect(searched).toEqual(['kind', 'body', 'safety_template_version']);
     const wording = safetyRows.map((f) => ({
       kind: f.kind,
       body: f.body,
       safety_template_version: f.safety_template_version,
     }));
-    expect(Object.keys(wording[0]!)).toEqual(['kind', 'body', 'safety_template_version']);
     expect(JSON.stringify(wording)).not.toMatch(/988|422-4453/);
     // The coaching feedback CS-R2-05 added is untouched: only the safety notice loses its wording.
     expect(data.childFeedback.some((f) => f.kind !== 'safety' && f.body !== null)).toBe(true);
@@ -847,8 +863,10 @@ describe('HUNT5-B-2 a slot-release permission failure is not reported as a missi
       insert into public.child_slot_assignments (family_id, child_id)
       values (${fam.familyId}, ${child.id})`;
     const parent = await unlockedParent(fam.ownerId);
-    // The release's only plausible failure mode, made reachable: take the service role's UPDATE grant
-    // away so its statement raises 42501. Restored in `finally` — the grant is the deployment's.
+    // One of the release's failure modes, made reachable: take the service role's UPDATE grant away so
+    // its statement raises 42501. Restored in `finally` — the grant is the deployment's. It is not the
+    // only one (HUNT6-B-4: its UPDATE can also be a deadlock or lock-timeout victim, and those
+    // SQLSTATEs must survive the wrapper — see the HUNT6-B-4 case below).
     await api.db.sql`revoke update on public.child_slot_assignments from service_role`;
     let res: Response;
     try {
@@ -909,11 +927,14 @@ describe('HUNT5-B-4 a child’s oldest open report is not hidden by newer ones',
     // Before the fix the child branch was `order by created_at desc limit 200`, so the six oldest
     // child reports — including the child's first — were not in the response at all.
     expect(reports.map((r) => r.id)).toContain(earliest!.id);
-    // Still bounded on that branch, and the flag on its own branch is untouched.
+    // Still bounded on that branch, and the flag on its own branch is untouched. The bound is two
+    // pages of that kind since HUNT6-B-1 widened the newest-first window from one row to a page, so
+    // the whole open queue is still never returned — 206 open child reports are all listed here
+    // because 206 is under that bound, not because the branch is unbounded.
     const pendingChild = reports.filter(
       (r) => r.reporterKind === 'child' && r.status !== 'resolved',
     );
-    expect(pendingChild.length).toBeLessThanOrEqual(UNRESOLVED_REPORTS_PAGE_SIZE + 1);
+    expect(pendingChild.length).toBeLessThanOrEqual(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
     expect(reports.map((r) => r.id)).toContain(reportId);
 
     // The drain, through the product's own path: a guardian may act on the child's earliest report.
@@ -971,5 +992,323 @@ describe('HUNT5-B-5 the newest unresolved flag is on the page its email names', 
       body: { outcome: 'addressed' },
     });
     expect(patched.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round-6 findings on the round-5 fixes (HUNT6-B-1, HUNT6-B-4, HUNT6-B-5).
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * HUNT6-B-1. HUNT5-B-5's second window was `order by created_at desc limit 1`, so the response was
+ * "the 200 oldest unresolved rows of the kind" UNION "exactly one row". One `safety_flag_email` job
+ * is enqueued PER report (jobs/scan-process.ts, inside safetyResponse, which runs once per question),
+ * so a single worksheet that flags two answers produces two flags and two emails — and each email
+ * says "open Privacy & safety to see the flag and what you can do next: <origin>/app/privacy" with
+ * no per-report deep link and no GET /v1/safety-reports/:id to fall back on. Behind a full window the
+ * one-row branch returned only the LATER of the two, so a guardian was emailed about a flag that was
+ * on no page of the product. The second window is a full page now, so a kind's unresolved rows are
+ * absent only from the MIDDLE of a queue longer than two pages.
+ */
+describe('HUNT6-B-1 every just-emailed flag is on the page its email names, not only the last one', () => {
+  it('lists both of two flags filed behind a full page of older open flags', async () => {
+    const { fam, reportId, questionId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    // A full page of system flags OLDER than the real one (the HUNT5-B-5 shape), shaped to satisfy
+    // safety_reports_system_shape and distinct on safety_reports_system_once's
+    // (question_id, transcription_at).
+    await api.db.sql`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id,
+                                         status, created_at, transcription_at, screen_version, screen_categories)
+      select ${fam.familyId}, ${fam.children[0]!.id}, 'system', 'severe_risk', ${questionId},
+             'escalated', flag.created_at - (n * interval '1 minute'),
+             flag.transcription_at - (n * interval '1 minute'), flag.screen_version, flag.screen_categories
+        from generate_series(1, ${UNRESOLVED_REPORTS_PAGE_SIZE}) as n,
+             (select created_at, transcription_at, screen_version, screen_categories
+                from public.safety_reports where id = ${reportId}) as flag`;
+    // The SECOND answer the same screen flagged: one minute later, its own report and its own email.
+    const [second] = await api.db.sql<{ id: string }[]>`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id,
+                                         status, created_at, transcription_at, screen_version, screen_categories)
+      select ${fam.familyId}, ${fam.children[0]!.id}, 'system', 'severe_risk', ${questionId},
+             'escalated', flag.created_at + interval '1 minute',
+             flag.transcription_at + interval '1 minute', flag.screen_version, flag.screen_categories
+        from (select created_at, transcription_at, screen_version, screen_categories
+                from public.safety_reports where id = ${reportId}) as flag
+      returning id`;
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    const listed = reports.map((r) => r.id);
+    // With a one-row second window only `second` came back: 202 unresolved flags, the 200 oldest in
+    // the drain window and the single newest beside them, so the earlier of the two emailed flags
+    // was in no response and reachable from no surface.
+    expect(listed).toContain(second!.id);
+    expect(listed).toContain(reportId);
+    // Still bounded: at most two pages of that kind, never the whole open queue (CS-R4-01).
+    const pendingFlags = reports.filter(
+      (r) => r.reporterKind === 'system' && r.status !== 'resolved',
+    );
+    expect(pendingFlags.length).toBeLessThanOrEqual(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
+    // And the oldest flag still leads the drain, so the page a guardian works through is unchanged.
+    const oldest = pendingFlags.reduce((a, b) => (a.createdAt <= b.createdAt ? a : b));
+    const patched = await api.request(`/v1/safety-reports/${oldest.id}`, {
+      method: 'PATCH',
+      token: parent,
+      body: { outcome: 'addressed' },
+    });
+    expect(patched.status).toBe(200);
+  });
+
+  it('lists a child’s three latest disclosures behind a full page of older child reports', async () => {
+    const { fam, reportId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    const childId = fam.children[0]!.id;
+    // A full page of older child reports, then three the child filed just now. Every instant derives
+    // from the flag's own row, never from a second clock (L-027).
+    await api.db.sql`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, ${childId}, 'child', 'wrong_or_confusing', 'open',
+             flag.created_at - interval '2 hours' + (n * interval '10 seconds')
+        from generate_series(1, ${UNRESOLVED_REPORTS_PAGE_SIZE}) as n,
+             (select created_at from public.safety_reports where id = ${reportId}) as flag`;
+    const latest = await api.db.sql<{ id: string }[]>`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, ${childId}, 'child', 'upsetting', 'open',
+             flag.created_at + (n * interval '1 minute')
+        from generate_series(1, 3) as n,
+             (select created_at from public.safety_reports where id = ${reportId}) as flag
+      returning id`;
+    expect(latest).toHaveLength(3);
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    const listed = reports.map((r) => r.id);
+    // The one-row branch returned the newest of the three; the child's other two disclosures were
+    // absent from the only list a guardian has.
+    for (const row of latest) expect(listed).toContain(row.id);
+    const pendingChild = reports.filter(
+      (r) => r.reporterKind === 'child' && r.status !== 'resolved',
+    );
+    expect(pendingChild.length).toBeLessThanOrEqual(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
+  });
+
+  /**
+   * The absence bound at UNRESOLVED_REPORTS_PAGE_SIZE and above r.get('/safety-reports') is stated
+   * over EVERY reporter kind: "never that kind's oldest rows and never its newest", absent only in
+   * the middle of a queue longer than two pages. The parent / catch-all branch had ONE newest-first
+   * page and no second window, so from row 201 of that kind onward its oldest rows were absent — an
+   * unlisted exception to a quantified claim, and the same loss HUNT5-B-4 fixed for the child branch:
+   * the EARLIEST report is the one most likely to be the substantive one, and it is the one that fell
+   * off. The branch has the oldest-first window too now.
+   */
+  it('lists the oldest of a kind that only has a newest-first page: the parent\u2019s own reports', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    // One page of open parent reports plus one, so the newest-first window cannot hold them all.
+    // Every instant derives from the pinned request clock (L-027).
+    const filed = await api.db.sql<{ id: string }[]>`
+      insert into public.safety_reports (family_id, reporter_kind, category, note, status, created_at)
+      select ${fam.familyId}, 'parent', 'other', 'synthetic parent report ' || n, 'open',
+             ${api.now.value}::timestamptz - ((${UNRESOLVED_REPORTS_PAGE_SIZE + 1} - n) * interval '1 minute')
+        from generate_series(1, ${UNRESOLVED_REPORTS_PAGE_SIZE + 1}) as n
+      returning id`;
+    expect(filed).toHaveLength(UNRESOLVED_REPORTS_PAGE_SIZE + 1);
+    const oldest = filed[0]!.id;
+    const newest = filed[filed.length - 1]!.id;
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    const listed = reports.map((r) => r.id);
+    // The newest was always there — the branch is newest-first. The OLDEST was on no page of the
+    // product, while the bound above the handler said no kind's oldest rows can be absent.
+    expect(listed).toContain(newest);
+    expect(listed).toContain(oldest);
+    // Still bounded per kind: two pages, not the whole open queue (CS-R4-01).
+    const pendingParent = reports.filter(
+      (r) => r.reporterKind === 'parent' && r.status !== 'resolved',
+    );
+    expect(pendingParent.length).toBeLessThanOrEqual(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
+  });
+});
+
+/**
+ * HUNT6-B-4. HUNT5-B-2 stopped POST /deletion reading a 42501 from the slot release as a missing PIN
+ * by wrapping EVERY throw out of releaseChildSlot in SlotReleaseFailed, whose cause pgErrorCode()
+ * does not walk. That hid three more SQLSTATEs the application deliberately distinguishes: 40P01,
+ * 40001 and 55P03 are lock contention the database resolved by aborting the transaction, which
+ * app.ts answers 503 PROVIDER_UNAVAILABLE with Retry-After and logs as a `db_transient_conflict`
+ * warning. Wrapped, such a failure reached app.ts as an unexpected error: 500 INTERNAL, no
+ * Retry-After, and an error-level `unhandled_error` — a retryable failure told to the parent as
+ * "Something went wrong" with nothing to retry on. The wrapper now re-throws a transient error
+ * unchanged and keeps wrapping everything else.
+ */
+describe('HUNT6-B-4 a slot-release lock conflict stays a retryable 503', () => {
+  it('answers PROVIDER_UNAVAILABLE with Retry-After instead of an unexpected 500', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const child = fam.children[0]!;
+    await api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${fam.familyId}, 1, 'app_store')`;
+    await api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id)
+      values (${fam.familyId}, ${child.id})`;
+    const parent = await unlockedParent(fam.ownerId);
+    // A LABELED TEST FIXTURE, not a production path: a statement-level trigger that raises 40P01 for
+    // the slot release only. It is keyed on `current_user = 'service_role'`, which is true exactly
+    // inside releaseChildSlot's `set local role service_role` and false inside
+    // public.request_deletion (SECURITY DEFINER, so its own release statement runs as the owner), so
+    // the conflict lands on the statement this finding is about. Statement level because migration
+    // 0890 has already released the row, so the API's belt-and-braces UPDATE matches no rows and a
+    // row-level trigger would never fire. Dropped in `finally`.
+    await api.db.sql`
+      create function pl_test_release_conflict() returns trigger language plpgsql as $$
+      begin
+        if current_user = 'service_role' then
+          raise exception 'injected lock contention' using errcode = '40P01';
+        end if;
+        return null;
+      end $$`;
+    await api.db.sql`
+      create trigger pl_test_release_conflict before update on public.child_slot_assignments
+      for each statement execute function pl_test_release_conflict()`;
+    let res: Response;
+    try {
+      res = await api.request('/v1/deletion', {
+        method: 'POST',
+        token: parent,
+        body: { scope: 'child', childId: child.id },
+      });
+    } finally {
+      await api.db.sql`drop trigger pl_test_release_conflict on public.child_slot_assignments`;
+      await api.db.sql`drop function pl_test_release_conflict()`;
+    }
+    const body = await json<{ error?: { code?: string; message?: string } }>(res);
+    // Wrapped, this was 500 INTERNAL "Something went wrong. Please try again." with no Retry-After.
+    expect(res.status).toBe(503);
+    expect(body.error?.code).toBe('PROVIDER_UNAVAILABLE');
+    expect(res.headers.get('retry-after')).toBe('1');
+    // And operations see the transient warning, not an error-level unhandled_error.
+    expect(api.logs.filter((e) => e.event === 'db_transient_conflict')).toHaveLength(1);
+    expect(api.logs.filter((e) => e.event === 'unhandled_error')).toEqual([]);
+    // The request still rolls back whole: the release must never land apart from it.
+    const [open] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.deletion_requests
+       where family_id = ${fam.familyId} and status in ('requested', 'processing')`;
+    expect(open!.n).toBe(0);
+  });
+
+  /**
+   * And the FACT that corrects SlotReleaseFailed's own doc (B-PROSE / L-053). That doc stated as
+   * present-tense fact that the release's UPDATE "contends for the child's assignment row with the
+   * archive route", which is what the wrapper's transient pass-through was first justified by. It
+   * matches nothing in the shipped schema: public.request_deletion released that row in the SAME
+   * transaction a statement earlier (0890, reordered by 0930), so `released_at is null` is already
+   * false, the UPDATE affects no row, and it takes no row lock on it to contend with. The case above
+   * has to raise its conflict from a STATEMENT-level trigger for exactly this reason; here the same
+   * trigger is ROW-level, so it fires only if a row is actually updated as the service role — and
+   * nothing goes wrong, which is the observable.
+   */
+  it('affects no assignment row at all, so it cannot contend for one', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const child = fam.children[0]!;
+    await api.db.sql`
+      insert into public.family_capacity (family_id, paid_slots, managing_channel)
+      values (${fam.familyId}, 1, 'app_store')`;
+    await api.db.sql`
+      insert into public.child_slot_assignments (family_id, child_id)
+      values (${fam.familyId}, ${child.id})`;
+    const parent = await unlockedParent(fam.ownerId);
+    // A LABELED TEST FIXTURE, not a production path, and the same guard as the case above: keyed on
+    // `current_user = 'service_role'`, true exactly inside releaseChildSlot's `set local role
+    // service_role` and false inside public.request_deletion (SECURITY DEFINER, so its own release
+    // runs as the owner). FOR EACH ROW, so it can only fire if that statement updates a row. It
+    // returns `new` rather than null, which a BEFORE ROW trigger must do or it would cancel the
+    // update it is watching. Dropped in `finally`.
+    await api.db.sql`
+      create function pl_test_release_row_conflict() returns trigger language plpgsql as $$
+      begin
+        if current_user = 'service_role' then
+          raise exception 'injected lock contention' using errcode = '40P01';
+        end if;
+        return new;
+      end $$`;
+    await api.db.sql`
+      create trigger pl_test_release_row_conflict before update on public.child_slot_assignments
+      for each row execute function pl_test_release_row_conflict()`;
+    let res: Response;
+    try {
+      res = await api.request('/v1/deletion', {
+        method: 'POST',
+        token: parent,
+        body: { scope: 'child', childId: child.id },
+      });
+    } finally {
+      await api.db.sql`drop trigger pl_test_release_row_conflict on public.child_slot_assignments`;
+      await api.db.sql`drop function pl_test_release_row_conflict()`;
+    }
+    // Take the slot release out of public.request_deletion and this is 503: the belt-and-braces
+    // UPDATE then matches the open row, fires the trigger as the service role, and the request that
+    // is supposed to be the database's own backstop becomes the thing that needs retrying.
+    expect(res.status).toBe(202);
+    expect(api.logs.filter((e) => e.event === 'db_transient_conflict')).toEqual([]);
+    // The slot is free and the request is open, both from the one transaction.
+    const [slot] = await api.db.sql<{ released_at: Date | null; release_reason: string | null }[]>`
+      select released_at, release_reason from public.child_slot_assignments
+       where family_id = ${fam.familyId} and child_id = ${child.id}`;
+    expect(slot!.released_at).not.toBeNull();
+    expect(slot!.release_reason).toBe('archived');
+    const [requested] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.deletion_requests
+       where family_id = ${fam.familyId} and status in ('requested', 'processing')`;
+    expect(requested!.n).toBe(1);
+  });
+});
+
+/**
+ * HUNT6-B-2, the user-visible half. `public.request_deletion` is granted to `authenticated`
+ * (migration 0840), so the Supabase Data API can file a deletion with a parent's own token and no
+ * Hono handler in the path. The export withdrawal lived only in the handler, so on that surface a
+ * finished family_data file holding the deleted child's homework, transcriptions, results and
+ * safety-notice rows stayed downloadable — export-download.ts reads kind, status, storage_path and
+ * expires_at and nothing about deletion — until the deletion_purge job removed the objects, and for
+ * ever if that job dead-lettered. Migration 0920 expires the rows inside the function; the handler's
+ * `withdrawExports` stays as the half that removes the files.
+ */
+describe('HUNT6-B-2 a deletion filed through the Data API withdraws the finished export', () => {
+  it('refuses the download that was served before the request', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const child = fam.children[0]!;
+    // A finished export as the export_build job leaves one; synthetic path, no real bytes.
+    const [built] = await api.db.sql<{ id: string }[]>`
+      insert into public.data_exports (family_id, requested_by, kind, child_id, status,
+                                       storage_path, expires_at)
+      values (${fam.familyId}, ${fam.ownerId}, 'family_data', ${child.id}, 'ready',
+              'exports/synthetic-family-data.json', ${new Date(api.now.value.getTime() + 7 * DAY_MS)})
+      returning id`;
+    const parent = await unlockedParent(fam.ownerId);
+    const before = await api.request(`/v1/exports/${built!.id}/download`, { token: parent });
+    expect(before.status).toBe(200);
+
+    // The Data API's own call: `authenticated`, the parent's claims, no handler in the path.
+    await grantAdultUnlock(api.db, fam.ownerId);
+    await api.db.asParent(
+      fam.ownerId,
+      (tx) => tx`
+        select id from public.request_deletion(${fam.familyId}::uuid, ${child.id}::uuid)`,
+    );
+
+    // Before 0920 this was still 200 with a signed URL for the deleted child's homework.
+    const after = await api.request(`/v1/exports/${built!.id}/download`, { token: parent });
+    expect(after.status).toBe(409);
+    expect((await json<{ error?: { code?: string } }>(after)).error?.code).toBe('CONFLICT');
+    const [row] = await api.db.sql<{ status: string; storage_path: string | null }[]>`
+      select status, storage_path from public.data_exports where id = ${built!.id}`;
+    expect(row!.status).toBe('expired');
+    // The file is still named: removing it is the handler's half and the purge job's.
+    expect(row!.storage_path).not.toBeNull();
   });
 });

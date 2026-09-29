@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -24,8 +24,6 @@ import { ParentAccessState, useParentAccess } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import { signOutClosedAccountOnDevice } from '../../src/family/runtime.ts';
 import {
-  accountClosedStillSignedInMessage,
-  closeAccountAction,
   confirmationPhrase,
   deletableChildren,
   deletionStatusText,
@@ -39,6 +37,7 @@ import {
   reportOutcomeAction,
   requestDeletionAction,
   requestExportAction,
+  runAccountClosure,
   SAFETY_REPORTS_INTRO,
   safetyReportView,
   unlockAction,
@@ -53,8 +52,21 @@ type ScreenState =
   | { status: 'loading' }
   | { status: 'error'; message: string }
   | { status: 'ready'; data: PrivacyOverview }
-  /** The parent deleted their own sign-in: the device is signed out; only the outcome remains. */
-  | { status: 'account_closed'; message: string };
+  /**
+   * The parent deleted their own sign-in and the closure is over: only the outcome remains, and this
+   * screen has nothing left to offer. It does NOT mean the device is signed out, which is what this
+   * comment used to claim (HUNT6-J-6): the closure goes through the whole device sign-out, but the
+   * session end and the two secret clears are reported rather than assumed (HUNT6-J-1), and `message`
+   * is what says whether this device really was signed out.
+   */
+  | { status: 'account_closed'; message: string }
+  /**
+   * The server has closed the sign-in and the device sign-out is still running (HUNT6-J-2). Its own
+   * state rather than a busy flag, because `data` is null here: the whole "Delete my account" section
+   * — including a second, live "Delete my account" button — is off the screen for the length of the
+   * operation, not just for the API call.
+   */
+  | { status: 'closing' };
 
 type Feedback =
   | { area: 'export' | 'delete' | 'account'; result: ActionResult; id: number }
@@ -86,22 +98,55 @@ export default function ParentPrivacyScreen() {
   const [target, setTarget] = useState<DeletionTarget | null>(null);
   const [typed, setTyped] = useState('');
   const [closeConfirmed, setCloseConfirmed] = useState(false);
+  /**
+   * The closure has started, so this screen is its outcome and nothing else (HUNT6-J-2). A ref, not
+   * state: the reload effect below must not replace that outcome, and the sign-out inside the closure
+   * un-registers this device's parent token source, which changes `api` and so changes `load`.
+   *
+   * Guarding that effect alone left the guarantee — "the section is off the screen for the length of
+   * the operation" — with a gesture-shaped exception: pull-to-refresh calls `load` directly, so one
+   * pull during the closure put the whole "Delete my account" section back, second live button and
+   * all. The guard belongs to `load` itself, which is the one way any of this screen's rows reach it.
+   */
+  const closureStarted = useRef(false);
+  /** The most recent load. Only the load holding this number may publish what it fetched. */
+  const latestLoad = useRef(0);
 
   const load = useCallback(async () => {
+    // Every reload door at once: the effect below, pull-to-refresh, and the post-action reloads.
+    if (closureStarted.current) return;
     if (!api) {
       setState({ status: 'not_connected' });
       return;
     }
+    latestLoad.current += 1;
+    const ticket = latestLoad.current;
     try {
-      setState({ status: 'ready', data: await loadPrivacyOverview(api) });
+      const data = await loadPrivacyOverview(api);
+      // A load superseded while its request was in flight publishes nothing. Two ways to be
+      // superseded: a newer load, which for this screen means a new client and so the next adult at
+      // the device (publishing here would show them the previous adult's children, exports and
+      // safety reports as their own — HUNT6-I-2's harm through the answer rather than the start); or
+      // a closure that began while this request was out, whose outcome is what the screen now is.
+      if (latestLoad.current !== ticket || closureStarted.current) return;
+      setState({ status: 'ready', data });
     } catch (error) {
+      if (latestLoad.current !== ticket || closureStarted.current) return;
       setState({ status: 'error', message: parentErrorMessage(error) });
     }
   }, [api]);
 
   useEffect(() => {
-    if (access.status === 'ready') void load();
-  }, [load, access.status]);
+    if (access.status !== 'ready' || closureStarted.current) return;
+    // The rows go BEFORE the fetch, not when it answers (HUNT6-I-2). This effect runs on mount and
+    // whenever `load` changes identity, which for this screen means a new client — and the parent gate
+    // publishes a new client when the adult at the device has changed, so leaving the previous adult's
+    // children, exports and safety reports up until the new fetch settled showed them to the next
+    // parent for the length of one request. Pull-to-refresh does not come through here, which is why
+    // the closure guard is inside `load` as well as on this effect.
+    setState(api ? { status: 'loading' } : { status: 'not_connected' });
+    void load();
+  }, [api, load, access.status]);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -130,36 +175,39 @@ export default function ParentPrivacyScreen() {
     setBusy(null);
   };
 
+  /**
+   * The app's normal sign-out path clears the parent session: the closure goes through the whole
+   * device sign-out (MOB-R2-06), so it attempts to leave no biometric PIN, no parent mode and no live
+   * unlock behind. Navigation is the only part left out, so the outcome stays on screen.
+   *
+   * The order and the claim both matter, and both live in src/privacy/parent-privacy.ts where they can
+   * be run in a test rather than grepped out of this file (L-054):
+   * - HUNT5-N6 / L-037: the outcome is shown only after the device sign-out, because
+   *   `ACCOUNT_CLOSE_COPY.closed` ends "and this device is signed out", which is this app's half of
+   *   the job, not the server's — and a claim about the device in front of the parent is the dangerous
+   *   one to get wrong, because they put it down.
+   * - HUNT6-J-1: that claim comes from what the sign-out REPORTED, not from its not throwing.
+   * - HUNT6-J-2: the screen leaves 'ready' before the sign-out starts, so the second "Delete my
+   *   account" is not live through three network calls, and the parent is acknowledged at once.
+   */
   const closeAccount = async () => {
     if (!api || busy !== null) return;
     setBusy('account');
     setFeedback(null);
-    const result = await closeAccountAction(api, closeConfirmed);
-    setBusy(null);
-    if (result.status === 'step_up' || result.status === 'error') {
-      setFeedbackCount((n) => n + 1);
-      setFeedback({ area: 'account', result, id: feedbackCount + 1 });
-      return;
-    }
-    // The API's signOut flag: the app's normal sign-out path clears the parent session. It goes
-    // through the whole device sign-out (MOB-R2-06), so the closed account leaves no biometric PIN,
-    // no parent mode and no live unlock behind; the outcome stays on screen until the parent leaves.
-    //
-    // HUNT5-N6 / L-037: the sign-out is awaited BEFORE the outcome is shown, and its failure is not
-    // swallowed. `result.message` ends "and this device is signed out", which is this app's half of
-    // the job, not the server's — so showing it first meant a parent read that the device was signed
-    // out while the sign-out was still running, and a thrown sign-out left the sentence on screen
-    // untrue. The portal draws exactly this distinction (PrivacyControlsPage's stillSignedInCopy),
-    // and a claim about the device in front of the parent is the dangerous one to get wrong: they put
-    // it down. The account is closed either way, so that fact is in both messages.
-    const signedOut = await signOutClosedAccountOnDevice().then(
-      () => true,
-      () => false,
-    );
-    setState({
-      status: 'account_closed',
-      message: signedOut ? result.message : accountClosedStillSignedInMessage(result.status),
+    await runAccountClosure(api, closeConfirmed, signOutClosedAccountOnDevice, (step) => {
+      if (step.kind === 'refused') {
+        setFeedbackCount((n) => n + 1);
+        setFeedback({ area: 'account', result: step.result, id: feedbackCount + 1 });
+        return;
+      }
+      closureStarted.current = true;
+      setState(
+        step.kind === 'closing'
+          ? { status: 'closing' }
+          : { status: 'account_closed', message: step.message },
+      );
     });
+    setBusy(null);
   };
 
   const requestDeletion = async () => {
@@ -215,7 +263,10 @@ export default function ParentPrivacyScreen() {
           contentContainerStyle={styles.content}
           keyboardShouldPersistTaps="handled"
           refreshControl={
-            api ? (
+            // Not offered while the closure is running or over: `load` refuses the pull anyway, so
+            // this is about not offering a gesture whose spinner would promise a reload that cannot
+            // happen — the outcome of a deletion is not a view with fresh rows behind it.
+            api && state.status !== 'closing' && state.status !== 'account_closed' ? (
               <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />
             ) : undefined
           }
@@ -240,6 +291,19 @@ export default function ParentPrivacyScreen() {
             />
           ) : null}
 
+          {state.status === 'closing' ? (
+            <Section title="Account deleted">
+              <Text accessibilityLiveRegion="polite" style={styles.body}>
+                Your request has gone through. Signing this device out…
+              </Text>
+              <ActivityIndicator
+                color={colors.teal}
+                accessibilityLabel="Signing this device out"
+                style={styles.loading}
+              />
+            </Section>
+          ) : null}
+
           {state.status === 'account_closed' ? (
             <Section title="Account deleted">
               <Text accessibilityLiveRegion="polite" style={styles.body}>
@@ -262,7 +326,7 @@ export default function ParentPrivacyScreen() {
             </View>
           ) : null}
 
-          {state.status !== 'account_closed' ? (
+          {state.status !== 'account_closed' && state.status !== 'closing' ? (
             <Section title="How long we keep information">
               {PRIVACY_RETENTION_LINES.map((line) => (
                 <Text key={line} style={[styles.body, styles.bullet]}>

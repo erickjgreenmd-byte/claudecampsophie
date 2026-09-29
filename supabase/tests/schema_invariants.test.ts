@@ -104,7 +104,12 @@ describe('schema invariants', () => {
     expect(await childWriteGrants()).toEqual([]);
 
     // And the invariant can see each of those grants: planted, caught, and revoked again. One plant
-    // per way a write reaches pl_child, so no arm of the query above can be dropped and stay green.
+    // per cell of the 2x2 matrix the query covers — {PUBLIC, pl_child} x {table level, column
+    // level} — so no grantee can be dropped from either arm and stay green. Five plants for four
+    // cells: each table-level cell is planted with DELETE, which has no column form and so can only
+    // be reported by the table-level arm, and PUBLIC x table also keeps the INSERT plant it started
+    // with (role_column_grants expands a table-level INSERT to every column, so that plant alone
+    // does not pin the table-level arm).
     //
     // 1. The grant to PUBLIC that `grantee = 'pl_child'` could not see, table level.
     await db.sql`grant insert on public.audit_events to public`;
@@ -141,11 +146,11 @@ describe('schema invariants', () => {
     }
     expect(await childWriteGrants()).toEqual([]);
 
-    // 4. The fourth combination, and the one the first three left unpinned: a grant that is BOTH to
-    // PUBLIC and column-level. Plants 1 and 2 pin 'PUBLIC' into the table arm and plant 3 pins the
-    // column arm's 'pl_child', so dropping 'PUBLIC' from the COLUMN arm alone kept this case green
-    // while the comment above claimed no arm could be dropped. It is the likeliest of the four to
-    // arrive by accident, since the migrations write grants column by column.
+    // 4. PUBLIC at column level: the cell plants 1-3 left unpinned. Plants 1 and 2 pin 'PUBLIC' into
+    // the table arm and plant 3 pins the column arm's 'pl_child', so dropping 'PUBLIC' from the
+    // COLUMN arm alone kept this case green while the comment above claimed no arm could be
+    // dropped. It is the likeliest of the four to arrive by accident, since the migrations write
+    // grants column by column.
     await db.sql`grant update (metadata) on public.audit_events to public`;
     try {
       expect(await childWriteGrants()).toEqual([
@@ -153,6 +158,23 @@ describe('schema invariants', () => {
       ]);
     } finally {
       await db.sql`revoke update (metadata) on public.audit_events from public`;
+    }
+    expect(await childWriteGrants()).toEqual([]);
+
+    // 5. pl_child at TABLE level — the cell the four plants above still left unpinned, and the cell
+    // this invariant's original `grantee = 'pl_child'` form existed for. role_column_grants expands
+    // a table-level INSERT or UPDATE to every column, so plant 3 is caught by the column arm alone
+    // and nothing forced 'pl_child' to stay in the table-level arm's grantee list: dropping it kept
+    // all four plants green while `grant delete on public.audit_events to pl_child` — a privilege
+    // with no column form, so invisible to the column arm — went unseen (HUNT6-E-4). DELETE is
+    // therefore the privilege to plant here; it reaches this arm and no other.
+    await db.sql`grant delete on public.audit_events to pl_child`;
+    try {
+      expect(await childWriteGrants()).toEqual([
+        { table_name: 'audit_events', grantee: 'pl_child', privilege_type: 'DELETE' },
+      ]);
+    } finally {
+      await db.sql`revoke delete on public.audit_events from pl_child`;
     }
     expect(await childWriteGrants()).toEqual([]);
   });
@@ -207,12 +229,18 @@ describe('schema invariants', () => {
     // PUBLIC is rendered with an empty grantee ('=Dxt/owner'), which no pattern over role names can
     // match, and whatever PUBLIC holds anon, authenticated and pl_child hold. So the bare '=' form
     // counts too, and the privilege-letter filter below reads it unchanged.
+    //
+    // Both PLACES a default can live count as well: `alter default privileges in schema public` and
+    // the global `alter default privileges` (no `in schema`) are separate pg_default_acl rows, and
+    // the global one has defaclnamespace = 0 and so no pg_namespace row to inner-join to. Postgres
+    // merges the two, so a new table in public inherits both — hence the left join and the
+    // `defaclnamespace = 0` arm, each pinned by a plant below (HUNT6-E-2).
     const clientTableDefaults = async () =>
       (
         await db.sql<{ acl: string }[]>`
           select unnest(d.defaclacl)::text as acl
-            from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
-           where n.nspname = 'public' and d.defaclobjtype = 'r'`
+            from pg_default_acl d left join pg_namespace n on n.oid = d.defaclnamespace
+           where (n.nspname = 'public' or d.defaclnamespace = 0) and d.defaclobjtype = 'r'`
       )
         .map((r) => r.acl)
         .filter((acl) => /^(anon|authenticated|pl_child)=/.test(acl) || acl.startsWith('='))
@@ -231,6 +259,22 @@ describe('schema invariants', () => {
     } finally {
       await db.sql`alter default privileges in schema public
         revoke truncate, trigger, references on tables from public`;
+    }
+    expect(await clientTableDefaults()).toEqual([]);
+
+    // And the GLOBAL spelling of the same default: `alter default privileges` with no `in schema`
+    // writes a pg_default_acl row whose defaclnamespace is 0, which an inner join on pg_namespace
+    // discards. Per-schema default privileges are merged ADDITIVELY onto the global ones
+    // (get_user_default_acl / aclmerge), so a table created in public inherits the global row just
+    // as it inherits the per-schema one, and a per-schema REVOKE cannot subtract it — the reason
+    // 0001_core_identity.sql:539 spells the function revoke globally (HUNT6-E-2).
+    await db.sql`alter default privileges grant truncate, trigger, references on tables to public`;
+    try {
+      const planted = await clientTableDefaults();
+      expect(planted).toHaveLength(1);
+      expect(planted[0]).toMatch(/^=Dxt\//);
+    } finally {
+      await db.sql`alter default privileges revoke truncate, trigger, references on tables from public`;
     }
     expect(await clientTableDefaults()).toEqual([]);
   });
@@ -277,13 +321,15 @@ describe('schema invariants', () => {
   it('[HR4-0860-01] the default privileges for new public sequences grant no client role', async () => {
     // ACL letters for a sequence: r = SELECT, w = UPDATE, U = USAGE. A default privilege granted to
     // PUBLIC is rendered with an empty grantee ('=U/owner'), which the named-role pattern misses,
-    // so the bare '=' form counts too — every client role holds what PUBLIC holds.
+    // so the bare '=' form counts too — every client role holds what PUBLIC holds. And the global
+    // row (defaclnamespace = 0) counts as much as the per-schema one, since Postgres merges them
+    // onto each other: hence the left join and the `defaclnamespace = 0` arm (HUNT6-E-2).
     const clientDefaults = async () =>
       (
         await db.sql<{ acl: string }[]>`
           select unnest(d.defaclacl)::text as acl
-            from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
-           where n.nspname = 'public' and d.defaclobjtype = 'S'`
+            from pg_default_acl d left join pg_namespace n on n.oid = d.defaclnamespace
+           where (n.nspname = 'public' or d.defaclnamespace = 0) and d.defaclobjtype = 'S'`
       )
         .map((r) => r.acl)
         .filter((a) => /^(anon|authenticated|pl_child)=/.test(a) || a.startsWith('='));
@@ -296,6 +342,20 @@ describe('schema invariants', () => {
       expect(planted[0]).toMatch(/^=U\//);
     } finally {
       await db.sql`alter default privileges in schema public revoke usage on sequences from public`;
+    }
+    expect(await clientDefaults()).toEqual([]);
+
+    // The GLOBAL spelling too (defaclnamespace = 0), which an inner join on pg_namespace discards:
+    // it is merged onto the per-schema defaults, so a sequence created in public inherits it, and
+    // 0910's per-schema revoke cannot subtract it — migration 0940 is the global revoke that can
+    // (HUNT6-E-2).
+    await db.sql`alter default privileges grant usage on sequences to public`;
+    try {
+      const planted = await clientDefaults();
+      expect(planted).toHaveLength(1);
+      expect(planted[0]).toMatch(/^=U\//);
+    } finally {
+      await db.sql`alter default privileges revoke usage on sequences from public`;
     }
     expect(await clientDefaults()).toEqual([]);
   });

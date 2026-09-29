@@ -128,7 +128,6 @@ function setup(skewMinutes: number) {
     publicApi: server.publicApi,
     authedApi: (token) => server.dataApi(token),
     now: deviceClock,
-    newRequestId: () => 'aaaaaaaa-0000-4000-8000-00000000000a',
   });
   return {
     server,
@@ -334,10 +333,6 @@ describe('a call that refreshed for itself still drops the token the server refu
         send: () => Promise.reject(new Error('unexpected send')),
       }),
       now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: (() => {
-        let n = 0;
-        return () => `66666666-0000-4000-8000-00000000006${++n}`;
-      })(),
     });
     // A grown-up tapped "Disconnect this device" in the portal between the rotation and this call:
     // every access token is refused from here on, while /v1/child/refresh still answers.
@@ -364,14 +359,6 @@ function pairedStorage(): SecureStorage & { data: Map<string, string> } {
   return storage;
 }
 
-/**
- * What the keychain holds for an unfinished refresh: the id AND the instant this device minted it,
- * so an id older than the server's recovery window is never presented for a later refresh.
- */
-function storedRequestId(raw: string | null): { id: string; mintedAtMs: number } | null {
-  return raw === null ? null : (JSON.parse(raw) as { id: string; mintedAtMs: number });
-}
-
 /** The shape POST /v1/child/refresh answers with, as childTokenResponseSchema parses it. */
 function freshTokens(accessToken: string, refreshToken: string) {
   return {
@@ -384,465 +371,116 @@ function freshTokens(accessToken: string, refreshToken: string) {
 }
 
 /**
- * BUG-244: one refresh, one id, kept across this device's own retries of that refresh.
+ * BUG-244 is an accepted, documented open defect again (HUNT6-A-1): the recovery that let the server
+ * answer a second time for a rotation it had already committed is REMOVED, on this side as on the
+ * server's. Nothing marked the row a recovery had served, so one captured request body was served
+ * again and again for the whole window and EVERY serving handed back a full-lifetime rotating refresh
+ * token — a self-renewing child session until the tablet's own next refresh. The window bounded when
+ * a replay could START, not how long it lasted.
  *
- * The server commits the rotation before its response goes out, so a lost response leaves this device
- * holding a token the server has marked used. Presenting it again with the id that consumed it is how
- * the server recognises the rightful holder finishing its attempt; a NEW id on the retry would be a
- * new refresh and would be treated as theft, which is what unpaired tablets before this.
+ * These cases pin both halves: the rule (the device presents the token it holds and nothing else, and
+ * any presentation of a spent token is theft) and the cost the product accepts for it (a lost answer
+ * unpairs the tablet and a grown-up mints a new pairing code).
  */
-describe('a refresh keeps its request id across this device’s own retries (BUG-244)', () => {
-  it('[repro] a retry after a network failure sends the SAME id, and a later refresh a new one', async () => {
-    const ids: (string | undefined)[] = [];
+describe('the child refresh presents the stored token and nothing else (HUNT6-A-1)', () => {
+  /**
+   * A server that rotates on every refresh and treats any presentation of a spent token as theft.
+   * `loseAnswer` drops the answer AFTER the rotation is committed, which is BUG-244's whole shape.
+   */
+  function rotatingServer(loseAnswer: (attempt: number) => boolean) {
+    const live = new Set<string>(['stored-refresh-token']);
+    const bodies: unknown[] = [];
     let attempt = 0;
-    let issued = 0;
-    const session = createChildSession({
-      storage: pairedStorage(),
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, _path, body) => {
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          attempt += 1;
-          // The first attempt's response never arrives; the second and third succeed.
-          if (attempt === 1) return Promise.reject(new Error('network down'));
-          issued += 1;
-          return Promise.resolve(freshTokens(`access-${issued}`, `rotated-${issued}`));
-        },
+    const publicApi: ApiClient = {
+      get: () => Promise.reject(new Error('unexpected GET')),
+      send: (_method, _path, body) => {
+        bodies.push(body);
+        attempt += 1;
+        const presented = (body as { refreshToken?: unknown }).refreshToken;
+        if (typeof presented !== 'string' || !live.delete(presented)) {
+          live.clear();
+          return Promise.reject(
+            new ApiRequestError(
+              'UNAUTHENTICATED',
+              'Ask a grown-up to connect this device again',
+              401,
+            ),
+          );
+        }
+        live.add(`rotated-${attempt}`);
+        if (loseAnswer(attempt)) {
+          return Promise.reject(new ApiRequestError('NETWORK', 'offline', 0));
+        }
+        return Promise.resolve(freshTokens(`access-${attempt}`, `rotated-${attempt}`));
       },
-      authedApi: () => ({
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: () => Promise.reject(new Error('unexpected send')),
-      }),
-      now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: (() => {
-        let n = 0;
-        return () => `00000000-0000-4000-8000-00000000000${++n}`;
-      })(),
-    });
-
-    await expect(session.accessToken()).rejects.toThrow('network down');
-    expect(await session.accessToken()).toBe('access-1');
-    // Same refresh, so the same id: the retry is the first attempt finishing, not a second refresh.
-    expect(ids).toEqual([
-      '00000000-0000-4000-8000-000000000001',
-      '00000000-0000-4000-8000-000000000001',
-    ]);
-
-    // A later refresh, after this one finished, is a new refresh and takes a new id.
-    session.invalidateAccessToken();
-    expect(await session.accessToken()).toBe('access-2');
-    expect(ids[2]).toBe('00000000-0000-4000-8000-000000000002');
-  });
-
-  it('a refusal ends the refresh, so the next one does not reuse its id', async () => {
-    // A refusal forgets the pairing, so the only road to a second refresh is a new pairing — which
-    // is what the parent does next: "Use a different code" on the pair screen, then "Connect", in
-    // one app process. The earlier version of this case stopped at the refusal and carried an
-    // `attempt === 2` mock branch that could never be reached (HUNT5-G-2), so nothing in it observed
-    // the property in its title.
-    const ids: (string | undefined)[] = [];
-    const storage = pairedStorage();
-    let refused = true;
-    const session = createChildSession({
-      storage,
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, path, body) => {
-          if (path === '/v1/child/pair') {
-            return Promise.resolve(freshTokens('access-repaired', 'rotated-repaired'));
-          }
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          return refused
-            ? Promise.reject(new ApiRequestError('UNAUTHENTICATED', 'no', 401))
-            : Promise.resolve(freshTokens('access-after', 'rotated-after'));
-        },
-      },
-      authedApi: () => ({
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: () => Promise.reject(new Error('unexpected send')),
-      }),
-      now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: (() => {
-        let n = 0;
-        return () => `00000000-0000-4000-8000-00000000001${++n}`;
-      })(),
-    });
-    // The refusal forgets the pairing, so this device asks for nothing more until it is paired again.
-    expect(await session.accessToken()).toBeNull();
-    expect(await storage.getItem(STORAGE_KEYS.childRefreshToken)).toBeNull();
-    expect(ids).toEqual(['00000000-0000-4000-8000-000000000011']);
-
-    // Paired again, so the next refresh is a NEW refresh: the refused session's id is never
-    // presented for the new session's token, which the server would read as theft.
-    refused = false;
-    expect(await pair(session)).toMatchObject({ ok: true });
-    session.invalidateAccessToken();
-    expect(await session.accessToken()).toBe('access-after');
-    expect(ids[1]).toBe('00000000-0000-4000-8000-000000000012');
-  });
-
-  /**
-   * The id has to outlive the PROCESS, not just the promise. A tablet's OS kills a backgrounded app
-   * whenever it likes, and a child who closes the app while a refresh is spinning loses the response
-   * exactly as a dropped connection does — so the next cold start has to finish that same refresh.
-   */
-  it('a process killed mid-refresh finishes that same refresh after a cold start', async () => {
-    const ids: (string | undefined)[] = [];
-    const storage = pairedStorage();
-    let allowed = false;
-    const build = (idPrefix: string) =>
-      createChildSession({
-        storage,
-        publicApi: {
-          get: () => Promise.reject(new Error('unexpected GET')),
-          send: (_method, _path, body) => {
-            ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-            return allowed
-              ? Promise.resolve(freshTokens('access-cold', 'rotated-cold'))
-              : Promise.reject(new Error('network down'));
-          },
-        },
-        authedApi: () => ({
-          get: () => Promise.reject(new Error('unexpected GET')),
-          send: () => Promise.reject(new Error('unexpected send')),
-        }),
-        now: () => new Date('2026-09-26T12:00:00.000Z'),
-        // A second process would mint a DIFFERENT id, which the server would read as theft.
-        newRequestId: () => `${idPrefix}-0000-4000-8000-000000000021`,
-      });
-
-    const first = build('11111111');
-    await expect(first.accessToken()).rejects.toThrow('network down');
-    // The app dies here: `first` is gone and nothing in memory survives — only storage does.
-    expect(storedRequestId(await storage.getItem(STORAGE_KEYS.childRefreshRequestId))).toEqual({
-      id: '11111111-0000-4000-8000-000000000021',
-      mintedAtMs: Date.parse('2026-09-26T12:00:00.000Z'),
-    });
-
-    allowed = true;
-    const afterRestart = build('22222222');
-    expect(await afterRestart.accessToken()).toBe('access-cold');
-    expect(ids).toEqual([
-      '11111111-0000-4000-8000-000000000021',
-      '11111111-0000-4000-8000-000000000021',
-    ]);
-    // Finished, so the id is gone and the next refresh is a new attempt.
-    expect(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)).toBeNull();
-    expect(await storage.getItem(STORAGE_KEYS.childRefreshToken)).toBe('rotated-cold');
-  });
-
-  it('a stored id that is not a uuid is replaced instead of wedging every refresh', async () => {
-    const ids: (string | undefined)[] = [];
-    const storage = pairedStorage();
-    // Whatever wrote this — a corrupted keychain entry, an older build — the contract would refuse it
-    // on every attempt, so refresh must not keep presenting it.
-    storage.data.set(STORAGE_KEYS.childRefreshRequestId, 'not-a-uuid');
-    const session = createChildSession({
-      storage,
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, _path, body) => {
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          return Promise.resolve(freshTokens('access-clean', 'rotated-clean'));
-        },
-      },
-      authedApi: () => ({
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: () => Promise.reject(new Error('unexpected send')),
-      }),
-      now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: () => '33333333-0000-4000-8000-000000000031',
-    });
-    expect(await session.accessToken()).toBe('access-clean');
-    expect(ids).toEqual(['33333333-0000-4000-8000-000000000031']);
-  });
-
-  /**
-   * FIX-A's residual, as the lead decided it. The server serves a retry of a rotated refresh only
-   * within RECOVERY_WINDOW_MS of the rotation (apps/api/src/routes/child-auth.ts), so an id the
-   * keychain still holds hours later belongs to an attempt the server cannot serve any more.
-   * Presenting it for a NEW refresh breaks the one rule the mechanism rests on — one id per logical
-   * attempt (L-049) — and it is how a single id came to be presented on every later refresh when the
-   * deleteItem in refreshFinished() failed and was swallowed. The id is stored with the instant this
-   * device minted it, and an id older than the window is replaced.
-   */
-  const coldStart = (
-    storage: SecureStorage & { data: Map<string, string> },
-    clock: () => Date,
-    id: string,
-    answer: () => Promise<unknown>,
-    ids: (string | undefined)[],
-  ) =>
-    createChildSession({
-      storage,
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, _path, body) => {
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          return answer() as Promise<never>;
-        },
-      },
-      authedApi: () => ({
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: () => Promise.reject(new Error('unexpected send')),
-      }),
-      now: clock,
-      newRequestId: () => id,
-    });
-
-  it('[repro] an id kept across a long cold start is replaced instead of presented', async () => {
-    const ids: (string | undefined)[] = [];
-    const storage = pairedStorage();
-    let nowMs = Date.parse('2026-09-26T12:00:00.000Z');
-    let offline = true;
-    const answer = () =>
-      offline
-        ? Promise.reject(new Error('network down'))
-        : Promise.resolve(freshTokens('access-fresh', 'rotated-fresh'));
-
-    const bedtime = coldStart(
-      storage,
-      () => new Date(nowMs),
-      '88888888-0000-4000-8000-000000000081',
-      answer,
-      ids,
-    );
-    await expect(bedtime.accessToken()).rejects.toThrow('network down');
-    // The tablet is put down and the OS kills the app; it is picked up the next morning.
-    nowMs += 14 * 60 * 60 * 1000;
-    offline = false;
-    const morning = coldStart(
-      storage,
-      () => new Date(nowMs),
-      '99999999-0000-4000-8000-000000000091',
-      answer,
-      ids,
-    );
-    expect(await morning.accessToken()).toBe('access-fresh');
-    // Last night's id is not presented for this morning's refresh: it is a new attempt, so it mints
-    // its own id, and the server can no longer serve a recovery for the old one anyway.
-    expect(ids).toEqual([
-      '88888888-0000-4000-8000-000000000081',
-      '99999999-0000-4000-8000-000000000091',
-    ]);
-    expect(storedRequestId(await storage.getItem(STORAGE_KEYS.childRefreshRequestId))).toBeNull();
-  });
-
-  it('a cold start seconds later still finishes the refresh it interrupted', async () => {
-    // The window must stay generous enough for what it is for: the process died mid-refresh, the
-    // child re-opens the app, and this is the SAME attempt finishing — so it keeps its id even
-    // though a fresh process would happily mint one.
-    const ids: (string | undefined)[] = [];
-    const storage = pairedStorage();
-    let nowMs = Date.parse('2026-09-26T12:00:00.000Z');
-    let offline = true;
-    const answer = () =>
-      offline
-        ? Promise.reject(new Error('network down'))
-        : Promise.resolve(freshTokens('access-resumed', 'rotated-resumed'));
-
-    const killed = coldStart(
-      storage,
-      () => new Date(nowMs),
-      '10101010-0000-4000-8000-000000000101',
-      answer,
-      ids,
-    );
-    await expect(killed.accessToken()).rejects.toThrow('network down');
-    expect(
-      storedRequestId(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)),
-    ).toMatchObject({ id: '10101010-0000-4000-8000-000000000101', mintedAtMs: nowMs });
-    nowMs += 30_000;
-    offline = false;
-    const reopened = coldStart(
-      storage,
-      () => new Date(nowMs),
-      '20202020-0000-4000-8000-000000000201',
-      answer,
-      ids,
-    );
-    expect(await reopened.accessToken()).toBe('access-resumed');
-    expect(ids).toEqual([
-      '10101010-0000-4000-8000-000000000101',
-      '10101010-0000-4000-8000-000000000101',
-    ]);
-  });
-
-  /**
-   * HUNT5-G-1. The pending request id is a closure variable, and only a refresh that FINISHED cleared
-   * it: `forget()` (a logout, or a refresh refused as UNAUTHENTICATED) deleted the stored copy and
-   * left the in-memory one, and `pair()` reset nothing. The next session's first refresh then found
-   * an id already in memory, so it presented a dead session's id AND skipped the write to storage —
-   * so an app the OS killed mid-refresh came back, found no stored id, minted a fresh one and
-   * presented the already-rotated token under it, which the server reads as theft (it stamps
-   * child_sessions.revoked_at with refresh_token_reuse). That is the harm BUG-244 closed.
-   */
-  it('[repro] a re-pairing after an offline refresh gets its own id, in storage first', async () => {
-    const storage = pairedStorage();
-    const ids: (string | undefined)[] = [];
-    /** What the keychain held at the moment each refresh request went out. */
-    const storedWhenSent: (string | null)[] = [];
-    let offline = true;
-    const session = createChildSession({
-      storage,
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, path, body) => {
-          if (path === '/v1/child/pair') {
-            return Promise.resolve(freshTokens('access-paired', 'rotated-paired'));
-          }
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          storedWhenSent.push(storage.data.get(STORAGE_KEYS.childRefreshRequestId) ?? null);
-          return offline
-            ? Promise.reject(new Error('network down'))
-            : Promise.resolve(freshTokens('access-new', 'rotated-new'));
-        },
-      },
-      authedApi: () => ({
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: () => Promise.reject(new Error('unexpected send')),
-      }),
-      now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: (() => {
-        let n = 0;
-        return () => `55555555-0000-4000-8000-00000000005${++n}`;
-      })(),
-    });
-
-    // A parent troubleshooting a child's tablet on a flaky connection: the refresh fails offline and
-    // the logout that follows swallows that same error, then they pair with a different code.
-    await session.logout();
-    expect(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)).toBeNull();
-
-    offline = false;
-    expect(await pair(session)).toMatchObject({ ok: true });
-    session.invalidateAccessToken();
-    expect(await session.accessToken()).toBe('access-new');
-
-    expect(ids).toHaveLength(2);
-    // A new session, a new refresh, a new id.
-    expect(ids[1]).not.toBe(ids[0]);
-    // And the id was in the keychain before the request went out, on this path too, so a process
-    // killed mid-refresh finishes THIS refresh instead of minting a third id for a used token.
-    expect(storedRequestId(storedWhenSent[1] ?? null)?.id).toBe(ids[1]);
-  });
-
-  /**
-   * The other half of the HUNT5-G-1 decision: the write to storage is UNCONDITIONAL, not "only when
-   * the id was minted". The case above mints the id it checks, and the pre-fix code wrote a minted id
-   * too, so nothing in it could tell the two rules apart. This one adopts an id the device already
-   * holds in memory, with nothing in the keychain to adopt it from — reachable because
-   * `setItem` is allowed to fail and the failure is swallowed: expo-secure-store rejects when the
-   * keychain is momentarily unavailable (a locked device, and the child session's items are
-   * WHEN_UNLOCKED_THIS_DEVICE_ONLY, src/lib/secure-storage.ts). Under the conditional write the
-   * refresh then ran to its end with its id in memory alone, which is the state BUG-244 exists to
-   * prevent: one process death and the next cold start mints a NEW id for an already-rotated token,
-   * and the server reads that as theft and revokes the child's session.
-   */
-  it('[repro] an id adopted from memory is in the keychain before the request goes out', async () => {
-    const ids: (string | undefined)[] = [];
-    /** What the keychain held at the moment each refresh request went out. */
-    const storedWhenSent: (string | null)[] = [];
-    const inner = pairedStorage();
-    let keychainRefusesWrites = true;
-    const storage: SecureStorage & { data: Map<string, string> } = {
-      data: inner.data,
-      getItem: (key) => inner.getItem(key),
-      setItem: (key, value) =>
-        keychainRefusesWrites && key === STORAGE_KEYS.childRefreshRequestId
-          ? Promise.reject(new Error('keychain unavailable'))
-          : inner.setItem(key, value),
-      deleteItem: (key) => inner.deleteItem(key),
     };
-    let offline = true;
-    const session = createChildSession({
+    return { publicApi, bodies };
+  }
+
+  function sessionOn(storage: SecureStorage, publicApi: ApiClient) {
+    return createChildSession({
       storage,
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, _path, body) => {
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          storedWhenSent.push(storage.data.get(STORAGE_KEYS.childRefreshRequestId) ?? null);
-          return offline
-            ? Promise.reject(new Error('network down'))
-            : Promise.resolve(freshTokens('access-retried', 'rotated-retried'));
-        },
-      },
+      publicApi,
       authedApi: () => ({
         get: () => Promise.reject(new Error('unexpected GET')),
         send: () => Promise.reject(new Error('unexpected send')),
       }),
       now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: (() => {
-        let n = 0;
-        return () => `12121212-0000-4000-8000-00000000012${++n}`;
-      })(),
     });
+  }
 
-    // The refresh mints its id, the keychain refuses the write, and the request goes out anyway
-    // (failing to note the id must not stop the child's session being refreshed) — and fails.
-    await expect(session.accessToken()).rejects.toThrow('network down');
-    expect(storedWhenSent[0]).toBeNull();
-
-    // The keychain is readable again and the device retries: same refresh, so the id is taken from
-    // memory rather than minted, and this attempt writes it before presenting it.
-    keychainRefusesWrites = false;
-    offline = false;
-    expect(await session.accessToken()).toBe('access-retried');
-    expect(ids).toEqual([
-      '12121212-0000-4000-8000-000000000121',
-      '12121212-0000-4000-8000-000000000121',
-    ]);
-    expect(storedRequestId(storedWhenSent[1] ?? null)?.id).toBe(
-      '12121212-0000-4000-8000-000000000121',
+  it('sends the refresh token alone, and writes no request id to the keychain', async () => {
+    const storage = pairedStorage();
+    const server = rotatingServer(() => false);
+    expect(await sessionOn(storage, server.publicApi).accessToken()).toBe('access-1');
+    expect(server.bodies).toEqual([{ refreshToken: 'stored-refresh-token' }]);
+    // The key the recovery needed is gone from the map every caller reads keys from, so no caller
+    // can write one by name, and the keychain holds only the rotated token and the cached profile.
+    expect(Object.keys(STORAGE_KEYS)).toEqual(['mode', 'childRefreshToken', 'childProfile']);
+    expect([...storage.data.keys()].sort()).toEqual(
+      [STORAGE_KEYS.childProfile, STORAGE_KEYS.childRefreshToken].sort(),
     );
   });
 
-  it('[repro] pairing a new code while a refresh is unfinished starts a new refresh', async () => {
-    // The same leak without a logout in between: an offline refresh leaves its id pending while the
-    // device is still paired, and the parent connects a different code. `pair()` used to reset
-    // nothing, so the next refresh of the NEW session presented the OLD session's id.
-    const ids: (string | undefined)[] = [];
-    let offline = true;
-    const session = createChildSession({
-      storage: pairedStorage(),
-      publicApi: {
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: (_method, path, body) => {
-          if (path === '/v1/child/pair') {
-            return Promise.resolve(freshTokens('access-paired', 'rotated-paired'));
-          }
-          ids.push((body as { refreshRequestId?: string }).refreshRequestId);
-          return offline
-            ? Promise.reject(new Error('network down'))
-            : Promise.resolve(freshTokens('access-second', 'rotated-second'));
-        },
-      },
-      authedApi: () => ({
-        get: () => Promise.reject(new Error('unexpected GET')),
-        send: () => Promise.reject(new Error('unexpected send')),
-      }),
-      now: () => new Date('2026-09-26T12:00:00.000Z'),
-      newRequestId: (() => {
-        let n = 0;
-        return () => `77777777-0000-4000-8000-00000000007${++n}`;
-      })(),
-    });
-
-    await expect(session.accessToken()).rejects.toThrow('network down');
-    offline = false;
-    expect(await pair(session)).toMatchObject({ ok: true });
-    session.invalidateAccessToken();
-    expect(await session.accessToken()).toBe('access-second');
-    expect(ids).toEqual([
-      '77777777-0000-4000-8000-000000000071',
-      '77777777-0000-4000-8000-000000000072',
+  it('[repro] a retry after a lost answer presents the spent token, and the tablet is unpaired', async () => {
+    // The accepted cost of the reversal (BUG-244, open in docs/Bug_Ledger.md): the rotation is
+    // committed before the answer that never arrived, so the token this device still holds is spent.
+    // The retry is an ordinary refresh — no id, no recovery — so the server reads it as reuse and
+    // revokes the session. This case exists so that cost stays visible and cannot be traded away
+    // again for a mechanism that hands a captured request body a renewable child session.
+    const storage = pairedStorage();
+    const server = rotatingServer((attempt) => attempt === 1);
+    const session = sessionOn(storage, server.publicApi);
+    await expect(session.accessToken()).rejects.toMatchObject({ code: 'NETWORK' });
+    // Still paired after the lost answer: the device keeps what it has and tries again.
+    expect(await session.isPaired()).toBe(true);
+    expect(await session.accessToken()).toBeNull();
+    expect(server.bodies).toEqual([
+      { refreshToken: 'stored-refresh-token' },
+      { refreshToken: 'stored-refresh-token' },
     ]);
+    expect(await session.isPaired()).toBe(false);
+    expect(await storage.getItem(STORAGE_KEYS.mode)).toBe('signed_out');
   });
 
-  it('unpairing takes the unfinished refresh with it', async () => {
+  it('unpairing leaves nothing of the child in the keychain', async () => {
     const storage = pairedStorage();
-    storage.data.set(STORAGE_KEYS.childRefreshRequestId, '44444444-0000-4000-8000-000000000041');
+    storage.data.set(STORAGE_KEYS.childProfile, '{"id":"child","nickname":"Riley"}');
     await unpairChildDevice(storage);
-    expect(await storage.getItem(STORAGE_KEYS.childRefreshRequestId)).toBeNull();
+    expect(storage.data.get(STORAGE_KEYS.childRefreshToken)).toBeUndefined();
+    expect(storage.data.get(STORAGE_KEYS.childProfile)).toBeUndefined();
+    expect(await storage.getItem(STORAGE_KEYS.mode)).toBe('signed_out');
+  });
+
+  it('the recovery machinery is gone from the modules, not merely unused', () => {
+    // The fix IS the removal, so the check is that there is nothing left to switch back on: no mint,
+    // no stored-record parser, no keychain mirror, no age bound. The cases above pin what the device
+    // sends; this pins that it has nothing else it could send.
+    const source = readFileSync(join(import.meta.dirname, 'child-session.ts'), 'utf8');
+    expect(source).not.toMatch(
+      /refreshRequestId|newRequestId|parseStoredRequest|REQUEST_ID_MAX_AGE|pendingRequest/,
+    );
+    const mode = readFileSync(join(import.meta.dirname, '..', 'lib', 'mode.ts'), 'utf8');
+    expect(mode).not.toMatch(/childRefreshRequestId|refresh\.rid/);
   });
 });

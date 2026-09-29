@@ -301,8 +301,65 @@ export const CONSENT_WITHDRAWN_SCAN_COPY =
 export const ARCHIVED_CHILD_SCAN_COPY =
   'Checking stopped because this child’s profile was archived, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Earlier scans and their results stay readable. Activate the profile again on the Children page, while a paid slot is free, to scan this worksheet once more.';
 
+/**
+ * G-DRAFT-COPY: the remedy this line ends with is printed WHOLE — `explainStatus` returns a code's own
+ * line untrimmed (apps/web/src/pages/app/HomeworkPage.tsx) — to the parent of the profile that records
+ * CHILD_NOT_ACTIVE: a draft `releaseSlotlessProfiles` demoted, and it demotes only a child whose slot
+ * was released `'expired'` or `'downgrade'` (apps/api/src/services/billing-sync.ts), i.e. after the
+ * family's paid capacity shrank. "Give the profile a paid slot again on the Children page" promised
+ * that page can restore one whatever the capacity; it can only assign a slot the family still has
+ * unused, and this portal cannot sell capacity (WEB-R1-04). Both sibling lines already hedge exactly
+ * that ("while a paid slot is free", "while one is free"), and the same child's other rows print the
+ * hedged wording, so two rows of one list offered the same remedy on different terms. It now names the
+ * action the Children page really offers and keeps the hedge; with no slot free that page says where
+ * one comes from.
+ */
 export const INACTIVE_CHILD_SCAN_COPY =
-  'Checking stopped because this child no longer has a paid slot, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Earlier scans and their results stay readable. Give the profile a paid slot again on the Children page to scan this worksheet once more.';
+  'Checking stopped because this child no longer has a paid slot, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Earlier scans and their results stay readable. Assign one of your family’s unused paid slots to this profile on the Children page, while one is free, and this worksheet can be scanned again then.';
+
+/**
+ * HUNT6-H-2: what to say INSTEAD of "get a new scan" when the outcome's own advice is a new scan and
+ * the child's profile makes one impossible. The two lines above cover the two permanent codes the
+ * archive itself records; these two cover every OTHER outcome on the same screen — `needs_rescan`,
+ * `uploading` and the permanent codes FORMAT_NEEDS_CONVERSION, SCAN_TOO_MANY_QUESTIONS and
+ * AI_PAUSED_TOO_LONG — each of which used to end in "scan again", "send the pages again" or "start a
+ * new one" whatever the profile's state.
+ *
+ * None of those can be acted on for a non-active profile: POST /v1/assignments goes through
+ * `assertCanCollect` → `readPaidProfile`, whose `entitled` requires `status = 'active'` (apps/api/src/
+ * routes/homework.ts), the portal offers no uploader for an archived child, and archiving revokes the
+ * child's sessions so the tablet cannot scan either. Meanwhile the rows stay listed — GET /v1/assignments
+ * drops only a child under an open deletion — so an archived child's history was printed under the
+ * page's own "new scans are not taken" notice while telling the parent to go and get one.
+ *
+ * Both name the Children page, where a slot is assigned and an archived profile activated again, and
+ * neither promises capacity this portal cannot sell (WEB-R1-04). Here rather than in a page so the
+ * portal and the app say the same thing, beside the two lines they replace the advice of.
+ */
+export const ARCHIVED_CHILD_NO_NEW_SCAN_COPY =
+  'A new scan can’t help while this child’s profile is archived: PencilLift takes no new scans for them and their paired devices are signed out. Activate the profile again on the Children page, while a paid slot is free, and these pages can go through then.';
+
+/**
+ * G-DRAFT: `draft` is the only status this line is printed for — the family contract has three
+ * (draft, active, archived) and the archived line above covers the other non-active one — and it
+ * asserts no history of the slot, because a draft has two populations. Adding a child creates an
+ * uncharged draft that becomes active when one of the family's unused slots is assigned to it
+ * (apps/web/src/pages/app/ChildrenPage.tsx), which is why every picker spells such a child "(no paid
+ * slot yet)"; and `releaseSlotlessProfiles` puts a previously ACTIVE child back into 'draft' whenever
+ * verified provider state releases its slot — an expiry or a store-confirmed downgrade
+ * (apps/api/src/services/billing-sync.ts) — which is the commoner case here, since that is also what
+ * makes a scan record CHILD_NOT_ACTIVE.
+ *
+ * G-DRAFT-COPY: so this line may claim neither history. "Give the profile a paid slot AGAIN" asserted
+ * a slot a new draft never had; "a draft has never held a paid slot", which this comment used to
+ * assert, is false of a demoted one, and a line resting on it could tell a family whose plan lapsed
+ * that their child had never been paid for. What is said instead is the present state and the action
+ * the Children page actually offers a draft ("Assign one of your family's unused paid slots"), which
+ * is true of both populations and still promises no capacity this portal cannot sell (WEB-R1-04):
+ * that page says where a slot comes from when none is free.
+ */
+export const INACTIVE_CHILD_NO_NEW_SCAN_COPY =
+  'A new scan can’t help while this child has no paid slot: PencilLift takes no new scans for them. Assign one of your family’s unused paid slots to this profile on the Children page, while one is free, and these pages can go through then.';
 
 /**
  * The two actions a guardian can take on an unresolved flag (portal and app; both need a recent PIN

@@ -1,4 +1,4 @@
-import { useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
 import {
   CHILD_ACTIVATION_RULES,
@@ -78,9 +78,25 @@ export function childPickerSuffix(child: {
   }
 }
 
-/** Status is always spelled out in text, never shown by colour alone. */
-export function childStatusLabel(status: FamilyChild['status']): string {
-  switch (status) {
+/**
+ * Status is always spelled out in text, never shown by colour alone.
+ *
+ * HUNT6-G-2: the flag is tested FIRST, before the status, exactly as `childPickerSuffix` above and
+ * the controls below already test it. `public.request_deletion` archives a child-scope target
+ * (migrations 0600, 0890), so every deletion-pending child is `archived` and this helper used to
+ * print "Archived: history only" — that the history is KEPT — for a child whose history the purge is
+ * deleting, two lines above this page's own notice that it is being deleted. HUNT5-F-2 removed that
+ * sentence from the dashboard row by wrapping the CALL there; the sibling call on this page kept it,
+ * so the branch lives in the one helper both surfaces print from (L-037).
+ */
+export function childStatusLabel(child: {
+  status: FamilyChild['status'];
+  // `| undefined` explicitly: with exactOptionalPropertyTypes a caller's parsed
+  // `deletionPending?: boolean | undefined` is not assignable to a bare optional.
+  deletionPending?: boolean | undefined;
+}): string {
+  if (child.deletionPending === true) return 'Data deletion under way';
+  switch (child.status) {
     case 'draft':
       return 'Draft: not active yet, no charge';
     case 'active':
@@ -192,7 +208,12 @@ function ChildCard({
 }) {
   const { api } = useSession();
   const { busy, feedback, run, setFeedback } = useAction();
-  const [code, setCode] = useState<{ code: string; expiresAt: string } | null>(null);
+  /**
+   * The pairing code this card minted, or 'stale' once the child left the only state that can redeem
+   * it (G-PROSE). The code string itself is dropped when that happens; 'stale' is what remains, so the
+   * parent is told the code is gone rather than left looking for it.
+   */
+  const [code, setCode] = useState<{ code: string; expiresAt: string } | 'stale' | null>(null);
   const [lastAction, setLastAction] = useState<'code' | 'activate' | 'archive' | 'edit' | null>(
     null,
   );
@@ -201,6 +222,32 @@ function ChildCard({
   const titleId = useId();
   /** A child whose data deletion is open is read-only here (API-AUTH-R2-02); see the notice below. */
   const deletionPending = child.deletionPending === true;
+  /** Nothing about this profile can be changed: the edit form and the archive confirmation both go. */
+  const readOnly = child.status === 'archived' || deletionPending;
+  /**
+   * Whether a pairing code this card is holding could still be redeemed. The redeem claim matches
+   * `c.status = 'active'` (apps/api/src/routes/child-auth.ts) and archiving does not consume an
+   * unexpired code, so "active and not being deleted" is exactly the window in which the code works.
+   */
+  const pairingRedeemable = child.status === 'active' && !deletionPending;
+
+  /**
+   * G-PROSE: the one rule every open panel on this card answers to, and it CLEARS the state rather
+   * than leaving it standing behind the notice. HUNT5-F-3 and HUNT6-G-5 each added a render condition,
+   * which is only half of it: this card is keyed on `child.id`, so a reload never remounts it, and a
+   * `confirmArchive` that was merely hidden reopened itself the moment the parent activated the child
+   * again — a confirmation to archive a child they had just brought back, which nobody asked for
+   * twice. The pairing-code panel had no condition at all, so a code minted before the reload stayed
+   * on screen for a child who can no longer redeem it; the parent would have typed it into the device
+   * and been refused.
+   */
+  useEffect(() => {
+    if (readOnly) {
+      setEditing(false);
+      setConfirmArchive(false);
+    }
+    if (!pairingRedeemable) setCode((open) => (open === null ? null : 'stale'));
+  }, [readOnly, pairingRedeemable]);
 
   // Spec P11 / AC_CAPACITY_03: an unused paid slot is assigned without buying again. The server
   // re-checks the slot count, consent and a recent PIN unlock; this never purchases anything.
@@ -305,7 +352,7 @@ function ChildCard({
       <p style={{ margin: '4px 0' }}>
         {gradeLabel(child.gradeLevel)} · ages {child.ageBand}
       </p>
-      <p style={{ margin: '4px 0', fontWeight: 700 }}>Status: {childStatusLabel(child.status)}</p>
+      <p style={{ margin: '4px 0', fontWeight: 700 }}>Status: {childStatusLabel(child)}</p>
       {deletionPending ? (
         // API-AUTH-R2-02: the child stays listed while a deletion is requested or processing, so a
         // parent can still see who it covers, but the server refuses activation, pairing and edits
@@ -314,12 +361,18 @@ function ChildCard({
         // it". There is no cancel: /v1/privacy exposes only POST and GET /deletion, nothing sets
         // deletion_requests.status = 'cancelled', and the privacy page itself says the deletion
         // can't be undone. The notice now says what is true and where a mistake is actually handled.
+        // G-I3-WEB / L-037: and it names the OPEN REQUEST, not the reader. `deletionPending` carries
+        // no requester — GET /v1/family computes it from the request's scope and target and never
+        // exposes deletion_requests.requested_by (apps/api/src/routes/family.ts) — any guardian may
+        // delete a child's data, and a child-scope request leaves every other adult's membership
+        // active, so the family's OTHER adult is served the same flag and was told they had asked for
+        // it. Same sentence as the app (apps/mobile/app/(parent)/children.tsx).
         <p className="notice" style={{ margin: '4px 0' }}>
-          <strong>Data deletion under way.</strong> You asked for {child.nickname}’s data to be
-          deleted. Processing has already stopped, so nothing can be changed, paired or activated
-          for them, and they stay listed here until the deletion finishes. You can follow it on the{' '}
-          <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the app: if you
-          did not mean it, <Link to="/app/support">contact support</Link> straight away.
+          <strong>Data deletion under way.</strong> A deletion request covering {child.nickname}’s
+          data is open. Processing has already stopped, so nothing can be changed, paired or
+          activated for them, and they stay listed here until the deletion finishes. You can follow
+          it on the <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the
+          app: if you did not mean it, <Link to="/app/support">contact support</Link> straight away.
         </p>
       ) : child.status === 'active' ? (
         <div style={buttonRow}>
@@ -381,7 +434,7 @@ function ChildCard({
           )}
         </>
       ) : null}
-      {child.status === 'archived' || deletionPending ? null : (
+      {readOnly ? null : (
         <div style={buttonRow}>
           <button
             type="button"
@@ -416,10 +469,20 @@ function ChildCard({
         archive, another card's action, a reload started elsewhere — closes a form the server would
         refuse to save. `setEditing(false)` in archive() covers this card; this covers the rest.
       */}
-      {editing && child.status !== 'archived' && !deletionPending ? (
+      {editing && !readOnly ? (
         <EditChildForm child={child} busy={busy === 'edit'} onSave={saveProfile} />
       ) : null}
-      {confirmArchive ? (
+      {/*
+        HUNT6-G-5: the same condition, for the same reason. This confirmation is one of the card's three
+        open panels and the button row above hides Edit AND Archive for an archived or deletion-pending
+        child, so without the status it was the one live control left under the notice that says
+        nothing can be changed for them — promising "You can activate them again later" while
+        POST /children/:id/archive answers NOT_FOUND, because `visibleChild` excludes a child under an
+        open deletion (apps/api/src/routes/family.ts). `readOnly` is the same value the edit form and
+        the button row use, and the effect above clears the state behind both panels, so one status
+        change closes every panel on this card — and none of them reopens when the status changes back.
+      */}
+      {confirmArchive && !readOnly ? (
         <div className="notice" role="group" aria-label={`Confirm archiving ${child.nickname}`}>
           <p style={{ margin: '0 0 8px' }}>
             Archive {child.nickname}? Their homework, practice, points and rewards are all kept and
@@ -460,7 +523,37 @@ function ChildCard({
           </p>
         </div>
       ) : null}
-      {code ? (
+      {code === null ? (
+        <ActionFeedback
+          feedback={
+            activationError?.rule === CHILD_ACTIVATION_RULES.consentRequired ? null : feedback
+          }
+          stepUpAction={stepUpAction}
+        />
+      ) : code === 'stale' ? (
+        // G-PROSE: what the parent is told instead of a code the device would refuse. Vanishing in
+        // silence would be its own puzzle — the panel says a code is shown only once — so the reason
+        // and the way back are both named here. A new code is one press away once the profile is
+        // active, and the notice above this one says why it is not.
+        <div className="notice" role="status" style={{ marginTop: 12 }}>
+          <p style={{ margin: '0 0 8px' }}>
+            <strong>That pairing code can’t connect a device any more.</strong> A code is only
+            redeemed for a profile that is active, and {child.nickname}’s is not, so the code was
+            taken off the screen rather than left here to fail on the device. Create a new one if{' '}
+            {child.nickname} is active again — the notice above says whether that is possible.
+          </p>
+          <button
+            type="button"
+            className="btn secondary"
+            onClick={() => {
+              setCode(null);
+              setFeedback(null);
+            }}
+          >
+            Done
+          </button>
+        </div>
+      ) : (
         <PairingCodePanel
           nickname={child.nickname}
           code={code}
@@ -468,13 +561,6 @@ function ChildCard({
             setCode(null);
             setFeedback(null);
           }}
-        />
-      ) : (
-        <ActionFeedback
-          feedback={
-            activationError?.rule === CHILD_ACTIVATION_RULES.consentRequired ? null : feedback
-          }
-          stepUpAction={stepUpAction}
         />
       )}
     </li>
@@ -489,16 +575,19 @@ function ChildCard({
  * WEBR4-03: the body used to carry all three fields every time, which made that promise false —
  * guardian A opening this form while the child was in grade 3, guardian B saving grade 4, then A
  * correcting only the nickname put the grade back to 3 with no warning, and the grade is what
- * practice generation is pitched at. The diff below is against the props the form was seeded with,
- * and the submit button stays disabled while the diff is empty (the contract's refine rejects an
- * empty body anyway).
+ * practice generation is pitched at. What the body carries now is the fields the parent EDITED here,
+ * and the submit button stays disabled until one of them is (the contract's refine rejects an empty
+ * body anyway).
  *
- * HUNT5-F-1: "seeded with" is now true. The diff used to compare the field state (seeded once, at
- * mount) against the LIVE `child` prop, which the page query replaces on every reload — and this
- * card is keyed on `child.id`, so a reload never remounts it. Any sibling action (a child added, a
- * card activated or archived) landed guardian B's grade 4 under the open form, and from that moment
- * the untouched grade select differed from the prop, so a nickname-only save carried grade 3 and
- * reverted the change WEBR4-03 was filed to protect.
+ * That is a diff no longer, and the two fixes behind it are why. HUNT5-F-1: the body used to be a diff
+ * of the field state (seeded once, at mount) against the LIVE `child` prop, which the page query
+ * replaces on every reload — and this card is keyed on `child.id`, so a reload never remounts it. Any
+ * sibling action (a child added, a card activated or archived) landed guardian B's grade 4 under the
+ * open form, and from that moment the untouched grade select differed from the prop, so a nickname-only
+ * save carried grade 3 and reverted the change WEBR4-03 was filed to protect. HUNT6-G-8: diffing
+ * against the SEED instead fixed that and made the value the parent can see unsavable, so `touched`
+ * below replaced the diff altogether. The seed is still read, by `drifted`, for the one job of naming
+ * what another guardian changed since the form opened.
  */
 function EditChildForm({
   child,
@@ -510,26 +599,58 @@ function EditChildForm({
   onSave: (body: UpdateChildProfileRequest) => Promise<boolean>;
 }) {
   /**
-   * The profile this form was opened on, captured once (HUNT5-F-1). Everything below diffs against
-   * this, never against `child`, which the page query refreshes under the open form.
+   * The profile this form was opened on, captured once (HUNT5-F-1). The fields below are seeded from
+   * this and never reseeded, so a reload cannot move them under the parent's hands. What this form
+   * SENDS is decided by `touched` alone (HUNT6-G-8), not by comparing anything. `child` — the live
+   * prop the page query refreshes under the open form — is read in exactly one place, `drifted`, and
+   * only to name what another guardian changed since; it never decides what travels.
    */
   const [seed] = useState(child);
   const [nickname, setNickname] = useState(seed.nickname);
   const [grade, setGrade] = useState(String(seed.gradeLevel));
   const [ageBand, setAgeBand] = useState<AgeBand>(seed.ageBand);
   const [fieldError, setFieldError] = useState<string | null>(null);
+  /**
+   * Which fields the parent has edited in THIS form (HUNT6-G-8). "Edited" is what the request body
+   * and the submit button hang on, instead of "differs from the seed".
+   *
+   * The seed diff was right about what to SEND and wrong about what to OFFER: once the other
+   * guardian's grade landed under the open form, the select kept showing the seeded grade 3, the diff
+   * against that seed was empty for it by construction, and no keystroke could enable Save for the
+   * grade the parent could see. Cancel and reopen reseeds to grade 4 — the opposite of what a parent
+   * correcting the grade is trying to do, and the grade is what practice generation is pitched at.
+   *
+   * An untouched field is still never sent, which is the WEBR4-03/HUNT5-F-1 property, and Save stays
+   * off until something is edited, so reopening the form and pressing it cannot revert anything. No
+   * diff decides any of that any more: `seed` only seeds the fields, and `drifted` below is the one
+   * comparison left in this form — of the live prop against the seed, to say what changed under it.
+   */
+  const [touched, setTouched] = useState({ nickname: false, gradeLevel: false, ageBand: false });
   const nicknameId = useId();
   const gradeId = useId();
   const bandId = useId();
   const errorId = useId();
 
-  /** Only what differs from the profile this form was opened on (WEBR4-03, HUNT5-F-1). */
+  /** Only the fields the parent edited in this form (WEBR4-03, HUNT5-F-1, HUNT6-G-8). */
   const changes = (name: string): UpdateChildProfileRequest => ({
-    ...(name === seed.nickname ? {} : { nickname: name }),
-    ...(Number(grade) === seed.gradeLevel ? {} : { gradeLevel: Number(grade) }),
-    ...(ageBand === seed.ageBand ? {} : { ageBand }),
+    ...(touched.nickname ? { nickname: name } : {}),
+    ...(touched.gradeLevel ? { gradeLevel: Number(grade) } : {}),
+    ...(touched.ageBand ? { ageBand } : {}),
   });
-  const nothingChanged = Object.keys(changes(nickname.trim())).length === 0;
+  const nothingEdited = Object.keys(changes(nickname.trim())).length === 0;
+
+  /**
+   * What another guardian changed while this form was open: the live prop against the seed
+   * (HUNT6-G-8). The card above the form shows the new values and the fields show the old ones;
+   * without this, nothing on screen said the two were about the same child.
+   */
+  const drifted = [
+    ...(child.nickname === seed.nickname ? [] : [`the nickname to “${child.nickname}”`]),
+    ...(child.gradeLevel === seed.gradeLevel
+      ? []
+      : [`the grade to ${gradeLabel(child.gradeLevel)}`]),
+    ...(child.ageBand === seed.ageBand ? [] : [`the age band to ages ${child.ageBand}`]),
+  ];
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -555,6 +676,7 @@ function EditChildForm({
         aria-describedby={fieldError ? errorId : undefined}
         onChange={(e) => {
           setNickname(e.target.value);
+          setTouched((t) => ({ ...t, nickname: true }));
           setFieldError(null);
         }}
       />
@@ -564,7 +686,14 @@ function EditChildForm({
         </p>
       ) : null}
       <label htmlFor={gradeId}>Grade</label>
-      <select id={gradeId} value={grade} onChange={(e) => setGrade(e.target.value)}>
+      <select
+        id={gradeId}
+        value={grade}
+        onChange={(e) => {
+          setGrade(e.target.value);
+          setTouched((t) => ({ ...t, gradeLevel: true }));
+        }}
+      >
         {GRADES.map((g) => (
           <option key={g} value={String(g)}>
             {gradeLabel(g)}
@@ -572,7 +701,14 @@ function EditChildForm({
         ))}
       </select>
       <label htmlFor={bandId}>Age band</label>
-      <select id={bandId} value={ageBand} onChange={(e) => setAgeBand(e.target.value as AgeBand)}>
+      <select
+        id={bandId}
+        value={ageBand}
+        onChange={(e) => {
+          setAgeBand(e.target.value as AgeBand);
+          setTouched((t) => ({ ...t, ageBand: true }));
+        }}
+      >
         {AGE_BAND_OPTIONS.map((band) => (
           <option key={band} value={band}>
             Ages {band}
@@ -582,8 +718,17 @@ function EditChildForm({
       <p style={{ margin: '8px 0 0', fontSize: '0.9rem' }}>
         New practice is built for the grade saved here, so update it when the school year changes.
       </p>
+      {drifted.length > 0 ? (
+        <p className="notice" role="note" style={{ margin: '8px 0 0' }}>
+          <strong>
+            Another guardian changed {drifted.join(' and ')} while this form was open.
+          </strong>{' '}
+          The fields above still show what you opened. Saving sends only the fields you edit here,
+          so their change stays unless you edit that field too.
+        </p>
+      ) : null}
       <div style={buttonRow}>
-        <button type="submit" className="btn" disabled={busy || nothingChanged}>
+        <button type="submit" className="btn" disabled={busy || nothingEdited}>
           {busy ? 'Saving…' : `Save ${child.nickname}’s details`}
         </button>
       </div>

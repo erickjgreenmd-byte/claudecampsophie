@@ -49,22 +49,23 @@ export const childTokenResponseSchema = z.strictObject({
   child: z.strictObject({ id: uuidSchema, nickname: z.string() }),
 });
 
+/**
+ * The device presents its stored refresh token and nothing else. Strict, so an extra field is a 400
+ * rather than an ignored one, which is the point: BUG-244's recovery id — one id per refresh, kept by
+ * the device across its own retries, matched against the id that consumed the token — was REMOVED in
+ * round 6 (HUNT6-A-1) and must not come back by accident. Nothing marked the row a recovery had
+ * served, so a captured request body was served again and again for the whole window, and every
+ * serving handed back a full-lifetime rotating refresh token: the window bounded when a replay could
+ * start, not how long it lasted, and a body read out of a log bought a child's session until the
+ * tablet's own next refresh.
+ *
+ * So BUG-244 is an accepted, documented open defect again: a refresh response lost on the way back
+ * unpairs the tablet, and the parent mints a new pairing code. Reuse of a rotated token is theft with
+ * no exception (apps/api/src/routes/child-auth.ts, tests/auth.test.ts > 'refresh tokens rotate and
+ * reuse revokes the session').
+ */
 export const childRefreshRequestSchema = z.strictObject({
   refreshToken: z.string().min(20).max(200),
-  /**
-   * One id per refresh, kept by the device across its own retries of that refresh (BUG-244).
-   *
-   * Rotation treats a used refresh token presented again as theft, which is right for a replay and
-   * wrong for the tablet's own retry after a response was lost on the way back: one dropped HTTP
-   * response unpaired the device. A time window cannot separate those two cases — inside it a
-   * replayer looks exactly like the rightful holder — so the request identifies itself instead. The
-   * server records the id that consumed each token, and only a re-presentation carrying that exact
-   * id is read as the rightful holder finishing its attempt.
-   *
-   * Optional: a client that sends nothing keeps today's behaviour exactly, so an installed app is
-   * never worse off. A new id on a retry is not a recovery, it is a new refresh.
-   */
-  refreshRequestId: uuidSchema.optional(),
 });
 
 /** POST /v1/adult/pin/reset — only right after an account re-authentication (spec P3 recovery). */

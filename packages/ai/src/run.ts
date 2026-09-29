@@ -10,7 +10,11 @@ import type { z } from 'zod';
 import type { ResponsesClient } from './client.ts';
 import { checkChildDataGate, type ChildDataGateInput } from './gate.ts';
 import type { InputPart, PromptDefinition } from './prompts.ts';
-import { STAGE_MODELS } from './routing.ts';
+import {
+  OUTPUT_TRUNCATED_BUDGET_MULTIPLE,
+  PROPOSED_STAGE_COST_BUDGET_MICROS,
+  STAGE_MODELS,
+} from './routing.ts';
 import { toStrictJsonSchema } from './schemas.ts';
 
 /**
@@ -50,21 +54,20 @@ export type RunStageErrorCode =
    * The provider cut the answer off at `max_output_tokens` (JOBS-R2-02). Not an outage: the same
    * request would be cut off again, so the caller must not treat it as retryable work. The loop
    * already tried once with a raised output budget (see raisedOutputBudget) unless the stage's cost
-   * cap had no room for any raise at all; this code means the work does not fit this stage.
+   * BUDGET had no room for any raise at all; this code means the work does not fit this stage.
    */
   | 'OUTPUT_TRUNCATED'
   | 'OUTPUT_INVALID'
   | 'UNKNOWN_MODEL';
 
 /**
- * The MOST of the stage's output budget a truncated answer is retried with (JOBS-R2-02): once, at up
- * to this multiple of the configured `maxOutputTokens`, and never past what the stage's cost cap
- * still admits — the owner's ceiling is never exceeded to fit a longer answer.
+ * Re-exported from routing.ts, where it sits next to the per-stage caps it is spent against and is
+ * priced by `fullRaiseCeiling` (HUNT6-D-1). Importing it from here keeps every existing caller.
  */
-export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE = 2;
+export { OUTPUT_TRUNCATED_BUDGET_MULTIPLE };
 
 /**
- * The output budget the one truncation retry is sent with: the largest budget the stage's cost cap
+ * The output budget the one truncation retry is sent with: the largest one the stage's cost BUDGET
  * still admits, up to OUTPUT_TRUNCATED_BUDGET_MULTIPLE x the configured one. Null when not even one
  * token more fits, and the stage settles with OUTPUT_TRUNCATED at once.
  *
@@ -76,27 +79,62 @@ export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE = 2;
  * always really attempted when there is room for a bigger answer at all. Monotone in the budget, so
  * a binary search finds the largest admissible one.
  *
- * Whether there is room at all is set by the STAGE'S COST CAP, not by this function. With terra at 2
- * micros per input token and 12 per output token, a retry at x output tokens needs
- * (2E + 48,000) + (2E + 12x) <= maxCostMicros, the first bracket being the cut-off answer metered at
- * the bound it was admitted with; E is inputTokenUpperBound of the request the caller sends, which
- * for extraction is the data envelope PLUS one image part per page (1,516 tokens each), i.e. 4,541
- * tokens for one page and 18,204 for the ten of DEFAULT_HOMEWORK_UPLOAD_LIMITS. At the old
- * 150,000-micro cap no raise fitted from 7 pages up, so HUNT5-C-1 raised both caps to
- * 4E + 144,000 at ten pages = 216,816 micros (see EXTRACTION_GRADING_COST_MICROS in routing.ts),
- * which makes extraction's FULL 2x raise reachable at every page count the product accepts.
+ * Whether there is room at all is set by the STAGE'S COST BUDGET, not by this function and not by the
+ * per-request admission bound: a retry at x output tokens needs
+ * (rateIn x E + rateOut x B) + (rateIn x E + rateOut x x) <= maxStageCostMicros, the first bracket
+ * being the cut-off answer metered at the usage it reported and B the configured budget; E is
+ * inputTokenUpperBound of the request the caller sends. `fullRaiseCeiling` in routing.ts is exactly
+ * that sum at x = OUTPUT_TRUNCATED_BUDGET_MULTIPLE x B and at the stage's FLOOR input, and every
+ * stage that can retry at all has a BUDGET at or above it (HUNT6-D-1, enforced at startup by
+ * `defineStageCostBudgets`; `escalation` has one attempt and is the single named exception), so no
+ * such stage is configured with a raise that is unreachable at every input size. That is a floor
+ * guarantee: above the floor the admissible raise shrinks as E grows, and the numbers differ per stage
+ * because the models do — terra is 2 micros an input token and 12 an output token, astra 10 and 50,
+ * luna 0.2 and 1.2.
  *
- * GRADING is bounded by QUESTIONS, not pages: it sends one data envelope and no image, so its E grows
- * with the questions and answers extraction found. On the same cap the full raise holds to about 85
- * questions of average length and disappears past about 149 — the count moves with question length,
- * since the bound is in bytes. A ten-page worksheet of dense questions can therefore still be cut off
- * in grading with no retry; that gap is measured and named in the cases below rather than claimed to
- * be covered. The parameterised cases in apps/api/tests/jobs-r2.review.test.ts pin extraction over
- * 1..maxPages on its real input and grading over a question sweep on ITS real input (envelope only,
- * no image part), and state where grading's bound bites; lower either cap and they go red.
+ * It is the BUDGET and not `maxCostMicros` because the two are different promises (HUNT6-D-CAP):
+ * `maxCostMicros` is what a single request may cost, and raising it to fit a retry admits bigger
+ * requests — which is exactly how the first attempt at HUNT6-D-1 made LJA-F4 send a personalization
+ * request it exists to refuse.
+ *
+ * Where each stage's bound bites, measured on the request the caller really sends:
+ * - EXTRACTION sends the data envelope PLUS one image part per page (1,516 tokens each), so its bound
+ *   is set by the PAGE count: 4,541 tokens for one page and 18,204 for the ten of
+ *   DEFAULT_HOMEWORK_UPLOAD_LIMITS. At the old 150,000-micro cap no raise fitted from 7 pages up;
+ *   HUNT5-C-1 raised extraction's and grading's cap to 4E + 144,000 at ten pages = 216,816 micros
+ *   (EXTRACTION_GRADING_COST_MICROS), which makes the FULL 2x raise reachable at every page count the
+ *   product accepts.
+ * - GRADING is bounded by QUESTIONS, not pages: one data envelope, no image, so its E grows with the
+ *   questions and answers extraction found. On the same cap the full raise holds to about 85 questions
+ *   of average length and disappears past about 149 — the count moves with question length, since the
+ *   bound is in bytes. A ten-page worksheet of dense questions can therefore still be cut off in
+ *   grading with no retry; that gap is measured and named in the cases below rather than claimed to be
+ *   covered.
+ * - The ASTRA stages (coaching, followup, daily_set, thursday_bundle) were left behind by that round
+ *   and were the worse case, because 3 x 50 x B alone was already past each of their caps: the full
+ *   raise was impossible at ANY input size and daily_set got NO raise at all at an ordinary set of
+ *   eight word problems. HUNT6-D-1 gave all four, and semantic_check, a stage BUDGET at their
+ *   full-raise ceiling (coaching 407,520, followup 240,000, daily_set 483,240, thursday_bundle
+ *   933,600, semantic_check 40,800) while their admission bounds stayed where the owner set them.
+ *
+ * What the cases actually cover. The parameterised cases in apps/api/tests/jobs-r2.review.test.ts call
+ * `runStage` DIRECTLY, on input the case itself builds: extraction over 1..maxPages with real image
+ * parts, grading over a question sweep (envelope only, no image part), and daily_set and coaching on
+ * envelopes hand-written to the same `dataEnvelope` FIELDS AND SIZES learning-jobs.ts and
+ * scan-process.ts send — the shape copied into the test, not the envelope those jobs produce. So they
+ * pin the raise at input bounds of the right ORDER, and NOT that the production job still builds an
+ * envelope that size: change what learning-jobs.ts puts in the envelope and those cases stay green.
+ * The daily_set envelope IS driven through production, by `personalizeItems` itself, in
+ * apps/api/tests/learning-jobs.test.ts > 'the personalization hold reserves the stage BUDGET the
+ * raised retry can spend (F-HOLD)', which takes the raised retry on the real envelope and weighs the
+ * whole stage against the hold. packages/ai/src/run-truncation.test.ts pins every stage's BUDGET
+ * against `fullRaiseCeiling`, that its admission cap was not widened to get there, and that a caller
+ * may not hand in a cap above the budget. Lower any of those numbers and they go red.
  */
 function raisedOutputBudget(args: {
   readonly limits: StageLimits;
+  /** The budget for the stage as a whole (routing.ts), which is what the retry is weighed against. */
+  readonly maxStageCostMicros: number;
   readonly rates: Parameters<typeof computeOperationCostMicros>[0];
   readonly modelId: string;
   readonly inputTokens: number;
@@ -110,11 +148,16 @@ function raisedOutputBudget(args: {
       maxOutputTokens,
     });
     if (!estimate.ok) return false;
-    return canAttempt(args.limits, {
-      attemptsSoFar: args.attemptsSoFar,
-      spentMicrosSoFar: args.spentMicros,
-      nextEstimateMicros: estimate.value,
-    }).allow;
+    // The same check the loop makes on the next attempt, so a raise this returns is never then
+    // refused at the top of the loop: attempts and cumulative cost against the STAGE BUDGET.
+    return canAttempt(
+      { ...args.limits, maxCostMicros: args.maxStageCostMicros },
+      {
+        attemptsSoFar: args.attemptsSoFar,
+        spentMicrosSoFar: args.spentMicros,
+        nextEstimateMicros: estimate.value,
+      },
+    ).allow;
   };
   let low = args.limits.maxOutputTokens + 1;
   let high = args.limits.maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE;
@@ -148,6 +191,18 @@ export interface RunStageInput<S extends z.ZodType> {
   readonly input: readonly InputPart[];
   readonly client: ResponsesClient;
   readonly limits: StageLimits;
+  /**
+   * The budget for the stage AS A WHOLE, in integer micro-USD (HUNT6-D-CAP): the cumulative metered
+   * cost of every attempt, including the one raised retry. Defaults to the stage's recorded budget,
+   * `PROPOSED_STAGE_COST_BUDGET_MICROS[prompt.stage]`, which is what every production caller wants;
+   * pass it only to weigh the stage against a different budget (the cases that sweep it). It NEVER
+   * widens admission: `limits.maxCostMicros` alone decides whether the first request is sent.
+   *
+   * It may never be BELOW `limits.maxCostMicros` either, however it was resolved: a stage whose
+   * single admitted request may cost more than the stage as a whole is a contradiction, and runStage
+   * throws a RangeError for it instead of quietly weighing the retry against the smaller of the two.
+   */
+  readonly maxStageCostMicros?: number;
   readonly rates: Parameters<typeof computeOperationCostMicros>[0];
   readonly gate: Omit<ChildDataGateInput, 'providerIsMock'>;
   readonly metadata: Readonly<Record<string, string>>;
@@ -168,6 +223,22 @@ export async function runStage<S extends z.ZodType>(
 ): Promise<RunStageOutput<z.infer<S>>> {
   const { prompt, client, limits, rates } = options;
   const attempts: AttemptRecord[] = [];
+  // The admission cap and the stage budget are resolved from two independent places (the caller's
+  // `limits`, the budget table or the caller's override), so nothing but this check stops a caller
+  // handing in a `limits.maxCostMicros` ABOVE the budget the retry is weighed against: attempt 1
+  // would be admitted at a price the stage as a whole may not pay, and every later attempt then
+  // silently weighed against the smaller number — the caller getting neither bound it asked for. That
+  // pair is a configuration error, so it is LOUD, in the same fail-closed style as
+  // `defineStageLimits` and `defineStageCostBudgets` in routing.ts, and it is raised before the gate,
+  // the provider and any spend. `PROPOSED_STAGE_COST_BUDGET_MICROS` is validated at import to sit at
+  // or above every stage's cap, so no production caller can reach it.
+  const maxStageCostMicros =
+    options.maxStageCostMicros ?? PROPOSED_STAGE_COST_BUDGET_MICROS[prompt.stage];
+  if (limits.maxCostMicros > maxStageCostMicros) {
+    throw new RangeError(
+      `${prompt.stage}: per-request admission cap ${limits.maxCostMicros} is above the stage budget ${maxStageCostMicros}`,
+    );
+  }
   const gate = checkChildDataGate({ ...options.gate, providerIsMock: client.isMock });
   if (!gate.ok)
     return {
@@ -181,7 +252,7 @@ export async function runStage<S extends z.ZodType>(
   let spent = 0;
   let lastError: RunStageErrorCode = 'PROVIDER_FAILED';
   // JOBS-R2-02: the output budget this attempt is sent with. A `max_output_tokens` incomplete raises
-  // it once (never twice, and never past what the stage's cost cap admits, R4-JOBS-1), so the
+  // it once (never twice, and never past what the stage's cost BUDGET admits, R4-JOBS-1), so the
   // identical request is never sent again.
   let maxOutputTokens = limits.maxOutputTokens;
   let budgetRaised = false;
@@ -193,11 +264,20 @@ export async function runStage<S extends z.ZodType>(
       maxOutputTokens,
     });
     if (!estimate.ok) return { result: err('UNKNOWN_MODEL', estimate.error.message), attempts };
-    const decision = canAttempt(limits, {
-      attemptsSoFar: attempt - 1,
-      spentMicrosSoFar: spent,
-      nextEstimateMicros: estimate.value,
-    });
+    // Two numbers, two jobs (HUNT6-D-CAP). ATTEMPT 1 is weighed against `limits.maxCostMicros`, the
+    // per-request ADMISSION bound: a request whose upper bound exceeds it is refused with STAGE_LIMIT
+    // and zero provider calls, which is the oversize guard LJA-F4 pins. Every LATER attempt is
+    // weighed against the budget for the stage as a whole, which is what the one raised retry has to
+    // fit and what the caller's spend hold reserved. `spent` is 0 on attempt 1, so the first check is
+    // exactly the per-request bound and nothing else.
+    const decision = canAttempt(
+      attempt === 1 ? limits : { ...limits, maxCostMicros: maxStageCostMicros },
+      {
+        attemptsSoFar: attempt - 1,
+        spentMicrosSoFar: spent,
+        nextEstimateMicros: estimate.value,
+      },
+    );
     if (!decision.allow) {
       return {
         result: err(attempt === 1 ? 'STAGE_LIMIT' : lastError, `Stage stopped: ${decision.deny}`, {
@@ -273,7 +353,7 @@ export async function runStage<S extends z.ZodType>(
       if (response.reason === 'max_output_tokens') {
         // JOBS-R2-02: the answer did not fit the budget. Re-sending the identical request would be
         // cut off at the same place, so the stage raises the budget once — as far as the stage's
-        // cost cap has room for (R4-JOBS-1) — and, if that answer is cut off too (or there is no
+        // cost BUDGET has room for (R4-JOBS-1) — and, if that answer is cut off too (or there is no
         // room for any raise), ends with its own code. The caller turns that into a parent-facing
         // outcome instead of spending every job attempt on truncated answers.
         lastError = 'OUTPUT_TRUNCATED';
@@ -281,6 +361,7 @@ export async function runStage<S extends z.ZodType>(
           ? null
           : raisedOutputBudget({
               limits,
+              maxStageCostMicros,
               rates,
               modelId,
               inputTokens: options.estimatedInputTokens,

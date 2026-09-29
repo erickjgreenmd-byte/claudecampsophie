@@ -94,6 +94,23 @@ describe('a deletion-pending child on the Children screen (ACC-FAM-03)', () => {
     expect(notice).toMatch(/contact\s+support/i);
   });
 
+  it('[repro] does not tell the reader that THEY asked for the deletion (HUNT6-I-3)', () => {
+    // `deletionPending` carries no requester: GET /v1/family computes it as "a requested/processing
+    // request whose scope is family OR whose target is this child" (apps/api/src/routes/family.ts),
+    // with no reference to the caller, and the response never exposes deletion_requests.requested_by.
+    // Any guardian may delete a child's data (apps/api/src/routes/privacy.ts) and a child-scope
+    // request leaves every other membership active (supabase/migrations/0840_hardening_r1_db.sql), so
+    // the family's OTHER adult is served the same flag — and was told, on the most alarming notice
+    // this screen carries, that they had asked for it. The sentence must be true of any adult who
+    // can see it.
+    const notice = /Data\s+deletion\s+under\s+way\.([\s\S]*?)<\/Notice>/.exec(children)?.[1] ?? '';
+    expect(notice).not.toBe('');
+    expect(notice).not.toMatch(/\byou\s+asked\b/i);
+    expect(notice).not.toMatch(/\byour\s+request\b/i);
+    // And still names the child it covers, which is why the row stays listed at all.
+    expect(notice).toMatch(/\{row\.nickname\}/);
+  });
+
   it('offers no pairing, activation, edit or archive control for that child', () => {
     expect(children).toMatch(/\{deletionPending \? null : row\.canPair \?/);
     expect(children).toMatch(/\{deletionPending \? null : row\.canActivate \?/);

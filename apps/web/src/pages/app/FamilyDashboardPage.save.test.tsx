@@ -171,7 +171,13 @@ describe('[HUNT5-F-1] the family form diffs against the props it was SEEDED with
     await user.click(retry);
     // The read lands: the summary above the open form now reads the new zone. The form's own field
     // still shows what it was seeded with, which is the point — it is not a change the parent made.
-    await waitFor(() => expect(screen.getAllByText(/Europe\/Berlin/).length).toBeGreaterThan(0));
+    //
+    // HUNT6-G-3: this used to synchronise on `getAllByText(/Europe\/Berlin/)`, which cannot fail: the
+    // form's own IANA hint renders <code>Europe/Berlin</code> (FamilyDashboardPage.tsx's zone hint),
+    // so the wait was satisfied by the open form itself and resolved before the retry's GET had
+    // resolved — proved by hanging that GET, which left the whole case green. The summary paragraph
+    // above the form is the ONLY node the reload changes, so it is the one to wait on.
+    expect(await screen.findByText('Time zone: Europe/Berlin')).toBeTruthy();
     expect(screen.getByLabelText(/time zone/i)).toHaveProperty('value', 'America/Chicago');
 
     const name2 = screen.getByLabelText(/family name/i);
@@ -208,5 +214,58 @@ describe('[HUNT5-F-2] the dashboard row of a child under deletion does not claim
     const row = await screen.findByText(/Riley/);
     expect(row.closest('li')!.textContent).toMatch(/data deletion under way/i);
     expect(row.closest('li')!.textContent).not.toMatch(/history only/i);
+  });
+});
+
+describe('[HUNT6-G-8] the zone the form is showing can still be saved after a concurrent change', () => {
+  it('re-enables Save when the parent edits the field back, and names what the other guardian changed', async () => {
+    // The state HUNT5-F-1 left behind: the summary above the form reads Europe/Berlin, the field
+    // reads the America/Chicago this form was opened with, and `nothingChanged` diffed the field
+    // against that seed — so the value the parent can SEE, and wants, could not be saved by any
+    // keystroke: clearing and retyping it left the diff empty and Save greyed out, with nothing on
+    // screen explaining why. Cancel-and-reopen reseeds to Europe/Berlin, which is the opposite of
+    // what the parent is trying to do.
+    const user = userEvent.setup();
+    const moved: FamilyOverview = { ...family, timezone: 'Europe/Berlin' };
+    const { api, sends } = fakeApi({
+      familyByGet: [family, new ApiRequestError('NETWORK', 'Network request failed', 0), moved],
+    });
+    renderPage(<FamilyDashboardPage />, { api });
+    await openForm(user);
+    const name = screen.getByLabelText(/family name/i);
+    await user.clear(name);
+    await user.type(name, 'The Riveras');
+    await user.click(screen.getByRole('button', { name: /^save family details$/i }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    const retry = await screen.findByRole('button', { name: /try again/i });
+
+    await openForm(user);
+    await user.click(retry);
+    expect(await screen.findByText('Time zone: Europe/Berlin')).toBeTruthy();
+
+    // Nothing has been edited in this form, so Save stays off: pressing it would revert the other
+    // guardian's zone, which is the loss HUNT5-F-1 was filed for. What is new is that the form SAYS
+    // what happened, and names the value that landed.
+    expect(screen.getByRole('button', { name: /^save family details$/i })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(
+      screen.getByText(/another guardian changed the time zone to Europe\/Berlin/i),
+    ).toBeTruthy();
+
+    // The parent edits the zone field back to the value it is showing them. That is an explicit
+    // statement about that field, so Save works and sends that field alone.
+    const zone = screen.getByLabelText(/time zone/i);
+    expect(zone).toHaveProperty('value', 'America/Chicago');
+    await user.clear(zone);
+    await user.type(zone, 'America/Chicago');
+    const save = screen.getByRole('button', { name: /^save family details$/i });
+    expect(save).toHaveProperty('disabled', false);
+    await user.click(save);
+    await waitFor(() => expect(sends).toHaveLength(2));
+    // The name was not edited in this reopened form, so it is not sent: only the field the parent
+    // touched travels (WEBR4-03, HUNT5-F-1).
+    expect(sends[1]!.body).toEqual({ timezone: 'America/Chicago' });
   });
 });

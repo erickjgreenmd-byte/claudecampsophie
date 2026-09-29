@@ -32,6 +32,7 @@ import {
   type StandardExportKind,
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
+import type { DeviceSignOutOutcome } from '../lib/mode.ts';
 
 export const PRIVACY_RETENTION_LINES: readonly string[] = [
   `Raw homework photos are deleted after ${PRIVACY_RETENTION.rawScanDays} days by default. Deleting a child or your account removes them sooner.`,
@@ -162,29 +163,103 @@ export type CloseAccountResult =
   | { readonly status: 'error'; readonly message: string };
 
 /**
+ * What the screen tells the parent once the server has closed the sign-in, or recorded that it will,
+ * decided by what this DEVICE managed to do (HUNT6-J-1; L-037, since the portal draws the same
+ * distinction in PrivacyControlsPage).
+ *
+ * `ACCOUNT_CLOSE_COPY.closed` and `.pending` both end "and this device is signed out", which is the
+ * app's own half of the job: the server closed the sign-in, and the app then ends the parent session
+ * and clears the biometric PIN and the store identity. When that second half did not finish, the first
+ * sentence is still true and the second is not — and it is the dangerous half to get wrong, because a
+ * parent who reads it walks away from a device that may still be unlocked.
+ *
+ * The premise this rests on, stated: the observable fact is what the auth service CONFIRMED, not what
+ * state the device is in. supabase-js removes the local session even when the logout call failed, so
+ * an unconfirmed sign-out does not prove the device is still signed in — and it does not prove it is
+ * signed out either, because a session it could not read is a session it leaves alone. So the
+ * unconfirmed copy claims neither: it says the app could not confirm, and names the one action that
+ * is right in both cases. `secretsCleared` is whether both device clears succeeded. Neither fact is
+ * "nothing threw", which is all the previous version could observe.
+ *
+ * No password advice on the `closed` branch (HUNT6-J-3): a completed closure soft-deletes the auth
+ * user — the email is replaced by a hash and every session ends
+ * (apps/api/src/providers/auth-admin.ts) — so there is no sign-in left to change a password for, and
+ * ACCOUNT_CLOSE_COPY.intro says exactly that. `pending` keeps it, because ACCOUNT_CLOSE_COPY.ownerRule
+ * says the parent can still sign in until the family deletion finishes.
+ */
+export function accountClosedDeviceMessage(
+  status: 'closed' | 'pending',
+  device: DeviceSignOutOutcome,
+): string {
+  if (device.sessionEndConfirmed && device.secretsCleared) {
+    return status === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending;
+  }
+  const closure =
+    status === 'closed'
+      ? 'Your PencilLift account is closed.'
+      : 'Your request is recorded, and your sign-in closes automatically once your family account\u2019s deletion has finished.';
+  const thisDevice = device.sessionEndConfirmed
+    ? 'This device is signed out, but we could not remove everything this app had saved for your account. Removing the app removes the rest.'
+    : 'We could not confirm this device is signed out. Sign out from the parent menu before you put it down.';
+  const worry =
+    status === 'pending' ? ' If you are worried, change your password from another device.' : '';
+  return `${closure} ${thisDevice}${worry}`;
+}
+
+/** A step the "Delete my account" flow hands the screen, in the order the screen must take them. */
+export type AccountClosureStep =
+  /** The server refused: a PIN step-up or an error. The screen shows it and stays as it was. */
+  | {
+      readonly kind: 'refused';
+      readonly result: Extract<CloseAccountResult, { status: 'step_up' | 'error' }>;
+    }
+  /** The server closed it. Every control goes NOW, before the device sign-out is even started. */
+  | { readonly kind: 'closing' }
+  /** The operation is over; `message` is what the parent reads. */
+  | { readonly kind: 'closed'; readonly message: string };
+
+/**
+ * The whole "Delete my account" operation, so its ORDER can be run and asserted rather than read out
+ * of the screen (HUNT6-J-2).
+ *
+ * The 'closing' step comes BEFORE the device sign-out, which is three network calls with a 20-second
+ * default timeout each (the server relock, the auth sign-out, the store-identity forget). The screen
+ * used to clear its busy flag as soon as the API answered and set its outcome only after the sign-out,
+ * so for that whole window it looked idle with every control live — including a second "Delete my
+ * account", which a parent who had just seen nothing happen presses, sending a second
+ * POST /v1/account/close that the still-live token and still-recent unlock accept: a second close job
+ * and a second audit row for the same user.
+ */
+export async function runAccountClosure(
+  api: ApiClient,
+  confirmed: boolean,
+  signOutDevice: () => Promise<DeviceSignOutOutcome>,
+  step: (next: AccountClosureStep) => void,
+): Promise<void> {
+  const result = await closeAccountAction(api, confirmed);
+  if (result.status === 'step_up' || result.status === 'error') {
+    step({ kind: 'refused', result });
+    return;
+  }
+  step({ kind: 'closing' });
+  // A sign-out that throws is an outcome, not a dead end: the device sign-out reads and writes the
+  // keychain outside a catch (src/lib/mode.ts), so it CAN reject, and leaving this unhandled would
+  // strand the parent on "Signing this device out…" for ever. Nothing confirmed is exactly what
+  // `DeviceSignOutOutcome` false means, so this maps an unreadable answer onto it rather than hiding
+  // it: the difference from the swallow HUNT6-J-1 is about is that the flag still means what it says.
+  const device = await signOutDevice().catch(() => ({
+    sessionEndConfirmed: false,
+    secretsCleared: false,
+  }));
+  step({ kind: 'closed', message: accountClosedDeviceMessage(result.status, device) });
+}
+
+/**
  * Deletes the parent's own sign-in (POST /v1/account/close). Nothing is sent until the parent has
  * ticked the confirmation; the server needs a recent PIN unlock. A family owner is told to delete
  * the family account first (the server's FAMILY_DELETION_REQUIRED rule); `closed` and `pending`
  * both mean the device must sign out now (the API's signOut flag).
  */
-/**
- * What the screen says when the account really is closed but this DEVICE could not be signed out
- * (HUNT5-N6 / L-037: the portal makes the same distinction, so the two surfaces must not differ).
- *
- * `ACCOUNT_CLOSE_COPY.closed` and `.pending` both end "and this device is signed out", which is the
- * app's own half of the job: the server closed the sign-in, and the app then clears the parent
- * session, the biometric PIN and every adult secret. When that second half fails, the first sentence
- * is still true and the second is not — and it is the dangerous half to get wrong, because a parent
- * who reads it walks away from a device that is still unlocked.
- */
-export function accountClosedStillSignedInMessage(status: 'closed' | 'pending'): string {
-  const closure =
-    status === 'closed'
-      ? 'Your PencilLift account is closed.'
-      : 'Your request is recorded, and your sign-in closes automatically once your family account\u2019s deletion has finished.';
-  return `${closure} We could not sign this device out. Sign out from the parent menu before you put it down, and if you are worried, change your password from another device.`;
-}
-
 export async function closeAccountAction(
   api: ApiClient,
   confirmed: boolean,

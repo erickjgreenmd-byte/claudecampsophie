@@ -94,3 +94,30 @@ describe('stopping a scan the server already took (HUNT4-MOB-5)', () => {
     expect(abortBranch).not.toMatch(/childUploadMessage/);
   });
 });
+
+/**
+ * HUNT6-J-7. `cancelScan` has had no throwing path since HUNT5-H-4: its one statement outside the try
+ * cannot throw, and its catch answers 'unsure' instead of rethrowing (src/homework/upload.test.ts
+ * proves it resolves against an api that rejects every call). The abort path was updated for that and
+ * dropped its handler; the page-change caller kept a `.catch(() => undefined)` that can never run.
+ * Dead error handling reads as live: a reader adding a third caller copies a handler that does nothing,
+ * or takes the abort path's lack of one for an omission.
+ */
+describe('the page-change cancel has no handler for a rejection that cannot happen (HUNT6-J-7)', () => {
+  /** `changePages` on its own, so the abort path's own call is not what is being read. */
+  const changeBranch =
+    /const changePages = useCallback\(([\s\S]*?)\n {2}\}, \[\]\);/.exec(scanScreen)?.[1] ?? '';
+
+  it('[repro] neither caller pretends cancelScan can reject', () => {
+    expect(changeBranch).not.toBe('');
+    expect(changeBranch).toMatch(/void cancelScan\(childApi, previous\);/);
+    // Nowhere in the screen, so the asymmetry the finding is about cannot come back on either side.
+    expect(scanScreen).not.toMatch(/cancelScan\([^)]*\)\s*\.catch/);
+  });
+
+  it('says in one line that cancelScan answers rather than throws', () => {
+    // The asymmetry with the abort path is deliberate — that one acts on the answer, this one cannot,
+    // because the pages have changed and a new scan is the right outcome whatever the server did.
+    expect(changeBranch).toMatch(/answers/i);
+  });
+});

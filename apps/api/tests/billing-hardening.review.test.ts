@@ -90,7 +90,20 @@ function snapshot(
   };
 }
 
-async function stripeInvoicePaid(ref: string, invoiceId: string, startIso: string) {
+async function stripeInvoicePaid(
+  ref: string,
+  invoiceId: string,
+  startIso: string,
+  /**
+   * The taxed variant (HUNT6-C-2): the pre-tax subscription amount and the state's sales tax on top
+   * of it, which is what the family pays and what every Stripe Charge and Dispute figure is stated in.
+   */
+  amounts: { subtotal: number; tax: number; amountPaid: number } = {
+    subtotal: 4998,
+    tax: 0,
+    amountPaid: 4998,
+  },
+) {
   const start = Date.parse(startIso) / 1000;
   const res = await postStripe({
     id: `evt_${randomUUID()}`,
@@ -100,8 +113,9 @@ async function stripeInvoicePaid(ref: string, invoiceId: string, startIso: strin
         id: invoiceId,
         billing_reason: 'subscription_cycle',
         status: 'paid',
-        amount_paid: 4998,
-        subtotal: 4998,
+        amount_paid: amounts.amountPaid,
+        subtotal: amounts.subtotal,
+        tax: amounts.tax,
         currency: 'usd',
         total_discount_amounts: [],
         subscription_details: { metadata: { billing_ref: ref } },
@@ -453,6 +467,63 @@ describe('BILL-R1-1: a won dispute after a partial refund, through the webhook',
     });
     const after = (await revenue()).months[0]!.channels.find((c) => c.channel === 'stripe')!;
     expect(after.netCents).toBe(before.netCents - 1000);
+  });
+
+  it('taxed: refund half the charge, dispute the other half, win it — the refund survives whole', async () => {
+    api.now.value = BASE_NOW;
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const invoiceId = `in_${randomUUID()}`;
+    // $49.98 plus $4.12 of state sales tax: the family paid 5410, the recorded charge is 4998
+    // (BILL-R2-4). Half of what was paid is refunded and the other half disputed, so each figure is
+    // exactly half of a tax-inclusive total — 2705 × 4998 ÷ 5410 = 2499 with no remainder, which is
+    // what keeps this case about the UNIT and not about half-cent rounding.
+    await stripeInvoicePaid(ref, invoiceId, '2026-09-04T00:00:00Z', {
+      subtotal: 4998,
+      tax: 412,
+      amountPaid: 5410,
+    });
+    const before = (await revenue()).months[0]!.channels.find((c) => c.channel === 'stripe')!;
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    const refunded = await postStripe({
+      id: `evt_${randomUUID()}`,
+      type: 'charge.refunded',
+      data: {
+        object: {
+          id: chargeId,
+          object: 'charge',
+          amount: 5410,
+          amount_refunded: 2705,
+          refunded: false,
+          currency: 'usd',
+          payment_intent: `pi_${randomUUID()}`,
+        },
+      },
+    });
+    expect(refunded.status).toBe(200);
+    expect(await periodRow(invoiceId)).toMatchObject({
+      settlement: 'partially_refunded',
+      refunded_cents: 2499,
+    });
+    // The Dispute's amount is a Charge figure too, so it must be restated in the same unit before it
+    // is added: 2499 + 2499 is exactly the recorded charge, so the cap changes nothing.
+    await stripeDispute(invoiceId, 2705);
+    expect(await periodRow(invoiceId)).toMatchObject({
+      settlement: 'chargeback',
+      refunded_cents: 4998,
+    });
+    // HUNT6-C-2: the win gives back what the chargeback added, so the genuine partial refund survives
+    // whole. Before the fix the dispute was added tax-inclusive (2705) and capped at the charge, then
+    // subtracted tax-inclusive, leaving 2293 — 206 cents of the family's refund read as kept revenue.
+    await stripeDispute(invoiceId, 2705, 'won');
+    expect(await periodRow(invoiceId)).toMatchObject({
+      settlement: 'partially_refunded',
+      refunded_cents: 2499,
+    });
+    const after = (await revenue()).months[0]!.channels.find((c) => c.channel === 'stripe')!;
+    expect(after.refundedCents).toBe(before.refundedCents + 2499);
+    expect(after.netCents).toBe(before.netCents - 2499);
   });
 });
 

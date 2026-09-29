@@ -238,11 +238,8 @@ async function auditActions(familyId: string): Promise<string[]> {
   return rows.map((r) => r.action);
 }
 
-const refresh = (refreshToken: string, refreshRequestId?: string) =>
-  api.request('/v1/child/refresh', {
-    method: 'POST',
-    body: refreshRequestId === undefined ? { refreshToken } : { refreshToken, refreshRequestId },
-  });
+const refresh = (refreshToken: string) =>
+  api.request('/v1/child/refresh', { method: 'POST', body: { refreshToken } });
 
 /** The session of the one device this test paired (seedFamily seeds its own 'Test tablet' too). */
 async function sessionRow(
@@ -257,18 +254,18 @@ async function sessionRow(
 }
 
 /**
- * HUNT4-MOB-1 / BUG-244, closed by the recovery below: reuse of a rotated refresh token is still
- * immediate revocation, EXCEPT for the one case the recovery names — a re-presentation that carries
- * the id which consumed the token, within the retry window, while the replacement is unclaimed.
+ * HUNT4-MOB-1 / BUG-244: reuse of a rotated refresh token is immediate revocation, with no exception
+ * of any kind. BUG-244's recovery — which served the tablet's own retry of a lost refresh when the
+ * request carried the id that consumed the token — was removed in round 6 (HUNT6-A-1), so this rule
+ * has no "except" clause again.
  *
- * This case pins the replay that carries NO id, which is every installed client and every replayer
- * who only holds the token: it takes the recovery branch's first condition away, so the session is
- * revoked at once, audited, and the replacement the rotation issued dies with it. That is what
- * tests/auth.test.ts:189 ("refresh tokens rotate and reuse revokes the session") and
- * docs/Threat_Model.md T20 require, and weakening it is a lead decision, not a fixer's.
+ * What it requires is stated by name, never by line number, because a line number rots the next time
+ * a helper is inserted above it and sends the next reviewer into an unrelated test (HUNT6-A-4):
+ * tests/auth.test.ts > 'refresh tokens rotate and reuse revokes the session', and
+ * docs/Threat_Model.md T20. Weakening either is a lead decision, not a fixer's.
  *
- * It is a PIN, not a repro: it passed before the recovery existed and passes after it. The recovery's
- * own cases — including the two replays the id alone would have served — are in the describe below.
+ * It is a PIN, not a repro: it passed before the recovery existed, while it existed, and after its
+ * removal. The cases that DO go red on the removal are in the describe below.
  */
 describe('reuse of a rotated refresh token revokes the session at once', () => {
   it('an immediate replay is revoked and audited, and the rotated replacement dies with it', async () => {
@@ -286,127 +283,125 @@ describe('reuse of a rotated refresh token revokes the session at once', () => {
 });
 
 /**
- * BUG-244, closed: the tablet's own retry of a refresh whose response was lost is served, and every
- * other re-presentation of a rotated token is still theft.
+ * [repro] HUNT6-A-1. The BUG-244 recovery is REMOVED, not repaired: a captured refresh request body
+ * must buy an attacker nothing ONCE THE TOKEN IN IT HAS BEEN ROTATED, which means the request must
+ * carry no recovery id — nothing a capture can present to be taken for the rightful retry. That is
+ * the whole of what the removal restores, and the premise is stated that narrowly on purpose, this
+ * being the reversal of a feature whose recorded residual over-claimed: a body captured BEFORE the
+ * device's own request reaches the server carries a LIVE refresh token, and whoever presents it
+ * first wins. That race predates BUG-244, survives its removal, and is not what is pinned here.
  *
- * The rejected alternative was a time window ALONE, which cannot separate the two cases — inside it a
- * replayer looks exactly like the rightful holder. The request identifies itself instead: one id per
- * refresh, kept by the device across its own retries of that refresh, recorded by the server as the id
- * that consumed the token. A used token presented again WITH that id, within the client retry window
- * the rotation is bounded to, is the same attempt finishing, and it is audited; with another id, none,
- * or after that window, it is theft and the session is revoked as before (HUNT5-A-1).
+ * The recovery never marked the row its id consumed, so the SAME captured body was served for the
+ * whole window, and each serving returned a full-lifetime rotating refresh token that then rotated
+ * down the ordinary path with no id, no window and no audit row: one captured body was a
+ * self-renewing child session until the tablet's own next refresh, which for a tablet put away is
+ * overnight. Against that the feature only avoided an occasional unpairing a parent can undo with a
+ * new pairing code, so BUG-244 goes back to an accepted, documented open defect.
  */
-describe('a refresh whose response was lost is recoverable by its own id (BUG-244)', () => {
-  it('[repro] the same token and the same request id issues tokens instead of revoking', async () => {
-    const device = await pairedDevice('Lost response tablet');
-    const rid = randomUUID();
-    const first = await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
-
-    // The tablet never saw that response. It retries the SAME refresh: same token, same id.
-    const retried = await refresh(device.refreshToken, rid);
-    expect(retried.status).toBe(200);
-    const second = await json<{ refreshToken: string }>(retried);
-    expect(second.refreshToken).not.toBe(first.refreshToken);
-    // The recovery itself is not a theft signal: the session survived it.
-    expect(await auditActions(device.fam.familyId)).not.toContain(
-      'child_session.revoked_token_reuse',
-    );
-    // But it is not silent either (HUNT5-A-1): serving a rotated token is recorded for the family
-    // and for ops, so a replay inside the window is visible instead of living in a log line alone.
-    expect(await auditActions(device.fam.familyId)).toContain('child_session.refresh_recovered');
-    expect((await sessionRow(device.fam.familyId, 'Lost response tablet')).revoked_at).toBeNull();
-    // The token the lost response carried is retired. Only someone who intercepted that response
-    // holds it, so presenting it is a real theft signal and is treated as one.
-    expect((await refresh(first.refreshToken, randomUUID())).status).toBe(401);
-    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
-  });
-
-  it('a second lost response in a row still recovers, through the same id', async () => {
-    const device = await pairedDevice('Twice lost tablet');
-    const rid = randomUUID();
-    await refresh(device.refreshToken, rid);
-    expect((await refresh(device.refreshToken, rid)).status).toBe(200);
-    const third = await refresh(device.refreshToken, rid);
-    expect(third.status).toBe(200);
-    const row = await sessionRow(device.fam.familyId, 'Twice lost tablet');
-    expect(row.revoked_at).toBeNull();
-  });
-
-  it('a replay with a different id is theft, and so is one with no id at all', async () => {
-    const other = await pairedDevice('Different id tablet');
-    await refresh(other.refreshToken, randomUUID());
-    expect((await refresh(other.refreshToken, randomUUID())).status).toBe(401);
-    expect(await auditActions(other.fam.familyId)).toContain('child_session.revoked_token_reuse');
-
-    const none = await pairedDevice('No id tablet');
-    await refresh(none.refreshToken, randomUUID());
-    expect((await refresh(none.refreshToken)).status).toBe(401);
-    expect(await auditActions(none.fam.familyId)).toContain('child_session.revoked_token_reuse');
-  });
-
-  it('once the replacement has been used, even the right id is theft', async () => {
-    const device = await pairedDevice('Claimed replacement tablet');
-    const rid = randomUUID();
-    const rotated = await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
-    // The response did arrive: the tablet used the replacement. A presentation of the old token now
-    // means two parties hold it, whatever id it carries.
-    expect((await refresh(rotated.refreshToken, randomUUID())).status).toBe(200);
-    expect((await refresh(device.refreshToken, rid)).status).toBe(401);
-    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
-  });
-
-  it('a token rotated by a client that sent no id keeps today’s behaviour exactly', async () => {
-    const device = await pairedDevice('Old client tablet');
-    await refresh(device.refreshToken);
-    expect((await refresh(device.refreshToken, randomUUID())).status).toBe(401);
-    expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+describe('the refresh request carries no recovery id at all (BUG-244 reopened, HUNT6-A-1)', () => {
+  it('[repro] a captured refresh body is refused outright, however right the id it carries', async () => {
+    const device = await pairedDevice('Replay chain tablet');
+    // One request body, posted twice: the tablet's own refresh, then a replay of the same body out of
+    // a log, which is the realistic capture vector because logs are read later. Before the reversal
+    // the first posting rotated normally AND recorded this id against the token it consumed, which
+    // is what made the second posting a recovery — served, and served again for the rest of the
+    // window, each serving handing back a rotating refresh token of full lifetime (HUNT6-A-1). The
+    // id is not a field of this request any more, so neither posting reaches the token at all.
+    const captured = { refreshToken: device.refreshToken, refreshRequestId: randomUUID() };
+    const first = await api.request('/v1/child/refresh', { method: 'POST', body: captured });
+    expect(first.status).toBe(400);
+    const again = await api.request('/v1/child/refresh', { method: 'POST', body: captured });
+    expect(again.status).toBe(400);
+    // The refusal is the request contract's, before any token work: nothing rotated and nothing was
+    // served, so the tablet's own token is still the live one.
+    expect((await sessionRow(device.fam.familyId, 'Replay chain tablet')).revoked_at).toBeNull();
+    expect((await refresh(device.refreshToken)).status).toBe(200);
+    // This case USED to also assert that no recovery audit row and no `child_refresh_recovered` log
+    // line were written. Both postings above are refused by readJson's strict contract, so neither
+    // reached the refresh route's token logic and no path that could emit those events ran: the
+    // assertions could not have failed for the reason they existed, whatever the route did (L-054).
+    // They now sit on the case below, whose replay the contract accepts and which therefore executes
+    // the used_at branch the recovery used to live in. The two assertions this case keeps are the
+    // ones a 400 can still get wrong — that the refusal cost the tablet's own token nothing.
   });
 
   /**
-   * HUNT5-A-1. The id says who is asking, not that anything was lost: after a fully successful
-   * refresh the consumed token and its id sit together in one captured request body, and the
-   * replacement stays unclaimed in the tablet's storage for the whole access-token lifetime (900s,
-   * longer while the app is closed). Without a bound on the rotation's age that body stayed a live
-   * child session for that entire interval, and serving it unpaired the tablet on its next refresh.
-   * A client's own retry horizon is seconds, so the recovery is bounded to the retry window and a
-   * later replay is theft again, exactly as before BUG-244.
+   * The rule the reversal restores, stated over the exact state the recovery used to look for: a
+   * rotation seconds old, whose replacement is still unclaimed. Inside the old two-minute window
+   * that state served tokens; it is theft again, as it was before BUG-244. A PIN, not a repro — with
+   * no id in the body the recovery branch could not be reached even while it existed, so this passed
+   * before the removal too. What goes red on a restored id-keyed recovery is the case above.
+   *
+   * This is also where the two "no recovery was served" assertions live, because this request is one
+   * that REACHES the token logic: the body is contract-valid, the row is found, and the used_at
+   * branch — the only place any recovery has ever been served from — runs. So the negatives can fail
+   * for the reason they exist, and a recovery keyed on the WINDOW ALONE (the shape child-auth.ts
+   * names as still rejected, which needs no id in the body) turns them red here.
    */
-  it('[repro] a replay after the retry window is theft, however right the id is', async () => {
-    const device = await pairedDevice('Replayed body tablet');
-    const rid = randomUUID();
-    // Nothing was lost: this response arrived and the tablet holds the token it carried.
-    await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
-
+  it('a rotated token presented seconds later is theft, and its replacement dies with it', async () => {
+    const device = await pairedDevice('Inside window tablet');
+    const rotated = await json<{ refreshToken: string }>(await refresh(device.refreshToken));
     const pinned = api.now.value;
-    // Three minutes later — past any client retry horizon — the same body is posted again.
-    api.now.value = new Date(pinned.getTime() + 3 * 60_000);
+    // Thirty seconds: well inside the retired RECOVERY_WINDOW_MS, and the replacement is unclaimed.
+    api.now.value = new Date(pinned.getTime() + 30_000);
     try {
-      expect((await refresh(device.refreshToken, rid)).status).toBe(401);
+      expect((await refresh(device.refreshToken)).status).toBe(401);
     } finally {
       api.now.value = pinned;
     }
+    expect((await sessionRow(device.fam.familyId, 'Inside window tablet')).revoke_reason).toBe(
+      'refresh_token_reuse',
+    );
     expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
-    expect((await sessionRow(device.fam.familyId, 'Replayed body tablet')).revoke_reason).toBe(
+    expect(await auditActions(device.fam.familyId)).not.toContain(
+      'child_session.refresh_recovered',
+    );
+    // Nor the log line: the audit row and the info log were the whole compensating control the
+    // threat model credited for BUG-244's residual, and neither reached a reader (HUNT6-A-2). With
+    // no recovery there is nothing to report, so both went rather than gaining an ops surface.
+    expect(api.logs.map((l) => l.event)).not.toContain('child_refresh_recovered');
+    // No chain survives the revocation: the token the rotation handed out is dead too.
+    expect((await refresh(rotated.refreshToken)).status).toBe(401);
+  });
+
+  /**
+   * There is no window of any length. The recovery had a two-minute one and a replay outside it was
+   * theft (the round-5 case this replaces); with the recovery gone, the delay is not a variable of
+   * the answer at all, so the same replay is refused at three minutes exactly as at thirty seconds.
+   */
+  it('a replay long after the rotation is theft on the same terms', async () => {
+    const device = await pairedDevice('Outside window tablet');
+    await json<{ refreshToken: string }>(await refresh(device.refreshToken));
+    const pinned = api.now.value;
+    api.now.value = new Date(pinned.getTime() + 3 * 60_000);
+    try {
+      expect((await refresh(device.refreshToken)).status).toBe(401);
+    } finally {
+      api.now.value = pinned;
+    }
+    expect((await sessionRow(device.fam.familyId, 'Outside window tablet')).revoke_reason).toBe(
       'refresh_token_reuse',
     );
   });
 
   /**
-   * HUNT5-A-2. Retiring the replacement must end its lineage, not hand out a second recovery key:
-   * whoever intercepted the lost response holds that token and saw the id in the same exchange, so
-   * if the retired row keeps the id it satisfies the recovery predicate in its own right.
+   * A token two rotations old, whose replacement the tablet really did use. The recovery refused this
+   * case on the ground that the replacement was claimed (its round-5 case, 'once the replacement has
+   * been used, even the right id is theft'); it is refused now because a rotated token is refused,
+   * and the session the tablet is actually using ends with it.
    */
-  it('[repro] the retired replacement is not a recovery key of its own', async () => {
-    const device = await pairedDevice('Intercepted tablet');
-    const rid = randomUUID();
-    const lost = await json<{ refreshToken: string }>(await refresh(device.refreshToken, rid));
-    // The tablet never saw that response and recovers; lost.refreshToken is retired.
-    expect((await refresh(device.refreshToken, rid)).status).toBe(200);
+  it('a token the tablet has already rotated past ends the session it is using', async () => {
+    const device = await pairedDevice('Claimed replacement tablet');
+    const second = await json<{ refreshToken: string }>(await refresh(device.refreshToken));
+    const third = await json<{ refreshToken: string }>(await refresh(second.refreshToken));
 
-    // Only an interceptor of the lost response holds that token: presenting it is theft whatever
-    // id it carries, including the id of the exchange it was captured from.
-    expect((await refresh(lost.refreshToken, rid)).status).toBe(401);
+    expect((await refresh(device.refreshToken)).status).toBe(401);
     expect(await auditActions(device.fam.familyId)).toContain('child_session.revoked_token_reuse');
+    // The live token the tablet is holding is dead too: the whole session went, not one token.
+    expect((await refresh(third.refreshToken)).status).toBe(401);
+    expect(
+      (await sessionRow(device.fam.familyId, 'Claimed replacement tablet')).revoke_reason,
+    ).toBe('refresh_token_reuse');
   });
 });
 

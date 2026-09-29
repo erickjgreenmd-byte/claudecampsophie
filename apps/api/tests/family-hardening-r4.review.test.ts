@@ -344,28 +344,62 @@ describe('FL-R4-04 a profile edit under an open deletion says why', () => {
 describe('HUNT5-B-7 GET /v1/family’s rationale for a deletion-pending child', () => {
   const ROOT = resolve(__dirname, '../../..');
 
+  /** Every `.ts` under a directory, recursively. No node_modules lives under apps/api/src. */
+  function tsFiles(dir: string): string[] {
+    const found: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) found.push(...tsFiles(full));
+      else if (entry.name.endsWith('.ts')) found.push(full);
+    }
+    return found;
+  }
+
   it('does not justify the listing by a cancellation the product does not offer', () => {
     const family = readFileSync(join(ROOT, 'apps/api/src/routes/family.ts'), 'utf8');
     expect(family).not.toMatch(/cancellab|cancel the request/i);
   });
 
-  it('and no surface cancels a deletion request, which is why', () => {
-    // Every `update public.deletion_requests ... set status` in the schema, statement by statement.
-    const dir = join(ROOT, 'supabase/migrations');
+  it('and no statement in any migration or API source, and no route in any router, cancels one', () => {
+    // HUNT6-B-6: the sources this searched were supabase/migrations for the lowercase literal
+    // `update public.deletion_requests`, and privacy.ts for two route regexes. A cancel written in
+    // TypeScript, spelled `UPDATE`, wrapped after `update`, or registered in account.ts (which
+    // already owns account closure), support.ts or family.ts left both assertions green while
+    // family.ts's rationale silently became untrue again — the regression BUG-259 exists to prevent.
+    // So: every migration AND every .ts under apps/api/src, normalised to lowercase with runs of
+    // whitespace collapsed so case and line wrapping cannot hide a statement.
+    const migrations = join(ROOT, 'supabase/migrations');
+    const sources = [
+      ...readdirSync(migrations)
+        .filter((n) => n.endsWith('.sql'))
+        .map((n) => join(migrations, n)),
+      ...tsFiles(join(ROOT, 'apps/api/src')),
+    ];
     const updates: string[] = [];
-    for (const name of readdirSync(dir).filter((n) => n.endsWith('.sql'))) {
-      const sql = readFileSync(join(dir, name), 'utf8');
-      for (let at = sql.indexOf('update public.deletion_requests'); at !== -1;) {
-        const end = sql.indexOf(';', at);
-        updates.push(sql.slice(at, end === -1 ? sql.length : end));
-        at = sql.indexOf('update public.deletion_requests', at + 1);
+    for (const file of sources) {
+      const text = readFileSync(file, 'utf8').toLowerCase().replace(/\s+/g, ' ');
+      for (let at = text.indexOf('update public.deletion_requests'); at !== -1;) {
+        const end = text.indexOf(';', at);
+        updates.push(
+          `${file.slice(ROOT.length + 1)}: ${text.slice(at, end === -1 ? text.length : end)}`,
+        );
+        at = text.indexOf('update public.deletion_requests', at + 1);
       }
     }
+    // The scan cannot pass by finding nothing: the purge paths do write this table (0620, 0710, 0820).
     expect(updates.length).toBeGreaterThan(0);
-    expect(updates.filter((s) => s.includes("'cancelled'"))).toEqual([]);
-    // And no route offers one: the deletion surface is POST and GET only.
-    const privacy = readFileSync(join(ROOT, 'apps/api/src/routes/privacy.ts'), 'utf8');
-    expect(privacy).not.toMatch(/r\.(delete|patch)\('\/deletion/);
-    expect(privacy).not.toMatch(/'\/deletion\/[^']*cancel/);
+    expect(updates.filter((u) => u.includes("'cancelled'"))).toEqual([]);
+
+    // And no router offers one. Every HTTP registration whose path names deletion, in every router
+    // file — the whole surface, whitelisted, so a cancel cannot be added under a method or a path
+    // this test did not think of either.
+    const registrations: string[] = [];
+    for (const file of tsFiles(join(ROOT, 'apps/api/src/routes'))) {
+      const text = readFileSync(file, 'utf8');
+      for (const m of text.matchAll(/\.(get|post|put|patch|delete)\(\s*'([^']*deletion[^']*)'/gi)) {
+        registrations.push(`${m[1]!.toUpperCase()} ${m[2]!}`);
+      }
+    }
+    expect([...registrations].sort()).toEqual(['GET /deletion', 'POST /deletion']);
   });
 });

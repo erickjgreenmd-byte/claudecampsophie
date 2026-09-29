@@ -202,6 +202,19 @@ describe('[ACC-FAM-03] a child whose data deletion is under way is listed, label
     renderPage(<ChildrenPage />, { api });
     const riley = await card('Riley');
     expect(riley.textContent).toMatch(/data deletion under way/i);
+    // HUNT6-G-2: the bold status line is the card's only sentence about what happens to this child's
+    // history, and "Archived: history only" says it is kept while the purge is deleting it — the
+    // exact sentence HUNT5-F-2 removed from the dashboard row, two lines above this card's own
+    // notice that the data is being deleted. `request_deletion` archives a child-scope target
+    // (migration 0890/0600), so EVERY deletion-pending child reaches it.
+    expect(riley.textContent).not.toMatch(/history only/i);
+    expect(riley.textContent).toMatch(/Status: Data deletion under way/);
+    // G-I3-WEB / L-037: and the notice must not tell whoever is reading it that THEY asked. Any
+    // guardian may delete a child's data, a child-scope request leaves the other adult's membership
+    // active, and GET /v1/family never exposes deletion_requests.requested_by — so the same flag is
+    // served to the adult who did not ask (apps/api/src/routes/family.ts).
+    expect(riley.textContent).not.toMatch(/\byou asked\b/i);
+    expect(riley.textContent).toMatch(/deletion request covering Riley’s data is open/i);
     for (const name of [/archive/i, /edit/i, /pairing code/i, /paid slot/i]) {
       expect(within(riley).queryByRole('button', { name })).toBeNull();
     }
@@ -233,6 +246,9 @@ describe('[ACC-FAM-03] a child whose data deletion is under way is listed, label
     renderPage(<ChildrenPage />, { api });
     const riley = await card('Riley');
     expect(riley.textContent).toMatch(/data deletion under way/i);
+    // HUNT6-G-2: and the status line must not say the slot is still in use either — the flag, not
+    // the status, decides this sentence, exactly as it decides the controls below it.
+    expect(riley.textContent).not.toMatch(/uses a paid slot/i);
     for (const name of [/archive/i, /edit/i, /pairing code/i]) {
       expect(within(riley).queryByRole('button', { name })).toBeNull();
     }

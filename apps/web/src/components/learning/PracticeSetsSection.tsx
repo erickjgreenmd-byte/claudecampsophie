@@ -76,7 +76,9 @@ const FILTERS: readonly { value: KindFilter; label: string }[] = [
  * listed on the Privacy page when ready.
  *
  * HUNT5-F-10: `childStatus` is the profile's status as GET /v1/family reports it ('active', 'draft'
- * or 'archived'; the planner types it as a plain string, so an unknown value is treated as live). It
+ * or 'archived'; the planner types it as a plain string, so a value this page does not recognise is
+ * treated as NOT active and gets the conditional — fail-closed — while omitting the prop altogether
+ * keeps the live promise, see the last sentence of this comment). It
  * is read for exactly one sentence, the per-set release line, and the test is "is this profile
  * ACTIVE?", not "is it archived?" — a draft cannot open a set either. An archived profile's sets stay listed
  * — that history is what BUG-070 made readable — and their release instants stay printed, because the
@@ -86,6 +88,12 @@ const FILTERS: readonly { value: KindFilter; label: string }[] = [
  * all, whatever its release instant, and the API refuses every write with CHILD_ARCHIVED. So the
  * instant is kept and re-worded as the notice's conditional. Omitting the prop keeps the live
  * behaviour, so a caller that has no status shows what it always showed.
+ *
+ * HUNT6-H-3: those two sentences used to read "an unknown value is treated as live", which is the
+ * opposite of what the condition does — a status string other than 'active' takes the conditional
+ * branch, and only `undefined` takes the promise. The code's behaviour is the one worth keeping
+ * (a promise to a child must not be made on a guess), so the prose says it (L-053), and
+ * ArchivedChildSections.test.tsx pins the unrecognised-status case so it cannot drift again.
  */
 export function PracticeSetsSection({
   childId,
@@ -360,8 +368,10 @@ function SetCard({
           for its paid slot — the first shipped fix tested only 'archived' and left the draft promising.
           The set stays listed and the instant stays printed, under the same conditional framing the
           planner's notice gives everything below it; only the promise becomes a hypothetical. A
-          hypothetical time under that heading is honest, a promise to the child is not. An unknown
-          status is treated as live, so an unwired caller loses nothing. */}
+          hypothetical time under that heading is honest, a promise to the child is not. A status this
+          page does not recognise is treated as NOT active and gets the conditional too (HUNT6-H-3);
+          it is a caller that passes NO status that keeps the promise, so an unwired caller loses
+          nothing. */}
       {set.releaseAt === null ? null : childStatus !== undefined && childStatus !== 'active' ? (
         <p style={hintStyle}>
           Would open for {childName} from {formatInZone(set.releaseAt, zone)} once the profile is

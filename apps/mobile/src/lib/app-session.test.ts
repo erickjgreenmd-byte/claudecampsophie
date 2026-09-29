@@ -23,6 +23,8 @@ const fake = vi.hoisted(() => ({
   cacheClears: 0,
   unlockScreens: 0,
   storeForgets: 0,
+  /** Every screen-privacy change the session layer made, in order (MOB-R2-05, HUNT6-I-4). */
+  privacy: [] as boolean[],
   appStateListener: null as null | ((next: string) => void),
 }));
 
@@ -49,7 +51,10 @@ vi.mock('../family/runtime.ts', () => ({
     },
     resetNavigationToChildHome: () => undefined,
     resetNavigationToWelcome: () => undefined,
-    setScreenPrivacy: () => Promise.resolve(),
+    setScreenPrivacy: (enabled: boolean) => {
+      fake.privacy.push(enabled);
+      return Promise.resolve();
+    },
   },
 }));
 vi.mock('../billing/revenuecat.ts', () => ({
@@ -93,6 +98,7 @@ afterEach(() => {
   fake.cacheClears = 0;
   fake.unlockScreens = 0;
   fake.storeForgets = 0;
+  fake.privacy = [];
   forgetParentUnlock();
 });
 
@@ -242,6 +248,54 @@ describe('leaving the app locks the parent area on the device too (MOB-R2-01)', 
       // The session ends elsewhere; nothing about this device changed otherwise.
       fake.onAuthChange?.(false);
       expect(parentUnlockActive(NOW)).toBe(false);
+    } finally {
+      stop();
+    }
+  });
+
+  /**
+   * HUNT6-I-4. BUG-287 gave the lock's paired branch a `setScreenPrivacy(false)`, because the child's
+   * space must allow screenshots, recording and casting. Its other caller is this backgrounding
+   * handler, so adult protection was removed at the one instant it exists for — the transition the OS
+   * snapshots for the app-switcher card — while the adult screen was still the last painted frame:
+   * resetNavigationToChildHome is a JS router.replace, which cannot paint while the app is suspended.
+   */
+  it('[repro] backgrounding a paired tablet keeps adult screen privacy on until the app is active', async () => {
+    const stop = initAppSession();
+    try {
+      fake.keychain.set(STORAGE_KEYS.childRefreshToken, 'child-refresh-mock');
+      await unlocked();
+      fake.appStateListener?.('background');
+      await settle();
+      // Locked, returned to the child's space — and still protected, because the frame on screen is
+      // the parent one and a screenshot from the app switcher would capture it.
+      expect(parentUnlockActive(NOW)).toBe(false);
+      expect(fake.keychain.get(STORAGE_KEYS.mode)).toBe('child');
+      expect(fake.privacy).toEqual([]);
+      // The child's space is owed the change and gets it the moment the app is in the foreground,
+      // which is the first moment the child home is what anyone can see.
+      fake.appStateListener?.('active');
+      await settle();
+      expect(fake.privacy).toEqual([false]);
+      // And only once: the debt is settled, not re-applied on every foreground.
+      fake.appStateListener?.('active');
+      await settle();
+      expect(fake.privacy).toEqual([false]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('a parent-only device is never asked to drop adult privacy at all', async () => {
+    const stop = initAppSession();
+    try {
+      await unlocked();
+      fake.appStateListener?.('background');
+      await settle();
+      fake.appStateListener?.('active');
+      await settle();
+      expect(fake.privacy).toEqual([]);
+      expect(fake.unlockScreens).toBe(1);
     } finally {
       stop();
     }

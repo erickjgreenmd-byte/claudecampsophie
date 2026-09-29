@@ -42,6 +42,13 @@ const client =
 
 export type SignInResult = { ok: true } | { ok: false; message: string };
 
+/**
+ * What ending this device's session did. The same shape as SignInResult, and deliberately not the
+ * same type: a sign-out failure is reported to decide what the screen may CLAIM about the device
+ * (HUNT6-J-1), not to offer the parent a retry.
+ */
+export type SignOutResult = { ok: true } | { ok: false; message: string };
+
 const OFFLINE_MESSAGE =
   'We couldn’t reach PencilLift. You may be offline — check your connection and try again.';
 const RATE_LIMIT_MESSAGE = 'Too many tries. Please wait a minute, then try again.';
@@ -107,9 +114,22 @@ export const parentAuth = {
    * Ends the session on THIS device only (WEB-R2-02). Signing out of the phone must not silently
    * end the parent's web portal session, so the scope is 'local' rather than Supabase's default
    * 'global'. Ending every session is the portal's own "sign out everywhere".
+   *
+   * It REPORTS what happened (HUNT6-J-1). supabase-js does not throw for a refused or failed
+   * sign-out; it returns the failure in `{ error }`, and when the logout call failed it does not
+   * remove the local session either — so dropping that `error` left a device still holding the
+   * parent's session with nothing in the app able to tell. `ok: false` means this device may still be
+   * signed in. Callers must still not let a failure stop the rest of their sign-out.
    */
-  async signOut(): Promise<void> {
-    await client?.auth.signOut({ scope: 'local' });
+  async signOut(): Promise<SignOutResult> {
+    // Not configured: there is no session on this device to end, so nothing failed.
+    if (!client) return { ok: true };
+    try {
+      const { error } = await client.auth.signOut({ scope: 'local' });
+      return error ? { ok: false, message: signInErrorMessage(error) } : { ok: true };
+    } catch (error) {
+      return { ok: false, message: thrownAuthMessage(error) };
+    }
   },
 
   async email(): Promise<string | null> {

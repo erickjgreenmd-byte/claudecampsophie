@@ -72,6 +72,12 @@ function RewardApprovals({ api }: { api: ApiClient }) {
   }, [api]);
 
   useEffect(() => {
+    // The rows go BEFORE the fetch, not when it answers (HUNT6-I-2). This effect runs on mount and
+    // whenever `load` changes identity, which for this screen means a new client — and the parent gate
+    // publishes a new client when the adult at the device has changed, so leaving the previous
+    // adult's balances and requests up until the new fetch settled showed them to the next parent for
+    // the length of one request. A manual Refresh does not come through here; it has its own spinner.
+    setState({ status: 'loading' });
     void load();
   }, [load]);
 

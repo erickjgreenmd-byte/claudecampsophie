@@ -42,6 +42,17 @@ const AAL1_OK = { data: { currentLevel: 'aal1' }, error: null };
 const AAL2_OK = { data: { currentLevel: 'aal2' }, error: null };
 /** Exactly what auth-js resolves with when the lookup could not be made (offline, outage). */
 const FETCH_FAILED = { data: null, error: { message: 'Failed to fetch' } };
+/**
+ * HUNT6-F-2: the OTHER way auth-js says it could not read the level, and the only one it uses for a
+ * session whose access token carries no `aal` claim (a project with a custom access-token hook, a
+ * token minted before `aal` was standard) or for no session at all: `error` is null and `data` is
+ * present, with `currentLevel: null`. GoTrueClient 2.116.0's no-jwt branch returns exactly this
+ * object. A guard that only looked at `error` and `data` never saw it.
+ */
+const AAL_UNREADABLE = {
+  data: { currentLevel: null, nextLevel: null, currentAuthenticationMethods: [] },
+  error: null,
+};
 const NO_FACTORS = { data: { totp: [] }, error: null };
 const VERIFIED_FACTOR = {
   data: { totp: [{ id: 'synthetic-factor', status: 'verified' }] },
@@ -186,6 +197,42 @@ describe('WEBR5-E-1 a failed two-step lookup never offers a fresh enrollment', (
     });
     expect(enroll).not.toHaveBeenCalled();
     expect(await screen.findByText(/Verified\./)).toBeTruthy();
+  });
+
+  /**
+   * HUNT6-F-2: the level is unreadable in the shape auth-js really uses for it — `{ data: {
+   * currentLevel: null }, error: null }` — beside a factor list that answered. Spending that as
+   * 'aal1' is the same loss WEBR5-E-1 closed for the factor list: the page believes it knows the
+   * session is at aal1 and carries on from a level nothing read.
+   */
+  it('refuses, and offers no setup, when the level came back unreadable beside a real factor', async () => {
+    const { enroll, challengeAndVerify } = pageOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL_UNREADABLE),
+      listFactors: () => Promise.resolve(VERIFIED_FACTOR),
+    });
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(
+      /could not check your two-step verification/i,
+    );
+    expect(screen.queryByRole('button', START_SETUP)).toBeNull();
+    // Nor the code form: a level nobody could read is not a licence to challenge the factor either.
+    expect(screen.queryByLabelText('6-digit code')).toBeNull();
+    expect(enroll).not.toHaveBeenCalled();
+    expect(challengeAndVerify).not.toHaveBeenCalled();
+  });
+
+  it('refuses, and offers no setup, when the level came back unreadable and there is no factor', async () => {
+    const { enroll } = pageOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL_UNREADABLE),
+      listFactors: () => Promise.resolve(NO_FACTORS),
+    });
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(
+      /could not check your two-step verification/i,
+    );
+    // The account may already hold a factor this unreadable session cannot rule out.
+    expect(screen.queryByRole('button', START_SETUP)).toBeNull();
+    expect(enroll).not.toHaveBeenCalled();
   });
 
   it('says two-step is already active for an aal2 session, and offers no setup', async () => {

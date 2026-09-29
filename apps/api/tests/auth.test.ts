@@ -206,6 +206,14 @@ describe('child pairing and sessions (AC_ACCESS_04, AC_ACCESS_06, AC_ACCESS_08)'
     ).toBe(401);
   });
 
+  /**
+   * The rule the rest of the tree cites by name for child refresh (HUNT6-A-4 asks for the name, not a
+   * line number, because a helper inserted above this moves it). Reuse of a rotated token is theft
+   * with NO exception: BUG-244's recovery, which served the tablet's own retry when the request
+   * carried the id that consumed the token, was removed in round 6 (HUNT6-A-1), so the exception
+   * clause this case once had to tolerate is gone. tests/mobile-r2.review.test.ts carries the cases
+   * that go red if it returns.
+   */
   it('refresh tokens rotate and reuse revokes the session', async () => {
     const tokens = await json<{ accessToken: string; refreshToken: string }>(
       await pair(await pairingCode()),
@@ -235,6 +243,21 @@ describe('child pairing and sessions (AC_ACCESS_04, AC_ACCESS_06, AC_ACCESS_08)'
         })
       ).status,
     ).toBe(401);
+    // A 401 alone would also be what a route that merely stopped serving this token returns. What is
+    // required is a REVOCATION of the session, recorded as theft, so the family has a record of it.
+    const actions = await api.db.sql<{ action: string }[]>`
+      select action from public.audit_events
+       where family_id = ${fam.familyId} and target_type = 'child_session'`;
+    expect(actions.map((a) => a.action)).toContain('child_session.revoked_token_reuse');
+    // And nothing heals it: a third presentation is still refused, and no token is issued.
+    const third = await api.request('/v1/child/refresh', {
+      method: 'POST',
+      body: { refreshToken: tokens.refreshToken },
+    });
+    expect(third.status).toBe(401);
+    expect(await json<{ error: { code: string } }>(third)).toMatchObject({
+      error: { code: 'UNAUTHENTICATED' },
+    });
   });
 
   it('revoking the device stops the still-unexpired access token immediately', async () => {

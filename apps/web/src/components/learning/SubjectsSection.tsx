@@ -23,18 +23,30 @@ const NAME_MAX = 60;
  * Subjects for one child (spec P7 "parent-selected grade/subjects", "subject exclusions"; P8
  * "review for every enabled subject"). The six supported subjects always exist; a family may add
  * custom subjects, which get test dates and notes but no generated practice.
+ *
+ * HUNT6-H-1: `childStatus` is the profile's status from GET /v1/family. Both writes below —
+ * PATCH /subjects (the toggle) and POST /subjects (the add form) — go through `ownedChild(c, 'write')`,
+ * which throws BUSINESS_RULE CHILD_ARCHIVED for an archived profile (apps/api/src/routes/learning.ts),
+ * so for that one status the controls are not offered and the stored subjects stay readable. The test
+ * is "is this profile ARCHIVED?", not "is it active?": the same guard keeps a DRAFT profile writable
+ * on purpose, because a parent sets the plan up before the slot is assigned. An unrecognised status
+ * therefore stays editable — the API, not this branch, is what refuses a write — and the contract has
+ * only these three (packages/contracts/src/family.ts).
  */
 export function SubjectsSection({
   childId,
   childName,
   subjects,
   onChanged,
+  childStatus,
 }: {
   childId: string;
   childName: string;
   subjects: readonly ChildSubject[];
   onChanged: () => void;
+  childStatus?: string;
 }) {
+  const readOnly = childStatus === 'archived';
   const { api } = useSession();
   const { busy, feedback, run } = useAction();
   const headingId = useId();
@@ -86,6 +98,13 @@ export function SubjectsSection({
         Subjects that are on get daily questions and a weekly review. Turning one off stops new
         practice for it; points {childName} already earned are always kept.
       </p>
+      {readOnly ? (
+        <p className="notice" style={{ margin: '8px 0' }}>
+          {childName}’s profile is archived, so subjects can’t be turned on or off and no new
+          subject can be added. What is set up stays readable. Activate {childName} again on the
+          Children page while a paid slot is free to change it.
+        </p>
+      ) : null}
       <ActionFeedback feedback={feedback} />
       <ul style={listReset}>
         {subjects.map((subject) => {
@@ -96,7 +115,7 @@ export function SubjectsSection({
                 <input
                   type="checkbox"
                   checked={subject.enabled}
-                  disabled={busy !== null}
+                  disabled={readOnly || busy !== null}
                   onChange={() => toggle(subject)}
                   aria-describedby={hintId}
                   style={{ width: 24, minHeight: 24 }}
@@ -113,23 +132,25 @@ export function SubjectsSection({
           );
         })}
       </ul>
-      <form onSubmit={add} noValidate aria-label="Add a custom subject">
-        <label htmlFor={nameId}>Add a custom subject</label>
-        <input
-          id={nameId}
-          value={name}
-          maxLength={NAME_MAX}
-          onChange={(e) => setName(e.target.value)}
-          aria-invalid={nameError ? true : undefined}
-          aria-describedby={nameError ? nameErrorId : undefined}
-        />
-        <FieldError id={nameErrorId} message={nameError} />
-        <div style={buttonRow}>
-          <button type="submit" className="btn secondary" disabled={busy !== null}>
-            {busy === 'add' ? 'Adding…' : 'Add subject'}
-          </button>
-        </div>
-      </form>
+      {readOnly ? null : (
+        <form onSubmit={add} noValidate aria-label="Add a custom subject">
+          <label htmlFor={nameId}>Add a custom subject</label>
+          <input
+            id={nameId}
+            value={name}
+            maxLength={NAME_MAX}
+            onChange={(e) => setName(e.target.value)}
+            aria-invalid={nameError ? true : undefined}
+            aria-describedby={nameError ? nameErrorId : undefined}
+          />
+          <FieldError id={nameErrorId} message={nameError} />
+          <div style={buttonRow}>
+            <button type="submit" className="btn secondary" disabled={busy !== null}>
+              {busy === 'add' ? 'Adding…' : 'Add subject'}
+            </button>
+          </div>
+        </form>
+      )}
     </section>
   );
 }

@@ -10,7 +10,7 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
-  accountClosedStillSignedInMessage,
+  accountClosedDeviceMessage,
   closeAccountAction,
   confirmationPhrase,
   deletableChildren,
@@ -24,9 +24,11 @@ import {
   reportOutcomeAction,
   requestDeletionAction,
   requestExportAction,
+  runAccountClosure,
   SAFETY_REPORTS_INTRO,
   safetyReportView,
   unlockAction,
+  type AccountClosureStep,
 } from './parent-privacy.ts';
 
 // Synthetic data only (Riley, Sam).
@@ -298,37 +300,172 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
    * sentence before the sign-out had even run, and swallowed its failure, so a parent could read that
    * the device was signed out while it was not — and then put it down. The portal already told the two
    * cases apart; this is the same distinction on the app, in the app's own words.
+   *
+   * HUNT6-J-1: the distinction was asserted and never performed. Every step that could leave the
+   * device signed in swallowed its failure — `auth.signOut().catch(() => undefined)` in
+   * src/lib/mode.ts, `parentAuth.signOut()` dropping supabase's `{ error }`, the two best-effort
+   * clears in src/family/runtime.ts — so the flag the screen read meant "no keychain write threw",
+   * not "this device is signed out". The message is chosen from the REPORTED outcome now, and the
+   * cases below run the helper rather than grepping the screen for a ternary (L-054).
    */
-  it('[HUNT5-N6] says the account is closed WITHOUT claiming the device is signed out, when it is not', () => {
+  const SIGNED_OUT = { sessionEndConfirmed: true, secretsCleared: true } as const;
+  /** The copy ASSERTING that the device is signed out, as opposed to hedging about it. */
+  const ASSERTS_SIGNED_OUT = /(?:^|[.!]\s+|\band\s+)this device is signed out/i;
+
+  it('[HUNT5-N6] says the device is signed out only when the sign-out reported that it was', () => {
     for (const status of ['closed', 'pending'] as const) {
-      const message = accountClosedStillSignedInMessage(status);
-      // The true half survives: the account really is closed (or its closure is recorded).
-      expect(message).toMatch(status === 'closed' ? /account is closed/i : /closes automatically/i);
-      // The untrue half is gone, in the word the copy uses.
-      expect(message).not.toMatch(/this device is signed out/i);
-      // And the parent is told what to do about the device in front of them.
-      expect(message).toMatch(/could not sign this device out/i);
-      expect(message).toMatch(/sign out from the parent menu/i);
-      expect(message).toMatch(/change your password/i);
+      expect(ASSERTS_SIGNED_OUT.test(accountClosedDeviceMessage(status, SIGNED_OUT))).toBe(true);
+
+      // [repro] HUNT6-J-1: the sign-out did not confirm the session ended. The account is closed
+      // either way, so that half stays; the claim about the device in front of the parent must go.
+      const failed = accountClosedDeviceMessage(status, {
+        sessionEndConfirmed: false,
+        secretsCleared: true,
+      });
+      expect(failed).toMatch(status === 'closed' ? /account is closed/i : /closes automatically/i);
+      expect(ASSERTS_SIGNED_OUT.test(failed)).toBe(false);
+      // And it claims neither state: supabase-js removes the local session even when the logout call
+      // failed, so "we could not sign this device out" would be an overstatement in the other
+      // direction. What the app knows is that it could not confirm — and the action it names is the
+      // right one whichever way it went.
+      expect(failed).toMatch(/could not confirm this device is signed out/i);
+      expect(failed).not.toMatch(/could not sign this device out/i);
+      expect(failed).toMatch(/sign out from the parent menu/i);
+
+      // The session end was confirmed but a device secret stayed: "signed out" is true and is said,
+      // and what did not happen is said too.
+      const partial = accountClosedDeviceMessage(status, {
+        sessionEndConfirmed: true,
+        secretsCleared: false,
+      });
+      expect(ASSERTS_SIGNED_OUT.test(partial)).toBe(true);
+      expect(partial).toMatch(/could not remove everything/i);
+      expect(partial).not.toMatch(/could not confirm/i);
     }
   });
 
-  it('[HUNT5-N6] the screen awaits the device sign-out before it claims one, and does not swallow its failure', () => {
-    // privacy.tsx imports react-native, so this suite reads its source, as the other screen tests do.
-    const source = readFileSync(
+  it('[repro] does not send a parent whose sign-in is gone to change its password (HUNT6-J-3)', () => {
+    // A completed closure soft-deletes the auth user: the email is replaced by a hash and every
+    // session ends (apps/api/src/providers/auth-admin.ts), and ACCOUNT_CLOSE_COPY.intro says the
+    // email and password stop working. So there is no password to change and no sign-in to change it
+    // from — the advice was the one thing that cannot work, offered to the parent most likely to act
+    // on it. It stays on `pending`, where ownerRule says the parent can still sign in.
+    for (const device of [
+      { sessionEndConfirmed: false, secretsCleared: true },
+      { sessionEndConfirmed: true, secretsCleared: false },
+    ] as const) {
+      expect(accountClosedDeviceMessage('closed', device)).not.toMatch(/change your password/i);
+      expect(accountClosedDeviceMessage('pending', device)).toMatch(/change your password/i);
+    }
+  });
+
+  /**
+   * HUNT6-J-2. The screen cleared its busy flag as soon as the API answered and set its outcome only
+   * after the device sign-out, which is up to three network calls at a 20-second default timeout. In
+   * between it looked idle with every control live, including a second "Delete my account" that the
+   * still-live token and still-recent unlock accept: a second close job and a second audit row. The
+   * ORDER is the fix, so the order is what is tested — the previous check grepped the screen for the
+   * await and the ternary, which both orderings satisfy.
+   */
+  describe('the closure takes the screen out of "ready" before the device sign-out (HUNT6-J-2)', () => {
+    const closingApi = () => fakeApi({ send: () => ({ status: 'closed', signOut: true }) });
+
+    it('[repro] the controls are gone while the sign-out runs, not after it', async () => {
+      const steps: string[] = [];
+      let release = (_: { sessionEndConfirmed: boolean; secretsCleared: boolean }) =>
+        undefined as void;
+      const pending = new Promise<{ sessionEndConfirmed: boolean; secretsCleared: boolean }>(
+        (resolve) => {
+          release = resolve;
+        },
+      );
+      const done = runAccountClosure(
+        closingApi().api,
+        true,
+        () => pending,
+        (step) => steps.push(step.kind),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      // The sign-out has not answered, and the screen has already left 'ready'.
+      expect(steps).toEqual(['closing']);
+      release(SIGNED_OUT);
+      await done;
+      expect(steps).toEqual(['closing', 'closed']);
+    });
+
+    it('[repro] a device sign-out that throws still reaches the outcome, and claims nothing', async () => {
+      // The sign-out reads and writes the keychain outside a catch, so it can reject; leaving that
+      // unhandled would strand the parent on "Signing this device out…" with the screen busy.
+      const steps: AccountClosureStep[] = [];
+      await runAccountClosure(
+        closingApi().api,
+        true,
+        () => Promise.reject(new Error('keychain unavailable')),
+        (step) => steps.push(step),
+      );
+      expect(steps.map((step) => step.kind)).toEqual(['closing', 'closed']);
+      const closed = steps[1];
+      expect(closed?.kind === 'closed' && closed.message).toMatch(/could not confirm/i);
+    });
+
+    it('a refused closure leaves the screen ready with feedback, and never says it closed', async () => {
+      const steps: AccountClosureStep[] = [];
+      const refused = fakeApi({
+        send: () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403),
+      });
+      await runAccountClosure(
+        refused.api,
+        true,
+        () => Promise.resolve(SIGNED_OUT),
+        (step) => steps.push(step),
+      );
+      expect(steps).toEqual([{ kind: 'refused', result: { status: 'step_up' } }]);
+    });
+
+    it('an unconfirmed closure never reaches the API or the sign-out', async () => {
+      const steps: AccountClosureStep[] = [];
+      const api = closingApi();
+      let signOuts = 0;
+      await runAccountClosure(
+        api.api,
+        false,
+        () => {
+          signOuts += 1;
+          return Promise.resolve(SIGNED_OUT);
+        },
+        (step) => steps.push(step),
+      );
+      expect(api.calls).toHaveLength(0);
+      expect(signOuts).toBe(0);
+      expect(steps.map((step) => step.kind)).toEqual(['refused']);
+    });
+  });
+
+  it('[HUNT6-J-5/J-6] the closure rules document the action, and the closed state says what it means', () => {
+    // J-5: the new copy helper was inserted between `closeAccountAction` and its JSDoc, so the block
+    // describing a POST, a confirmation tick and the FAMILY_DELETION_REQUIRED rule arrived above a
+    // function that does none of those — which is what an editor hover shows.
+    const source = readFileSync(join(import.meta.dirname, 'parent-privacy.ts'), 'utf8');
+    const docFor = (declaration: string) =>
+      new RegExp(`/\\*\\*((?:(?!\\*/)[\\s\\S])*)\\*/\\s*${declaration}`).exec(source)?.[1] ?? '';
+    expect(docFor('export async function closeAccountAction')).toMatch(/POST \/v1\/account\/close/);
+    expect(docFor('export function accountClosedDeviceMessage')).not.toMatch(
+      /POST \/v1\/account\/close/,
+    );
+
+    // J-6: the screen's own state was documented as "the device is signed out", which is precisely
+    // what the state can no longer be taken to mean.
+    const privacy = readFileSync(
       join(import.meta.dirname, '..', '..', 'app', '(parent)', 'privacy.tsx'),
       'utf8',
     );
-    // The sign-out is awaited and its outcome captured...
-    expect(source).toMatch(/const signedOut = await signOutClosedAccountOnDevice\(\)/);
-    // ...and the message is chosen by that outcome, not printed before it.
-    expect(source).toMatch(
-      /signedOut \? result\.message : accountClosedStillSignedInMessage\(result\.status\)/,
-    );
-    // The old shape: the outcome set first, the failure thrown away.
-    expect(source).not.toMatch(
-      /setState\(\{ status: 'account_closed', message: result\.message \}\);\s*\n\s*await signOutClosedAccountOnDevice\(\)\.catch/,
-    );
+    const closedDoc =
+      /\/\*\*((?:(?!\*\/)[\s\S])*)\*\/\s*\| \{ status: 'account_closed'/.exec(privacy)?.[1] ?? '';
+    expect(closedDoc).not.toBe('');
+    expect(closedDoc).not.toMatch(/the device is signed out;/);
+    expect(closedDoc).toMatch(/whether/i);
   });
 
   it('[APL-07 / PLAY-10] deletes the parent’s own sign-in only once confirmed, and maps the owner rule and step-up', async () => {

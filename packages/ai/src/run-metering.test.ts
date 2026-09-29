@@ -6,13 +6,17 @@ import {
 } from '@pencillift/domain/quotas';
 import { createMockResponsesClient, type ResponsesResult } from './client.ts';
 import { dataEnvelope, PROMPTS } from './prompts.ts';
-import { PROPOSED_STAGE_LIMITS, STAGE_MODELS } from './routing.ts';
+import {
+  PROPOSED_STAGE_COST_BUDGET_MICROS,
+  PROPOSED_STAGE_LIMITS,
+  STAGE_MODELS,
+} from './routing.ts';
 import { runStage } from './run.ts';
 
 /**
  * JOBS-R1-03: an attempt whose usage the provider never reported (a client-side timeout, a network
  * failure, a 5xx) may still have been run and billed in full, so it is metered at the upper bound
- * the loop admitted it with and counts against the stage's cost cap; a request the provider refused
+ * the loop admitted it with and counts against the stage's cost BUDGET; a request the provider refused
  * outright (4xx, 429) never ran and is metered at zero. JOBS-R1-02: a refusal of the request itself
  * (400/413/415/422) is PROVIDER_REJECTED, so callers do not send the same body again.
  */
@@ -48,15 +52,19 @@ const upperBound = (inputTokens: number) => {
 /**
  * The largest estimated input at which the stage's COST CAP admits exactly `attempts` attempts and
  * refuses the next one, searched with the production estimator (monotone in inputTokens) instead of
- * hardcoded. HUNT5-C-1 raised extraction's cap from 150,000 to 216,816 micros so the one truncation
+ * hardcoded. HUNT5-C-1 raised extraction's ceiling from 150,000 to 216,816 micros so the one truncation
  * retry is reachable at the product's ten-page limit, and that invalidated the 5,000-token /
  * 58,000-micro / "two attempts fit" arithmetic the cap case below used to carry: at 5,000 tokens
- * three attempts now fit, so `maxAttempts` — not the cap — would have ended the loop and the case
- * would have stopped testing what it names. Derived here, the next ceiling change re-derives the
+ * three attempts now fit, so `maxAttempts` — not the cost limit — would have ended the loop and the
+ * case would have stopped testing what it names. Derived here, the next ceiling change re-derives the
  * input instead of silently reddening the case for the wrong reason.
+ *
+ * What bounds a RETRY is the stage's cost BUDGET, not its per-request admission cap (HUNT6-D-CAP), so
+ * that is the number searched against — extraction's two happen to be the same 216,816 today, and this
+ * keeps naming the one that really ends the loop if the owner ever parts them.
  */
 function largestInputAdmitting(attempts: number): number {
-  const cap = PROPOSED_STAGE_LIMITS.extraction.maxCostMicros;
+  const cap = PROPOSED_STAGE_COST_BUDGET_MICROS.extraction;
   let low = 1;
   // upperBound(cap) is already past the cap for any sane rate table, so the answer is bracketed.
   let high = cap;
@@ -141,29 +149,33 @@ describe('metering of attempts with unknown usage (JOBS-R1-03)', () => {
     }
   });
 
-  it('timed-out attempts count against the stage cap: no attempt is admitted past it', async () => {
+  it('timed-out attempts count against the stage budget: no attempt is admitted past it', async () => {
     const limits = PROPOSED_STAGE_LIMITS.extraction;
-    // An input sized from the cap so THE CAP is what ends the loop: two attempts spend all of it and
-    // a third would pass it, while maxAttempts still has room for that third attempt. Both of those
-    // premises are asserted, so the case cannot quietly become a maxAttempts test.
+    const budget = PROPOSED_STAGE_COST_BUDGET_MICROS.extraction;
+    // An input sized from the budget so THE COST LIMIT is what ends the loop: two attempts spend all
+    // of it and a third would pass it, while maxAttempts still has room for that third attempt. All
+    // three premises are asserted, so the case cannot quietly become a maxAttempts test — and the
+    // first attempt has to be ADMITTED, which is the per-request cap and a different number
+    // (HUNT6-D-CAP).
     const estimatedInputTokens = largestInputAdmitting(2);
     const bound = upperBound(estimatedInputTokens);
     expect(limits.maxAttempts).toBeGreaterThan(2);
-    expect(2 * bound).toBeLessThanOrEqual(limits.maxCostMicros);
-    expect(3 * bound).toBeGreaterThan(limits.maxCostMicros);
+    expect(bound).toBeLessThanOrEqual(limits.maxCostMicros);
+    expect(2 * bound).toBeLessThanOrEqual(budget);
+    expect(3 * bound).toBeGreaterThan(budget);
     const client = createMockResponsesClient(() => errorResult(null, true));
     const out = await runStage({ ...common, client, estimatedInputTokens });
     expect(out.attempts).toHaveLength(2);
     const recorded = out.attempts.reduce((n, a) => n + a.costMicros, 0);
     expect(recorded).toBe(2 * bound);
-    expect(recorded).toBeLessThanOrEqual(limits.maxCostMicros);
-    const third = canAttempt(limits, {
-      attemptsSoFar: 2,
-      spentMicrosSoFar: recorded,
-      nextEstimateMicros: bound,
-    });
+    expect(recorded).toBeLessThanOrEqual(budget);
+    const third = canAttempt(
+      { ...limits, maxCostMicros: budget },
+      { attemptsSoFar: 2, spentMicrosSoFar: recorded, nextEstimateMicros: bound },
+    );
     expect(third.allow).toBe(false);
-    // The cap, not the attempt count: a MAX_ATTEMPTS denial here would mean the case had drifted.
+    // The cost limit, not the attempt count: a MAX_ATTEMPTS denial here would mean the case had
+    // drifted.
     if (!third.allow) expect(third.deny).toBe('STAGE_COST_CAP');
     expect(out.result.ok).toBe(false);
     if (!out.result.ok) expect(out.result.error.code).toBe('PROVIDER_FAILED');

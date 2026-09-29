@@ -41,15 +41,24 @@ const KIND_COPY: Record<Kind, { label: string; hint: string; subjectKey: string 
  * Teacher spelling lists, taught notes and reading passages (spec P7 "honor teacher spelling
  * lists and current reading passages"; P8 "current study material"). Text only, size-limited
  * per kind exactly as the API enforces.
+ *
+ * HUNT6-H-1: `childStatus` is the profile's status from GET /v1/family. This section is a write form
+ * only: POST /study-materials goes through `ownedChild(c, 'write')`, which answers BUSINESS_RULE
+ * CHILD_ARCHIVED for an archived profile (apps/api/src/routes/learning.ts), so for that one status the
+ * form is not offered and the section says why instead of taking a spelling list it cannot store. The
+ * test is "is this profile ARCHIVED?", not "is it active?": the same guard keeps a DRAFT profile
+ * writable on purpose, so a parent can put the teacher's list in before the slot is assigned.
  */
 export function StudyMaterialSection({
   childId,
   childName,
   subjects,
+  childStatus,
 }: {
   childId: string;
   childName: string;
   subjects: readonly ChildSubject[];
+  childStatus?: string;
 }) {
   const { api } = useSession();
   const { busy, feedback, run } = useAction();
@@ -119,44 +128,52 @@ export function StudyMaterialSection({
         leave out names, photos and other personal details.
       </p>
       <ActionFeedback feedback={feedback} />
-      <form onSubmit={submit} noValidate aria-label="Add a spelling list or notes">
-        <label htmlFor={kindId}>What is it?</label>
-        <select id={kindId} value={kind} onChange={(e) => changeKind(e.target.value as Kind)}>
-          {STUDY_MATERIAL_KINDS.map((k) => (
-            <option key={k} value={k}>
-              {KIND_COPY[k].label}
-            </option>
-          ))}
-        </select>
-        <label htmlFor={subjectId}>Subject</label>
-        <select id={subjectId} value={subject} onChange={(e) => setSubject(e.target.value)}>
-          <option value="">Any subject</option>
-          {subjects.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.displayName}
-            </option>
-          ))}
-        </select>
-        <label htmlFor={textId}>{KIND_COPY[kind].label}</label>
-        <textarea
-          id={textId}
-          value={text}
-          maxLength={max}
-          onChange={(e) => setText(e.target.value)}
-          style={textareaStyle}
-          aria-invalid={error ? true : undefined}
-          aria-describedby={`${textId}-hint${error ? ` ${textId}-error` : ''}`}
-        />
-        <p id={`${textId}-hint`} style={hintStyle}>
-          {KIND_COPY[kind].hint} {text.length}/{max} characters.
+      {childStatus === 'archived' ? (
+        <p className="notice" style={{ margin: '8px 0 0' }}>
+          {childName}’s profile is archived, so no new spelling list, notes or reading passage can
+          be added. What was added before stays with the practice it shaped. Activate {childName}{' '}
+          again on the Children page while a paid slot is free to add more.
         </p>
-        <FieldError id={`${textId}-error`} message={error} />
-        <div style={buttonRow}>
-          <button type="submit" className="btn" disabled={busy !== null}>
-            {busy === 'save' ? 'Saving…' : 'Save'}
-          </button>
-        </div>
-      </form>
+      ) : (
+        <form onSubmit={submit} noValidate aria-label="Add a spelling list or notes">
+          <label htmlFor={kindId}>What is it?</label>
+          <select id={kindId} value={kind} onChange={(e) => changeKind(e.target.value as Kind)}>
+            {STUDY_MATERIAL_KINDS.map((k) => (
+              <option key={k} value={k}>
+                {KIND_COPY[k].label}
+              </option>
+            ))}
+          </select>
+          <label htmlFor={subjectId}>Subject</label>
+          <select id={subjectId} value={subject} onChange={(e) => setSubject(e.target.value)}>
+            <option value="">Any subject</option>
+            {subjects.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.displayName}
+              </option>
+            ))}
+          </select>
+          <label htmlFor={textId}>{KIND_COPY[kind].label}</label>
+          <textarea
+            id={textId}
+            value={text}
+            maxLength={max}
+            onChange={(e) => setText(e.target.value)}
+            style={textareaStyle}
+            aria-invalid={error ? true : undefined}
+            aria-describedby={`${textId}-hint${error ? ` ${textId}-error` : ''}`}
+          />
+          <p id={`${textId}-hint`} style={hintStyle}>
+            {KIND_COPY[kind].hint} {text.length}/{max} characters.
+          </p>
+          <FieldError id={`${textId}-error`} message={error} />
+          <div style={buttonRow}>
+            <button type="submit" className="btn" disabled={busy !== null}>
+              {busy === 'save' ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </form>
+      )}
     </section>
   );
 }

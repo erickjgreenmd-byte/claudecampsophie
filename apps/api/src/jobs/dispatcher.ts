@@ -77,22 +77,33 @@ const TICK_CLAIM_BUDGET_MS = 10 * 60_000;
 /**
  * How long a Cron Trigger invocation lives in wall time. Measured against the TICK's start, not
  * runJobs' own (JOBS-R2-07): every earlier step of the tick is unbounded in time (an inactivity
- * sweep sends up to 50 emails with a 10 s timeout each, entitlement syncs call the store), so the
- * ledger can start late and must not claim work it has no time to finish.
+ * sweep sends up to 50 emails with a 10 s timeout each; the scan-retention purge and the
+ * late-upload pass each remove up to 500 storage objects), so the ledger can start late and must not
+ * claim work it has no time to finish. HUNT6-D-3: the example used to name a billing-store sync,
+ * which has not run in front of the ledger since JOBS-R2-04 moved the sweep behind it.
  */
 const TICK_WALL_LIMIT_MS = 15 * 60_000;
 /**
- * Wall time the ledger leaves to the steps that run AFTER it (R4-JOBS-4).
+ * Wall time the LEDGER may not claim into: a job is claimed only while its worst case still fits
+ * TICK_WALL_LIMIT_MS minus this (R4-JOBS-4).
  *
- * Decision: a RESERVED SLICE, not a re-ordering. The entitlement sweep must stay behind the ledger —
- * the work a family is waiting on (a scan, a safety email, an export) comes first, and a store that
- * answers slowly must delay only itself (JOBS-R2-04) — but the claim arithmetic gave it nothing: a
- * scan (7-minute worst case) could be claimed at minute 8 of a 15-minute invocation and run to the
- * wall, so `entitlementsReconciled` was 0 on every tick with a deep scan queue and a family whose
- * subscription lapsed without a webhook kept paid AI until a lighter tick happened to sweep. Two
- * minutes is enough for the sweep to reconcile several families per tick (each request is bounded by
- * BILLING_REQUEST_TIMEOUT_MS and one failure never stops it), and entitlement staleness is measured
- * in days, so the slice does not have to fit all 25 families.
+ * Decision: a bound on the ledger, not a re-ordering. The entitlement sweep must stay behind the
+ * ledger — the work a family is waiting on (a scan, a safety email, an export) comes first, and a
+ * store that answers slowly must delay only itself (JOBS-R2-04) — but the claim arithmetic gave the
+ * sweep nothing at all: a scan (7-minute worst case) could be claimed at minute 8 of a 15-minute
+ * invocation and run to the wall, so `entitlementsReconciled` was 0 on every tick with a deep scan
+ * queue and a family whose subscription lapsed without a webhook kept paid AI until a lighter tick
+ * happened to sweep it.
+ *
+ * What this does NOT do (HUNT6-D-2): give the trailing steps two minutes. `remaining` at the claim
+ * filter is measured from the TICK's start, and every step in front of the ledger is unbounded in
+ * wall time (see TICK_WALL_LIMIT_MS), so a long enough one leaves the sweep under a minute and
+ * `entitlementsReconciled` 0 on such a tick is still not by itself a defect — the residual BUG-264
+ * carries. Handing the sweep a floor would take a deadline on the steps in front of the ledger, which
+ * none of them has (HUNT5-C-5). What the bound does buy, when the tick reaches it with time to spare,
+ * the sweep can use: each request is bounded by BILLING_REQUEST_TIMEOUT_MS, one failure never stops
+ * it, and entitlement staleness is measured in days, so one tick does not have to reach all 25
+ * families.
  */
 const TICK_TRAILING_RESERVE_MS = 2 * 60_000;
 /**
@@ -734,8 +745,10 @@ export async function runJobs(
   for (let n = 0; n < limit; n += 1) {
     const elapsed = deps.clock().getTime() - tickStart.getTime();
     if (elapsed > TICK_CLAIM_BUDGET_MS) break;
-    // Only kinds whose worst case still fits the rest of the invocation (JOBS-R2-07), keeping the
-    // trailing steps their reserved slice of it (R4-JOBS-4).
+    // Only kinds whose worst case still fits the rest of the invocation (JOBS-R2-07), and never into
+    // its last TICK_TRAILING_RESERVE_MS (R4-JOBS-4). That bounds the LEDGER; it does not hand the
+    // steps behind it that time, because `elapsed` is measured from the TICK's start and no step in
+    // front of the ledger has a deadline (HUNT6-D-2, same wording as the constant's own docstring).
     const remaining = TICK_WALL_LIMIT_MS - TICK_TRAILING_RESERVE_MS - elapsed;
     const claimable = kinds.filter(
       (kind) => (JOB_WORST_CASE_MS[kind] ?? DEFAULT_JOB_WORST_CASE_MS) <= remaining,
@@ -1317,10 +1330,12 @@ export async function runScheduledTick(
   // that misses the end of a tick loses nothing. The LEDGER alone cannot starve it: no job is claimed
   // that would run past TICK_WALL_LIMIT_MS − TICK_TRAILING_RESERVE_MS (R4-JOBS-4). That is the whole
   // guarantee: every step BEFORE the ledger is unbounded in wall time (see TICK_WALL_LIMIT_MS — an
-  // inactivity sweep sends up to 50 emails with a 10 s timeout each, entitlement syncs call the
-  // store), so a long enough one still leaves this step nothing and `entitlementsReconciled` 0 on
-  // such a tick is not by itself a defect. Guaranteeing it a slice would take a deadline check on the
-  // steps in front of the ledger, which none of them has (HUNT5-C-5).
+  // inactivity sweep sends up to 50 emails with a 10 s timeout each; the scan-retention purge and the
+  // late-upload pass each remove up to 500 storage objects), so a long enough one still leaves this
+  // step nothing and `entitlementsReconciled` 0 on such a tick is not by itself a defect. This step is
+  // the only caller of the billing store in a tick; nothing in front of the ledger touches it
+  // (HUNT6-D-3, which is why the example above names the purges). Guaranteeing it a slice would take a
+  // deadline check on the steps in front of the ledger, which none of them has (HUNT5-C-5).
   const entitlementsReconciled = await step('entitlements', 0, () =>
     reconcileStaleEntitlements(deps),
   );

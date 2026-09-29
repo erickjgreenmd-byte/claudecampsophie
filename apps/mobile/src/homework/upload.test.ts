@@ -595,17 +595,38 @@ describe('a scan the child stopped too late is not reported as stopped (HUNT4-MO
     expect(outcome.message).not.toMatch(/stopped/i);
   });
 
-  it('a scan that really was stopped keeps the calm "Stopped" copy and a fresh attempt', () => {
-    for (const cancel of ['cancelled', 'nothing_to_cancel'] as const) {
-      const outcome = stoppedScanOutcome(cancel);
-      expect(outcome.keepAttempt).toBe(false);
-      // The words, not the expression. This used to compare with
-      // `childUploadMessage(new ScanCancelledError())` — the implementation's own expression — so it
-      // pinned the routing and left the copy it is here to protect unverified: any rewording, calm
-      // or not, stayed green. A child who stopped a scan is told plainly that their pages are safe.
-      expect(outcome.message).toBe('Stopped. Your pages are still here.');
-      expect(outcome.message).toBe(childUploadMessage(new ScanCancelledError()));
-    }
+  it('a scan the server confirmed it stopped gets the calm copy and a fresh attempt', () => {
+    const outcome = stoppedScanOutcome('cancelled');
+    expect(outcome.keepAttempt).toBe(false);
+    // The words, not the expression. This used to compare with
+    // `childUploadMessage(new ScanCancelledError())` — the implementation's own expression — so it
+    // pinned the routing and left the copy it is here to protect unverified: any rewording, calm
+    // or not, stayed green. A child who stopped a scan is told plainly that their pages are safe.
+    expect(outcome.message).toBe('Stopped. Your pages are still here.');
+    expect(outcome.message).toBe(childUploadMessage(new ScanCancelledError()));
+  });
+
+  it('[repro] “nothing_to_cancel” keeps the attempt: no local id is not proof of no scan (HUNT6-J-4)', () => {
+    // This case used to be looped in with 'cancelled' under the title "a scan that really was
+    // stopped", and it is not one. cancelScan answers 'nothing_to_cancel' whenever
+    // `attempt.assignmentId === null`, and that id is only set when the CREATE RESPONSE was seen
+    // (uploadScan's onAttempt). A child who taps "Stop sending" while the create round trip is in
+    // flight aborts before the response arrives, so the id is null although POST /v1/assignments may
+    // well have committed — the same premise error the 'unsure' branch was fixed for one branch away.
+    // Rotating the keys there discards the createKey that would have made "Try again" idempotent, so
+    // the retry creates a SECOND assignment and the first is orphaned in the child's own list as
+    // "Not sent yet" for ever, having burned a create against their hourly limit.
+    //
+    // Keeping the key is safe in the other direction: a retained createKey can never belong to a
+    // different page set, because changePages and startOver both mint a fresh attempt
+    // (app/(child)/scan.tsx), and POST /v1/assignments with a key it has seen answers with the
+    // assignment it already has instead of a second one.
+    const outcome = stoppedScanOutcome('nothing_to_cancel');
+    expect(outcome.keepAttempt).toBe(true);
+    // The copy stays calm and stays true: nothing was sent for checking either way — the finalize is
+    // the authoritative reservation — so the child's pages are still here and "Try again" continues
+    // this same scan.
+    expect(outcome.message).toBe('Stopped. Your pages are still here.');
   });
 
   it('never offers a purchase or shows raw server text (spec P11, P14)', () => {

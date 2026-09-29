@@ -9,6 +9,7 @@ import {
   isRevenueCatRefund,
   mapRevenueCatEventToPeriod,
   mapStripeInvoiceToPeriod,
+  prorationPeriodFor,
   reconcilePromotionsForPeriod,
   reconcileFamilyBilling,
   recordBillingPeriod,
@@ -311,6 +312,23 @@ async function processStripeEvent(
   if (event.type === 'invoice.paid') {
     const period = mapStripeInvoiceToPeriod(object);
     if (!period) return;
+    // HUNT6-C-1: this invoice may ALSO have collected a mid-cycle proration item Stripe left pending
+    // and listed on it. That money is no part of the period charge below (BILL-R2-4) and the family
+    // paid it, so it is recorded once as its own 'proration' period; before this it was booked
+    // nowhere and the owner's gross understated every deferred upgrade. Its id derives from the
+    // invoice's, so a provider retry of the same invoice.paid updates that row instead of adding one.
+    //
+    // C-PRORATION-REVERSAL: it is recorded BEFORE the subscription period, because recording the
+    // subscription period is what replays a refund that arrived ahead of this invoice
+    // (recordBillingPeriod's pending_refunds hand-off, RV-lead-billing-p17-3) and that replay now
+    // walks on to this row with whatever the subscription period could not absorb. Written the other
+    // way round, an early-arriving FULL refund would have reversed the subscription charge and left
+    // the proration money in gross — the very hole this finding is about, reachable through the one
+    // ordering the finding did not name. Both rows go in one transaction either way.
+    const pendingProration = prorationPeriodFor(period);
+    if (pendingProration) {
+      await recordBillingPeriod(tx, familyId, pendingProration, deps.config.billingEnvironment);
+    }
     const recorded = await recordBillingPeriod(
       tx,
       familyId,
@@ -334,17 +352,14 @@ async function processStripeEvent(
     const full =
       object.refunded === true || (refunded !== null && refunded >= (object.amount ?? 0));
     // A partial refund is recorded as partial with its real amount (RV-lead-billing-p17-7).
-    // BILL-R4-3: `amount_refunded` and `amount` are Charge figures, i.e. what the family paid
-    // INCLUDING sales tax, while the recorded charge is the pre-tax subscription amount. The charge
-    // total goes with the refund so applyRefund knows the amount is in that provider unit and
-    // restates it. HUNT5-C-2: it is only that signal — the conversion divides by the tax stored for
-    // this period's own charge, because this total is the whole invoice and may include proration
-    // lines that were never booked as revenue (N1-TAX-APPORTION: nor is the invoice's whole TAX that
-    // unit, since part of it was added to those lines).
-    const chargeTotal =
-      typeof object.amount === 'number' && Number.isSafeInteger(object.amount) && object.amount >= 0
-        ? object.amount
-        : null;
+    // BILL-R4-3: `amount_refunded` is a Charge figure, i.e. part of what the family paid INCLUDING
+    // sales tax, while the recorded charge is the pre-tax subscription amount, so applyRefund is told
+    // the amount is tax-inclusive and restates it. HUNT5-C-2 / N1-TAX-APPORTION: the conversion
+    // divides by the tax stored for this period's own charge, never by any total this event states —
+    // the Charge total is the whole invoice and may include proration lines this period never booked,
+    // and part of the invoice's TAX was added to those lines. C-PRORATION-REVERSAL: the event names
+    // the INVOICE, and applyRefund reaches every period that invoice wrote — the subscription charge
+    // first and, with whatever the amount has left over, the ':proration' period beside it.
     await applyRefund(
       tx,
       familyId,
@@ -352,24 +367,35 @@ async function processStripeEvent(
       target.invoiceId,
       full ? 'refund' : 'partial_refund',
       refunded,
-      chargeTotal,
+      true,
     );
     return;
   }
   // The disputed amount (Stripe allows partial disputes); without one the whole charge is
-  // treated as clawed back, and given back when the dispute is won (BILL-R1-1). A Dispute carries no
-  // charge total, so there is nothing to convert the amount with (BILL-R4-3): a full dispute is exact
-  // through the cap, and a partial dispute of a taxed charge still carries that charge's tax share.
+  // treated as clawed back, and given back when the dispute is won (BILL-R1-1). HUNT6-C-2: a Dispute
+  // `amount` is a Charge figure too — part of what the family paid, tax included — so it is converted
+  // exactly like a refund. It states no charge total, and that says nothing about its unit: while the
+  // conversion was inferred from a total's presence, a dispute on a taxed charge was added and then
+  // subtracted in the provider's unit against a pre-tax charge, and winning the dispute erased the
+  // tax share of the disputed part from an earlier genuine refund.
   const disputed =
     typeof object.amount === 'number' && Number.isSafeInteger(object.amount) && object.amount >= 0
       ? object.amount
       : null;
   if (event.type === 'charge.dispute.created') {
-    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback', disputed);
+    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback', disputed, true);
     return;
   }
   if (event.type === 'charge.dispute.closed' && object.status === 'won') {
-    await applyRefund(tx, familyId, 'stripe', target.invoiceId, 'chargeback_reversed', disputed);
+    await applyRefund(
+      tx,
+      familyId,
+      'stripe',
+      target.invoiceId,
+      'chargeback_reversed',
+      disputed,
+      true,
+    );
   }
 }
 
@@ -510,8 +536,20 @@ export function webhooksRoutes(): Hono<AppEnv> {
             }
             if (isRevenueCatRefund(event) && event.transaction_id) {
               const channel = revenueCatRefundChannel(event);
-              if (channel)
-                await applyRefund(tx, family.id, channel, event.transaction_id, 'refund', null);
+              if (channel) {
+                // A store refund carries no amount at all, so there is nothing to convert: the whole
+                // charge is taken back. The flag is stated rather than defaulted so every call site
+                // says which unit its amount is in (HUNT6-C-2).
+                await applyRefund(
+                  tx,
+                  family.id,
+                  channel,
+                  event.transaction_id,
+                  'refund',
+                  null,
+                  false,
+                );
+              }
             }
           },
         );

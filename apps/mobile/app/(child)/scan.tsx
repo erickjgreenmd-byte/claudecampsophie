@@ -124,7 +124,11 @@ export default function ScanScreen() {
   /** Any change to the pages starts a fresh scan; an earlier unfinished one is stopped. */
   const changePages = useCallback((next: ScanSession) => {
     const previous = attemptRef.current;
-    if (previous.assignmentId !== null) void cancelScan(childApi, previous).catch(() => undefined);
+    // cancelScan answers rather than throws (HUNT5-H-4), and here the answer is not actionable: the
+    // pages have changed, so a fresh scan is right whatever the server did with the old one. The
+    // abort path below acts on its answer, which is why only that one reads it — the `.catch` that
+    // used to sit here could never run (HUNT6-J-7).
+    if (previous.assignmentId !== null) void cancelScan(childApi, previous);
     attemptRef.current = newAttempt(newKey);
     setUpload({ kind: 'idle' });
     setSession(next);

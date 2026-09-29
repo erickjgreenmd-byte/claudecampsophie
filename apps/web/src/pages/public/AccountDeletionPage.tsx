@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router';
-import { ACCOUNT_CLOSE_COPY } from '@pencillift/contracts';
+import { ACCOUNT_CLOSE_COPY, SIGN_OUT_NOT_TOLD_COPY } from '@pencillift/contracts';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
 import { DraftOnly, draftPrefix, lead, PageTitle, Section, SupportEmail } from './common.tsx';
 
@@ -39,14 +39,26 @@ function signOutRefusedFromState(state: unknown): boolean {
 }
 
 /**
- * Said only on the refusal path, beside the closure line. The adapter has already removed this
- * browser's stored session, so "this computer is signed out" is true; what failed is telling the auth
- * service, so a session elsewhere may still work — on the `pending` path the sign-in is not closed
- * yet either. Word for word SignOutControl's SERVER_NOT_TOLD (components/SignOutControl.tsx), because
- * the two paths report the same fact and a parent should not have to tell them apart.
+ * Said only on the refusal path, beside the closure line. "This computer is signed out" is the
+ * closure flow's finding, not an inference from the report: PrivacyControlsPage re-reads
+ * `currentSession()` on every refusal path and travels here only when the session is really gone,
+ * keeping the parent on the portal page otherwise (HUNT6-G-1). What failed is telling the auth
+ * service.
+ *
+ * HUNT6-G-6: which remedy follows depends on the outcome, so there are two strings, not one. On
+ * `pending` the sign-in is deliberately still usable until the family purge finishes, so a password
+ * change is something the parent can carry out — that string is the one SignOutControl says on its
+ * own path, shared through the contracts constant. On `closed` the sign-in is gone: naming a password
+ * change or a sign-out elsewhere would ask the parent, on the screen confirming their account is
+ * deleted, to do two things the deletion has just made impossible. The earlier copy said the same
+ * sentence for both and its comment justified that with "a session elsewhere may still work", which
+ * is a property only the `pending` path has.
  */
-const SERVER_NOT_TOLD =
-  'This computer is signed out. We could not tell PencilLift’s servers to end the session, so sign out on your phone, or change your password if you are worried.';
+function serverNotTold(closed: ClosedState): string {
+  return closed === 'closed'
+    ? SIGN_OUT_NOT_TOLD_COPY.signInClosed
+    : SIGN_OUT_NOT_TOLD_COPY.signInOpen;
+}
 
 export default function AccountDeletionPage() {
   const state: unknown = useLocation().state;
@@ -66,7 +78,7 @@ export default function AccountDeletionPage() {
               {closed === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending}
             </strong>
           </p>
-          {signOutRefused ? <p style={{ margin: '8px 0 0' }}>{SERVER_NOT_TOLD}</p> : null}
+          {signOutRefused ? <p style={{ margin: '8px 0 0' }}>{serverNotTold(closed)}</p> : null}
         </div>
       ) : null}
       <p style={lead}>

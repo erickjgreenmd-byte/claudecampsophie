@@ -121,3 +121,79 @@ describe('parent sign-in error copy (MOB-R1-02)', () => {
     expect(await parentAuth.sendPasswordReset('riley.parent@example.test')).toEqual({ ok: true });
   });
 });
+
+/**
+ * HUNT6-J-1. supabase-js does not THROW for a refused or failed sign-out: it returns the failure in
+ * `{ error }`, and when the logout call failed it does not remove the local session either. This
+ * wrapper dropped that `error` and answered `Promise<void>`, so the one layer that could see "this
+ * device is still signed in" threw the fact away — and the account-closure screen, which tells the
+ * parent "and this device is signed out" about the device they are about to put down, had nothing
+ * left to read but "nothing threw".
+ */
+describe('signing out reports whether the session ended (HUNT6-J-1)', () => {
+  /** A synthetic password grant, as GoTrue answers one. No real credentials. */
+  const grant = {
+    access_token: 'mock-access-token',
+    token_type: 'bearer',
+    expires_in: 3600,
+    expires_at: Math.floor(Date.now() / 1000) + 3600,
+    refresh_token: 'mock-refresh-token',
+    user: {
+      id: '11111111-1111-4111-8111-111111111111',
+      aud: 'authenticated',
+      role: 'authenticated',
+      email: 'riley.parent@example.test',
+      app_metadata: {},
+      user_metadata: {},
+      created_at: '2026-09-24T15:00:00.000Z',
+    },
+  };
+
+  async function signedIn(): Promise<void> {
+    vi.stubGlobal('fetch', () => Promise.resolve(authResponse(200, grant)));
+    expect(await parentAuth.signIn('riley.parent@example.test', 'not-a-real-password')).toEqual({
+      ok: true,
+    });
+    expect(await parentAuth.userId()).toBe(grant.user.id);
+  }
+
+  it('[repro] a logout the service refuses is reported, not reported as a sign-out', async () => {
+    await signedIn();
+    vi.stubGlobal('fetch', (input: string | URL) =>
+      input.toString().includes('/logout')
+        ? Promise.resolve(authResponse(500, { code: 500, msg: 'Internal Server Error' }))
+        : Promise.resolve(authResponse(200, grant)),
+    );
+    const result = await parentAuth.signOut();
+    expect(result.ok).toBe(false);
+    // What `ok: false` stands for, checked against the library rather than assumed: auth-js 2.116
+    // removes the LOCAL session even when the logout call failed, so this is "the service was not
+    // told", not "the device is still signed in". That is why the closure copy claims neither state
+    // and says the app could not confirm (src/privacy/parent-privacy.ts).
+    expect(await parentAuth.userId()).toBeNull();
+  });
+
+  it('a logout that goes through is reported as a sign-out, and the session is gone', async () => {
+    await signedIn();
+    vi.stubGlobal('fetch', (input: string | URL) =>
+      input.toString().includes('/logout')
+        ? Promise.resolve(new Response(null, { status: 204 }))
+        : Promise.resolve(authResponse(200, grant)),
+    );
+    expect(await parentAuth.signOut()).toEqual({ ok: true });
+    expect(await parentAuth.userId()).toBeNull();
+  });
+
+  it('a logout that cannot even be attempted is reported too, in the app’s own words', async () => {
+    await signedIn();
+    vi.stubGlobal('fetch', (input: string | URL) =>
+      input.toString().includes('/logout')
+        ? Promise.reject(new TypeError('Network request failed'))
+        : Promise.resolve(authResponse(200, grant)),
+    );
+    const result = await parentAuth.signOut();
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toMatch(/offline|connection/i);
+  });
+});

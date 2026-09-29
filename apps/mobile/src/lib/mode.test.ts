@@ -141,7 +141,7 @@ describe('parent sign-out (MOB-R1-01)', () => {
     const auth = {
       signOut: () => {
         fx.calls.push('auth-sign-out');
-        return Promise.resolve();
+        return Promise.resolve({ ok: true as const });
       },
     };
     await signOutParent(storage, fx, auth);
@@ -165,11 +165,48 @@ describe('parent sign-out (MOB-R1-01)', () => {
     expect(await currentMode(storage)).toBe('signed_out');
   });
 
+  it('[repro] reports a sign-out that did not end the session, instead of swallowing it', async () => {
+    // HUNT6-J-1. This function swallowed the auth answer — `auth.signOut().catch(() => undefined)` —
+    // and parentAuth.signOut dropped supabase's own `{ error }` one layer below, so a caller could
+    // only ever observe that no keychain write threw. The account-closure screen then told a parent
+    // "and this device is signed out" on exactly the flaky connection where it was not, and they put
+    // the device down. Nothing may STOP the sign-out, and nothing here does: the local clears, the
+    // mode write and the navigation all still happen. Only the hiding stops.
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.mode, 'parent');
+    const fx = effects();
+
+    const refused = await signOutParent(storage, fx, {
+      signOut: () => Promise.resolve({ ok: false as const, message: 'You may be offline.' }),
+    });
+    expect(refused).toEqual({ sessionEndConfirmed: false });
+    expect(fx.calls).toContain('clear');
+    expect(fx.calls).toContain('reset-welcome');
+    expect(fx.calls).toContain('privacy:false');
+    expect(await currentMode(storage)).toBe('signed_out');
+    expect(parentUnlockActive(NOW)).toBe(false);
+
+    // A thrown sign-out is the same answer — an unreadable outcome is not a successful one.
+    expect(
+      await signOutParent(storage, effects(), {
+        signOut: () => Promise.reject(new Error('offline')),
+      }),
+    ).toEqual({ sessionEndConfirmed: false });
+
+    expect(
+      await signOutParent(storage, effects(), {
+        signOut: () => Promise.resolve({ ok: true as const }),
+      }),
+    ).toEqual({ sessionEndConfirmed: true });
+  });
+
   it('a paired child device stays paired: sign-out only ends the parent session', async () => {
     const storage = memoryStorage();
     await storage.setItem(STORAGE_KEYS.childRefreshToken, 'secret-refresh');
     await storage.setItem(STORAGE_KEYS.mode, 'parent');
-    await signOutParent(storage, effects(), { signOut: () => Promise.resolve() });
+    await signOutParent(storage, effects(), {
+      signOut: () => Promise.resolve({ ok: true as const }),
+    });
     expect(storage.data.get(STORAGE_KEYS.childRefreshToken)).toBe('secret-refresh');
   });
 });

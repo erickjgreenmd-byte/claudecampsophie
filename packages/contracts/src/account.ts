@@ -63,6 +63,45 @@ export const ACCOUNT_CLOSE_COPY = {
     'Delete your whole family account first, then delete your account. Your sign-in closes once the family deletion has finished.',
 } as const;
 
+/**
+ * HUNT6-F-1 / HUNT6-G-6: what a parent reads when this browser's session has been removed but the
+ * auth service was never told to end it. Shared by the two surfaces that say it, so their wording
+ * cannot drift apart: the portal's Sign out (apps/web/src/components/SignOutControl.tsx, `signInOpen`)
+ * and the public deletion page (apps/web/src/pages/public/AccountDeletionPage.tsx, both strings). Each
+ * is asserted against this constant where it is rendered — App.signout.test.tsx and
+ * PrivacyControlsPage.test.tsx — so a surface that inlined its own sentence would turn a test red.
+ *
+ * HUNT6-F-SHARED-COPY: "and the app" was part of that list and was never true. The mobile app does not
+ * import this constant. apps/mobile/src/privacy/parent-privacy.ts writes its own sentences in
+ * accountClosedDeviceMessage, and they already differ — because they report a different fact: the app
+ * knows whether ITS OWN device sign-out was confirmed, not whether the auth service was told, and it
+ * points the parent at the app's parent menu rather than at a password. (ACCOUNT_CLOSE_COPY above is
+ * genuinely shared with the app, which is how the list came to include it here.) Whether the app should
+ * say this sentence too is a change to a mobile file, not to this one.
+ *
+ * Two strings, because the two situations offer different remedies and one of them offers none.
+ * The first round of this copy named "sign out on your phone" first: every sign-out in this product
+ * is scope 'local' by design (spec P3, L-039), so a phone sign-out ends the phone's session and
+ * cannot touch this one — the first thing the parent was told to do did nothing, and they skipped
+ * the one that helps. There is no "sign out everywhere" action in the product to point at.
+ */
+export const SIGN_OUT_NOT_TOLD_COPY = {
+  /**
+   * The sign-in still exists, so a password change is a remedy the parent can actually carry out
+   * (ordinary sign-out; and the `pending` closure, where the sign-in stays usable until the family
+   * purge finishes).
+   */
+  signInOpen:
+    'This computer is signed out. We could not tell PencilLift’s servers to end the session, so change your password if you are worried.',
+  /**
+   * The sign-in is already closed (`closed`), so there is no password to change and no account to
+   * sign into anywhere: naming either would ask the parent to do something the closure has just
+   * made impossible.
+   */
+  signInClosed:
+    'This computer is signed out. We could not tell PencilLift’s servers to end the session, but your sign-in is closed, so there is nothing left to do.',
+} as const;
+
 // ---------------------------------------------------------------------------------------------
 // Export downloads (GET /v1/exports/:id/download; apps/api/src/routes/export-download.ts). Kept
 // here rather than in privacy.ts because that file belongs to the privacy vertical; the route

@@ -12,6 +12,41 @@ import { ApiRequestError } from '@pencillift/contracts/client';
  * out in text so it never relies on colour alone. Pure: no react-native imports.
  */
 
+/**
+ * The state a parent screen's load is in, as `useLoad` (src/family/ui.tsx) and the screens that own
+ * their own fetch hold it.
+ */
+export type LoadState<T> =
+  | { readonly status: 'idle' }
+  | { readonly status: 'loading' }
+  | { readonly status: 'error'; readonly error: unknown }
+  | { readonly status: 'ready'; readonly data: T };
+
+/**
+ * What a screen shows while a load runs: the rows it already has, or 'loading' (HUNT6-I-2).
+ *
+ * Premise, in one sentence: the rows on a parent screen were produced by one particular `load`
+ * closure, and `producedBy !== running` is the observable fact that the rows on screen were NOT
+ * produced by the load that is running now — so the screen cannot vouch for them and shows none.
+ * That is deliberately not the same claim as "the adult changed": every parent screen's load is
+ * `useCallback(…, [api])` and the parent gate publishes a new client whenever the adult at the device
+ * changed (src/lib/mode.ts), so an adult change always reaches here as a new load; a remount or any
+ * other new client reaches here the same way and costs the same one refetch. The direction that must
+ * never happen is the other one — keeping rows across a load the screen did not run — because that is
+ * the handed-on tablet showing the previous family's children.
+ *
+ * `useLoad` preserved 'ready' unconditionally, which meant the rows stayed up for the length of the
+ * new adult's request (DEFAULT_REQUEST_TIMEOUT_MS is 20 s, longer on a retry). A manual reload passes
+ * the same load twice, so pull-to-refresh and the post-edit reloads keep their no-flash behaviour.
+ */
+export function loadStateForRun<T>(
+  state: LoadState<T>,
+  producedBy: (() => Promise<T>) | null,
+  running: () => Promise<T>,
+): LoadState<T> {
+  return state.status === 'ready' && producedBy === running ? state : { status: 'loading' };
+}
+
 export function gradeText(grade: number): string {
   return grade === 0 ? 'Kindergarten' : `Grade ${grade}`;
 }
@@ -25,6 +60,21 @@ export function childStatusText(status: FamilyChild['status']): string {
     case 'archived':
       return 'Archived: history only';
   }
+}
+
+/**
+ * Whether the parent may still change a child's practice plan (HUNT6-H-1).
+ *
+ * The API decides it: the learning writes — PATCH /subjects, PUT /learning-schedule — go through
+ * `ownedChild(c, 'write')`, which answers 422 BUSINESS_RULE CHILD_ARCHIVED for an archived profile,
+ * while the reads behind the same screen succeed (apps/api/src/routes/learning.ts). So the planner
+ * mounted every editing control for a child whose every save the server refuses: a parent who
+ * archived a child to free a paid slot edited the daily practice time, pressed Save and lost what they
+ * typed. A DRAFT stays writable on purpose — learning.ts keeps it so — which is why this is not
+ * "only an active child".
+ */
+export function childPlanEditable(status: FamilyChild['status']): boolean {
+  return status !== 'archived';
 }
 
 export interface ChildRow {

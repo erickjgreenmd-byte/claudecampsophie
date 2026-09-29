@@ -238,12 +238,19 @@ function ChildCard({
         // Privacy "cancels it if you did not mean it" (HUNT5-H-2), and there is no cancel anywhere:
         // /v1/privacy has only POST and GET /deletion, nothing marks a request cancelled, and the
         // purge is enqueued with the request. Support is where a mistake is actually handled.
+        //
+        // HUNT6-I-3: the rewrite that removed the hedge then said "You asked for …", which the flag
+        // cannot establish. GET /v1/family computes `deletionPending` from the request's scope and
+        // target alone and never exposes deletion_requests.requested_by, any guardian may delete a
+        // child's data, and a child-scope request leaves every other membership active — so the
+        // family's other adult is served the same flag and was told they had asked for it. The
+        // sentence is true of whoever is reading it now.
         <Notice>
           <Body>
-            Data deletion under way. You asked for {row.nickname}’s data to be deleted. Processing
-            has already stopped, so nothing can be changed, paired or activated for them, and they
-            stay listed here until the deletion finishes. Deletion can’t be undone from the app: if
-            you did not mean it, contact support straight away.
+            Data deletion under way. A deletion request covering {row.nickname}’s data is open.
+            Processing has already stopped, so nothing can be changed, paired or activated for them,
+            and they stay listed here until the deletion finishes. Deletion can’t be undone from the
+            app: if you did not mean it, contact support straight away.
           </Body>
           <Button
             label="Privacy and data"

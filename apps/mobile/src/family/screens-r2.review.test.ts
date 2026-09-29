@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { biometricOffer, BIOMETRIC_OWNER_KEY } from './unlock.ts';
@@ -113,7 +113,7 @@ describe('the biometric PIN never outlives its owner (MOB-R2-06)', () => {
   it('signing out on the device clears the stored PIN', () => {
     // Both device exits go through the same helper, so neither can drop the PIN removal.
     expect(runtime).toMatch(
-      /export async function signOutParentOnDevice[^]*?await clearDeviceAdultSecrets\(\);/,
+      /export async function signOutParentOnDevice[^]*?clearDeviceAdultSecrets\(\)/,
     );
     expect(runtime).toMatch(
       /async function clearDeviceAdultSecrets[^]*?biometricPinStore\.clear\(\)/,
@@ -125,13 +125,17 @@ describe('the biometric PIN never outlives its owner (MOB-R2-06)', () => {
     // The whole device sign-out, so a closed account leaves no PIN, no parent mode and no unlock.
     // The call takes no argument (MOB-R4-LOCK-05): nothing at the call site can switch part of the
     // closure off, which is how the first round-4 attempt ended up inert.
-    expect(privacy).toMatch(/signOutClosedAccountOnDevice\(\)/);
+    // The screen hands the shared device sign-out to the closure flow (HUNT6-J-2 moved the ordering
+    // into src/privacy/parent-privacy.ts, where it is run in a test rather than grepped for here).
+    expect(privacy).toMatch(
+      /runAccountClosure\(api, closeConfirmed, signOutClosedAccountOnDevice,/,
+    );
     expect(privacy).not.toMatch(/parentAuth\.signOut\(\)/);
     expect(runtime).toMatch(
       /export async function signOutClosedAccountOnDevice[^]*?await signOutClosedAccount\(/,
     );
     expect(runtime).toMatch(
-      /export async function signOutClosedAccountOnDevice[^]*?await clearDeviceAdultSecrets\(\);/,
+      /export async function signOutClosedAccountOnDevice[^]*?clearDeviceAdultSecrets\(\)/,
     );
   });
 });
@@ -251,7 +255,7 @@ describe('closing the account leaves no child pairing on the device (MOB-R4-LOCK
     // and purely local — no child session is revoked on the wire — and the signature has no argument
     // for a call site to omit.
     expect(runtime).toMatch(
-      /export async function signOutClosedAccountOnDevice\(\): Promise<void>/,
+      /export async function signOutClosedAccountOnDevice\(\): Promise<DeviceSignOutOutcome>/,
     );
     expect(runtime).not.toMatch(/familyDeleted: false/);
     expect(runtime).not.toMatch(/childSession\.logout\(\)/);
@@ -294,10 +298,25 @@ describe('the Children screen tells the truth about an open deletion (HUNT5-H-2,
     // /v1/family cannot answer for any adult of that family, and the screen renders its no-family
     // notice instead of a child card at all. Telling a parent who asked for one child that their
     // whole family account may be being deleted — and that the app cannot say which — was the most
-    // alarming ambiguity on this screen. The web client states the reachable truth
-    // (apps/web/src/pages/app/ChildrenPage.tsx) and the two surfaces now agree.
-    expect(notice).toMatch(/You\s+asked\s+for\s+\{row\.nickname\}/);
+    // alarming ambiguity on this screen.
+    //
+    // This comment used to end "The web client states the reachable truth
+    // (apps/web/src/pages/app/ChildrenPage.tsx) and the two surfaces now agree", in the very test
+    // whose job is to pin the sentence. It cannot say that. The assertions below read this app's
+    // source and nothing else, so agreement between the surfaces is not something this file knows or
+    // pins — and it was false as written, because the requester-neutral form below is the mobile half
+    // of HUNT6-I-3 while the web client's identical claim is its other half, in another area's file
+    // with its own suite (apps/web/src/pages/app/ChildrenPage.archive.test.tsx). What is true here is
+    // that this screen says only what `deletionPending` carries.
+    //
+    // HUNT6-I-3: this assertion used to pin "You asked for {row.nickname}", which named the READER as
+    // the requester — a fact `deletionPending` does not carry (the flag is computed from the request's
+    // scope and target, the response never exposes requested_by, and any guardian may delete a
+    // child's data, so the other adult is served the same flag). It pins the requester-neutral form
+    // now, and children-screen.test.ts asserts the claim cannot come back.
+    expect(notice).toMatch(/request\s+covering\s+\{row\.nickname\}/);
     expect(notice).not.toMatch(/whole\s+family/i);
+    expect(notice).not.toMatch(/\byou\s+asked\b/i);
     expect(children).toMatch(/Data\s+deletion\s+under\s+way/);
   });
 });
@@ -321,5 +340,239 @@ describe('signing out of the phone leaves other sessions alone (WEB-R2-02, mobil
   it('the mobile parent sign-out is local to this device', () => {
     const auth = readFileSync(join(srcDir, 'lib', 'parent-auth.ts'), 'utf8');
     expect(auth).toMatch(/signOut\(\{ scope: 'local' \}\)/);
+  });
+});
+
+/**
+ * HUNT6-I-1. The HUNT5-H-1 fix rests on a premise about the screens — the gate publishes fresh state
+ * for a moved parent identity, and "the screens key their load on the client", so fresh state is what
+ * makes them refetch. One screen did not: the Practice planner ran its own loader whose effect
+ * depended on a literal path string and a manual counter, so publishing fresh state changed nothing
+ * there and the next adult kept the previous family's children, subjects and schedule with no request
+ * made at all. That is L-037 in its purest form — verified on the one screen its test comment named
+ * (app/(parent)/home.tsx, above) and assumed for the rest.
+ *
+ * So the premise is asserted rather than assumed, over EVERY parent screen: a hook that reads the
+ * gate's client, or calls a loader closed over it, must list it, so a new client re-runs the load.
+ * A screen added later cannot opt out silently.
+ */
+describe('every parent screen keys its loads on the client the gate published (HUNT6-I-1)', () => {
+  const parentDir = join(appDir, '(parent)');
+  const screens = readdirSync(parentDir).filter((name) => name.endsWith('.tsx'));
+
+  /** Comments and quoted strings are not code: a `'load'` label or a "then load" comment is not a use. */
+  const code = (source: string) =>
+    source
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\/\/[^\n]*/g, ' ')
+      .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
+      .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+
+  /**
+   * Every `useCallback(…)`/`useEffect(…)` in a screen as {body, deps}, found by walking to the
+   * matching close paren of the hook call, so a nested hook or a multi-line body is not mis-split.
+   */
+  function hooks(source: string): { body: string; deps: string | null }[] {
+    const found: { body: string; deps: string | null }[] = [];
+    const calls = /\buse(?:Callback|Effect)\(/g;
+    for (let m = calls.exec(source); m !== null; m = calls.exec(source)) {
+      let depth = 1;
+      let i = m.index + m[0].length;
+      for (; i < source.length && depth > 0; i += 1) {
+        const c = source[i];
+        if (c === '(' || c === '[' || c === '{') depth += 1;
+        else if (c === ')' || c === ']' || c === '}') depth -= 1;
+      }
+      const call = source.slice(m.index + m[0].length, i - 1);
+      // A trailing comma is prettier's, on a multi-line hook call; a hook whose dependency array
+      // cannot be read reads as none, which FAILS the check below rather than excusing the screen.
+      const deps = /,\s*(\[[^[\]]*\])\s*,?\s*$/.exec(call.trimEnd())?.[1] ?? null;
+      found.push(
+        deps === null
+          ? { body: call, deps }
+          : { body: call.slice(0, call.lastIndexOf(deps)), deps },
+      );
+    }
+    return found;
+  }
+
+  const uses = (text: string, name: string) => new RegExp(`(?<![\\w.])${name}(?![\\w])`).test(text);
+
+  it('[repro] no parent screen has a load hook that a new client cannot re-run', () => {
+    const offenders: string[] = [];
+    for (const name of screens) {
+      const source = code(readFileSync(join(parentDir, name), 'utf8'));
+      for (const hook of hooks(source)) {
+        for (const dependency of ['api', 'load']) {
+          if (uses(hook.body, dependency) && !uses(hook.deps ?? '', dependency)) {
+            offenders.push(
+              `${name}: a hook using \`${dependency}\` has deps ${hook.deps ?? '(none)'}`,
+            );
+          }
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the screens really do go through the shared hook, so the check above has something to check', () => {
+    // A guard over an empty set passes (L-054): at least one hook per data screen must be found, and
+    // the shared loader must be the one they use.
+    expect(screens.length).toBeGreaterThan(8);
+    for (const name of ['children.tsx', 'home.tsx', 'planner.tsx', 'devices.tsx']) {
+      expect(hooks(code(readFileSync(join(parentDir, name), 'utf8'))).length).toBeGreaterThan(0);
+      expect(screen('(parent)', name)).toMatch(/useLoad\(/);
+    }
+  });
+});
+
+/**
+ * HUNT6-I-1, the half its own fix introduced. Keying the planner's loads on the client makes the next
+ * adult's rows arrive; it does not make the SELECTION follow. The screen remembered the child id the
+ * parent tapped in a `useState` and set it once from an effect ("if it is null and a first child
+ * exists"), so a load for a different family left that id in place — and with it in none of the new
+ * family's children the screen fell out of every branch it has: no loading, no error, no
+ * empty-family notice and no plan, which is a blank screen under the title for a family with one
+ * child, and a <Choice> holding a value that is not one of its options for a family with more.
+ *
+ * A source pin, not a rendered test: app/(parent)/planner.tsx imports react-native, which this
+ * project cannot load (see the file header). What is pinned is the shape that makes the invalid state
+ * unreachable — the selection is computed from `children` on every render — and that each of the
+ * screen's four states still renders something. The mutation that turns it red: put the remembered
+ * pick back in the <Choice> and in the `children.find(…)`, which is the line the finding names.
+ */
+describe('the planner’s child selection is derived from the family it loaded (HUNT6-I-1)', () => {
+  const planner = screen('(parent)', 'planner.tsx');
+
+  it('[repro] the id the screen uses is computed from the loaded children, not remembered', () => {
+    // `picked` is what the parent tapped; it reaches the screen only through this line, which admits
+    // it only while the loaded family has that child and falls back to the family's first child.
+    expect(planner).toMatch(
+      /const childId = children\.some\(\(c\) => c\.id === picked\) \? picked : \(children\[0\]\?\.id \?\? null\);/,
+    );
+    // So the <Choice> holds one of its own options, and the plan resolves whenever there are children.
+    expect(planner).toMatch(/value=\{childId\}/);
+    expect(planner).toMatch(
+      /const child = children\.find\(\(c\) => c\.id === childId\) \?\? null;/,
+    );
+    // The remembered pick itself never reaches the render: not as the Choice's value, and not as the
+    // id the child is looked up by.
+    expect(planner).not.toMatch(/value=\{picked\}/);
+    expect(planner).not.toMatch(/children\.find\(\(c\) => c\.id === picked\)/);
+    // And nothing sets it once and leaves it — the effect shape that survived the family change, and
+    // any other writer than the parent's own tap (the <Choice> hands the setter over, it never calls
+    // it), since a selection written anywhere else is a selection a load cannot re-derive.
+    expect(planner).not.toMatch(/childId === null && firstChild !== null/);
+    expect(planner).not.toMatch(/setPicked\(/);
+  });
+
+  it('every state of the load renders something, so no family can leave the screen blank', () => {
+    // A guard over an empty set passes (L-054): these four are the only branches under the title, so
+    // the check is that each one exists and that between them they cover idle/loading, error, ready
+    // with no children, and ready with children — the last guaranteed by the derivation above.
+    expect(planner).toMatch(
+      /family\.state\.status === 'idle' \|\| family\.state\.status === 'loading' \? \(\s*<Loading/,
+    );
+    expect(planner).toMatch(/family\.state\.status === 'error' \? \(\s*<ErrorBox/);
+    expect(planner).toMatch(
+      /family\.state\.status === 'ready' && children\.length === 0 \? \(\s*<Notice/,
+    );
+    expect(planner).toMatch(/\{child && family\.state\.status === 'ready' \? \(\s*<ChildPlan/);
+  });
+});
+
+/**
+ * HUNT6-I-2. `useLoad` preserved a 'ready' state across a load it had never run, so the previous
+ * adult's rows stayed on screen for the length of the new adult's request. The rule is a pure function
+ * (src/family/family-view.ts `loadStateForRun`, tested in family-view.test.ts); what is pinned here is
+ * the hook's wiring, which this suite cannot render.
+ */
+describe('useLoad drops rows produced by a different load (HUNT6-I-2)', () => {
+  it('keeps the owning load in a ref and consults it through the shared rule', () => {
+    expect(ui).toMatch(/const producedBy = useRef<\(\(\) => Promise<T>\) \| null>\(null\)/);
+    expect(ui).toMatch(/loadStateForRun\(/);
+    // And no longer the unconditional keep, which is what served one adult's rows to the next.
+    expect(ui).not.toMatch(
+      /setState\(\(s\) => \(s\.status === 'ready' \? s : \{ status: 'loading' \}\)\)/,
+    );
+  });
+
+  it('[repro] the owning load is captured BEFORE the setter, not read inside the updater', () => {
+    // The same mistake as the parent gate's first HUNT5-H-1 fix (pinned above): a state updater runs
+    // during the next render, so an updater that read `producedBy.current` would read what the line
+    // recording the new owner wrote and compare `load` with itself — it would keep the previous
+    // adult's rows in exactly the case this exists for.
+    expect(ui).toMatch(
+      /const producer = producedBy\.current;\s*producedBy\.current = load;\s*setState\(\(s\) => loadStateForRun\(s, producer, load\)\);/,
+    );
+    expect(ui).not.toMatch(/loadStateForRun\(s, producedBy\.current/);
+  });
+
+  /**
+   * [repro] The residual the HUNT6-I-2 prose overstated away: dropping the rows before the new fetch
+   * is not the whole of it, because the ANSWER of the previous adult's request is still coming. The
+   * hook awaited `load()` and published whatever resolved, so a request started for the PREVIOUS
+   * client that settles after a newer load began put the previous adult's rows on screen as 'ready',
+   * under the new adult's client — the same privacy harm, through the door the identity check does not
+   * watch. It is reachable in the ordinary case, not a rare interleaving: the new load starts the
+   * moment the gate publishes the new client, while the old request is still in flight.
+   *
+   * A source pin (react-native, see the file header). The mutation that turns it red is the line the
+   * guard replaced: `setState({ status: 'ready', data: await load() })`, which is what the negative
+   * below names.
+   */
+  it('[repro] an answer that arrives after a newer load began is dropped, not published', () => {
+    expect(ui).toMatch(/const latestRun = useRef\(0\)/);
+    // The ticket is taken before anything is awaited, and checked after — for the rows and for the
+    // error alike, since publishing a superseded load's failure is the same lie about whose load it is.
+    expect(ui).toMatch(/latestRun\.current \+= 1;\s*const ticket = latestRun\.current;/);
+    expect(ui).toMatch(
+      /const data = await load\(\);[\s\S]*?if \(latestRun\.current !== ticket\) return;\s*setState\(\{ status: 'ready', data \}\);/,
+    );
+    expect(ui).toMatch(
+      /\} catch \(error\) \{\s*if \(latestRun\.current !== ticket\) return;\s*setState\(\{ status: 'error', error \}\);/,
+    );
+    // The unguarded publish itself: awaiting inside the setter leaves no place to check the ticket.
+    expect(ui).not.toMatch(/setState\(\{ status: 'ready', data: await load\(\) \}\)/);
+  });
+});
+
+/**
+ * HUNT6-J-2's residual. The privacy screen is the one screen with its own loader, and its closure
+ * guard was on the reload EFFECT only: pull-to-refresh calls `load` directly, so a pull during the
+ * closure replaced the outcome with the ordinary screen — the whole "Delete my account" section back
+ * on screen, second live button and all, in the middle of an operation of up to three network calls.
+ * The claim being defended ("the section is off the screen for the length of the operation") had a
+ * gesture-shaped exception, so the guard moved into `load`, where every door leads.
+ *
+ * A source pin (react-native, see the file header); the closure's own ordering is run as logic in
+ * src/privacy/parent-privacy.test.ts. The mutation: move the check back out of `load`.
+ */
+describe('nothing puts the deleted account’s sections back on the screen (HUNT6-J-2)', () => {
+  const privacy = screen('(parent)', 'privacy.tsx');
+
+  it('[repro] `load` itself refuses once the closure has started, not just the reload effect', () => {
+    const body = /const load = useCallback\(async \(\) => \{([^]*?)\n {2}\}, \[api\]\);/.exec(
+      privacy,
+    )?.[1];
+    expect(body).toBeDefined();
+    expect(body).toMatch(/if \(closureStarted\.current\) return;/);
+    // And the closure cannot be overtaken by a load that was already in flight when it started, nor
+    // by the previous adult's load (the same in-flight door as useLoad's, this loader's own copy).
+    expect(body).toMatch(/const ticket = latestLoad\.current;/);
+    expect(body).toMatch(
+      /if \(latestLoad\.current !== ticket \|\| closureStarted\.current\) return;\s*setState\(\{ status: 'ready', data \}\);/,
+    );
+    expect(body).toMatch(
+      /if \(latestLoad\.current !== ticket \|\| closureStarted\.current\) return;\s*setState\(\{ status: 'error'/,
+    );
+    // The effect keeps its own guard: it must not re-run the load at all on a new client mid-closure.
+    expect(privacy).toMatch(/access\.status !== 'ready' \|\| closureStarted\.current/);
+  });
+
+  it('the pull-to-refresh gesture is not offered while the closure is the screen', () => {
+    expect(privacy).toMatch(
+      /api && state\.status !== 'closing' && state\.status !== 'account_closed' \? \(\s*<RefreshControl/,
+    );
   });
 });

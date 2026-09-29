@@ -3,7 +3,11 @@ import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import { cryptoRandom } from '@pencillift/domain';
-import { DEFAULT_RATE_TABLE_2026_09_18 } from '@pencillift/domain/quotas';
+import {
+  AI_STAGES,
+  DEFAULT_RATE_TABLE_2026_09_18,
+  estimateUpperBoundCostMicros,
+} from '@pencillift/domain/quotas';
 import {
   createMockResponsesClient,
   dataEnvelope,
@@ -12,6 +16,8 @@ import {
   PROMPTS,
   PROPOSED_STAGE_LIMITS,
   runStage,
+  STAGE_FLOOR_INPUT_TOKENS,
+  STAGE_MODELS,
   type InputPart,
   type PromptDefinition,
 } from '@pencillift/ai';
@@ -26,6 +32,11 @@ import {
   type JobHandler,
 } from '../src/jobs/dispatcher.ts';
 import { createExportBuildHandler, storageUploader } from '../src/jobs/export-build.ts';
+import {
+  extractionInputParts,
+  gradingInputParts,
+  type GradingQuestionPart,
+} from '../src/jobs/scan-process.ts';
 import { inputTokenUpperBound } from '../src/jobs/spend-ceiling.ts';
 import { stripImageMetadata } from '../src/services/image-metadata.ts';
 import { createTestApi, type TestApi } from './helpers.ts';
@@ -396,7 +407,8 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
    * entitlement step nothing. There is no run-time assertion for a promise made in a comment: the
    * claim is the defect, so the source is what this checks. It failed on "so this step always gets a
    * slice (R4-JOBS-4)", which a reader would have trusted while looking for the wrong bug the next
-   * time `entitlementsReconciled` was 0.
+   * time `entitlementsReconciled` was 0. The NEGATIVE half of that check now lives in the whole-file
+   * case below, which covers this window too and cannot be escaped by moving the sentence.
    */
   it('does not promise the trailing entitlement step a slice the tick cannot give it', () => {
     const source = readFileSync(new URL('../src/jobs/dispatcher.ts', import.meta.url), 'utf8');
@@ -406,9 +418,82 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
     expect(sweep).toBeGreaterThan(ledger);
     const note = source.slice(ledger, sweep);
     expect(note).toMatch(/R4-JOBS-4/);
-    expect(note).not.toMatch(/always gets a slice/);
     // It must point at what really bounds the step: the steps in front of it are unbounded.
     expect(note).toMatch(/unbounded/);
+  });
+
+  /**
+   * HUNT6-D-2: BUG-264 rewrote ONE of the places that promised the sweep a slice, and the round-6 fix
+   * rewrote two more but searched for the survivors only inside the two windows those rewrites landed
+   * in — so a FOURTH copy sat at the claim filter itself ("keeping the trailing steps their reserved
+   * slice of it"), one line from `remaining`, inside neither window and in lower case, which the
+   * previous pattern would have missed even in range. That is the L-054 defect the finding was filed
+   * about, repeated one line away.
+   *
+   * So this searches the WHOLE FILE, case-insensitively, and reports the offending LINES: no window
+   * for the next copy to hide between. The reserve keeps the LEDGER from claiming into the last two
+   * minutes of the invocation; it does not hand the trailing steps two minutes, because `remaining` is
+   * measured from the TICK's start and no step in front of the ledger has a deadline.
+   */
+  it('nowhere in the dispatcher promises the trailing steps a reserved slice', () => {
+    const source = readFileSync(new URL('../src/jobs/dispatcher.ts', import.meta.url), 'utf8');
+    const promises = /reserved slice|enough for the sweep|always gets a slice|leaves to the steps/i;
+    const offenders = source
+      .split('\n')
+      .map((line, index) => `${index + 1}: ${line.trim()}`)
+      .filter((line) => promises.test(line));
+    expect(offenders).toEqual([]);
+    // And the two places that DO explain the bound must still say what really bounds the trailing
+    // steps: nothing does. Positive checks stay windowed, because a claim has a place it belongs.
+    const constants = source.slice(
+      source.indexOf('const TICK_CLAIM_BUDGET_MS'),
+      source.indexOf('const TICK_TRAILING_RESERVE_MS'),
+    );
+    expect(constants).toMatch(/unbounded|no wall-clock budget/);
+    const filter = source.indexOf('const remaining = TICK_WALL_LIMIT_MS');
+    expect(filter).toBeGreaterThan(-1);
+    // Unwrapped, because a sentence a formatter split over two comment lines must still be readable
+    // to a regex — otherwise this guard passes on a claim it cannot see (the L-054 shape again).
+    const claimFilter = source
+      .slice(filter - 600, filter)
+      .replace(/\s*\/\/\s*/g, ' ')
+      .replace(/\s+/g, ' ');
+    expect(claimFilter).toMatch(/R4-JOBS-4/);
+    expect(claimFilter).toMatch(/no step in front of the ledger has a deadline/);
+  });
+
+  /**
+   * HUNT6-D-3: the same diff justified the starvation claim with "entitlement syncs call the store"
+   * as an example of a step that runs BEFORE the ledger — two sentences after saying the sweep runs
+   * AFTER it. There is no entitlement sync in front of the ledger, so a reader following the example
+   * hunts a phantom store call and then distrusts the load-bearing half of the comment. The example
+   * was copied out of TICK_WALL_LIMIT_MS's docstring, which has been stale since JOBS-R2-04 moved the
+   * sweep behind the ledger, so both copies are checked here: first the FACT in the code, then the
+   * prose that must agree with it.
+   */
+  it('offers no entitlement sync as an example of the unbounded work in front of the ledger', () => {
+    const source = readFileSync(new URL('../src/jobs/dispatcher.ts', import.meta.url), 'utf8');
+    const tick = source.indexOf('export async function runScheduledTick');
+    const ledger = source.indexOf("const jobs = await step('jobs'", tick);
+    const sweep = source.indexOf('const entitlementsReconciled = await step(', ledger);
+    expect(tick).toBeGreaterThan(-1);
+    expect(ledger).toBeGreaterThan(tick);
+    expect(sweep).toBeGreaterThan(ledger);
+    // The fact: not one of the steps before the ledger touches the billing store.
+    expect(source.slice(tick, ledger)).not.toMatch(
+      /reconcileStaleEntitlements|syncFamilyFromProvider/,
+    );
+    // So neither comment may name an entitlement sync as one of them.
+    const constants = source.slice(
+      source.indexOf('const TICK_CLAIM_BUDGET_MS'),
+      source.indexOf('const TICK_TRAILING_RESERVE_MS'),
+    );
+    for (const [where, note] of [
+      ['the constants', constants],
+      ['the sweep call site', source.slice(ledger, sweep)],
+    ] as const) {
+      expect(note, where).not.toMatch(/entitlement sync/i);
+    }
   });
 });
 
@@ -448,20 +533,22 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
   );
 
   /**
-   * EXTRACTION's real input for a scan of `pages` pages: the data envelope plus one `input_image`
-   * part per page (apps/api/src/jobs/scan-process.ts's extract() always sends both, and refuses a
-   * scan of zero pages with NO_PAGES). inputTokenUpperBound charges IMAGE_INPUT_TOKEN_BOUND + the
-   * part overhead for each image, so this is the bound the stage's cost cap is really measured
-   * against — the image-free floor no caller can send is 1,500 tokens per page smaller.
+   * EXTRACTION's real input for a scan of `pages` pages, built by the PRODUCTION builder
+   * (`extractionInputParts`, the only place extract() builds its parts): the data envelope plus one
+   * `input_image` part per page. inputTokenUpperBound charges IMAGE_INPUT_TOKEN_BOUND + the part
+   * overhead for each image, so this is the bound the stage's cost cap is really measured against —
+   * the image-free floor no caller can send is 1,500 tokens per page smaller.
+   *
+   * HUNT6-D-6: this used to hand-copy the envelope out of scan-process.ts. A field added there would
+   * have left every measured bound below stale with the whole suite green, and those bounds are what
+   * EXTRACTION_GRADING_COST_MICROS itself is derived from.
    */
   function extractionInput(pages: number): InputPart[] {
-    return [
-      dataEnvelope({
-        pageNumbers: Array.from({ length: pages }, (_, i) => i + 1),
-        gradeLevel: 4,
-      }),
-      ...Array.from({ length: pages }, () => imagePart('image/jpeg', 'AAAA')),
-    ];
+    return extractionInputParts(
+      Array.from({ length: pages }, (_, i) => i + 1),
+      4,
+      Array.from({ length: pages }, () => imagePart('image/jpeg', 'AAAA')),
+    );
   }
 
   /**
@@ -469,12 +556,12 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
    * JSON with its `q<n>` ref. Grading's bound grows with these BYTES, so the size is stated here and
    * pinned below — the question count the cap admits is only meaningful next to it.
    */
-  const GRADING_QUESTION = {
+  const GRADING_QUESTION: Omit<GradingQuestionPart, 'questionNumber'> = {
     prompt: 'Write 3/4 as a decimal and explain how you know.',
     studentAnswer: '0.75 because 3 divided by 4 is 0.75.',
     answerKind: 'open_response',
     subject: 'math',
-  } as const;
+  };
 
   /**
    * GRADING's real input: ONE data envelope of the grade level, the pages whose source passage was
@@ -484,23 +571,26 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
    * it only through how many questions those pages carried.
    */
   function gradingInput(questions: number): InputPart[] {
-    return [
-      dataEnvelope({
-        gradeLevel: 4,
-        pagesMissingSourcePassage: [],
-        questions: Array.from({ length: questions }, (_, i) => ({
-          questionNumber: `q${i + 1}`,
-          ...GRADING_QUESTION,
-        })),
-      }),
-    ];
+    return gradingInputParts(
+      4,
+      [],
+      Array.from({ length: questions }, (_, i) => ({
+        questionNumber: `q${i + 1}`,
+        ...GRADING_QUESTION,
+      })),
+    );
   }
 
   async function raisedRetry<S extends z.ZodType>(
     prompt: PromptDefinition<S>,
     input: readonly InputPart[],
+    /** The cap this stage had before it was raised, for the cases that compare the two. */
+    capMicros?: number,
   ) {
-    const limits = PROPOSED_STAGE_LIMITS[prompt.stage];
+    const limits =
+      capMicros === undefined
+        ? PROPOSED_STAGE_LIMITS[prompt.stage]
+        : { ...PROPOSED_STAGE_LIMITS[prompt.stage], maxCostMicros: capMicros };
     const estimatedInputTokens = inputTokenUpperBound(prompt, input);
     const client = createMockResponsesClient((request) => ({
       kind: 'incomplete' as const,
@@ -602,12 +692,111 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
     'is admitted for grading at the input bound %i extracted questions really send (one envelope, no image)',
     async (questions) => {
       const input = gradingInput(questions);
-      // The shape itself, so the image-part stand-in cannot come back: grade() sends one text part.
+      // The shape PRODUCTION builds, not one this file wrote: `gradingInputParts` is what grade()
+      // calls, so the image-part stand-in cannot come back and a part added to the envelope moves
+      // these measured bounds instead of passing unnoticed (HUNT6-D-6).
       expect(input).toHaveLength(1);
       expect(input[0]!.type).toBe('input_text');
       expectRaisedRetry(await raisedRetry(PROMPTS.grading, input));
     },
   );
+
+  /**
+   * The largest `estimatedInputTokens` grading is ADMITTED at under `cap`. run.ts's pre-flight check
+   * is `estimateUpperBoundCostMicros(E, maxOutputTokens) <= cap`, and it returns STAGE_LIMIT with
+   * `attempts: []` and NO provider call at all above it — so the cap is not only a hold, it is also a
+   * free-refusal gate, and raising it moves that gate. Derived from the production estimator, so it
+   * moves with the rate table instead of restating it.
+   */
+  function largestAdmittedInputBound(cap: number): number {
+    let low = 0;
+    let high = 1_000_000;
+    let best = 0;
+    while (low <= high) {
+      const mid = low + Math.floor((high - low) / 2);
+      const estimate = estimateUpperBoundCostMicros(DEFAULT_RATE_TABLE_2026_09_18, {
+        modelId: STAGE_MODELS.grading,
+        inputTokens: mid,
+        maxOutputTokens: PROPOSED_STAGE_LIMITS.grading.maxOutputTokens,
+      });
+      if (estimate.ok && estimate.value <= cap) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * HUNT6-D-1's sibling, HUNT6-D-4: routing.ts used to say the ceiling raise "moves the transient
+   * reservation, not the spend". It does, for a scan that succeeds — but the cap is ALSO the
+   * pre-flight gate, so between the old gate and the new one a worksheet that used to be refused for
+   * free now costs exactly one billed generation. The docstring now names that band; this case is
+   * what makes the number checkable, because the owner's cost record quotes it.
+   */
+  it('turns a free pre-flight refusal into ONE billed generation for the input band the raise admitted', async () => {
+    // The two edges the routing.ts note quotes.
+    expect(largestAdmittedInputBound(150_000)).toBe(51_000);
+    expect(largestAdmittedInputBound(PROPOSED_STAGE_LIMITS.grading.maxCostMicros)).toBe(84_408);
+
+    // A ten-page arithmetic drill sheet at 30 problems a page is inside the product's page limit.
+    const input = gradingInput(300);
+    const bound = inputTokenUpperBound(PROMPTS.grading, input);
+    expect(bound).toBeGreaterThan(largestAdmittedInputBound(150_000));
+    expect(bound).toBeLessThanOrEqual(
+      largestAdmittedInputBound(PROPOSED_STAGE_LIMITS.grading.maxCostMicros),
+    );
+
+    // At the old cap: refused before anything was sent, nothing metered, and the parent saw a bare
+    // STAGE_LIMIT with no copy of its own.
+    const refused = await raisedRetry(PROMPTS.grading, input, 150_000);
+    expect(refused.budgets).toEqual([]);
+    expect(refused.out.attempts).toEqual([]);
+    expect(refused.out.result.ok).toBe(false);
+    if (!refused.out.result.ok) expect(refused.out.result.error.code).toBe('STAGE_LIMIT');
+
+    // At the raised cap: admitted, ONE billed generation, and no raise fits at this bound either, so
+    // it ends OUTPUT_TRUNCATED -> SCAN_TOO_MANY_QUESTIONS, which the parent can act on.
+    const billed = await raisedRetry(PROMPTS.grading, input);
+    expect(billed.budgets).toHaveLength(1);
+    expect(billed.out.attempts).toHaveLength(1);
+    expect(billed.out.attempts[0]!.costMicros).toBeGreaterThan(0);
+    expect(billed.out.result.ok).toBe(false);
+    if (!billed.out.result.ok) expect(billed.out.result.error.code).toBe('OUTPUT_TRUNCATED');
+  });
+
+  /**
+   * HUNT6-D-6, the other half: sharing the builder only pins the bounds while extract() and grade()
+   * really go through it. A part added straight into either call site would bypass the builder and
+   * leave every measured number above stale with this file green — so the call sites themselves are
+   * what this checks, in the style of the dispatcher case above. It is a LINKAGE guard, not a claim
+   * about the prose.
+   */
+  it("builds both stages' request parts only through the exported builders", () => {
+    const source = readFileSync(new URL('../src/jobs/scan-process.ts', import.meta.url), 'utf8');
+    const blocks: readonly [string, string, string, RegExp][] = [
+      [
+        'extract',
+        "await this.spending(['extraction']",
+        'if (extraction === null)',
+        /extractionInputParts\(/,
+      ],
+      ['grade', "['grading', 'verification'],", 'const primaryByRef', /gradingInputParts\(/],
+    ];
+    for (const [name, from, to, builder] of blocks) {
+      const start = source.indexOf(from);
+      const end = source.indexOf(to, start);
+      expect(start, name).toBeGreaterThan(-1);
+      expect(end, name).toBeGreaterThan(start);
+      const block = source.slice(start, end);
+      expect(block, name).toMatch(builder);
+      // No envelope and no image part built in place: the builder is the single definition of the
+      // shape the measured bounds were measured on.
+      expect(block, name).not.toMatch(/dataEnvelope\(|imagePart/);
+    }
+  });
 
   it(`grading's full raise stops above ${GRADING_FULL_RAISE_MAX_QUESTIONS} extracted questions and any raise above ${GRADING_ANY_RAISE_MAX_QUESTIONS}, so a ten-page worksheet is NOT covered (lead decision, no ceiling raised here)`, async () => {
     const limits = PROPOSED_STAGE_LIMITS.grading;
@@ -653,6 +842,182 @@ describe('the one raised retry after a truncated answer (R4-JOBS-1)', () => {
     expect(none.budgets).toHaveLength(1);
     expect(none.out.result.ok).toBe(false);
     if (!none.out.result.ok) expect(none.out.result.error.code).toBe('OUTPUT_TRUNCATED');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HUNT6-D-1: the raised retry must be reachable for the astra stages too, at the input they send
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * BUG-260 was closed for extraction and grading only. The four astra stages kept their old caps,
+ * and astra costs 10 micros an input token and 50 an output token (five times terra), so the ONE
+ * raised retry JOBS-R2-02 promises was out of reach: at an ORDINARY daily set (eight word problems)
+ * `raisedOutputBudget` returned null and the child silently got the un-personalized bank items
+ * after one billed generation (learning-jobs.ts returns `unchanged` on any runStage failure).
+ *
+ * These cases drive the stage at the envelope the production job really builds. They assert only
+ * that a raised retry HAPPENS at every ordinary size — the FULL multiple is guaranteed at the
+ * stage's floor input, which packages/ai/src/run-truncation.test.ts pins against
+ * `fullRaiseCeiling`; above the floor the raise shrinks with the input, by design.
+ *
+ * Labeled mock provider (docs/Connections.md). Synthetic skills, names and answers only.
+ */
+describe('the one raised retry is reachable for the astra stages (HUNT6-D-1)', () => {
+  const gate = {
+    containsChildPersonalData: true,
+    ageBand: '8-10' as const,
+    zdrEvidence: null,
+    environment: 'test' as const,
+    now: new Date('2026-09-24T12:00:00Z'),
+  };
+
+  /** Six skill labels, the most `focusSkills` carries (learning-jobs.ts slices to six). */
+  const FOCUS_SKILLS = [
+    'Word problems',
+    'Multi-digit multiplication',
+    'Equivalent fractions',
+    'Rounding to the nearest ten',
+    'Main idea and details',
+    'Subject-verb agreement',
+  ];
+
+  /** Synthetic story contexts of the shape DEFAULT_CONTEXTS carries in the reviewed bank. */
+  const CONTEXTS = [
+    { name: 'Maya', things: 'seashells', place: 'beach' },
+    { name: 'Leo', things: 'stickers', place: 'library' },
+    { name: 'Ana', things: 'apples', place: 'orchard' },
+    { name: 'Omar', things: 'marbles', place: 'park' },
+    { name: 'Kai', things: 'pinecones', place: 'forest trail' },
+  ];
+  const TEMPLATES = ['join', 'separate', 'compare', 'array', 'share'];
+
+  /**
+   * DAILY_SET's real input: the ONE envelope apps/api/src/jobs/learning-jobs.ts builds for the
+   * practice personalization call — the grade, the age band, up to six skill LABELS (never homework
+   * text, answers or scores) and one entry per word problem in the set.
+   */
+  function dailySetInput(wordProblems: number): InputPart[] {
+    return [
+      dataEnvelope({
+        gradeLevel: 4,
+        ageBand: '8-10',
+        focusSkills: FOCUS_SKILLS,
+        wordProblems: Array.from({ length: wordProblems }, (_, i) => ({
+          ref: `w${i + 1}`,
+          template: TEMPLATES[i % TEMPLATES.length],
+          context: CONTEXTS[i % CONTEXTS.length],
+        })),
+      }),
+    ];
+  }
+
+  /**
+   * COACHING's real input: the ONE envelope apps/api/src/jobs/scan-process.ts's coachOne() builds —
+   * grade, age band, skill, the printed question, the child's answer, the likely misconception and
+   * the protected key. A worksheet question of a few hundred bytes is ordinary; schemas.ts admits up
+   * to 4,000 bytes for the prompt and the same for the answer.
+   */
+  function coachingInput(): InputPart[] {
+    return [
+      dataEnvelope({
+        gradeLevel: 4,
+        ageBand: '8-10',
+        skill: 'math.word_problems',
+        question:
+          'Maya collected seashells at the beach on four different mornings. On the first morning she found 48 seashells, on the second morning she found 36, on the third morning she found twice as many as on the second morning, and on the fourth morning she found 19 fewer than on the third morning. She wants to share all of the seashells she collected equally among her 6 friends at the beach clean-up club. Work out how many seashells each friend receives and explain every step of your reasoning in complete sentences so that a classmate who missed the lesson could follow it from start to finish.',
+        studentAnswer:
+          'First I added 48 and 36 and got 84. Then I doubled 36 and got 72 so I added that and got 156. Then I took 19 off 72 and got 53 and added it so I had 209 altogether. Then I divided 209 by 6 and I got 34 with 5 left over, so I said each friend gets 34 seashells and there are 5 seashells that nobody gets.',
+        likelyMisconception: 'treats the remainder as a leftover instead of checking the total',
+        answerForTutorOnly: '34 remainder 5',
+      }),
+    ];
+  }
+
+  /** Drives the stage with a provider that cuts EVERY answer off at the budget it was sent. */
+  async function alwaysTruncated<S extends z.ZodType>(
+    prompt: PromptDefinition<S>,
+    input: readonly InputPart[],
+  ) {
+    const limits = PROPOSED_STAGE_LIMITS[prompt.stage];
+    const estimatedInputTokens = inputTokenUpperBound(prompt, input);
+    const client = createMockResponsesClient((request) => ({
+      kind: 'incomplete' as const,
+      usage: {
+        inputTokens: estimatedInputTokens,
+        cachedInputTokens: 0,
+        outputTokens: request.maxOutputTokens,
+      },
+      // The stage's own model: astra is five times terra, which is the whole point here.
+      modelId: STAGE_MODELS[prompt.stage],
+      latencyMs: 10,
+      reason: 'max_output_tokens' as const,
+    }));
+    const out = await runStage({
+      prompt,
+      input,
+      client,
+      limits,
+      rates: DEFAULT_RATE_TABLE_2026_09_18,
+      gate,
+      metadata: { stage: prompt.stage },
+      estimatedInputTokens,
+      sleep: () => Promise.resolve(),
+    });
+    return {
+      limits,
+      out,
+      estimatedInputTokens,
+      budgets: client.requests.map((r) => r.maxOutputTokens),
+    };
+  }
+
+  /**
+   * The premise every raised cap rests on: `STAGE_FLOOR_INPUT_TOKENS` in packages/ai/src/routing.ts
+   * says it is `inputTokenUpperBound` of the stage's instructions and strict schema plus an EMPTY
+   * envelope, and `fullRaiseCeiling` prices the full raise at exactly that bound. routing.ts cannot
+   * import `inputTokenUpperBound` (it lives in apps/api), so the numbers are hand-carried there —
+   * which is only safe while THIS case holds them to the production function. Rewrite a prompt's
+   * instructions or its output schema and this goes red, which is the point: the caps move with it.
+   */
+  it('derives every stage cap from the real bound of the smallest request that stage can send', () => {
+    const prompted = Object.values(PROMPTS) as PromptDefinition<z.ZodType>[];
+    for (const prompt of prompted) {
+      expect(STAGE_FLOOR_INPUT_TOKENS[prompt.stage], prompt.stage).toBe(
+        inputTokenUpperBound(prompt, [dataEnvelope({})]),
+      );
+    }
+    // The three stages with no prompt cannot be measured, so routing.ts sizes them against a floor
+    // ABOVE every prompt that exists. Pinned here so that writing one of those prompts turns this
+    // case red and the cap is re-derived then, rather than silently dropping below the line.
+    const measured = prompted.map((prompt) => STAGE_FLOOR_INPUT_TOKENS[prompt.stage]);
+    const promptless = AI_STAGES.filter((stage) => !(stage in PROMPTS));
+    expect([...promptless].sort()).toEqual(['escalation', 'followup', 'semantic_check']);
+    for (const stage of promptless) {
+      expect(STAGE_FLOOR_INPUT_TOKENS[stage], stage).toBeGreaterThanOrEqual(Math.max(...measured));
+    }
+  });
+
+  /** One word problem per question, up to the twelve a daily set can carry. */
+  const WORD_PROBLEM_COUNTS = [1, 5, 8, 10, 12];
+
+  it.each(WORD_PROBLEM_COUNTS)(
+    'daily_set retries a cut-off set of %i word problems at a raised budget',
+    async (wordProblems) => {
+      const run = await alwaysTruncated(PROMPTS.daily_set, dailySetInput(wordProblems));
+      expect(run.budgets, `input bound ${run.estimatedInputTokens} tokens`).toHaveLength(2);
+      expect(run.budgets[1]!, `input bound ${run.estimatedInputTokens} tokens`).toBeGreaterThan(
+        run.limits.maxOutputTokens,
+      );
+      expect(run.out.result.ok).toBe(false);
+      if (!run.out.result.ok) expect(run.out.result.error.code).toBe('OUTPUT_TRUNCATED');
+    },
+  );
+
+  it('coaching retries a cut-off hint on a long worksheet question at a raised budget', async () => {
+    const run = await alwaysTruncated(PROMPTS.coaching, coachingInput());
+    expect(run.budgets, `input bound ${run.estimatedInputTokens} tokens`).toHaveLength(2);
+    expect(run.budgets[1]!).toBeGreaterThan(run.limits.maxOutputTokens);
   });
 });
 

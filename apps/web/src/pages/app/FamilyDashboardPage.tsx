@@ -140,13 +140,15 @@ function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: (
             HUNT5-F-2: a child whose data deletion is under way is archived by request_deletion, so
             this row used to read "Archived: history only" while the purge was deleting that history.
             The flag is on this response (the full contract schema), so the row says what is true.
+
+            HUNT6-G-2: the branch is inside `childStatusLabel` now, not here. Wrapping this one call
+            left the Children page — the other caller, in the file that defines the label — printing
+            the sentence this comment describes; one helper decides it for every surface (L-037).
           */}
           {data.children.map((child) => (
             <li key={child.id}>
               <strong>{child.nickname}</strong> · {gradeLabel(child.gradeLevel)} ·{' '}
-              {child.deletionPending === true
-                ? 'Data deletion under way'
-                : childStatusLabel(child.status)}
+              {childStatusLabel(child)}
             </li>
           ))}
         </ul>
@@ -183,21 +185,48 @@ function EditFamilyForm({
   const [name, setName] = useState(seed.displayName);
   const [timezone, setTimezone] = useState(seed.timezone);
   const [fieldError, setFieldError] = useState<string | null>(null);
+  /**
+   * Which fields the parent has edited in THIS form (HUNT6-G-8). "Edited" is what the request body
+   * and the submit button now hang on, instead of "differs from the seed".
+   *
+   * The seed diff was right about what to SEND and wrong about what to OFFER. When the other
+   * guardian's zone landed under the open form, the field kept showing the seeded America/Chicago
+   * and the diff against that seed was empty for it by construction — so a parent who wanted the
+   * value the field was showing them found Save greyed out and no keystroke could change that:
+   * clearing and retyping America/Chicago left the diff empty too. The only way through was Cancel
+   * and reopen, which reseeds to Europe/Berlin, i.e. the opposite of what they were doing.
+   *
+   * Editing a field is an explicit statement about that field, so it is sent even when it equals the
+   * seed. An untouched field is still never sent, which is the WEBR4-03/HUNT5-F-1 property: a
+   * nickname-only save cannot revert the other guardian's zone, and Save stays off until the parent
+   * edits something, so reopening the form and pressing it cannot revert anything either.
+   */
+  const [touched, setTouched] = useState({ displayName: false, timezone: false });
   const nameId = useId();
   const zoneId = useId();
   const errorId = useId();
 
   /**
-   * Only what differs from the family this form was opened on (WEBR4-03, HUNT5-F-1). Sending both
+   * Only the fields the parent edited in this form (WEBR4-03, HUNT5-F-1, HUNT6-G-8). Sending both
    * fields every time reverted the other guardian's time-zone change when a parent corrected only
    * the name, and the zone is what every daily release, weekly review and school report is planned
    * in.
    */
   const changes = (displayName: string, zone: string): UpdateFamilyRequest => ({
-    ...(displayName === seed.displayName ? {} : { displayName }),
-    ...(zone === seed.timezone ? {} : { timezone: zone }),
+    ...(touched.displayName ? { displayName } : {}),
+    ...(touched.timezone ? { timezone: zone } : {}),
   });
-  const nothingChanged = Object.keys(changes(name.trim(), timezone.trim())).length === 0;
+  const nothingEdited = Object.keys(changes(name.trim(), timezone.trim())).length === 0;
+
+  /**
+   * What another guardian changed while this form was open: the live prop against the seed
+   * (HUNT6-G-8). Without this the divergence was invisible — the summary above the form showed the
+   * new value, the field showed the old one, and nothing said the two were about the same thing.
+   */
+  const drifted = [
+    ...(data.displayName === seed.displayName ? [] : [`the family name to “${data.displayName}”`]),
+    ...(data.timezone === seed.timezone ? [] : [`the time zone to ${data.timezone}`]),
+  ];
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -232,6 +261,7 @@ function EditFamilyForm({
         aria-describedby={fieldError ? errorId : undefined}
         onChange={(e) => {
           setName(e.target.value);
+          setTouched((t) => ({ ...t, displayName: true }));
           setFieldError(null);
         }}
       />
@@ -244,6 +274,7 @@ function EditFamilyForm({
         aria-describedby={fieldError ? errorId : undefined}
         onChange={(e) => {
           setTimezone(e.target.value);
+          setTouched((t) => ({ ...t, timezone: true }));
           setFieldError(null);
         }}
       />
@@ -257,8 +288,17 @@ function EditFamilyForm({
         Practice release times, weekly reviews and reports all follow this zone. Changing it does
         not move practice already released.
       </p>
+      {drifted.length > 0 ? (
+        <p className="notice" role="note" style={{ margin: '8px 0 0' }}>
+          <strong>
+            Another guardian changed {drifted.join(' and ')} while this form was open.
+          </strong>{' '}
+          The fields above still show what you opened. Saving sends only the fields you edit here,
+          so their change stays unless you edit that field too.
+        </p>
+      ) : null}
       <div style={buttonRow}>
-        <button type="submit" className="btn" disabled={busy || nothingChanged}>
+        <button type="submit" className="btn" disabled={busy || nothingEdited}>
           {busy ? 'Saving…' : 'Save family details'}
         </button>
       </div>

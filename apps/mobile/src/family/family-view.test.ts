@@ -6,8 +6,10 @@ import { ApiRequestError } from '@pencillift/contracts/client';
 import {
   activationError,
   activationMessage,
+  childPlanEditable,
   childRows,
   deviceRows,
+  loadStateForRun,
   parentActionError,
   slotSummary,
   unusedPaidSlots,
@@ -200,5 +202,54 @@ describe('the ChildRow contract describes the behaviour the code has (HUNT5-H-5)
 
   it('the note helper still named for drafts says it serves both cases', () => {
     expect(docFor('function draftActivationNote')).toMatch(/archived/i);
+  });
+});
+
+/**
+ * HUNT6-I-2. `useLoad` (src/family/ui.tsx) preserved a 'ready' state across a load it had never run,
+ * so on a handed-on tablet the previous adult's rows stayed on screen for the length of the new
+ * adult's request — up to DEFAULT_REQUEST_TIMEOUT_MS. The hook itself cannot be rendered in this
+ * suite (ui.tsx imports react-native; see src/family/screens-r2.review.test.ts), so the decision it
+ * makes lives here as a value-in, value-out rule and is pinned behaviourally.
+ */
+describe('a screen does not keep rows it cannot vouch for (HUNT6-I-2)', () => {
+  const rileyRow = { status: 'ready', data: 'Riley' } as const;
+  const loadA = () => Promise.resolve('Riley');
+  const loadB = () => Promise.resolve('Ada');
+
+  it('[repro] rows fetched by another load are dropped before the new one runs', () => {
+    expect(loadStateForRun(rileyRow, loadA, loadB)).toEqual({ status: 'loading' });
+  });
+
+  it('a reload of the SAME load keeps the rows, so refresh does not flash', () => {
+    expect(loadStateForRun(rileyRow, loadA, loadA)).toBe(rileyRow);
+  });
+
+  it('a first run has no rows to vouch for', () => {
+    expect(loadStateForRun({ status: 'idle' }, null, loadA)).toEqual({ status: 'loading' });
+  });
+
+  it('an error or a load still in flight becomes loading either way', () => {
+    expect(loadStateForRun({ status: 'error', error: new Error('x') }, loadA, loadA)).toEqual({
+      status: 'loading',
+    });
+    expect(loadStateForRun({ status: 'loading' }, loadA, loadA)).toEqual({ status: 'loading' });
+  });
+});
+
+/**
+ * HUNT6-H-1 (the mobile half named in its suggested fix). The Practice planner mounted its subject
+ * toggles and its schedule editor for any child GET /v1/family returned, and both writes go through
+ * `ownedChild(c, 'write')`, which answers 422 BUSINESS_RULE CHILD_ARCHIVED for an archived profile
+ * (apps/api/src/routes/learning.ts). The reads succeed, so every control was offered and every one of
+ * them could only be refused.
+ */
+describe('a planner write is offered only where the API accepts one (HUNT6-H-1)', () => {
+  it('[repro] an archived child is read-only; a draft is not', () => {
+    expect(childPlanEditable('active')).toBe(true);
+    // A draft profile stays writable on purpose (learning.ts keeps it so), which is why this is not
+    // "only active children".
+    expect(childPlanEditable('draft')).toBe(true);
+    expect(childPlanEditable('archived')).toBe(false);
   });
 });

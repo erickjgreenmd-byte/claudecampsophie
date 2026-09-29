@@ -6,12 +6,16 @@ import type {
   ParentPracticeSet,
   learningScheduleResponseSchema,
   practiceSetsResponseSchema,
+  testDatesResponseSchema,
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { renderPage } from '../../test/render.tsx';
 import { formatInZone } from './format.ts';
 import { PracticeSetsSection } from './PracticeSetsSection.tsx';
 import { ScheduleSection } from './ScheduleSection.tsx';
+import { StudyMaterialSection } from './StudyMaterialSection.tsx';
+import { SubjectsSection } from './SubjectsSection.tsx';
+import { TestDatesSection } from './TestDatesSection.tsx';
 
 /**
  * HUNT5-F-10, as the lead settled it. Two designs were on the table for an archived child's planner
@@ -116,17 +120,16 @@ const DAILY_TEXT = formatInZone(DAILY_AT, ZONE);
 afterEach(cleanup);
 
 describe('[HUNT5-F-10] the schedule section keeps the release times whatever the status', () => {
-  it('has no status branch at all: an archived child still sees the times the notice explains', async () => {
+  it('an archived child still sees the times the notice explains', async () => {
     renderPage(
+      // HUNT6-H-1: the prop is back, and it is wired — but it governs the EDITOR, not the times. The
+      // assertions below are what HUNT5-F-10 settled: an archived profile's saved schedule and its
+      // next release instants stay on screen, under the planner notice that frames them.
       <ScheduleSection
         childId={CHILD}
         childName="Riley"
         subjects={SUBJECTS}
         refreshKey={0}
-        // The type-level half of the assertion: under the shipped design there is no status to
-        // branch on, so this prop must not exist. While it did, the branch it fed was dead for
-        // every real archived child — the planner, its only caller, passed no status.
-        // @ts-expect-error -- ScheduleSection takes no childStatus prop.
         childStatus="archived"
       />,
       { api: scheduleApi() },
@@ -195,7 +198,12 @@ describe('[HUNT5-F-10] a practice set promises nothing to an archived child', ()
     expect(set.textContent).not.toMatch(/shown to (your child|riley)/i);
     expect(set.textContent).toContain(DAILY_TEXT);
     expect(set.textContent).toMatch(/would open for riley from/i);
-    // 'again' belongs to a profile that WAS active; a draft never was.
+    // HUNT6-H-4: the wording stays, the reason for it does not. This used to say "'again' belongs to
+    // a profile that WAS active; a draft never was", which is false: `releaseSlotlessProfiles`
+    // (apps/api/src/services/billing-sync.ts) puts a previously ACTIVE child back into 'draft' when a
+    // store downgrade or an expiry releases its slot. The plain sentence is true of both populations —
+    // the one that never held a slot and the one that lost it — and "again", which asserts the second,
+    // is what this page cannot know from the status alone.
     expect(set.textContent).toMatch(/once the profile is active\./i);
     expect(set.textContent).not.toMatch(/active again/i);
   });
@@ -217,6 +225,33 @@ describe('[HUNT5-F-10] a practice set promises nothing to an archived child', ()
     expect(within(set).queryByText(/once the profile is active again/i)).toBeNull();
   });
 
+  it('an UNRECOGNISED status gets the conditional: only an absent prop keeps the promise', async () => {
+    // HUNT6-H-3: the docstring and the inline comment in PracticeSetsSection both said "an unknown
+    // value is treated as live", which is a claim about the VALUE; the code's condition is
+    // `childStatus !== undefined && childStatus !== 'active'`, so an unrecognised value fails CLOSED
+    // and only omitting the prop keeps the promise. Asserting the documented behaviour here
+    // (/shown to your child/) went red — the card renders the conditional — which is what settled
+    // which of the two is true (L-053). Failing closed is the one worth keeping: the promise is
+    // "shown to your child", and `app.current_child_id()` requires `c.status = 'active'`, so any
+    // status the page does not recognise must not make that promise on a guess.
+    renderPage(
+      <PracticeSetsSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        zone={ZONE}
+        childStatus="suspended"
+      />,
+      { api: setsApi() },
+    );
+    const set = await screen.findByRole('listitem', { name: /daily practice/i });
+    expect(set.textContent).not.toMatch(/shown to (your child|riley)/i);
+    expect(set.textContent).toMatch(/would open for riley from/i);
+    // No "again": that belongs to a profile this page knows was archived.
+    expect(set.textContent).not.toMatch(/active again/i);
+    expect(set.textContent).toContain(DAILY_TEXT);
+  });
+
   it('keeps it when no status is given at all, so an unwired caller loses nothing', async () => {
     renderPage(
       <PracticeSetsSection childId={CHILD} childName="Riley" subjects={SUBJECTS} zone={ZONE} />,
@@ -225,5 +260,171 @@ describe('[HUNT5-F-10] a practice set promises nothing to an archived child', ()
     const set = await screen.findByRole('listitem', { name: /daily practice/i });
     await waitFor(() => expect(set.textContent).toMatch(/shown to your child from/i));
     expect(set.textContent).toContain(DAILY_TEXT);
+  });
+});
+
+/**
+ * HUNT6-H-1: the four editing sections offer writes the API refuses for an archived profile.
+ * `ownedChild(c, 'write')` throws BUSINESS_RULE CHILD_ARCHIVED for `status = 'archived'`
+ * (apps/api/src/routes/learning.ts), and every write on these sections goes through it: POST/PATCH
+ * /subjects, PUT /learning-schedule, POST and DELETE /test-dates, POST /study-materials. The reads
+ * take `'read'`, which admits an archived profile, so the stored plan stays visible — that is the
+ * history BUG-070/AC_CAPACITY_08 made readable, and what the planner's own notice promises.
+ *
+ * A DRAFT profile stays editable on purpose: the same guard admits it, because a parent sets the plan
+ * up before activation (learning.ts's ownedChild docstring). So the test here is "is this profile
+ * ARCHIVED?", not "is it active?" — the opposite of PracticeSetsSection's one sentence, which is a
+ * promise to the CHILD and fails closed for any non-active profile.
+ */
+const TEST_DATES: z.infer<typeof testDatesResponseSchema> = {
+  testDates: [
+    {
+      id: '44444444-4444-4444-8444-000000000001',
+      subjectId: MATH_SUBJECT,
+      subjectKey: 'math',
+      testDate: '2026-10-06',
+      scopeNotes: 'adding fractions',
+      matchedSkills: [{ skill: 'fraction_addition', label: 'Adding fractions' }],
+    },
+  ],
+};
+
+function testDatesApi(): Partial<ApiClient> {
+  return {
+    get: <S extends z.ZodType>(_path: string, schema: S) =>
+      Promise.resolve(schema.parse(TEST_DATES)),
+  };
+}
+
+describe('[HUNT6-H-1] an archived child’s planner offers no write the API refuses', () => {
+  it('SubjectsSection: no add-a-subject submit and no live subject toggle', async () => {
+    renderPage(
+      <SubjectsSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        onChanged={() => {}}
+        childStatus="archived"
+      />,
+    );
+    const section = await screen.findByRole('region', { name: 'Subjects' });
+    expect(screen.queryByRole('button', { name: /add subject/i })).toBeNull();
+    // The stored value stays readable, as history: the subject and its on/off state are still there.
+    expect(section.textContent).toMatch(/Math/);
+    expect(within(section).getByText('On')).toBeTruthy();
+    // The toggle is a PATCH: it must not be pressable, and the reason has to be on screen.
+    expect(within(section).getByRole('checkbox')).toHaveProperty('disabled', true);
+    expect(section.textContent).toMatch(/archived/i);
+  });
+
+  it('SubjectsSection: a DRAFT child keeps every control, because the API keeps a draft writable', async () => {
+    renderPage(
+      <SubjectsSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        onChanged={() => {}}
+        childStatus="draft"
+      />,
+    );
+    const section = await screen.findByRole('region', { name: 'Subjects' });
+    expect(within(section).getByRole('button', { name: /add subject/i })).toBeTruthy();
+    expect(within(section).getByRole('checkbox')).toHaveProperty('disabled', false);
+  });
+
+  it('ScheduleSection: no "Save schedule" submit, and the saved schedule still readable', async () => {
+    renderPage(
+      <ScheduleSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        refreshKey={0}
+        childStatus="archived"
+      />,
+      { api: scheduleApi() },
+    );
+    await screen.findByRole('region', { name: /coming up for riley/i });
+    expect(screen.queryByRole('button', { name: /save schedule/i })).toBeNull();
+    // The stored plan is what the parent came to read (the planner's notice promises it stays).
+    expect(screen.getByLabelText(/daily questions/i)).toHaveProperty('value', '5');
+    expect(screen.getByLabelText(/daily questions/i)).toHaveProperty('disabled', true);
+  });
+
+  it('ScheduleSection: a DRAFT child can still save, which is how a plan is set up before activation', async () => {
+    renderPage(
+      <ScheduleSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        refreshKey={0}
+        childStatus="draft"
+      />,
+      { api: scheduleApi() },
+    );
+    expect(await screen.findByRole('button', { name: /save schedule/i })).toBeTruthy();
+    expect(screen.getByLabelText(/daily questions/i)).toHaveProperty('disabled', false);
+  });
+
+  it('TestDatesSection: no add form and no Remove, with the saved dates still listed', async () => {
+    renderPage(
+      <TestDatesSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        onChanged={() => {}}
+        childStatus="archived"
+      />,
+      { api: testDatesApi() },
+    );
+    const saved = await screen.findByLabelText('Saved test dates');
+    expect(saved.textContent).toMatch(/adding fractions/i);
+    expect(screen.queryByRole('button', { name: /save test date/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /remove the math test/i })).toBeNull();
+    expect(screen.queryByLabelText('Add a test date')).toBeNull();
+  });
+
+  it('TestDatesSection: a DRAFT child keeps the add form and Remove', async () => {
+    renderPage(
+      <TestDatesSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        onChanged={() => {}}
+        childStatus="draft"
+      />,
+      { api: testDatesApi() },
+    );
+    expect(await screen.findByRole('button', { name: /save test date/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /remove the math test/i })).toBeTruthy();
+  });
+
+  it('StudyMaterialSection: no Save for an archived child, and a DRAFT child keeps it', async () => {
+    const { unmount } = renderPage(
+      <StudyMaterialSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        childStatus="archived"
+      />,
+    );
+    const section = await screen.findByRole('region', { name: /spelling lists and class notes/i });
+    expect(within(section).queryByRole('button', { name: /^save$/i })).toBeNull();
+    expect(within(section).queryByRole('textbox')).toBeNull();
+    expect(section.textContent).toMatch(/archived/i);
+    unmount();
+
+    renderPage(
+      <StudyMaterialSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        childStatus="draft"
+      />,
+    );
+    expect(
+      within(
+        await screen.findByRole('region', { name: /spelling lists and class notes/i }),
+      ).getByRole('button', { name: /^save$/i }),
+    ).toBeTruthy();
   });
 });

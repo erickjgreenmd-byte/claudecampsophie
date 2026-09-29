@@ -653,15 +653,16 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const fam = await family();
     await consent(fam);
     const adminId = await seedOwnerAdmin(api.db);
-    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS } = await import('@pencillift/ai');
     const recorded = async () => {
       const [row] = await api.db.sql<{ micros: string }[]>`
         select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
       return BigInt(row!.micros);
     };
-    // Room for exactly one stage: the owner's cap is recorded spend plus one daily-set upper-bound
-    // estimate, so a second concurrent daily set would cross it.
-    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros);
+    // Room for exactly one stage: the owner's cap is recorded spend plus what one daily set RESERVES,
+    // which is the stage's cost BUDGET and not its per-request cap (F-HOLD), so a second concurrent
+    // daily set would cross it.
+    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set);
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
       values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
@@ -764,13 +765,14 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
     const fam = await family();
     await consent(fam);
     const adminId = await seedOwnerAdmin(api.db);
-    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS } = await import('@pencillift/ai');
     const recorded = async () => {
       const [row] = await api.db.sql<{ micros: string }[]>`
         select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
       return BigInt(row!.micros);
     };
-    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros);
+    // Room for exactly one stage's RESERVATION, which is its cost budget (F-HOLD).
+    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set);
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
       values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
@@ -834,7 +836,10 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
   it('a personalization request larger than its stage budget is not sent (LJA-F4)', async () => {
     const fam = await family();
     await consent(fam);
-    // About 21 KB of template text: over what the daily_set cost cap allows at one token per byte.
+    // About 21 KB of template text: over what daily_set's per-request ADMISSION bound
+    // (PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros) allows at one token per byte. Deliberately a
+    // FIXED size and not one derived from the bound, so raising the bound turns this case red instead
+    // of moving with it — which is how it caught HUNT6-D-1's raise (see the premise below).
     const oversized = wordProblems.map((item) => ({
       ...item,
       wordProblem: {
@@ -859,6 +864,115 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
       event: 'practice_ai_failed',
       code: 'STAGE_LIMIT',
     });
+    // The premise this case rests on, and the one HUNT6-D-1 broke (HUNT6-D-CAP): what admits a request
+    // is the stage's per-request cap, NOT the budget for the stage as a whole. Making the one raised
+    // retry affordable by raising the cap to that budget is what sent this request — one provider call
+    // where the case requires none — so the two numbers must stay two. Collapse them again and this
+    // goes red here as well as above, which says WHY.
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS, PROPOSED_STAGE_LIMITS } =
+      await import('@pencillift/ai');
+    expect(PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros).toBeLessThan(
+      PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set,
+    );
+  });
+
+  /**
+   * F-HOLD. The hold taken before the personalization stage is the only thing that keeps that stage
+   * inside the owner's monthly ceiling, so it has to reserve the MOST the stage can spend. HUNT6-D-CAP
+   * split the one stage number in two — an admission cap for a single request, a BUDGET for the stage
+   * as a whole, which is what runStage weighs attempts 2+ against — and applied the split to runStage
+   * and to scan-process.ts's `spending()`, but this caller kept reserving the CAP. A daily set that
+   * took its one raised retry then spent past its own hold: daily_set's cap is 350,000 micros and its
+   * two attempts may cost 483,240, so the hold bounded nothing.
+   *
+   * This drives the real production path — `personalizeItems` builds the envelope, takes the hold and
+   * runs the stage — with a provider that cuts every answer off at the budget it was sent, which is
+   * the one case that makes the stage spend twice. Under the old reservation the hold observed while
+   * the stage ran is 350,000 and the stage's metered cost is above it: both assertions below go red.
+   *
+   * Labeled mock provider (docs/Connections.md); synthetic child and bank items only.
+   */
+  it('the personalization hold reserves the stage BUDGET the raised retry can spend (F-HOLD)', async () => {
+    const fam = await family();
+    await consent(fam);
+    const adminId = await seedOwnerAdmin(api.db);
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS, PROPOSED_STAGE_LIMITS } =
+      await import('@pencillift/ai');
+    const admissionCap = PROPOSED_STAGE_LIMITS.daily_set.maxCostMicros;
+    const stageBudget = PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set;
+    // The premise: since HUNT6-D-CAP these are two different numbers, and the attempt after a
+    // truncated answer is weighed against the larger one.
+    expect(stageBudget).toBeGreaterThan(admissionCap);
+    const totals = async () => {
+      const [row] = await api.db.sql<{ spent: string; held: string }[]>`
+        select coalesce((select sum(cost_micros) from public.ai_usage_events), 0)::text as spent,
+               coalesce((select sum(micros) from private.ai_spend_holds
+                          where expires_at > ${api.now.value}), 0)::text as held`;
+      return { spent: BigInt(row!.spent), held: BigInt(row!.held) };
+    };
+    const before = await totals();
+    // The owner's ceiling leaves room for exactly one daily set's reservation and nothing more, so a
+    // reservation that is too small is not merely untidy: it lets the stage spend past the ceiling.
+    const ceiling = before.spent + before.held + BigInt(stageBudget);
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${ceiling.toString()}::bigint, ${adminId})`;
+    // Every answer is cut off at the budget it was sent, so runStage raises the output budget once
+    // (JOBS-R2-02) and the stage is billed for both attempts. The hold live at that moment is read
+    // from inside the provider call, before settleSpend replaces it with the metered usage.
+    let heldWhileRunning = -1n;
+    const client = createMockResponsesClient(async (request) => {
+      heldWhileRunning = (await totals()).held - before.held;
+      return {
+        kind: 'incomplete' as const,
+        usage: {
+          inputTokens: 1_700,
+          cachedInputTokens: 0,
+          outputTokens: request.maxOutputTokens,
+        },
+        modelId: 'gpt-6-astra',
+        latencyMs: 20,
+        reason: 'max_output_tokens' as const,
+      };
+    });
+    try {
+      const out = await personalizeItems(
+        deps,
+        { ai: client, moderation: createMockModerationClient(), sleep: () => Promise.resolve() },
+        await context(fam),
+        wordProblems,
+        'daily_set',
+        ['math.word_problems'],
+      );
+      // The one raised retry really happened, on the envelope this job builds for itself.
+      const budgets = client.requests.map((r) => r.maxOutputTokens);
+      expect(budgets).toHaveLength(2);
+      expect(budgets[0]).toBe(PROPOSED_STAGE_LIMITS.daily_set.maxOutputTokens);
+      expect(budgets[1]!).toBeGreaterThan(budgets[0]!);
+      // What was reserved for it: the stage BUDGET, not the per-request admission cap.
+      expect(heldWhileRunning).toBe(BigInt(stageBudget));
+      const [row] = await api.db.sql<{ micros: string; n: number }[]>`
+        select coalesce(sum(cost_micros), 0)::text as micros, count(*)::int as n
+          from public.ai_usage_events where family_id = ${fam.familyId} and stage = 'daily_set'`;
+      const stageCost = BigInt(row!.micros);
+      expect(row!.n).toBe(2);
+      // Why the hold has to be the budget: the two attempts really cost MORE than the cap the hold
+      // used to reserve, and the hold still bounds them.
+      expect(stageCost).toBeGreaterThan(BigInt(admissionCap));
+      expect(stageCost).toBeLessThanOrEqual(heldWhileRunning);
+      // So the owner's ceiling holds: nothing was spent that the reservation had not counted.
+      expect((await totals()).spent).toBeLessThanOrEqual(ceiling);
+      // A truncated answer keeps the reviewed bank items; the set is still delivered.
+      expect(out.items).toEqual(wordProblems);
+      expect(out.intro).toBeNull();
+      expect(api.logs).toContainEqual({
+        level: 'warn',
+        event: 'practice_ai_failed',
+        code: 'OUTPUT_TRUNCATED',
+      });
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
   });
 
   it('without consent nothing is sent to AI and the bank set is generated', async () => {

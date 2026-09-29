@@ -32,6 +32,12 @@
 -- back to a draft: billing's releaseSlotlessProfiles only touches `status = 'active'` rows whose
 -- latest release_reason is 'expired' or 'downgrade', and this child is 'archived' with reason
 -- 'archived'.
+--
+-- HUNT6-B-3 (added later, comment only): that is the whole of this migration's deadlock reasoning,
+-- and it covers only the capacity TRIGGER. It says nothing about the ORDER in which this function
+-- takes public.child_slot_assignments and public.child_profiles relative to the other writers of
+-- that pair — the archive route and billing-sync — and the order here is the reverse of both.
+-- 0930_deletion_lock_order.sql fixes it and states the canonical order.
 create or replace function public.request_deletion(p_family uuid, p_child uuid default null)
 returns public.deletion_requests
 language plpgsql security definer

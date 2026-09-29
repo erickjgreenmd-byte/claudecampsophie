@@ -25,7 +25,7 @@ import {
 } from '@pencillift/contracts';
 import { readJson } from '../app.ts';
 import { stateRequestInstant, type Tx } from '../db.ts';
-import { ApiError, businessRule, pgErrorCode } from '../errors.ts';
+import { ApiError, businessRule, isTransientDbError, pgErrorCode } from '../errors.ts';
 import {
   assertOwnerAdmin,
   assertRecentUnlock,
@@ -148,13 +148,27 @@ const RESOLVED_REPORTS_PAGE_SIZE = 100;
  *    drains that branch; the newest is what a guardian needs to see, and rows they cannot act on can
  *    no longer consume the room a flag needs.
  *
- * Plus, on every kind, the NEWEST unresolved row of that kind (HUNT5-B-5). An oldest-first window is
- * the right thing for a guardian working through the queue, and on its own it made the newest flag
- * row 201 — while the flag email tells the parent to open /app/privacy "to see the flag and what you
- * can do next", that page renders this list, and there is no GET /safety-reports/:id or per-report
- * deep link to fall back to. The newest-first parent branch already satisfies this by construction.
- * So the total is bounded by one page per kind plus at most one row per kind, all far above any
- * honest family's queue.
+ * Plus, on EVERY kind, a second page of the same size from the other end, so each kind is bounded by
+ * two pages that together hold both of its ends:
+ *  - On the drainable kinds that second page is the NEWEST one (HUNT5-B-5, widened by HUNT6-B-1). An
+ *    oldest-first window is the right thing for a guardian working through the queue, and on its own
+ *    it made the newest flag row 201 — while the flag email tells the parent to open /app/privacy "to
+ *    see the flag and what you can do next", that page renders this list, and there is no GET
+ *    /safety-reports/:id or per-report deep link to fall back to. One email is enqueued PER report
+ *    (jobs/scan-process.ts), so a single screen that flags two answers sends two emails and a ONE-row
+ *    second window still left the earlier of them on no page (HUNT6-B-1); the same held for a child
+ *    who filed several disclosures in a row.
+ *  - On the parent / catch-all kind it is the OLDEST one. Its newest end is already satisfied by
+ *    construction, but with a single page the claim below was false of exactly this branch: from that
+ *    kind's 201st open row onward its oldest rows were absent, and the earliest report is the one most
+ *    likely to be the substantive one (the argument HUNT5-B-4 made for the child branch). A separate
+ *    per-kind window costs the flags nothing, which is what the per-kind split is for.
+ *
+ * So the bound is at most TWO pages per kind, and what can be absent is stated exactly: rows in the
+ * MIDDLE of a kind's queue, once that kind has more than 400 unresolved rows open at once — never
+ * the oldest of a kind and never its newest, for every kind, with no exception. Both ends are far
+ * above any honest family's queue; BUG-117's keyset paging is still the honest answer if a family
+ * ever needs to walk the middle of one.
  */
 export const UNRESOLVED_REPORTS_PAGE_SIZE = 200;
 
@@ -344,10 +358,24 @@ async function assertFamilyChild(
  * uploads, derivatives ..."; E4 "purge owned derivatives"; RV-privacy-3, RV-privacy-4): a deletion
  * withdraws every finished export file that holds the deleted data as soon as it is requested —
  * all of the family's exports for a family deletion; for a child deletion, that child's exports and
- * every family-wide export (child_id null: family data and progress files list every child). The
- * rows become 'expired' (the download route refuses them; parents see "request a new copy") and the
- * files are removed from private storage. A family-wide export that is still queued is left alone:
- * the builder leaves out every child with an open deletion request.
+ * every family-wide export (child_id null: family data and progress files list every child). A
+ * family-wide export that is still queued is left alone: the builder leaves out every child with an
+ * open deletion request.
+ *
+ * The withdrawal has TWO halves, and this function is only one of them (HUNT6-B-2):
+ *  - The DATABASE's half is the row status. `public.request_deletion` sets those rows to 'expired'
+ *    and pulls their expiry back (migration 0920), which is what makes routes/export-download.ts
+ *    refuse them — it reads kind, status, storage_path and expires_at and nothing about deletion, and
+ *    answers 409 "This export is not ready yet" for a non-ready row. It lives in the function because
+ *    the function is granted to `authenticated`, so the Supabase Data API can file a deletion with a
+ *    parent's own token and never reach this handler at all (the BUG-240 class, L-037), and because
+ *    the request and the withdrawal must commit together.
+ *  - This handler's half is the FILE. SQL cannot delete a storage object, so the statement below
+ *    re-asserts the status (idempotent after 0920) and then removes the objects, which the
+ *    deletion_purge job also does. Its predicate is WIDER than the function's by one arm — an
+ *    already-'expired' row that still names a file — and that arm belongs here rather than there:
+ *    here `returning id, storage_path` feeds the removal, so such a file still goes, while in the
+ *    function the same arm would return nothing, change no column and only lock the row.
  *
  * Service role (the caller has no update grant on exports); scoped to the family and child the
  * handler verified. Runs after the deletion is recorded, so a storage failure never loses the
@@ -556,9 +584,34 @@ async function releaseChildSlot(tx: Tx, familyId: string, childId: string): Prom
  *
  * The wrapping is the mechanism: pgErrorCode() reads `.code` off the thrown object and does not walk
  * `cause`, so a wrapped failure carries no SQLSTATE, matches none of those branches, and reaches
- * app.ts as an unexpected error — a generic 500 logged under this class's name, which is what a
- * server-side grant problem is. The request still rolls back whole, because the release must never
- * land apart from it.
+ * app.ts as an unexpected error — a generic 500 logged under this class's name. The request still
+ * rolls back whole, because the release must never land apart from it.
+ *
+ * A grant problem is not the release's only plausible failure, which is what this wrapper was first
+ * justified by (HUNT6-B-4). But the reason first given for that was itself untrue and is corrected
+ * here: this UPDATE does NOT contend for the child's assignment row with the archive route. With
+ * migration 0890 (and 0930) applied, public.request_deletion has already released that row inside
+ * THIS transaction, so `released_at is null` matches nothing, the statement takes no row lock, and no
+ * contention on that row is possible — which is why the HUNT6-B-4 test has to inject its conflict
+ * with a STATEMENT-level trigger, and why a row-level one never fires at all (the case beside it pins
+ * that fact).
+ *
+ * What the pass-through is for is the SQLSTATEs themselves, wherever they come from: 40P01, 40001 and
+ * 55P03 are lock contention the database resolved by aborting the transaction, so app.ts reads them
+ * deliberately — isTransientDbError turns them into 503 PROVIDER_UNAVAILABLE with Retry-After and a
+ * `db_transient_conflict` warning, because nothing was written and the same request can simply be
+ * retried. Two things still deliver one here. The API and the schema deploy separately, and against a
+ * database not yet at 0890 the predicate DOES still match the open row, so the statement really does
+ * contend with the archive route and can be chosen as the victim. And it still takes a table-level
+ * RowExclusiveLock on public.child_slot_assignments whatever it matches, so a migration holding that
+ * table can make it wait, and a waiter can end in 40P01 or (under lock_timeout) 55P03. Erasing the
+ * code turned an honest "the service is busy, please try again" into "something went wrong" with
+ * nothing to retry on, so the caller re-throws a transient error UNCHANGED and wraps everything else.
+ *
+ * knownConstraintError is deliberately NOT given the same treatment: its 23505 would then reach the
+ * handler's own 23505 branch and be announced as "a deletion request for this is already in
+ * progress", which is the class of misread HUNT5-B-2 removed. The transient codes match none of the
+ * handler's branches, so they are safe to let through.
  */
 class SlotReleaseFailed extends Error {
   constructor(cause: unknown) {
@@ -604,6 +657,9 @@ export function privacyRoutes(): Hono<AppEnv> {
           try {
             await releaseChildSlot(tx, membership.familyId, childId);
           } catch (error) {
+            // Lock contention the database resolved by aborting this transaction keeps its SQLSTATE
+            // so app.ts still answers 503 with Retry-After (HUNT6-B-4); see SlotReleaseFailed.
+            if (isTransientDbError(error)) throw error;
             throw new SlotReleaseFailed(error);
           }
         }
@@ -865,13 +921,16 @@ export function privacyRoutes(): Hono<AppEnv> {
   // The unresolved rows are bounded PER REPORTER KIND (CS-R4-01), not as one page: a single page over
   // all of them, taken from the oldest end, let 200 open parent reports — which no family-facing
   // surface can resolve — hide every later flag and every later child report for good. A kind the
-  // family can drain (system flags, the child's own reports) comes oldest-first so the bound drains;
-  // a parent's own reports, which only the reviewer closes, come newest-first (HUNT5-B-4). Each kind
-  // also always contributes its NEWEST unresolved row, so the flag a parent was just emailed about is
-  // on the page that email names even behind a full window (HUNT5-B-5); see
-  // UNRESOLVED_REPORTS_PAGE_SIZE. BUG-117's keyset paging is still the honest answer if a family ever
-  // needs to page through more than this, and until then nothing unresolved is absent from the
-  // response except rows in the middle of a drain that is under way.
+  // family can drain (system flags, the child's own reports) leads with its oldest page so the bound
+  // drains; a parent's own reports, which only the reviewer closes, lead with their newest
+  // (HUNT5-B-4). EVERY kind then contributes the other end as a second page of the same size: on the
+  // drainable kinds so the flags a parent was just emailed about are on the page that email names
+  // even behind a full window — all of them, not only the last, because one email is sent per report
+  // (HUNT5-B-5, HUNT6-B-1) — and on the catch-all kind so its oldest rows are not the unlisted
+  // exception to the claim that follows; see UNRESOLVED_REPORTS_PAGE_SIZE. So a kind contributes at
+  // most two pages, and the rows that CAN be absent are the ones in the middle of a kind's queue once
+  // more than 400 of that kind are open at once — never that kind's oldest rows and never its newest.
+  // BUG-117's keyset paging is still the honest answer if a family ever needs to walk that middle.
   r.get('/safety-reports', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
@@ -882,13 +941,16 @@ export function privacyRoutes(): Hono<AppEnv> {
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status <> 'resolved' and reporter_kind = 'system'
            order by created_at asc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
-        ), newest_flag as (
-          -- The newest unresolved flag, when a full window of older ones would have pushed it out
-          -- (HUNT5-B-5): the flag email names this page and nothing else can reach a single report.
+        ), newest_flags as (
+          -- The newest PAGE of unresolved flags that the older window did not already hold
+          -- (HUNT5-B-5, widened by HUNT6-B-1): the flag email names this page and nothing else can
+          -- reach a single report, and one email is sent PER report — a screen that flags two
+          -- answers on one worksheet sends two, so a one-row window still left one of them on no
+          -- page of the product.
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status <> 'resolved' and reporter_kind = 'system'
              and id not in (select id from unresolved_flags)
-           order by created_at desc limit 1
+           order by created_at desc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
         ), unresolved_child as (
           -- Oldest-first like the flags, and for the same reason: a guardian resolves a child's
           -- report too, so this bound drains, and the child's earliest report is the one that must
@@ -897,24 +959,40 @@ export function privacyRoutes(): Hono<AppEnv> {
            where family_id = ${familyId} and status <> 'resolved' and reporter_kind = 'child'
            order by created_at asc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
         ), newest_child as (
+          -- The same newest page for the child's own reports: three disclosures filed this evening
+          -- are three rows, not one (HUNT6-B-1).
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status <> 'resolved' and reporter_kind = 'child'
              and id not in (select id from unresolved_child)
-           order by created_at desc limit 1
+           order by created_at desc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
         ), unresolved_parent as (
           -- The catch-all branch (today: 'parent', the only other kind migration 0760 permits), so a
           -- reporter kind added later is listed rather than silently dropped from the family's list.
-          -- Newest-first, so this branch already holds its newest unresolved row.
+          -- Newest-first, because only the reviewer closes these, so nothing the family does drains
+          -- the branch and the newest is what a guardian needs first.
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status <> 'resolved'
              and reporter_kind not in ('system', 'child')
            order by created_at desc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
+        ), oldest_parent as (
+          -- And its OLDEST page, so the bound above holds for THIS kind too and not only for the two
+          -- drainable ones: with one newest-first page, a family's 201st open report pushed its FIRST
+          -- one off every surface. That is the loss HUNT5-B-4 named for the child branch — the
+          -- earliest report is the one most likely to be the substantive one — and nothing about this
+          -- kind makes it acceptable here. Per kind, so these rows still cannot consume the room a
+          -- flag needs.
+          select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
+           where family_id = ${familyId} and status <> 'resolved'
+             and reporter_kind not in ('system', 'child')
+             and id not in (select id from unresolved_parent)
+           order by created_at asc limit ${UNRESOLVED_REPORTS_PAGE_SIZE}
         ), unresolved as (
           select * from unresolved_flags
-          union all select * from newest_flag
+          union all select * from newest_flags
           union all select * from unresolved_child
           union all select * from newest_child
           union all select * from unresolved_parent
+          union all select * from oldest_parent
         ), newest_resolved as (
           select ${tx.unsafe(REPORT_COLUMNS)} from public.safety_reports
            where family_id = ${familyId} and status = 'resolved'

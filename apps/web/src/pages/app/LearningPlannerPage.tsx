@@ -106,14 +106,22 @@ function ChildPlanner({ child, zone }: { child: PlannerChild; zone: string }) {
   // (GET /v1/children/:id/subjects answers NOT_FOUND for it). Nothing here may promise that what was
   // planned and practised stays readable, or offer an activation the API refuses — the Children page
   // offers none either. Same wording as that page's notice for the same state.
+  //
+  // G-THIRD-NOTICE / G-I3-WEB / L-037: the notice names the OPEN REQUEST, not the reader. This is the
+  // third of the portal's three notices off `deletionPending`, and the flag carries no requester —
+  // GET /v1/family computes it from the request's scope and target and never exposes
+  // deletion_requests.requested_by (apps/api/src/routes/family.ts). Any guardian may delete a child's
+  // data, and a child-scope request leaves every other adult's membership active, so the family's
+  // other adult is served the same flag and was told THEY had asked for it. Same sentence as the
+  // Children page, the Homework page and the app (apps/mobile/app/(parent)/children.tsx).
   if (child.deletionPending === true) {
     return (
       <div aria-label={`Learning plan for ${child.nickname}`} role="region">
         <h2 style={{ marginTop: 24 }}>{child.nickname}</h2>
         <p className="notice">
-          <strong>Data deletion under way.</strong> You asked for {child.nickname}’s data to be
-          deleted. Processing has already stopped, so no practice is prepared or released for them
-          and their plan is not kept. You can follow it on the{' '}
+          <strong>Data deletion under way.</strong> A deletion request covering {child.nickname}’s
+          data is open. Processing has already stopped, so no practice is prepared or released for
+          them and their plan is not kept. You can follow it on the{' '}
           <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the app: if you
           did not mean it, <Link to="/app/support">contact support</Link> straight away.
         </p>
@@ -152,7 +160,16 @@ function ActivePlanner({ child, zone }: { child: PlannerChild; zone: string }) {
       {/*
         WEBR4-10: an archived child has no slot waiting to be bought — the profile is history only —
         so "doesn't have a paid slot yet … see Subscription" was both false and unactionable for it.
-        A draft still gets that copy, because a draft really is waiting for a slot.
+
+        HUNT6-H-4: the draft branch below no longer says "yet" either. That word rested on the premise
+        this comment used to state — "a draft really is waiting for a slot", i.e. has never had one —
+        and `releaseSlotlessProfiles` (apps/api/src/services/billing-sync.ts) makes it false: it sets
+        `status = 'draft'` on a previously ACTIVE child whenever verified provider state releases its
+        slot (an expiry or a store-confirmed downgrade). A family whose plan lapsed was told their
+        child "doesn't have a paid slot YET … once they have one", as if they had never paid for them.
+        The sentence is state-neutral now, in the words HomeworkPage's allowance card already uses, and
+        it names both remedies: an unused slot assigned on the Children page (no purchase, spec P11 /
+        AC_CAPACITY_03), or capacity added in the store from the Subscription page (WEB-R1-04).
       */}
       {child.status === 'active' ? null : child.status === 'archived' ? (
         // HUNT5-F-10: this used to end "and nothing here is released to them", which the schedule
@@ -162,8 +179,9 @@ function ActivePlanner({ child, zone }: { child: PlannerChild; zone: string }) {
         // prepared, and those times are what the schedule would produce for an active profile.
         <p className="notice">
           {child.nickname}’s profile is archived, so no new practice is prepared for them. What was
-          planned and practised stays readable, and the times below are what the schedule would
-          produce if the profile were active again.{' '}
+          planned and practised stays readable — and can’t be changed while the profile is archived
+          — and the times below are what the schedule would produce if the profile were active
+          again.{' '}
           <Link to="/app/children">
             Activate {child.nickname} again on the Children page while a paid slot is free
           </Link>
@@ -171,9 +189,10 @@ function ActivePlanner({ child, zone }: { child: PlannerChild; zone: string }) {
         </p>
       ) : (
         <p className="notice">
-          {child.nickname} doesn’t have a paid slot yet, so no practice is prepared, and the times
-          below are what the schedule would produce once they have one. You can still set things up;
-          see <Link to="/app/subscription">Subscription</Link>.
+          {child.nickname} doesn’t have a paid slot right now, so no practice is prepared, and the
+          times below are what the schedule would produce while they hold one. You can still set
+          things up. Assign an unused paid slot on the <Link to="/app/children">Children page</Link>{' '}
+          — no new purchase — or add capacity from <Link to="/app/subscription">Subscription</Link>.
         </p>
       )}
       {current === null && subjects.status === 'loading' ? (
@@ -187,25 +206,41 @@ function ActivePlanner({ child, zone }: { child: PlannerChild; zone: string }) {
       ) : null}
       {current !== null ? (
         <>
+          {/* HUNT6-H-1: the status reaches every section that WRITES. GET /subjects takes
+              `ownedChild(c, 'read')`, which admits an archived profile, so all of these mounted for an
+              archived child and each offered a write the API answers 422 CHILD_ARCHIVED — under the
+              notice above, which says what was planned stays readable. Each section renders its
+              stored values and drops its write controls for that one status; a DRAFT profile keeps
+              them, because the same guard keeps a draft writable on purpose (learning.ts). Without
+              this wiring the branches would be dead for every real archived child, which is how
+              HUNT5-F-10's first attempt failed. */}
           <SubjectsSection
             childId={child.id}
             childName={child.nickname}
             subjects={current}
             onChanged={subjectsChanged}
+            childStatus={child.status}
           />
           <ScheduleSection
             childId={child.id}
             childName={child.nickname}
             subjects={current}
             refreshKey={scheduleKey}
+            childStatus={child.status}
           />
           <TestDatesSection
             childId={child.id}
             childName={child.nickname}
             subjects={current}
             onChanged={testDatesChanged}
+            childStatus={child.status}
           />
-          <StudyMaterialSection childId={child.id} childName={child.nickname} subjects={current} />
+          <StudyMaterialSection
+            childId={child.id}
+            childName={child.nickname}
+            subjects={current}
+            childStatus={child.status}
+          />
           <SkillsSection
             childId={child.id}
             childName={child.nickname}

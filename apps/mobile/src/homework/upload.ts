@@ -323,6 +323,19 @@ export interface StoppedScanOutcome {
  * reason and says so plainly: this device cannot promise the scan stopped, and the retained keys make
  * "Try again" the same scan whatever the server did, so one piece of homework is never checked and
  * charged twice.
+ *
+ * 'nothing_to_cancel' keeps the attempt too (HUNT6-J-4). cancelScan answers it when the attempt holds
+ * no assignment id, and that id is only set once the CREATE RESPONSE was seen: a child who taps
+ * "Stop sending" while the create round trip is in flight aborts before it arrives, so the id is null
+ * although POST /v1/assignments may have committed — "this device never saw a create response" is not
+ * "no scan was created", which is the same conflation the 'unsure' branch was fixed for. Rotating the
+ * keys there threw away the createKey that makes the retry idempotent, so "Try again" created a SECOND
+ * assignment and left the first in the child's own list as "Not sent yet" for ever, one create burned
+ * against their hourly limit. Keeping it costs nothing in the other direction: a retained createKey
+ * can only ever address the same pages, because any change to them mints a fresh attempt
+ * (app/(child)/scan.tsx changePages / startOver), and the create route answers a key it has seen with
+ * the assignment it already has. The copy stays the calm one, and stays true either way: the finalize
+ * is the authoritative reservation, so nothing went for checking and nothing was charged.
  */
 export function stoppedScanOutcome(
   cancel: 'cancelled' | 'nothing_to_cancel' | 'too_late' | 'unsure',
@@ -336,7 +349,10 @@ export function stoppedScanOutcome(
       keepAttempt: true,
     };
   }
-  return { message: childUploadMessage(new ScanCancelledError()), keepAttempt: false };
+  return {
+    message: childUploadMessage(new ScanCancelledError()),
+    keepAttempt: cancel === 'nothing_to_cancel',
+  };
 }
 
 const GENERIC_COPY = 'Something went wrong. Let’s try again.';

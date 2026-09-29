@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
-import { familyOkResponseSchema } from '@pencillift/contracts';
+import { familyOkResponseSchema, SIGN_OUT_NOT_TOLD_COPY } from '@pencillift/contracts';
 import { maskEmail } from '../lib/auth.ts';
 import { useParentSession, useSession } from '../lib/session.tsx';
 
@@ -11,9 +11,25 @@ const STILL_OPEN =
  * WEBR5-E-2: this browser's session is already gone on this path, so the copy no longer asks for a
  * retry it cannot carry out — with the stored refresh token removed, auth-js skips the server call
  * altogether and a second press only looks like it worked.
+ *
+ * HUNT6-F-1: it no longer asks for a phone sign-out either. That was the first remedy the sentence
+ * named and it cannot end this session: every sign-out in this product is scope 'local' by design
+ * (spec P3, L-039 — this control passes 'local' below, and the app's parent sign-out is hard-coded to
+ * it), and GoTrue's /logout?scope=local revokes only the calling session. There is no "sign out
+ * everywhere" action anywhere in the product to point at, so what the parent is told is the one thing
+ * they can do.
+ *
+ * HUNT6-F-SHARED: what is actually shared is this sentence and the public deletion page's
+ * (apps/web/src/pages/public/AccountDeletionPage.tsx), both read from SIGN_OUT_NOT_TOLD_COPY in
+ * @pencillift/contracts, and each asserted against that constant where it is rendered
+ * (App.signout.test.tsx, PrivacyControlsPage.test.tsx) — so those two surfaces cannot drift apart. The
+ * app was in that list and never belonged there: it does not import this constant. It writes its own
+ * sentences in apps/mobile/src/privacy/parent-privacy.ts (`accountClosedDeviceMessage`), and they
+ * already differ, because they report a different fact — whether the APP's own device sign-out was
+ * confirmed, not whether the auth service was told — and point the parent at the app's parent menu
+ * rather than at a password. Whether the app should say this sentence too is a change to a mobile file.
  */
-const SERVER_NOT_TOLD =
-  'This computer is signed out. We could not tell PencilLift’s servers to end the session, so sign out on your phone, or change your password if you are worried.';
+const SERVER_NOT_TOLD = SIGN_OUT_NOT_TOLD_COPY.signInOpen;
 
 /**
  * WEB-R2-01: ends the parent's session on this browser. Until this existed the only call to

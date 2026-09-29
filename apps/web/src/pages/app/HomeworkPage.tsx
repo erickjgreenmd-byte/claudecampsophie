@@ -27,8 +27,10 @@ import {
   correctTranscriptionResponseSchema,
   homeworkImageSizeProblem,
   homeworkRubricSchema,
+  ARCHIVED_CHILD_NO_NEW_SCAN_COPY,
   ARCHIVED_CHILD_SCAN_COPY,
   CONSENT_WITHDRAWN_SCAN_COPY,
+  INACTIVE_CHILD_NO_NEW_SCAN_COPY,
   INACTIVE_CHILD_SCAN_COPY,
   homeworkScanFits,
   overrideResultResponseSchema,
@@ -161,13 +163,105 @@ const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
   CHILD_NOT_ACTIVE: INACTIVE_CHILD_SCAN_COPY,
 };
 
+/**
+ * HUNT6-H-2: the outcomes whose advice is "get a new scan", with the advice taken off. Keyed by the
+ * assignment status, or by the permanent error code where the code is what decides the advice. A
+ * non-active profile keeps the outcome sentence and gets a blocker line instead of the advice.
+ *
+ * G-H2: `failed_final` is in here BY STATE, and that is what closes the hole. The round-6 fix keyed
+ * the replacement on five keys, and a `failed_final` row is looked up by its CODE — so every code
+ * with no line of its own fell through to `STATUS_COPY.failed_final.explain` and its "Please start a
+ * new scan with clear photos.", printed under this page's own "new scans are not taken" notice. Those
+ * codes are the ordinary ones: PROCESSING_ERROR is the catch-all for any error that is neither
+ * PermanentFailure nor RetryableFailure, PROCESSING_TIMEOUT is what a lost lock records, and
+ * AI_NOT_AVAILABLE, NO_PAGES, SCAN_TOO_LARGE, STAGE_LIMIT, UNKNOWN_MODEL, the per-stage
+ * *_REQUEST_REJECTED and *_OUTPUT_TRUNCATED codes, the fail-closed moderation codes and any retryable
+ * code that runs out of attempts all reach it too (apps/api/src/jobs/scan-process.ts), as does a row
+ * that recorded no code at all. The state's own line is the answer for all of them, so no future code
+ * has to be added here to stay covered.
+ */
+const OUTCOME_WITHOUT_NEW_SCAN_ADVICE: Readonly<Record<string, string>> = {
+  needs_rescan:
+    'Some pages were hard to read (blur, glare, rotation or cut-off edges), and PencilLift will not guess.',
+  uploading: 'Pages are still being sent. If sending stopped, it can’t be finished from here.',
+  failed_final: 'This scan could not be processed after several tries.',
+  FORMAT_NEEDS_CONVERSION:
+    'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back.',
+  SCAN_TOO_MANY_QUESTIONS:
+    'This worksheet has more questions than one check can handle, so its pages were given back.',
+  AI_PAUSED_TOO_LONG: 'PencilLift could not check this scan in time and its pages were given back.',
+};
+
+/**
+ * HUNT6-H-2: `childStatus` is the profile's status from GET /v1/family. HUNT5-F-5 added the two
+ * permanent codes the archive itself records to FAILED_FINAL_COPY, but that table is consulted only
+ * for `failed_final`, so every other outcome on this page still told the parent to get a new scan for
+ * a child whose profile makes one impossible — `readPaidProfile` requires status 'active'
+ * (apps/api/src/routes/homework.ts), this page offers no uploader for an archived child, and archiving
+ * signs the child's devices out. The rows are listed all the same (GET /v1/assignments drops only a
+ * child under an open deletion), so the advice sat directly under this page's own "new scans are not
+ * taken" notice.
+ *
+ * Only 'archived' and 'draft' are named: those are the two non-active values the family contract has
+ * (packages/contracts/src/family.ts), and each names its own blocker. An unrecognised status keeps the
+ * generic copy rather than asserting a reason — "no paid slot" — that might not be true of it.
+ *
+ * G-H2: the lookup is by code AND THEN by state, which is the whole point. Keying it on the code alone
+ * meant a code in neither table — PROCESSING_ERROR and the rest, see the table above — walked past
+ * both and printed the state's generic "Please start a new scan with clear photos." The state-level
+ * entry answers every such row, so the advice cannot come back through a code nobody listed.
+ */
+function noNewScanCopy(childStatus?: string): string | null {
+  return childStatus === 'archived'
+    ? ARCHIVED_CHILD_NO_NEW_SCAN_COPY
+    : childStatus === 'draft'
+      ? INACTIVE_CHILD_NO_NEW_SCAN_COPY
+      : null;
+}
+
+/**
+ * G-LABEL: the state's own label, and the one state whose label is an imperative the profile can
+ * refuse. `needs_rescan` prints "Needs a new scan" in the row header and as the detail panel's
+ * prefix, so once HUNT6-H-2 replaced the EXPLANATION's rescan advice for a non-active child, the
+ * panel read "Needs a new scan: … A new scan can’t help while this child’s profile is archived" —
+ * the label asking for exactly what the sentence beside it says cannot happen, and what POST
+ * /v1/assignments refuses (`readPaidProfile` requires `status = 'active'`) for a child whose devices
+ * are signed out. For those profiles the label names the outcome instead and asks for nothing; the
+ * explanation still says what happened and why no scan can help. Every other label is a description
+ * already ("Delayed", "Could not finish"), and an ACTIVE child keeps this one, because for them a new
+ * scan is the next step.
+ */
+function statusLabel(status: AssignmentStatus, childStatus?: string): string {
+  if (status === 'needs_rescan' && noNewScanCopy(childStatus) !== null) return 'Couldn’t be read';
+  return STATUS_COPY[status].label;
+}
+
 function explainStatus(
   assignment: { status: AssignmentStatus; errorCode: string | null },
   name: string,
+  childStatus?: string,
 ): string {
-  if (assignment.status === 'failed_final' && assignment.errorCode !== null) {
-    const copy = FAILED_FINAL_COPY[assignment.errorCode];
+  const blocked = noNewScanCopy(childStatus);
+  const code = assignment.status === 'failed_final' ? assignment.errorCode : null;
+  // 1. A code whose own line ENDS in the advice this replaces (three of FAILED_FINAL_COPY's six), so
+  //    it is trimmed before that table can print it.
+  if (blocked !== null && code !== null) {
+    const trimmed = OUTCOME_WITHOUT_NEW_SCAN_ADVICE[code];
+    if (trimmed !== undefined) return `${trimmed} ${blocked}`;
+  }
+  // 2. A code with a line of its own and no such advice keeps it whole. CHILD_ARCHIVED and
+  //    CHILD_NOT_ACTIVE already name this very profile as the blocker, and CONSENT_REQUIRED names
+  //    consent, a prior blocker of its own whose remedy the parent still needs; each says what to do
+  //    before scanning again rather than asking for a scan now.
+  if (code !== null) {
+    const copy = FAILED_FINAL_COPY[code];
     if (copy !== undefined) return copy;
+  }
+  // 3. Otherwise the STATE decides — including every `failed_final` code this page has no line for,
+  //    which is what used to fall through to the generic advice below.
+  if (blocked !== null) {
+    const trimmed = OUTCOME_WITHOUT_NEW_SCAN_ADVICE[assignment.status];
+    if (trimmed !== undefined) return `${trimmed} ${blocked}`;
   }
   return STATUS_COPY[assignment.status].explain(name);
 }
@@ -415,6 +509,13 @@ function ChildHomework({ child }: { child: FamilyChild }) {
         if (ok) reload();
       });
 
+  // G-I3-WEB / L-037: the notice names the OPEN REQUEST, not the reader. GET /v1/family computes
+  // `deletionPending` from the request's scope and target and never exposes
+  // deletion_requests.requested_by (apps/api/src/routes/family.ts); any guardian may delete a child's
+  // data and a child-scope request leaves every other adult's membership active, so the family's
+  // other adult is served the same flag and was told THEY had asked for it. Same sentence as the app
+  // (apps/mobile/app/(parent)/children.tsx) and as the Children page.
+  //
   // HUNT5-F-2: before the query's own states, because GET /v1/assignments answers NOT_FOUND for a
   // child whose data deletion is `requested` or `processing` (homework.ts) — so the parent read
   // "Child not found" and a Try again that can never succeed. Processing has stopped for this child,
@@ -424,11 +525,11 @@ function ChildHomework({ child }: { child: FamilyChild }) {
     return (
       <section className="notice" aria-label="Data deletion under way" style={{ marginTop: 16 }}>
         <p style={{ margin: 0 }}>
-          <strong>Data deletion under way.</strong> You asked for {child.nickname}’s data to be
-          deleted. Processing has already stopped, so no homework is checked or kept for them and
-          nothing new can be scanned. You can follow it on the{' '}
-          <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the app: if you
-          did not mean it, <Link to="/app/support">contact support</Link> straight away.
+          <strong>Data deletion under way.</strong> A deletion request covering {child.nickname}’s
+          data is open. Processing has already stopped, so no homework is checked or kept for them,
+          nothing new can be scanned, and the scans already here are being deleted. You can follow
+          it on the <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the
+          app: if you did not mean it, <Link to="/app/support">contact support</Link> straight away.
         </p>
       </section>
     );
@@ -477,20 +578,16 @@ function ChildHomework({ child }: { child: FamilyChild }) {
       >
         <h2>Scans for {child.nickname}</h2>
         {assignments.length === 0 ? (
-          <p>
-            No scans for {child.nickname} yet. Add one above, or {child.nickname} can scan homework
-            in the PencilLift app on a paired phone or tablet; each scan appears here as it is
-            processed.
-          </p>
+          <NoScans child={child} />
         ) : (
           <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
             {assignments.map((a) => (
               <li key={a.id} style={{ borderTop: '1px solid #e3e8ee', padding: '12px 0' }}>
                 <strong>
                   {formatDate(a.createdAt)} · {a.pageCount} {a.pageCount === 1 ? 'page' : 'pages'} ·{' '}
-                  {STATUS_COPY[a.status].label}
+                  {statusLabel(a.status, child.status)}
                 </strong>
-                <p style={{ margin: '4px 0' }}>{explainStatus(a, child.nickname)}</p>
+                <p style={{ margin: '4px 0' }}>{explainStatus(a, child.nickname, child.status)}</p>
                 <div style={buttonRow}>
                   <button
                     type="button"
@@ -536,6 +633,7 @@ function ChildHomework({ child }: { child: FamilyChild }) {
           key={openId}
           assignmentId={openId}
           childName={child.nickname}
+          childStatus={child.status}
           onChanged={reload}
         />
       ) : null}
@@ -905,6 +1003,54 @@ function uploadBlockedReason(child: FamilyChild, allowance: PageAllowance | null
   return null;
 }
 
+/**
+ * G-NO-SCANS-COPY: the empty Scans list said "Add one above, or {name} can scan homework in the
+ * PencilLift app on a paired phone or tablet". Both halves are false for a profile that is not
+ * active, and this page renders the refutation itself: an archived child gets no uploader at all
+ * (WEBR4-10 replaced it with the "Scanning paused" notice) and any other non-active profile gets the
+ * uploader region with `uploadBlockedReason` and no control — so nothing is "above" to add from — and
+ * no paired device can scan either, because POST /v1/assignments requires `status = 'active'`
+ * (`readPaidProfile`, apps/api/src/routes/homework.ts) and archiving revokes the child's sessions.
+ * It is the two-regions-disagree defect HUNT6-H-2 and G-H2 closed for this list's ROWS, left in the
+ * branch that renders when there are none.
+ *
+ * Split the same way as `uploadBlockedReason` — archived, then every other non-active status —
+ * because this sentence is about that region: "no paid slot" is the reason it gives for all of them,
+ * and it asserts no history of the slot, since a draft may never have held one or may have lost one
+ * to a downgrade (`releaseSlotlessProfiles`, apps/api/src/services/billing-sync.ts).
+ */
+function NoScans({ child }: { child: FamilyChild }) {
+  const name = child.nickname;
+  if (child.status === 'active') {
+    return (
+      <p>
+        No scans for {name} yet. Add one above, or {name} can scan homework in the PencilLift app on
+        a paired phone or tablet; each scan appears here as it is processed.
+      </p>
+    );
+  }
+  return (
+    <p>
+      No scans for {name}.{' '}
+      {child.status === 'archived'
+        ? `PencilLift takes no new scans while ${name}’s profile is archived, and their paired devices are signed out, so none can be added here or in the app. `
+        : `PencilLift takes no new scans while ${name} has no paid slot, so none can be added here or in the app. `}
+      {child.status === 'archived' ? (
+        <>
+          Activate {name} again on the <Link to="/app/children">Children page</Link>, while a paid
+          slot is free
+        </>
+      ) : (
+        <>
+          Assign one of your family’s unused paid slots to this profile on the{' '}
+          <Link to="/app/children">Children page</Link>, while one is free
+        </>
+      )}
+      , and new scans will appear here as they are processed.
+    </p>
+  );
+}
+
 function ScanUploader({
   child,
   allowance,
@@ -1233,10 +1379,13 @@ function UploadPanel({
 function AssignmentDetail({
   assignmentId,
   childName,
+  childStatus,
   onChanged,
 }: {
   assignmentId: string;
   childName: string;
+  /** HUNT6-H-2: the same status the list rows use, so the panel does not ask for a refused rescan. */
+  childStatus: string;
   onChanged: () => void;
 }) {
   const query = useRefreshingQuery(
@@ -1284,8 +1433,8 @@ function AssignmentDetail({
       {query.status === 'ready' ? (
         <>
           <p>
-            {STATUS_COPY[query.data.assignment.status].label}:{' '}
-            {explainStatus(query.data.assignment, childName)}
+            {statusLabel(query.data.assignment.status, childStatus)}:{' '}
+            {explainStatus(query.data.assignment, childName, childStatus)}
           </p>
           {query.data.questions.length === 0 ? (
             <p>No questions have been read from this scan yet.</p>

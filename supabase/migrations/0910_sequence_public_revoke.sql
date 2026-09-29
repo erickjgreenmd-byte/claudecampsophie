@@ -15,17 +15,38 @@
 -- supabase/tests/schema_invariants.test.ts now counts PUBLIC as a client role, but a CI invariant
 -- reports the state after the fact. These two statements are what keeps the state from arising: the
 -- deployed schema holds no PUBLIC privilege on any sequence in public, and a sequence created later
--- inherits none.
+-- inherits none from the PER-SCHEMA default.
 --
--- What a revoke does and does not do, stated plainly: it removes the privilege wherever it is held
--- now, including a grant made by an earlier migration or by the hosted platform before this schema
--- was deployed, and it cancels the schema default so new sequences do not receive it again. It
--- cannot stop a LATER `grant ... to public` written by a future migration — that is what the two
--- [HR4-0860-01] cases in supabase/tests/schema_invariants.test.ts are for.
+-- Which form cancels which, since Postgres keeps the per-schema and the global default privileges in
+-- independent pg_default_acl rows and MERGES them when it creates an object: the second statement
+-- below cancels the PUBLIC entry in the per-schema row (defaclnamespace = the public schema) only. It
+-- cannot cancel a PUBLIC entry in the GLOBAL row (defaclnamespace = 0), because a per-schema default
+-- can only ADD to the global one — the rule 0001_core_identity.sql:535-539 already records for
+-- functions, which is why the function revoke there is spelled globally. The global spelling for
+-- sequences is 0940_sequence_public_default_global.sql; both are needed, neither replaces the other
+-- (HUNT6-E-2).
+--
+-- What a revoke does and does not do, stated plainly: it removes a privilege GRANTED BY the role that
+-- runs this migration, or by a role that role is a member of — which covers a grant made by an
+-- earlier migration. It does NOT remove a grant made by any other grantor. A PUBLIC grant issued by a
+-- hosted platform role before this schema was deployed renders in relacl as `=wU/<that role>`, and
+-- the statement below leaves it exactly as it is while still reporting success — no error, no
+-- warning — so the migration commits and the deploy looks clean with the privilege still held
+-- (HUNT6-E-3; the non-grantor case in supabase/tests/hardening_r2_db.test.ts pins that behaviour).
+-- On hosted Supabase migrations run as `postgres`, which is not a superuser there, so this is the
+-- realistic case, and nothing in CI can see it: CI applies these migrations to a fresh database that
+-- carries no platform grant. Checking the deployed database means running the query from the
+-- [HR4-0860-01] sequence case in supabase/tests/schema_invariants.test.ts against it; repairing a hit
+-- takes a revoke issued by the grantor. Nor can any revoke here stop a LATER `grant ... to public`
+-- written by a future migration — that is what the two [HR4-0860-01] cases in
+-- supabase/tests/schema_invariants.test.ts are for.
 --
 -- 0870 is left exactly as it shipped; this is an additive second pass over the same objects with the
--- same two statement shapes, and applying it twice is a no-op
--- (supabase/tests/hardening_r2_db.test.ts pins both facts).
+-- same two statement shapes, and applying it twice is a no-op. supabase/tests/hardening_r2_db.test.ts
+-- pins both facts as stated: it asserts both of 0870's two statements verbatim, and it re-applies
+-- this file twice over — on the deployed schema and on a schema carrying the PUBLIC grant and the
+-- PUBLIC per-schema default — comparing the relacl of every sequence in public, which is what the
+-- first statement acts on, as well as the pg_default_acl row the second acts on (HUNT6-E-5).
 
 -- The shape of 0870:44, for the grantee it did not name. service_role keeps its privileges, as it
 -- does for tables: every real ledger append runs as the service role or inside a SECURITY DEFINER
@@ -34,5 +55,6 @@
 revoke all on all sequences in schema public from public;
 
 -- The shape of 0870:49, for the grantee it did not name. Per granting role, like the table entry
--- 0860 cancelled.
+-- 0860 cancelled. This is the PER-SCHEMA default-privilege row only; the global row is
+-- 0940_sequence_public_default_global.sql's, and a per-schema revoke cannot reach it.
 alter default privileges in schema public revoke all on sequences from public;

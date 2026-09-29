@@ -35,25 +35,33 @@ import {
  * in its IANA zone, which is named on screen; the server computes the next releases with the zone's
  * daylight-saving rules. `refreshKey` reloads the releases after subject or test-date changes.
  *
- * HUNT5-F-10: the section takes no child status and does not branch on one. For an archived profile
- * the planner's own notice frames every time below it — "the times below are what the schedule would
- * produce if the profile were active again" — so these instants are read as the hypothetical they
- * are, and the stored plan the parent came to read stays on screen. A branch that blanked them was
- * built for the other design of that finding and removed with it: the planner, this section's only
- * caller, never passed a status, so it was dead for every real archived child. What the section must
- * not do is PROMISE a child something (see PracticeSetsSection's `childStatus`, which exists for one
- * such sentence); nothing here addresses the child at all.
+ * HUNT5-F-10: the RELEASE TIMES do not branch on the status. For an archived profile the planner's
+ * own notice frames every time below it — "the times below are what the schedule would produce if the
+ * profile were active again" — so these instants are read as the hypothetical they are, and the
+ * stored plan the parent came to read stays on screen. Blanking them would throw that plan away.
+ *
+ * HUNT6-H-1: the EDITOR does branch, and `childStatus` is back for that. Its submit is
+ * PUT /learning-schedule, which goes through `ownedChild(c, 'write')` and answers BUSINESS_RULE
+ * CHILD_ARCHIVED for an archived profile (apps/api/src/routes/learning.ts), while the GET above takes
+ * `'read'` and succeeds — so the section mounted, printed the plan, and offered a "Save schedule" the
+ * server refuses, under a notice saying the page is readable. For that one status the fields are
+ * shown disabled and the submit is not rendered; the values stay visible. The test is "is this
+ * profile ARCHIVED?", not "is it active?": the same guard keeps a DRAFT profile writable on purpose,
+ * because a parent sets the plan up before the slot is assigned, so a draft — and an unrecognised
+ * status, which the family contract has none of — keeps the editor.
  */
 export function ScheduleSection({
   childId,
   childName,
   subjects,
   refreshKey,
+  childStatus,
 }: {
   childId: string;
   childName: string;
   subjects: readonly ChildSubject[];
   refreshKey: number;
+  childStatus?: string;
 }) {
   const path = `/v1/children/${encodeURIComponent(childId)}/learning-schedule`;
   const query = useApiQuery(
@@ -85,6 +93,7 @@ export function ScheduleSection({
             path={path}
             childName={childName}
             initial={data}
+            readOnly={childStatus === 'archived'}
             onSaved={(saved) => setSnapshot(saved)}
           />
           <UpcomingReleases data={data} subjects={subjects} childName={childName} />
@@ -130,11 +139,14 @@ function ScheduleEditor({
   path,
   childName,
   initial,
+  readOnly,
   onSaved,
 }: {
   path: string;
   childName: string;
   initial: LearningScheduleResponse;
+  /** HUNT6-H-1: the saved schedule stays readable; PUT /learning-schedule is refused (CHILD_ARCHIVED). */
+  readOnly: boolean;
   onSaved: (saved: LearningScheduleResponse) => void;
 }) {
   const { api } = useSession();
@@ -152,6 +164,10 @@ function ScheduleEditor({
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    // HUNT6-H-1: this form stays mounted read-only, so the property is "no PUT is issued", not "no
+    // button is rendered" — every field is disabled and the submit is gone, and this holds even if a
+    // later field arrives without one.
+    if (readOnly) return;
     const result = validateScheduleForm(form);
     if (!result.ok) {
       setErrors(result.errors);
@@ -183,6 +199,7 @@ function ScheduleEditor({
           <select
             id={id('reviewWeekday')}
             value={form.reviewWeekday}
+            disabled={readOnly}
             onChange={(e) => set('reviewWeekday', e.target.value)}
             aria-invalid={errors.reviewWeekday ? true : undefined}
             aria-describedby={describedBy(id('reviewWeekday'), errors.reviewWeekday, false)}
@@ -204,6 +221,7 @@ function ScheduleEditor({
             id={id('reviewLocalTime')}
             type="time"
             value={form.reviewLocalTime}
+            disabled={readOnly}
             onChange={(e) => set('reviewLocalTime', e.target.value)}
             aria-invalid={errors.reviewLocalTime ? true : undefined}
             aria-describedby={describedBy(id('reviewLocalTime'), errors.reviewLocalTime, true)}
@@ -223,6 +241,7 @@ function ScheduleEditor({
             max={reviewLimits.max}
             step={1}
             value={form.reviewQuestionsPerSubject}
+            disabled={readOnly}
             onChange={(e) => set('reviewQuestionsPerSubject', e.target.value)}
             aria-invalid={errors.reviewQuestionsPerSubject ? true : undefined}
             aria-describedby={describedBy(
@@ -245,6 +264,7 @@ function ScheduleEditor({
             id={id('dailyLocalTime')}
             type="time"
             value={form.dailyLocalTime}
+            disabled={readOnly}
             onChange={(e) => set('dailyLocalTime', e.target.value)}
             aria-invalid={errors.dailyLocalTime ? true : undefined}
             aria-describedby={describedBy(id('dailyLocalTime'), errors.dailyLocalTime, false)}
@@ -264,6 +284,7 @@ function ScheduleEditor({
             max={dailyLimits.max}
             step={1}
             value={form.dailyQuestionCount}
+            disabled={readOnly}
             onChange={(e) => set('dailyQuestionCount', e.target.value)}
             aria-invalid={errors.dailyQuestionCount ? true : undefined}
             aria-describedby={describedBy(
@@ -278,6 +299,7 @@ function ScheduleEditor({
           <input
             type="checkbox"
             checked={form.pauseEnabled}
+            disabled={readOnly}
             onChange={(e) => set('pauseEnabled', e.target.checked)}
             style={{ width: 24, minHeight: 24 }}
           />
@@ -290,6 +312,7 @@ function ScheduleEditor({
               id={id('pauseFrom')}
               type="date"
               value={form.pauseFrom}
+              disabled={readOnly}
               onChange={(e) => set('pauseFrom', e.target.value)}
               aria-invalid={errors.pause ? true : undefined}
               aria-describedby={errors.pause ? id('pause-error') : undefined}
@@ -299,6 +322,7 @@ function ScheduleEditor({
               id={id('pauseTo')}
               type="date"
               value={form.pauseTo}
+              disabled={readOnly}
               onChange={(e) => set('pauseTo', e.target.value)}
               aria-invalid={errors.pause ? true : undefined}
               aria-describedby={errors.pause ? id('pause-error') : undefined}
@@ -324,11 +348,19 @@ function ScheduleEditor({
         <FieldError id={id('quiet-error')} message={errors.quietHours} />
       </fieldset>
 
-      <div style={buttonRow}>
-        <button type="submit" className="btn" disabled={busy !== null}>
-          {busy === 'save' ? 'Saving…' : 'Save schedule'}
-        </button>
-      </div>
+      {readOnly ? (
+        <p className="notice" style={{ margin: '16px 0 0' }}>
+          {childName}’s profile is archived, so this schedule can’t be changed. The saved times are
+          shown above and stay readable. Activate {childName} again on the Children page while a
+          paid slot is free to change them.
+        </p>
+      ) : (
+        <div style={buttonRow}>
+          <button type="submit" className="btn" disabled={busy !== null}>
+            {busy === 'save' ? 'Saving…' : 'Save schedule'}
+          </button>
+        </div>
+      )}
     </form>
   );
 }

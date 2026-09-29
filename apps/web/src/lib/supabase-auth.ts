@@ -142,17 +142,51 @@ function portalClient(storageKey: string | null): ClientAuthOptions {
 
 /**
  * WEB-R4-AUTH-2: removes this origin's stored session. Used only when supabase-js has refused a
- * sign-out *without* clearing it — with an expired access token it tries a refresh first, and when
- * that fails at the fetch level (offline, captive portal, auth outage) it returns the error before
- * removeCurrentSession(), leaving a still-valid refresh token in localStorage. On a shared family,
- * school or library computer the next person would sign straight back in with it.
+ * sign-out *without* clearing it, which in the pinned @supabase/auth-js 2.116.0 is exactly one path:
+ * the stored access token has ALREADY EXPIRED (`expires_at` is in the past), so the refresh token is
+ * the only credential left and `__loadSession` must refresh before `_signOut` can have a token at all;
+ * that refresh fails at the fetch level (offline, captive portal, auth outage), which is the one
+ * refresh failure `_callRefreshToken` does NOT clear storage for; and `_useSession` hands `_signOut`
+ * the refresh error as a `sessionError`, which it returns before it reaches `removeCurrentSession()`.
+ * A still-usable refresh token is left in localStorage, and on a shared family, school or library
+ * computer the next person signs straight back in with it as soon as the network returns.
+ *
+ * HUNT6-F-MARGIN: "the stored access token is inside EXPIRY_MARGIN_MS" was the precondition this
+ * comment stated, and a token merely inside that margin takes the OTHER path. Being inside the 90s
+ * margin is only what makes `__loadSession` refresh at all; when that refresh fails, auth-js compares
+ * the access token against its REAL expiry, and while the token is still valid it keeps the stored
+ * session and returns it with `error: null` (its proactive-preserve branch, mirrored in
+ * `_callRefreshToken`). `_signOut` therefore still has an access token, calls /logout, and lands on the
+ * other refusal path described next — the one that removes the session before returning. Expiry, not
+ * the margin, is what leaves a refresh token behind. (auth-js also drops the fallback when storage
+ * changed under the refresh, but then the stored session is already gone and this has nothing to
+ * remove.) Run against the real library in App.signout.test.tsx's [HUNT6-F-MARGIN] case, beside the
+ * expired-token case it is contrasted with.
+ *
+ * HUNT6-F-PREMISE: on auth-js's OTHER refusal path — the /logout request itself failing with anything
+ * but 404/401/403/session-missing — the order is the reverse. `removeCurrentSession()` runs inside
+ * that error branch and only then is the error returned, so there is nothing left for this to remove
+ * and it is a no-op. The mechanism this comment used to cite, "it returns the error before
+ * removeCurrentSession(), so its in-memory session survives the removal", is in neither path: 2.116.0
+ * holds no in-memory session at all. `getSession()` goes through `__loadSession`, which re-reads
+ * `this.storage` on every call, and `this.storage` is `globalThis.localStorage` whenever
+ * `supportsLocalStorage()` is true — so removing that key removes what `getSession()` reads. Both
+ * paths are run against the real library in App.signout.test.tsx's [HUNT6-F-PREMISE] cases.
+ *
+ * Still best-effort, and callers are promised no more than that (the SignOutRefused doc in
+ * lib/auth.ts): this cannot report a failure, and with site data blocked it removes nothing.
  */
 function forgetStoredSession(storageKey: string | null): void {
   if (!storageKey) return;
   try {
     globalThis.localStorage?.removeItem(storageKey);
   } catch {
-    // Storage blocked (private mode, a locked-down browser): nothing was stored to remove.
+    // Storage blocked (site data blocked, a locked-down browser): merely touching localStorage
+    // throws, so auth-js's supportsLocalStorage() is false and this origin's session is held in its
+    // memoryLocalStorageAdapter instead — where a localStorage removal cannot reach it. Nothing is
+    // removed here, and nothing was persisted either, so that session cannot outlive the tab; what
+    // this function can establish is unchanged, which is why the report stays about the server alone
+    // and the callers read the session for themselves (HUNT6-F-3, HUNT6-F-PREMISE).
   }
 }
 
@@ -304,10 +338,21 @@ export function createSupabaseAuth(
         return { ok: false };
       }
     },
-    /** `null` only when the level could not be read at all — never as a stand-in for aal1. */
+    /**
+     * `null` only when the level could not be read at all — never as a stand-in for aal1.
+     *
+     * HUNT6-F-2: guarded on the field that carries the level, not on the wrapper around it. auth-js
+     * does not report an unreadable level through `data`: its no-jwt branch resolves `{ data: {
+     * currentLevel: null, nextLevel: null, currentAuthenticationMethods: [] }, error: null }`, both
+     * when there is no session and when the access token carries no `aal` claim. Checking `error`
+     * and `data` alone left that case to the mapping below, which spent it as 'aal1' — the one
+     * answer this comment says `null` must never stand in for, and enough for PinResetPage to run
+     * the session-replacing password grant with no two-step step. `!data.currentLevel` is the whole
+     * fact: a level was read, or it was not.
+     */
     async assuranceLevel() {
       const { data, error } = await auth.mfa.getAuthenticatorAssuranceLevel();
-      if (error || !data) return null;
+      if (error || !data || !data.currentLevel) return null;
       return data.currentLevel === 'aal2' ? 'aal2' : 'aal1';
     },
     async enrollTotp() {
@@ -368,6 +413,20 @@ export function createSupabaseAuth(
       // — those catches are belt and braces, and a page that swallows a refusal cannot tell the
       // parent about it — but it is no longer observable through either page, so it is asserted on
       // this adapter directly (App.signout.test.tsx, ACC-WEB-AUTH-A).
+      //
+      // HUNT6-F-3: the report says the SERVER was not told, and only that. The clearing below is
+      // best-effort (forgetStoredSession) and cannot report what it achieved, so both callers re-read
+      // currentSession() before showing a signed-out screen; this return value is never a statement
+      // that this origin's session is gone.
+      //
+      // HUNT6-F-PREMISE: with this pinned auth-js that read is expected to find nothing. Every path on
+      // which auth-js resolves with an error leaves `getSession()` answering `session: null` — it
+      // removes the session itself before returning a /logout failure, and a pre-flight refresh that
+      // failed is the same failure `getSession()` goes on to hit. The read is kept all the same,
+      // because that is a fact about one pinned version's internals while "This computer is signed
+      // out" is a sentence said to a parent, and the read is the only thing that establishes it. It is
+      // not dead either: it fires for an adapter that throws, a currentSession() that throws, a
+      // storage adapter other than the two auth-js picks for itself, and the next auth-js.
       const { error } = await auth.signOut({ scope });
       if (!error) return;
       forgetStoredSession(storageKey);

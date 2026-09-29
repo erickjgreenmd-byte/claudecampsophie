@@ -14,6 +14,27 @@ export interface SecureStorage {
   deleteItem(key: string): Promise<void>;
 }
 
+/**
+ * What a sign-out on this device managed to do (HUNT6-J-1). Every step below is best effort — nothing
+ * may STOP a sign-out — but each one is reported, because the screen that follows a closure tells the
+ * parent what state the device in front of them is in, and they act on it.
+ */
+export interface DeviceSignOutOutcome {
+  /**
+   * The auth service CONFIRMED that the session ended.
+   *
+   * False is deliberately not "this device is still signed in" — that is the adjacent fact, and
+   * claiming it would be as wrong as the claim this replaced. supabase-js (auth-js 2.116) removes the
+   * local session even when the logout call failed, and returns the failure in `{ error }`; it does
+   * NOT remove it when it could not read the session in the first place. So false means only that
+   * this device cannot say the session is gone: either the service was never told, or the session
+   * could not be read at all. The copy says exactly that (src/privacy/parent-privacy.ts).
+   */
+  readonly sessionEndConfirmed: boolean;
+  /** The parent's biometric PIN and the store SDK identity were both removed from this device. */
+  readonly secretsCleared: boolean;
+}
+
 export interface ModeEffects {
   /** Clears every cached adult API response (query client, in-memory stores). */
   clearAdultCaches(): void;
@@ -36,17 +57,6 @@ export const STORAGE_KEYS = {
   mode: 'pl.mode',
   childRefreshToken: 'pl.child.refresh',
   childProfile: 'pl.child.profile',
-  /**
-   * The refresh this device has not finished yet (BUG-244): the request id together with the instant
-   * this device minted it. Persisted, not in memory only: the OS can kill a backgrounded tablet app
-   * while a refresh is in flight, which loses the response exactly as a dropped connection does, and
-   * the next attempt has to present the SAME id to be recognised as this device finishing its own
-   * refresh rather than a replay of a stolen token. The instant bounds that: the server serves such a
-   * retry only briefly after the rotation, so an id older than its window is replaced rather than
-   * presented for a later refresh (src/family/child-session.ts). Neither part is a credential — the
-   * id opens nothing on its own, and only ever matches the one token it rotated.
-   */
-  childRefreshRequestId: 'pl.child.refresh.rid',
 } as const;
 
 /**
@@ -95,7 +105,16 @@ export function parentIdentityGeneration(): number {
  * stands for an adult this device cannot name as well as for no adult at all — and an early return on
  * null after null left a screen published for the previous adult current for the next one, which is
  * the handed-on tablet HUNT5-H-1 is about. So an unnamed owner always moves the identity: it costs a
- * mounted screen one refetch and never keeps its rows.
+ * mounted screen one refetch.
+ *
+ * What that refetch does to the rows already on the screen is the SCREEN's business, not this
+ * counter's: the sentence here used to add "and never keeps its rows", which was untrue of every
+ * screen — the moved identity publishes a new client, and the shared load hook preserved its 'ready'
+ * state across it, so the previous adult's rows stayed up for the length of the new request
+ * (HUNT6-I-2). The hook drops them before the fetch now (`loadStateForRun`,
+ * src/family/family-view.ts). Component state that is not keyed on the identity — a nickname typed
+ * into Add child and never submitted — still survives the refetch, so this is about rows, not about
+ * everything on the screen.
  */
 export function noteParentIdentity(userId: string | null): void {
   if (userId !== null && userId === parentStateOwnerUserId) return;
@@ -109,6 +128,43 @@ export function noteParentIdentity(userId: string | null): void {
  */
 export function parentStateStillCurrent(publishedUnder: number | null): boolean {
   return publishedUnder !== null && publishedUnder === parentIdentityChanges;
+}
+
+/**
+ * A screen-privacy change the child's space is owed, applied only once the app is in the foreground
+ * (HUNT6-I-4). Memory only, never persisted; a fresh process starts with OS capture allowed anyway,
+ * because expo-screen-capture's protection lives in the process that asked for it.
+ *
+ * Locking a paired tablet returns it to the child's space, and the child's space must allow
+ * screenshots, screen recording and casting (MOB-R2-05, BUG-287). But one of the two ways the lock is
+ * reached is the app LEAVING the foreground (src/lib/app-session.ts), and the frame the OS snapshots
+ * for its app-switcher card at that transition is still the ADULT one: resetNavigationToChildHome is
+ * a JS router.replace (src/family/runtime.ts), which cannot paint while the app is suspended. Turning
+ * protection off inside that handler removed it at the one instant it exists for. So the lock records
+ * the debt, and the two callers that KNOW the app is in the foreground settle it: the 'active'
+ * handler in src/lib/app-session.ts, and the Lock button the parent has just pressed
+ * (src/family/ui.tsx).
+ */
+let childSpaceOwedScreenPrivacyOff = false;
+
+/** Whether the child's space is still owed its screen-privacy change. */
+export function childSpaceOwesScreenPrivacy(): boolean {
+  return childSpaceOwedScreenPrivacyOff;
+}
+
+/**
+ * Settles that debt — and only from a caller that is sure the app is in the foreground, since the
+ * whole point is that the adult frame stays protected while the OS snapshots it. Answers whether
+ * anything was owed. The debt is cleared before the call, so an OS that refuses is not retried on
+ * every foreground: the child's space allowing capture is a comfort, adult protection is not.
+ */
+export async function settleChildSpaceScreenPrivacy(
+  effects: Pick<ModeEffects, 'setScreenPrivacy'>,
+): Promise<boolean> {
+  if (!childSpaceOwedScreenPrivacyOff) return false;
+  childSpaceOwedScreenPrivacyOff = false;
+  await effects.setScreenPrivacy(false).catch(() => undefined);
+  return true;
 }
 
 /**
@@ -140,11 +196,14 @@ export async function lockParentAreaOnDevice(
   if (childPaired) {
     await storage.setItem(STORAGE_KEYS.mode, 'child').catch(() => undefined);
     effects.resetNavigationToChildHome();
-    // The child's space is not an adult screen: screen privacy goes off here as it does on every
-    // other way in (enterChildMode, signOutParent), or the child keeps a tablet that refuses
+    // The child's space is not an adult screen, so it is owed screen privacy off as every other way
+    // in gives it (enterChildMode, signOutParent), or the child keeps a tablet that refuses
     // screenshots, screen recording and casting (MOB-R2-05, HUNT5-G-4). useChildModeOnFocus cannot
-    // correct it, because the mode written above makes that hook return early.
-    await effects.setScreenPrivacy(false).catch(() => undefined);
+    // correct it, because the mode written above makes that hook return early. It is RECORDED here
+    // and not applied here (HUNT6-I-4): this same function runs from the backgrounding handler, where
+    // the adult screen is still the painted frame, so switching protection off here removed it at the
+    // exact moment the OS snapshots the app. `settleChildSpaceScreenPrivacy` applies it.
+    childSpaceOwedScreenPrivacyOff = true;
   } else {
     // A parent-only device stays in parent mode on the unlock screen: adult privacy stays on.
     effects.resetNavigationToUnlock();
@@ -250,13 +309,20 @@ export async function enterParentMode(
 export async function signOutParent(
   storage: SecureStorage,
   effects: ModeEffects,
-  auth: { signOut(): Promise<void> },
-): Promise<void> {
+  auth: { signOut(): Promise<{ ok: boolean }> },
+): Promise<Pick<DeviceSignOutOutcome, 'sessionEndConfirmed'>> {
   const childPaired = (await storage.getItem(STORAGE_KEYS.childRefreshToken)) !== null;
   effects.clearAdultCaches();
   await effects.relockOnServer().catch(() => undefined);
   forgetParentUnlock();
-  await auth.signOut().catch(() => undefined);
+  // Reported, not swallowed (HUNT6-J-1). Nothing below is skipped whatever this answered — that is
+  // the "nothing may stop the sign-out" rule and it is unchanged — but the answer reaches the caller,
+  // because `.catch(() => undefined)` here, on top of parentAuth.signOut dropping supabase's own
+  // `{ error }`, meant the only fact a screen could observe was that no keychain write threw.
+  const sessionEndConfirmed = await auth.signOut().then(
+    (result) => result.ok,
+    () => false,
+  );
   // The session watcher clears caches again and unbinds the store SDK; this covers a watcher that
   // never fires (e.g. an offline sign-out that only removed the local session).
   effects.clearAdultCaches();
@@ -264,6 +330,7 @@ export async function signOutParent(
   if (childPaired) effects.resetNavigationToChildHome();
   else effects.resetNavigationToWelcome();
   await effects.setScreenPrivacy(false);
+  return { sessionEndConfirmed };
 }
 
 /**
@@ -289,10 +356,11 @@ export async function signOutParent(
 export async function signOutClosedAccount(
   storage: SecureStorage,
   effects: ModeEffects,
-  auth: { signOut(): Promise<void> },
-): Promise<void> {
-  await signOutParent(storage, effects, auth);
+  auth: { signOut(): Promise<{ ok: boolean }> },
+): Promise<Pick<DeviceSignOutOutcome, 'sessionEndConfirmed'>> {
+  const outcome = await signOutParent(storage, effects, auth);
   await unpairChildDevice(storage);
+  return outcome;
 }
 
 /** Unpairing a child device removes the child's refresh token and cached profile. */
@@ -300,8 +368,6 @@ export async function unpairChildDevice(storage: SecureStorage): Promise<void> {
   forgetParentUnlock();
   await storage.deleteItem(STORAGE_KEYS.childRefreshToken);
   await storage.deleteItem(STORAGE_KEYS.childProfile);
-  // The unfinished refresh goes with the session it belonged to.
-  await storage.deleteItem(STORAGE_KEYS.childRefreshRequestId);
   await storage.setItem(STORAGE_KEYS.mode, 'signed_out');
 }
 

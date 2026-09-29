@@ -397,6 +397,16 @@ function BalancesSection({
             >
               <strong>{child.nickname}</strong>
               <span>{pointsLabel(child.balance)}</span>
+              {/*
+                HUNT6-G-2 asked whether this line, like the Children card's, can say "history only"
+                about history a purge is deleting. It cannot: GET /v1/rewards builds this list with
+                `notBeingDeleted(tx, 'c.id')` (apps/api/src/routes/rewards.ts), so a child whose
+                deletion is `requested` or `processing` is not in `children` at all, and
+                `rewardChildBalanceSchema` is a strictObject with no `deletionPending` field
+                (packages/contracts/src/rewards.ts) — there is no flag to branch on and no row to
+                print. If that response ever starts carrying such a child, the contract has to change
+                first, and this is the line that needs the branch `childStatusLabel` now has.
+              */}
               {child.status === 'active' ? null : (
                 <span style={{ color: 'var(--muted)' }}>
                   ({child.status === 'archived' ? 'archived' : 'no paid slot'} — history only)

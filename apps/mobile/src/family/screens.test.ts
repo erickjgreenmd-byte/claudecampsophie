@@ -137,7 +137,15 @@ describe('parent screens need the PIN after a restart (MOB-R1-09)', () => {
   it('the parent privacy screen goes through the same gate and loads nothing before it opens', () => {
     const privacy = screen('(parent)', 'privacy.tsx');
     expect(privacy).toMatch(/const access = useParentAccess\(\)/);
-    expect(privacy).toMatch(/if \(access\.status === 'ready'\) void load\(\)/);
+    // The load is gated on the OPEN parent area, and the effect leaves early otherwise, so nothing
+    // is fetched before the PIN. It also drops what is on screen before the fetch when `load` changes
+    // identity, i.e. when a new client belongs to a new adult (HUNT6-I-2).
+    expect(privacy).toMatch(
+      /if \(access\.status !== 'ready' \|\| closureStarted\.current\) return;/,
+    );
+    expect(privacy).toMatch(
+      /setState\(api \? \{ status: 'loading' \} : \{ status: 'not_connected' \}\);\s*void load\(\);/,
+    );
     expect(privacy).toMatch(
       /if \(access\.status !== 'ready'\) \{\s*return \([^]*?<ParentAccessState access=\{access\} \/>/,
     );
@@ -162,5 +170,31 @@ describe('the deletion warning names this build’s store (MOB-R1-10)', () => {
 
   it('a build for no store names all three stores rather than guessing one', () => {
     expect(privacy).toMatch(/App Store, Google Play or Amazon Appstore subscription/);
+  });
+});
+
+/**
+ * HUNT6-H-1, mobile half. Every write control on the planner must be gated on the child's status, or
+ * the parent who archived a child to free a paid slot edits their practice plan, presses Save and is
+ * refused 422 CHILD_ARCHIVED with nothing kept. The rule itself is `childPlanEditable`
+ * (src/family/family-view.ts), tested there; this pins that the screen goes through it.
+ */
+describe('the planner offers no write an archived child cannot take (HUNT6-H-1)', () => {
+  const planner = screen('(parent)', 'planner.tsx');
+
+  it('[repro] the subject toggle and the schedule save are behind the status', () => {
+    expect(planner).toMatch(/const editable = childPlanEditable\(child\.status\)/);
+    // The PATCH's own control: no Switch for a child whose subjects the API refuses to change.
+    expect(planner).toMatch(/editable \? \(\s*<Switch/);
+    // And the PUT's: no "Save schedule" button at all.
+    expect(planner).toMatch(/if \(!editable\) \{/);
+    expect(planner).toMatch(
+      /editable \? \(\s*<Button\s+label=\{busy \? 'Saving…' : 'Save schedule'\}/,
+    );
+  });
+
+  it('says why, and points at the screen that can change it back', () => {
+    expect(planner).toMatch(/archived/i);
+    expect(planner).toMatch(/in Children/);
   });
 });

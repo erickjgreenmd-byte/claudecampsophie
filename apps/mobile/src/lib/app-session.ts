@@ -10,6 +10,7 @@ import {
   forgetParentUnlock,
   lockParentAreaOnDevice,
   noteParentIdentity,
+  settleChildSpaceScreenPrivacy,
   storePurchaseInFlight,
   type AppMode,
 } from './mode.ts';
@@ -82,8 +83,10 @@ export function initAppSession(): () => void {
       // replaced rather than reused even if this device never saw that session end (HUNT5-H-1).
       // Reading the id is asynchronous; it cannot leave a gap, because a session ending has already
       // moved the identity above, and the same id twice changes nothing. An id that cannot be read
-      // counts as nobody's, which costs a mounted screen one refetch and never keeps its rows —
-      // including when the previous owner was also nobody, because noteParentIdentity treats an
+      // counts as nobody's, which costs a mounted screen one refetch — and the shared load hook drops
+      // the rows before that fetch rather than serving them to the new adult while it runs
+      // (HUNT6-I-2; src/family/family-view.ts) — including when the previous owner was also nobody,
+      // because noteParentIdentity treats an
       // unnamed owner as a new one every time (src/lib/mode.ts: nobody is not the same person
       // twice). userId() reads the session, so an offline device past its token expiry reaches this
       // line with null for an adult who is signed in.
@@ -93,6 +96,13 @@ export function initAppSession(): () => void {
   });
 
   const appState = AppState.addEventListener('change', (next) => {
+    if (next === 'active') {
+      // A paired tablet locked on its way out is owed the child space's screen-privacy change, and
+      // this is the first moment the child home is what anyone can see (HUNT6-I-4): applying it while
+      // the app was going out kept the ADULT frame capturable in the app-switcher card.
+      void settleChildSpaceScreenPrivacy(modeEffects);
+      return;
+    }
     if (next !== 'background') return;
     // The store's own purchase sheet backgrounds the activity on Android. Locking there would take
     // the plan screen away in the middle of a purchase; the verify step that follows

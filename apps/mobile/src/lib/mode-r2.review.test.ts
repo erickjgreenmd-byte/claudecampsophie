@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { entryRoute } from './entry.ts';
 import {
+  childSpaceOwesScreenPrivacy,
   currentMode,
   enterParentMode,
   forgetParentUnlock,
@@ -9,6 +10,7 @@ import {
   parentIdentityGeneration,
   parentStateStillCurrent,
   parentUnlockActive,
+  settleChildSpaceScreenPrivacy,
   signOutClosedAccount,
   signOutParent,
   storePurchaseInFlight,
@@ -63,7 +65,12 @@ function effects(overrides: Partial<ModeEffects> = {}): ModeEffects & { calls: s
   };
 }
 
-afterEach(() => forgetParentUnlock());
+afterEach(async () => {
+  forgetParentUnlock();
+  // The deferred child-space screen-privacy change is module state (HUNT6-I-4): settling it with a
+  // no-op effect leaves each case independent of the order the others ran in.
+  await settleChildSpaceScreenPrivacy({ setScreenPrivacy: () => Promise.resolve() });
+});
 
 /**
  * MOB-R2-01. Backgrounding the app, and either "Lock parent area" button, used to revoke only the
@@ -220,6 +227,11 @@ describe('locking a paired family tablet returns it to the child space (MOB-R4-L
     // cannot heal it: the lock has already written mode 'child', so that hook returns early. The
     // child's own space then blocked screenshots, screen recording and casting for the whole
     // session, on a device the child is meant to be holding.
+    //
+    // HUNT6-I-4: the change is owed by the lock and applied by whoever knows the app is in the
+    // foreground, NOT inside the lock — this same function runs from the backgrounding handler, where
+    // the painted frame is still the adult screen and the OS is about to snapshot it. So the case
+    // asserts both halves: nothing is switched off during the lock, and the debt is real and settles.
     const storage = memoryStorage();
     await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-6-abcdefghijkl');
     await enterParentMode(
@@ -230,10 +242,30 @@ describe('locking a paired family tablet returns it to the child space (MOB-R4-L
     );
     const fx = effects();
     await lockParentAreaOnDevice(storage, fx);
-    expect(fx.calls).toContain('privacy:false');
+    expect(fx.calls).not.toContain('privacy:false');
+    expect(childSpaceOwesScreenPrivacy()).toBe(true);
+
+    const foreground = effects();
+    expect(await settleChildSpaceScreenPrivacy(foreground)).toBe(true);
+    expect(foreground.calls).toEqual(['privacy:false']);
+    // Settled once: a second foreground has nothing to apply.
+    const again = effects();
+    expect(await settleChildSpaceScreenPrivacy(again)).toBe(false);
+    expect(again.calls).toEqual([]);
   });
 
-  it('a parent-only device keeps screen privacy on behind the PIN', async () => {
+  it('an OS that refuses the change does not leave the debt open for every later foreground', async () => {
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-7-abcdefghijkl');
+    await lockParentAreaOnDevice(storage, effects());
+    const refuses = effects({
+      setScreenPrivacy: () => Promise.reject(new Error('not supported on this OS')),
+    });
+    expect(await settleChildSpaceScreenPrivacy(refuses)).toBe(true);
+    expect(childSpaceOwesScreenPrivacy()).toBe(false);
+  });
+
+  it('a parent-only device keeps screen privacy on behind the PIN, and owes nothing', async () => {
     // Nothing changes for the unpaired case: the device stays in parent mode on the unlock screen,
     // so the adult protection the next adult expects is still in place.
     const storage = memoryStorage();
@@ -246,6 +278,10 @@ describe('locking a paired family tablet returns it to the child space (MOB-R4-L
     const fx = effects();
     await lockParentAreaOnDevice(storage, fx);
     expect(fx.calls).not.toContain('privacy:false');
+    expect(childSpaceOwesScreenPrivacy()).toBe(false);
+    const foreground = effects();
+    expect(await settleChildSpaceScreenPrivacy(foreground)).toBe(false);
+    expect(foreground.calls).toEqual([]);
   });
 
   it('a keychain that cannot be read falls back to the unlock screen', async () => {
@@ -338,7 +374,7 @@ describe('signing out on a paired child device keeps the child space (MOB-R2-04)
     await storage.setItem(STORAGE_KEYS.mode, 'child');
     await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-1-abcdefghijkl');
     const fx = effects();
-    await signOutParent(storage, fx, { signOut: () => Promise.resolve() });
+    await signOutParent(storage, fx, { signOut: () => Promise.resolve({ ok: true as const }) });
     expect(await currentMode(storage)).toBe('child');
     expect(fx.calls).toContain('reset-nav');
     expect(fx.calls).not.toContain('reset-welcome');
@@ -353,7 +389,7 @@ describe('signing out on a paired child device keeps the child space (MOB-R2-04)
     await storage.setItem(STORAGE_KEYS.mode, 'parent');
     await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-2-abcdefghijkl');
     const fx = effects();
-    await signOutParent(storage, fx, { signOut: () => Promise.resolve() });
+    await signOutParent(storage, fx, { signOut: () => Promise.resolve({ ok: true as const }) });
     expect(await currentMode(storage)).toBe('child');
     expect(fx.calls).toContain('reset-nav');
   });
@@ -362,7 +398,7 @@ describe('signing out on a paired child device keeps the child space (MOB-R2-04)
     const storage = memoryStorage();
     await storage.setItem(STORAGE_KEYS.mode, 'parent');
     const fx = effects();
-    await signOutParent(storage, fx, { signOut: () => Promise.resolve() });
+    await signOutParent(storage, fx, { signOut: () => Promise.resolve({ ok: true as const }) });
     expect(await currentMode(storage)).toBe('signed_out');
     expect(fx.calls).toContain('reset-welcome');
     expect(fx.calls).not.toContain('reset-nav');
@@ -378,7 +414,7 @@ describe('signing out on a paired child device keeps the child space (MOB-R2-04)
       SERVER_NOW,
     );
     const fx = effects();
-    await signOutParent(storage, fx, { signOut: () => Promise.resolve() });
+    await signOutParent(storage, fx, { signOut: () => Promise.resolve({ ok: true as const }) });
     expect(parentUnlockActive(SERVER_NOW)).toBe(false);
     expect(fx.calls).toContain('clear');
     expect(fx.calls).toContain('privacy:false');
@@ -400,7 +436,9 @@ describe('closing an account leaves no child pairing on the device (MOB-R4-LOCK-
     await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-5-abcdefghijkl');
     await storage.setItem(STORAGE_KEYS.childProfile, '{"id":"child-1","nickname":"Robin"}');
     const fx = effects();
-    await signOutClosedAccount(storage, fx, { signOut: () => Promise.resolve() });
+    await signOutClosedAccount(storage, fx, {
+      signOut: () => Promise.resolve({ ok: true as const }),
+    });
     expect(await currentMode(storage)).toBe('signed_out');
     expect(storage.data.has(STORAGE_KEYS.childRefreshToken)).toBe(false);
     expect(storage.data.has(STORAGE_KEYS.childProfile)).toBe(false);
@@ -413,7 +451,9 @@ describe('closing an account leaves no child pairing on the device (MOB-R4-LOCK-
     const storage = memoryStorage();
     await storage.setItem(STORAGE_KEYS.mode, 'parent');
     const fx = effects();
-    await signOutClosedAccount(storage, fx, { signOut: () => Promise.resolve() });
+    await signOutClosedAccount(storage, fx, {
+      signOut: () => Promise.resolve({ ok: true as const }),
+    });
     expect(await currentMode(storage)).toBe('signed_out');
     expect(fx.calls).toContain('clear');
     expect(fx.calls).toContain('relock');
@@ -429,7 +469,9 @@ describe('closing an account leaves no child pairing on the device (MOB-R4-LOCK-
       SERVER_NOW,
     );
     expect(parentUnlockActive(SERVER_NOW)).toBe(true);
-    await signOutClosedAccount(storage, effects(), { signOut: () => Promise.resolve() });
+    await signOutClosedAccount(storage, effects(), {
+      signOut: () => Promise.resolve({ ok: true as const }),
+    });
     expect(parentUnlockActive(SERVER_NOW)).toBe(false);
   });
 });

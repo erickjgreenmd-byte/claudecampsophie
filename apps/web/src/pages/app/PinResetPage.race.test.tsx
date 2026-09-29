@@ -190,6 +190,16 @@ interface FakeMfa {
 
 const AAL2_OK = { data: { currentLevel: 'aal2' }, error: null };
 const FETCH_FAILED = { data: null, error: { message: 'Failed to fetch' } };
+/**
+ * HUNT6-F-2: auth-js's other "could not read the level" answer, and the only one it gives for a
+ * session whose access token carries no `aal` claim: `error` null, `data` present, `currentLevel`
+ * null (GoTrueClient 2.116.0's no-jwt branch). A guard over the wrapper alone let this through as
+ * 'aal1', and 'aal1' is an answer — one that sends an owner straight past the two-step step.
+ */
+const AAL_UNREADABLE = {
+  data: { currentLevel: null, nextLevel: null, currentAuthenticationMethods: [] },
+  error: null,
+};
 const VERIFIED_FACTOR = {
   data: { totp: [{ id: 'synthetic-factor', status: 'verified' }] },
   error: null,
@@ -246,6 +256,41 @@ describe('WEBR5-E-1 a two-step lookup that failed is never read as “no two-ste
 
     expect((await screen.findByRole('alert')).textContent).toMatch(/two-step verification/i);
     // The aal2 session is untouched, so nothing was dropped and the PIN step is unreachable.
+    expect(signInWithPassword).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('New 6-digit PIN')).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  /**
+   * HUNT6-F-2, adapter half. `null` is the adapter's one way of saying "the level could not be read"
+   * (lib/auth.ts's AccountAuth.assuranceLevel), and the value auth-js uses to say the same thing is
+   * `data.currentLevel === null`, not a missing `data`. Asserted on the field auth-js really fills.
+   */
+  it('reports an unreadable level as null rather than as aal1', async () => {
+    const { adapter } = adapterOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL_UNREADABLE),
+      listFactors: () => Promise.resolve(VERIFIED_FACTOR),
+    });
+    expect(await adapter.account!.assuranceLevel()).toBeNull();
+  });
+
+  /**
+   * HUNT6-F-2, page half: the same unreadable level beside a VERIFIED factor. Read as 'aal1' the page
+   * takes the `not_needed` branch and runs the password grant, which replaces this browser's session
+   * with a fresh aal1 one — the owner's authenticator step is skipped and every /admin page then
+   * refuses them. Driven through the real adapter over the labeled fake client, so the fixture is a
+   * value auth-js really produces (L-046).
+   */
+  it('refuses the password submit when the level came back unreadable beside a real factor', async () => {
+    const send = vi.fn(() => Promise.resolve({ ok: true }));
+    const { adapter, signInWithPassword } = adapterOverFakeClient({
+      getAuthenticatorAssuranceLevel: () => Promise.resolve(AAL_UNREADABLE),
+      listFactors: () => Promise.resolve(VERIFIED_FACTOR),
+    });
+    renderWithAuth(adapter, send as unknown as ApiClient['send']);
+    await confirmPassword();
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/two-step verification/i);
     expect(signInWithPassword).not.toHaveBeenCalled();
     expect(screen.queryByLabelText('New 6-digit PIN')).toBeNull();
     expect(send).not.toHaveBeenCalled();

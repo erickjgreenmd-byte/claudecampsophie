@@ -11,6 +11,7 @@ import {
   MODERATION_TIMEOUT_MS,
   moderationFlagged,
   PROMPTS,
+  PROPOSED_STAGE_COST_BUDGET_MICROS,
   PROPOSED_STAGE_LIMITS,
   providerModerationCodes,
   providerSafetyScreen,
@@ -674,6 +675,62 @@ export function storageReader(
  * URL is encoded. At most two page-sized buffers are alive at any point. Throws ImageFormatError
  * for content that is not the declared image type.
  */
+/**
+ * EXTRACTION's request parts: the data envelope of the page numbers and the grade level, then one
+ * image part per page, in that order.
+ *
+ * HUNT6-D-6: exported, and the ONLY place either stage's envelope is built, because
+ * EXTRACTION_GRADING_COST_MICROS (216,816 micros) and every measured question and page bound in
+ * apps/api/tests/jobs-r2.review.test.ts, packages/ai/src/run.ts's docstring and docs/Cost_Analysis.md
+ * are measurements of THIS shape. The test used to hand-copy it, so a field added here would have
+ * left every one of those numbers stale with a green suite. The keys are rebuilt here rather than
+ * spread, so the JSON bytes — which is what `inputTokenUpperBound` counts — do not depend on the
+ * caller's key order.
+ */
+export function extractionInputParts(
+  pageNumbers: readonly number[],
+  gradeLevel: number,
+  images: readonly InputPart[],
+): InputPart[] {
+  return [dataEnvelope({ pageNumbers: [...pageNumbers], gradeLevel }), ...images];
+}
+
+/** One extracted question as GRADING's envelope carries it. No answer key ever goes in here. */
+export interface GradingQuestionPart {
+  readonly questionNumber: string;
+  readonly prompt: string;
+  /** Null where the child left the answer blank; the envelope carries it as JSON null, as before. */
+  readonly studentAnswer: string | null;
+  readonly answerKind: string;
+  readonly subject: string;
+}
+
+/**
+ * GRADING's request parts: ONE data envelope of the grade level, the pages whose source passage was
+ * missing and every extracted question's printed prompt and the child's answer — and NO image part.
+ * Grading's input bound is therefore measured in QUESTIONS, not pages. Exported for the same reason
+ * as `extractionInputParts` above (HUNT6-D-6).
+ */
+export function gradingInputParts(
+  gradeLevel: number,
+  pagesMissingSourcePassage: readonly number[],
+  questions: readonly GradingQuestionPart[],
+): InputPart[] {
+  return [
+    dataEnvelope({
+      gradeLevel,
+      pagesMissingSourcePassage: [...pagesMissingSourcePassage],
+      questions: questions.map((q) => ({
+        questionNumber: q.questionNumber,
+        prompt: q.prompt,
+        studentAnswer: q.studentAnswer,
+        answerKind: q.answerKind,
+        subject: q.subject,
+      })),
+    }),
+  ];
+}
+
 function strippedImagePart(
   held: { bytes: Uint8Array | null },
   mimeType: 'image/jpeg' | 'image/png',
@@ -1161,12 +1218,18 @@ class ScanRun {
    * Admits a group of AI stages against the owner's spend ceiling with their upper-bound cost, runs
    * them, then records their actual cost and releases the hold in one transaction; a cost that
    * cannot be recorded stays counted by the hold (RV-lead-jobs-ai-10, LJA-F5).
+   *
+   * The hold is the WORST CASE of the whole group, so it is summed from each stage's cost BUDGET and
+   * not from its admission cap (HUNT6-D-CAP): the budget is what every attempt together, including
+   * the one raised retry after a truncated answer, may cost, while the cap bounds a single request.
+   * Summing the caps would reserve less than the group can spend for any stage whose budget is
+   * higher. It stays a hold and not spend — settleSpend replaces it with the metered usage.
    */
   private async spending<T>(
     stages: readonly (keyof typeof PROPOSED_STAGE_LIMITS)[],
     fn: () => Promise<T>,
   ): Promise<T> {
-    const micros = stages.reduce((n, s) => n + PROPOSED_STAGE_LIMITS[s].maxCostMicros, 0);
+    const micros = stages.reduce((n, s) => n + PROPOSED_STAGE_COST_BUDGET_MICROS[s], 0);
     // No hold (and no wait at the ceiling) for a profile that may no longer use paid AI.
     await this.deps.db.asService((tx) => this.assertActive(tx, false, true));
     const hold = await acquireSpendHold(this.deps, micros);
@@ -1311,13 +1374,14 @@ class ScanRun {
     const extraction = await this.spending(['extraction'], async () => {
       const images = await this.readPages(pages);
       if (images === null) return null;
-      return await this.stage<typeof PROMPTS.extraction.outputSchema>(PROMPTS.extraction, [
-        dataEnvelope({
-          pageNumbers: pages.map((p) => p.page_number),
-          gradeLevel: this.ctx.gradeLevel,
-        }),
-        ...images,
-      ]);
+      return await this.stage<typeof PROMPTS.extraction.outputSchema>(
+        PROMPTS.extraction,
+        extractionInputParts(
+          pages.map((p) => p.page_number),
+          this.ctx.gradeLevel,
+          images,
+        ),
+      );
     });
     if (extraction === null) return null; // a retake was asked for while the pages were read
 
@@ -1525,19 +1589,20 @@ class ScanRun {
     const { verification, pending, early } = await this.spending(
       ['grading', 'verification'],
       async () => {
-        const grading = await this.stage<typeof PROMPTS.grading.outputSchema>(PROMPTS.grading, [
-          dataEnvelope({
-            gradeLevel: this.ctx.gradeLevel,
-            pagesMissingSourcePassage: [...missingPassage],
-            questions: refs.map(({ ref, q }) => ({
+        const grading = await this.stage<typeof PROMPTS.grading.outputSchema>(
+          PROMPTS.grading,
+          gradingInputParts(
+            this.ctx.gradeLevel,
+            [...missingPassage],
+            refs.map(({ ref, q }) => ({
               questionNumber: ref,
               prompt: q.prompt,
               studentAnswer: q.answer,
               answerKind: q.answer_kind,
               subject: q.subject_key,
             })),
-          }),
-        ]);
+          ),
+        );
         const primaryByRef = new Map(grading.results.map((r) => [r.questionNumber, r]));
         if (this.ctx.status === 'checking') await this.transition('verifying');
 

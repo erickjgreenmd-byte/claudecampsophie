@@ -316,7 +316,14 @@ describe('[HUNT5-F-1] the edit form diffs against the props it was SEEDED with',
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
-    await waitFor(async () => expect((await card('Riley')).textContent).toMatch(/Grade 4/));
+    // HUNT6-G-4: this used to wait on `card('Riley').textContent` matching /Grade 4/, which cannot
+    // fail — the open EditChildForm renders one <option> per grade, so "Grade 4" is inside the card
+    // from the moment the form opened. Proved by hanging the sibling GET: the whole case stayed
+    // green while the reload never landed. The card's own detail paragraph is the only node the
+    // reload changes, and the grade select cannot produce that exact string.
+    await waitFor(async () =>
+      expect(within(await card('Riley')).getByText('Grade 4 · ages 8-10')).toBeTruthy(),
+    );
 
     // The parent corrects only the nickname.
     const reloaded = await card('Riley');
@@ -392,5 +399,283 @@ describe('[HUNT5-F-3] a successful archive closes the edit form it leaves behind
     await waitFor(() => expect(reloaded.textContent).toMatch(/Archived/));
     expect(within(reloaded).queryByLabelText(/nickname/i)).toBeNull();
     expect(within(reloaded).queryByRole('button', { name: /save Riley/i })).toBeNull();
+  });
+});
+
+describe('[HUNT6-G-5] a status change closes the archive confirmation, not just the edit form', () => {
+  it('takes away "Yes, archive" when a reload makes the child deletion-pending', async () => {
+    // The other guardian files a child-scope deletion on their own device. `request_deletion`
+    // archives the child, so the next reload — started by any sibling action on this page — lands
+    // `deletionPending: true` under the confirmation this parent already has open. HUNT5-F-3 gave the
+    // edit form that condition; the confirmation in the same card, hidden by the same button row,
+    // had none, so the card rendered "nothing can be changed, paired or activated for them" above a
+    // live "Yes, archive Riley" that POSTs a route answering NOT_FOUND ('Child not found'), because
+    // `visibleChild` excludes a child under an open deletion (apps/api/src/routes/family.ts).
+    const user = userEvent.setup();
+    const { api, sends } = fakeApi(
+      overview(
+        [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' }],
+        2,
+      ),
+      {
+        later: overview(
+          [
+            {
+              id: RILEY,
+              nickname: 'Riley',
+              gradeLevel: 3,
+              ageBand: '8-10',
+              status: 'archived',
+              deletionPending: true,
+            },
+          ],
+          2,
+        ),
+      },
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: /archive Riley/i }));
+    expect(within(riley).getByRole('button', { name: /yes, archive Riley/i })).toBeTruthy();
+
+    // A sibling action reloads the family. Nothing on this card was pressed, so only the render
+    // condition can close the confirmation.
+    const add = screen.getByRole('region', { name: 'Add a child' });
+    await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    await user.click(within(add).getByRole('button', { name: /add draft child/i }));
+
+    const reloaded = await card('Riley');
+    await waitFor(() => expect(reloaded.textContent).toMatch(/data deletion under way/i));
+    expect(within(reloaded).queryByRole('button', { name: /yes, archive Riley/i })).toBeNull();
+    // And the promise that came with it — "You can activate them again later while a paid slot is
+    // free" — is gone too: no archive was sent, and none can be.
+    expect(reloaded.textContent).not.toMatch(/activate them again later/i);
+    expect(sends.filter((c) => c.path.endsWith('/archive'))).toHaveLength(0);
+  });
+
+  it('takes it away when the reload lands an archive from the other guardian', async () => {
+    // The idempotent case: the route would answer 200 here, so nothing misleads the parent about the
+    // outcome — but the panel still promises a slot is freed for a profile that holds none, and the
+    // buttons around it are already hidden for an archived child.
+    const user = userEvent.setup();
+    const { api } = fakeApi(
+      overview(
+        [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' }],
+        2,
+      ),
+      {
+        later: overview(
+          [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'archived' }],
+          2,
+        ),
+      },
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: /archive Riley/i }));
+    const add = screen.getByRole('region', { name: 'Add a child' });
+    await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    await user.click(within(add).getByRole('button', { name: /add draft child/i }));
+
+    const reloaded = await card('Riley');
+    await waitFor(() => expect(reloaded.textContent).toMatch(/Archived/));
+    expect(within(reloaded).queryByRole('button', { name: /yes, archive Riley/i })).toBeNull();
+  });
+});
+
+describe('[HUNT6-G-8] the grade the form is showing can still be saved after a concurrent change', () => {
+  it('re-enables Save when the parent puts the grade back, and names what the other guardian changed', async () => {
+    // HUNT5-F-1 stopped the silent revert by diffing against the seed, and in doing so made the
+    // value the parent can SEE unsavable: the select still reads Grade 3, the card above it reads
+    // Grade 4, and no sequence of keystrokes could enable Save for Grade 3 — the diff against the
+    // seed is empty for it by construction. Cancel-and-reopen reseeds to Grade 4, the opposite of
+    // what a parent correcting the grade wants. The grade is what practice generation is pitched at.
+    const user = userEvent.setup();
+    const { api, sends } = fakeApi(
+      overview(
+        [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' }],
+        2,
+      ),
+      {
+        later: overview(
+          [{ id: RILEY, nickname: 'Riley', gradeLevel: 4, ageBand: '8-10', status: 'active' }],
+          2,
+        ),
+      },
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: /edit Riley/i }));
+
+    const add = screen.getByRole('region', { name: 'Add a child' });
+    await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    await user.click(within(add).getByRole('button', { name: /add draft child/i }));
+    const reloaded = await card('Riley');
+    await waitFor(async () =>
+      expect(within(await card('Riley')).getByText('Grade 4 · ages 8-10')).toBeTruthy(),
+    );
+
+    // Nothing edited in this form: Save stays off, because pressing it would put last year's grade
+    // back (HUNT5-F-1). What is new is the form saying so, and naming the grade that landed.
+    expect(within(reloaded).getByRole('button', { name: /save Riley/i })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(
+      within(reloaded).getByText(/another guardian changed the grade to Grade 4/i),
+    ).toBeTruthy();
+
+    // The parent puts the grade back to the one the form is showing them.
+    const grade = within(reloaded).getByLabelText(/grade/i);
+    expect(grade).toHaveProperty('value', '3');
+    await user.selectOptions(grade, '4');
+    await user.selectOptions(grade, '3');
+    const save = within(reloaded).getByRole('button', { name: /save Riley/i });
+    expect(save).toHaveProperty('disabled', false);
+    await user.click(save);
+    await waitFor(() => expect(sends.filter((c) => c.method === 'PATCH')).toHaveLength(1));
+    // Only the field the parent touched travels: the nickname and the age band stay the other
+    // guardian's (WEBR4-03, HUNT5-F-1).
+    expect(sends.find((c) => c.method === 'PATCH')!.body).toEqual({ gradeLevel: 3 });
+  });
+});
+
+/**
+ * G-PROSE: HUNT6-G-5's own comment claims "One status change now closes every open panel on the card",
+ * and two things made that untrue. The pairing-code panel — the card's third open panel — carries no
+ * status condition at all, so a code minted while the child was active stays on screen after a reload
+ * makes them archived or deletion-pending, where it is dead: the redeem claim in
+ * apps/api/src/routes/child-auth.ts matches `c.status = 'active'`, and archiving does not consume the
+ * code, so the parent types a code the device will refuse. And `confirmArchive` is only HIDDEN by the
+ * new render condition, never cleared — this card is keyed on `child.id`, so a reload never remounts
+ * it, and the confirmation reopens itself the moment the child is activated again.
+ */
+describe('[G-PROSE] one status change closes every open panel, and clears it', () => {
+  const rileyAt = (
+    status: 'active' | 'archived',
+    extra: { deletionPending?: true } = {},
+  ): FamilyOverview['children'][number] => ({
+    id: RILEY,
+    nickname: 'Riley',
+    gradeLevel: 3,
+    ageBand: '8-10',
+    status,
+    ...extra,
+  });
+
+  /** A fake that answers GET /v1/family with whatever the test has put in `serving` by then. */
+  function servingApi(serving: { current: FamilyOverview }): {
+    api: Partial<ApiClient>;
+    sends: Call[];
+  } {
+    const sends: Call[] = [];
+    const api: Partial<ApiClient> = {
+      get: <S extends z.ZodType>(_path: string, schema: S) =>
+        Promise.resolve(schema.parse(serving.current)),
+      send: <S extends z.ZodType>(
+        method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+        path: string,
+        body: unknown,
+        schema: S,
+      ) => {
+        sends.push({ method, path, body });
+        const value = path.endsWith('/pairing-code')
+          ? { code: 'ABCD-EFGH', expiresAt: '2026-09-24T15:10:00.000Z' }
+          : path.endsWith('/activate')
+            ? { childId: RILEY, status: 'active', paidSlots: 2, assignedSlots: 1 }
+            : { childId: SAM, status: 'draft' };
+        return Promise.resolve(schema.parse(value));
+      },
+    };
+    return { api, sends };
+  }
+
+  /** A sibling action on the page, which is what reloads GET /v1/family under the open panels. */
+  async function addAChild(user: ReturnType<typeof userEvent.setup>, nickname: string) {
+    const add = screen.getByRole('region', { name: 'Add a child' });
+    await user.type(within(add).getByLabelText(/nickname/i), nickname);
+    await user.click(within(add).getByRole('button', { name: /add draft child/i }));
+  }
+
+  it('takes away a pairing code the child can no longer redeem, and says why', async () => {
+    const user = userEvent.setup();
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api, sends } = servingApi(serving);
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: 'Create pairing code' }));
+    expect(await within(riley).findByText('ABCD-EFGH')).toBeTruthy();
+
+    // The other guardian files a child-scope deletion, which archives the child.
+    serving.current = overview([rileyAt('archived', { deletionPending: true })], 2);
+    await addAChild(user, 'Sam');
+    const reloaded = await card('Riley');
+    await waitFor(() => expect(reloaded.textContent).toMatch(/data deletion under way/i));
+
+    expect(within(reloaded).queryByText('ABCD-EFGH')).toBeNull();
+    expect(within(reloaded).getByText(/can’t connect a device/i)).toBeTruthy();
+    expect(sends.filter((c) => c.path.endsWith('/pairing-code'))).toHaveLength(1);
+  });
+
+  it('clears the archive confirmation rather than hiding it, so it cannot reopen itself', async () => {
+    const user = userEvent.setup();
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api, sends } = servingApi(serving);
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: 'Create pairing code' }));
+    expect(await within(riley).findByText('ABCD-EFGH')).toBeTruthy();
+    await user.click(within(riley).getByRole('button', { name: /archive Riley/i }));
+    expect(within(riley).getByRole('button', { name: /yes, archive Riley/i })).toBeTruthy();
+
+    serving.current = overview([rileyAt('archived')], 2);
+    await addAChild(user, 'Sam');
+    const archived = await card('Riley');
+    await waitFor(() => expect(archived.textContent).toMatch(/Archived/));
+    expect(within(archived).queryByRole('button', { name: /yes, archive Riley/i })).toBeNull();
+
+    // The parent activates Riley again (WEBR4-01). Nothing was pressed on either panel, so neither
+    // may come back: the confirmation's promise was spent, and the code was already dead.
+    serving.current = overview([rileyAt('active')], 2);
+    await user.click(within(archived).getByRole('button', { name: /Activate Riley again/i }));
+    const back = await card('Riley');
+    await waitFor(() => expect(back.textContent).toMatch(/Active: uses a paid slot/));
+    expect(within(back).queryByRole('button', { name: /yes, archive Riley/i })).toBeNull();
+    expect(within(back).queryByText('ABCD-EFGH')).toBeNull();
+    expect(sends.filter((c) => c.path.endsWith('/archive'))).toHaveLength(0);
+  });
+});
+
+/**
+ * G-I3-WEB / L-037: the notice asserted the reader's own act. `deletionPending` cannot carry it — GET
+ * /v1/family computes the flag from the request's scope and target and never exposes
+ * deletion_requests.requested_by (apps/api/src/routes/family.ts) — any guardian may delete a child's
+ * data, and a child-scope request leaves every other adult's membership active, so the family's other
+ * adult is served the same flag. The app was corrected this round; this is the same sentence here.
+ */
+describe('[G-I3-WEB] the deletion notice does not tell the reader they asked for it', () => {
+  it('names the open request, not the reader', async () => {
+    const { api } = fakeApi(
+      overview(
+        [
+          {
+            id: RILEY,
+            nickname: 'Riley',
+            gradeLevel: 3,
+            ageBand: '8-10',
+            status: 'archived',
+            deletionPending: true,
+          },
+        ],
+        2,
+      ),
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    expect(riley.textContent).not.toMatch(/\byou asked\b/i);
+    expect(riley.textContent).toMatch(/deletion request covering Riley’s data is open/i);
+    // The rest of the notice is unchanged: what is true, and where a mistake is handled.
+    expect(within(riley).getByRole('link', { name: /privacy page/i })).toBeTruthy();
+    expect(within(riley).getByRole('link', { name: /contact support/i })).toBeTruthy();
   });
 });

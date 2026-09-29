@@ -30,18 +30,29 @@ const noContentSchema = z.null();
  * Test dates by subject (spec P6 "parents mark an upcoming test", P8 "test dates by subject").
  * A test moves that subject's review to before the test; scope notes steer which skills are
  * practiced. Review practice happens beforehand; there is no live exam help.
+ *
+ * HUNT6-H-1: `childStatus` is the profile's status from GET /v1/family. POST /test-dates and
+ * DELETE /test-dates/:id both go through `ownedChild(c, 'write')`, which answers BUSINESS_RULE
+ * CHILD_ARCHIVED for an archived profile (apps/api/src/routes/learning.ts), while the GET takes
+ * `'read'` and succeeds — so an archived child's saved dates are listed (history, AC_CAPACITY_08) and
+ * the add form and Remove are not offered. The test is "is this profile ARCHIVED?", not "is it
+ * active?": the same guard keeps a DRAFT profile writable on purpose, so a parent can put next week's
+ * test in before the slot is assigned.
  */
 export function TestDatesSection({
   childId,
   childName,
   subjects,
   onChanged,
+  childStatus,
 }: {
   childId: string;
   childName: string;
   subjects: readonly ChildSubject[];
   onChanged: () => void;
+  childStatus?: string;
 }) {
+  const readOnly = childStatus === 'archived';
   const base = `/v1/children/${encodeURIComponent(childId)}/test-dates`;
   const query = useApiQuery((api) => api.get(base, testDatesResponseSchema), [base]);
   const { api } = useSession();
@@ -137,24 +148,32 @@ export function TestDatesSection({
                     skills.
                   </p>
                 ) : null}
-                <div style={buttonRow}>
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    disabled={busy !== null}
-                    aria-label={`Remove the ${nameOf(t)} test on ${formatCalendarDate(t.testDate)}`}
-                    onClick={() => remove(t)}
-                  >
-                    {busy === t.id ? 'Removing…' : 'Remove'}
-                  </button>
-                </div>
+                {readOnly ? null : (
+                  <div style={buttonRow}>
+                    <button
+                      type="button"
+                      className="btn secondary"
+                      disabled={busy !== null}
+                      aria-label={`Remove the ${nameOf(t)} test on ${formatCalendarDate(t.testDate)}`}
+                      onClick={() => remove(t)}
+                    >
+                      {busy === t.id ? 'Removing…' : 'Remove'}
+                    </button>
+                  </div>
+                )}
               </li>
             ))}
           </ul>
         )
       ) : null}
 
-      {choices.length === 0 ? (
+      {readOnly ? (
+        <p className="notice" style={{ margin: '8px 0 0' }}>
+          {childName}’s profile is archived, so test dates can’t be added or removed. The dates
+          already saved stay readable above. Activate {childName} again on the Children page while a
+          paid slot is free to change them.
+        </p>
+      ) : choices.length === 0 ? (
         <p>Turn on a subject above to add a test date.</p>
       ) : (
         <form onSubmit={submit} noValidate aria-label="Add a test date">

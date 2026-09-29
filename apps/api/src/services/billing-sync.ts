@@ -58,6 +58,15 @@ export interface NormalizedPeriod {
    * of this charge and may not scale a refund of it either (N1-TAX-APPORTION, subscriptionTaxCents).
    */
   readonly taxCents: number;
+  /**
+   * HUNT6-C-1: money this invoice ALSO collected for mid-cycle proration items Stripe left pending
+   * and listed on it, net of any credit line beside them, in integer cents and never negative. It is
+   * no part of `chargedCents` (BILL-R2-4 books the subscription line alone) and it is money the
+   * family paid, so it is recorded as its own 'proration' period beside this one (see
+   * `prorationPeriodFor`) instead of appearing in no month's gross at all. 0 when the invoice lists
+   * no pending item, and on the store channels, which invoice nothing.
+   */
+  readonly pendingProrationNetCents: number;
   /** Provider-reported discount on the subscription charge, if the provider reports one. */
   readonly reportedDiscountCents: number | null;
   readonly discountSources: DiscountSource[];
@@ -117,6 +126,8 @@ export function mapRevenueCatEventToPeriod(event: RevenueCatEvent): NormalizedPe
     // RevenueCat reports one price and no tax breakdown, so there is no tax figure to record and
     // nothing to convert a store refund with (a store refund reports no amount either).
     taxCents: 0,
+    // A store transaction is one price: there are no invoice lines and so no pending proration item.
+    pendingProrationNetCents: 0,
     reportedDiscountCents: null,
     discountSources,
     currency: (event.currency ?? 'USD').toUpperCase(),
@@ -238,6 +249,31 @@ const cents = (value: number | null | undefined): number | null =>
   typeof value === 'number' && Number.isSafeInteger(value) ? value : null;
 
 /**
+ * BILL-R4-4: the pre-tax money this invoice actually COLLECTED — what it took (`amount_paid`) less
+ * the sales tax it took with it, in integer cents. An `invoice.paid` event states a paid-in-full
+ * invoice, so that difference is the money that came in for PencilLift. Null only when the invoice
+ * states no payment figure at all, i.e. there is nothing to bound anything by.
+ *
+ * C-NEGATIVE-NET: it used to be computed ONLY when a negative `starting_balance` showed that a
+ * customer credit BALANCE had settled part of the invoice, which made the bound below an accident of
+ * one Stripe field. A credit LINE does the same thing to what the invoice collects and leaves
+ * `starting_balance` untouched, and `subscriptionChargeCents`' first branch returns the subscription
+ * LINE's own amount — so a renewal listing a net proration credit of 200 beside its 3999 line
+ * collected 3799 and booked 3999, and `pendingProrationNetCents` justified dropping that negative net
+ * with "the subscription charge already reflects it through amount_paid" while it did not. The bound
+ * is therefore unconditional: the claim is now true of every invoice, and the two periods one invoice
+ * can write are bounded at the collection (the charge) and at what is left of it (the pending net), so
+ * their sum can never exceed what the invoice took. A bound that never bites on an ordinary invoice —
+ * a full-price renewal collects exactly its line amount plus tax — is the point: it bites exactly when
+ * the lines say more came in than did.
+ */
+function collectedPreTaxCents(invoice: StripeInvoice): number | null {
+  const paid = cents(invoice.amount_paid);
+  if (paid === null) return null;
+  return Math.max(0, paid - (cents(invoice.tax) ?? 0));
+}
+
+/**
  * BILL-R2-4: what the family was charged FOR THE SUBSCRIPTION, which is what the $1 school donation
  * rule compares with the regular tier price (donations eligibility regular_tier_price) and what the
  * owner's revenue view books as gross. It is not `amount_paid`: that total also carries US sales tax
@@ -251,23 +287,26 @@ const cents = (value: number | null | undefined): number | null =>
  * discounts; finally what was paid less the reported tax. The last two invoice-level figures still
  * include other lines, so any proration line that states its own amount is taken back off.
  *
- * BILL-R4-4: gross is money COLLECTED for the subscription, so the figure is also bounded by what the
- * invoice actually took when a customer credit balance settled part of it. A negative
- * `starting_balance` (a credit left by an earlier proration) lowers `amount_due`/`amount_paid` while
- * the line amount, the subtotal and `total_excluding_tax` stay at full price and no discount is
- * reported: booking the line amount then counted money that was never collected in that month as
- * revenue AND made the month pass the donation rule's regular_tier_price equality, so the $1 school
- * accrual was created for a month whose collection was below the tier price.
+ * BILL-R4-4: gross is money COLLECTED for the subscription, so the figure is bounded by what the
+ * invoice actually took (`collectedPreTaxCents`). A negative `starting_balance` (a credit left by an
+ * earlier proration) lowers `amount_due`/`amount_paid` while the line amount, the subtotal and
+ * `total_excluding_tax` stay at full price and no discount is reported: booking the line amount then
+ * counted money that was never collected in that month as revenue AND made the month pass the donation
+ * rule's regular_tier_price equality, so the $1 school accrual was created for a month whose
+ * collection was below the tier price.
+ *
+ * C-NEGATIVE-NET: that bound is unconditional, not a credit-balance special case. A proration CREDIT
+ * LINE lowers what the invoice collects in exactly the same way and touches no `starting_balance`, and
+ * an immediate mid-cycle change is billed as a credit line beside a charge line — so on both shapes
+ * the line amount stated more than came in, and every reader who was told `amount_paid` already
+ * reflected a credit was being told something true of one Stripe field only.
  */
 function subscriptionChargeCents(
   invoice: StripeInvoice,
   line: StripeLine,
   invoiceDiscountCents: number,
 ): number {
-  const collectedPreTax =
-    cents(invoice.starting_balance) !== null && cents(invoice.starting_balance)! < 0
-      ? Math.max(0, (cents(invoice.amount_paid) ?? 0) - (cents(invoice.tax) ?? 0))
-      : null;
+  const collectedPreTax = collectedPreTaxCents(invoice);
   const collected = (amount: number): number =>
     collectedPreTax === null ? amount : Math.min(amount, collectedPreTax);
   const lineAmount = cents(line.amount);
@@ -316,7 +355,21 @@ function subscriptionChargeCents(
  * and discount_amounts only). Where the rates really differ, this share is wrong in whichever
  * direction the other line's rate differs, and if the subscription line were the exempt one the share
  * would be overstated, which is the unsafe direction. That case needs the provider's per-line tax in
- * the model, not a cleverer ratio, and it is recorded as an open item rather than guessed at here.
+ * the model, not a cleverer ratio.
+ *
+ * It is NOT tracked (HUNT6-C-4, correcting a comment that sent the reader to an open item no record
+ * ever held): nothing here detects differing per-line rates and nothing fails safe on them, so a
+ * later reader may not assume someone is watching for this. The exact condition under
+ * which it bites: the invoice carries another line whose tax rate differs from the subscription
+ * line's AND the subscription line is the lower-taxed one — an exempt subscription line beside a
+ * taxed add-on is the worst case. $1 of tax levied on a $10 add-on beside an exempt $39.99
+ * subscription line stores floor(100 × 3999 ÷ 4999) = 79 cents of tax against a charge whose own tax
+ * is 0, and every partial refund of that charge is then recorded 79/4078 of itself smaller ($20 back
+ * recorded as 1961), i.e. net revenue overstated. Those numbers are pinned by the HUNT6-C-4 case in
+ * apps/api/tests/billing-r2.review.test.ts so the arithmetic and this comment cannot drift apart;
+ * what closes the item is modelling `lines.data[].tax_amounts` and using the subscription line's own
+ * tax instead of this ratio. Every invoice PencilLift bills today is one subscription line plus
+ * proration lines for the same product, so one rate applies and the share is exact.
  */
 function subscriptionTaxCents(
   invoice: StripeInvoice,
@@ -330,6 +383,38 @@ function subscriptionTaxCents(
     .reduce((sum, l) => sum + Math.max(0, cents(l.amount) ?? 0), 0);
   if (otherLinesCents <= 0) return tax;
   return Math.floor((tax * chargedCents) / (chargedCents + otherLinesCents));
+}
+
+/**
+ * HUNT6-C-1: the NET of the pending proration lines an invoice lists BESIDE its subscription line.
+ * Stripe's default `create_prorations` leaves a mid-cycle change to the next renewal and states it
+ * there as a credit line plus a charge line, so the net of those lines is what the change really
+ * added to this invoice, and `amount_paid` collected it. `subscriptionChargeCents` books the
+ * subscription line alone and takes these lines back off the invoice-level fallbacks (BILL-R2-4),
+ * which is right for THIS period's charge and left the money nowhere: one row was written per
+ * invoice, so no month's gross held it (the owner's page understated every deferred upgrade).
+ *
+ * Only a positive net is money in: a net credit lowers what the invoice collected, which the
+ * subscription charge already reflects through `amount_paid` (`collectedPreTaxCents` bounds it on
+ * every invoice, C-NEGATIVE-NET — while that bound applied only to a credit BALANCE this sentence was
+ * false of the credit LINE it was about), and a negative charge is not a billing period.
+ *
+ * BILL-R4-4: gross is money COLLECTED, so the net is bounded by what the collection left after the
+ * subscription charge — without that bound this would book cents the invoice never took, and with it
+ * the charge and the net together can never exceed the collection: charge <= collected and
+ * net <= collected - charge, both in integer cents.
+ */
+function pendingProrationNetCents(
+  invoice: StripeInvoice,
+  line: StripeLine,
+  chargedCents: number,
+): number {
+  const net = (invoice.lines?.data ?? [])
+    .filter((l) => l !== line && l.proration === true)
+    .reduce((sum, l) => sum + (cents(l.amount) ?? 0), 0);
+  if (net <= 0) return 0;
+  const collected = collectedPreTaxCents(invoice);
+  return collected === null ? net : Math.max(0, Math.min(net, collected - chargedCents));
 }
 
 export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeriod | null {
@@ -358,10 +443,50 @@ export function mapStripeInvoiceToPeriod(invoice: StripeInvoice): NormalizedPeri
     // apportioned to the subscription portion, never the tax of lines this period never booked
     // (N1-TAX-APPORTION).
     taxCents: subscriptionTaxCents(invoice, line, chargedCents),
+    // Money this invoice also collected for a proration item listed as pending, recorded as its own
+    // period by `prorationPeriodFor` (HUNT6-C-1); no part of the charge above.
+    pendingProrationNetCents: pendingProrationNetCents(invoice, line, chargedCents),
     reportedDiscountCents: discount,
     discountSources: discount > 0 ? ['promo_code'] : [],
     currency: (invoice.currency ?? 'usd').toUpperCase(),
     settledAt: new Date((invoice.status_transitions?.paid_at ?? period.start) * 1000),
+  };
+}
+
+/**
+ * The suffix that makes the second period's provider id out of the invoice's own. It is the whole link
+ * between the two rows: `applyRefund` derives it to reach the proration period of the invoice a refund
+ * or dispute names (C-PRORATION-REVERSAL), so it is defined once here rather than spelled out twice.
+ */
+export const PRORATION_PERIOD_SUFFIX = ':proration';
+
+/**
+ * The second billing period a renewal's PENDING proration money is recorded as (HUNT6-C-1): the same
+ * family, channel, product and settlement instant, kind 'proration', charged the net computed above.
+ * Null when the invoice listed no pending item, which is every invoice but a deferred mid-cycle
+ * change. The id is derived from the invoice's own, so `recordBillingPeriod`'s (channel,
+ * provider_period_id) key makes a provider retry of the same invoice.paid update this row rather
+ * than write a second one.
+ *
+ * It carries no tax: US sales tax is never revenue, and the tax figure exists only so a provider
+ * refund amount can be restated in the charge's unit (`preTaxRefundCents`), and this row's charge is
+ * already in that unit. C-PRORATION-REVERSAL: that is NOT the same as saying no refund reaches this
+ * row. A refund or dispute names the INVOICE, and while it was applied to the primary period alone
+ * this money was unreachable — a fully refunded renewal kept its deferred proration in gross with
+ * nothing reversing it. `applyRefund` now walks from the invoice's period to this one with whatever
+ * the primary period's own bucket did not absorb.
+ */
+export function prorationPeriodFor(period: NormalizedPeriod): NormalizedPeriod | null {
+  if (period.pendingProrationNetCents <= 0) return null;
+  return {
+    ...period,
+    providerPeriodId: `${period.providerPeriodId}${PRORATION_PERIOD_SUFFIX}`,
+    kind: 'proration',
+    chargedCents: period.pendingProrationNetCents,
+    taxCents: 0,
+    pendingProrationNetCents: 0,
+    reportedDiscountCents: 0,
+    discountSources: [],
   };
 }
 
@@ -630,7 +755,10 @@ export async function recordBillingPeriod(
               ${JSON.stringify({ channel: period.channel, currency: period.currency })}::text::jsonb)
     `;
   }
-  // A refund that arrived before this charge is applied now (RV-lead-billing-p17-3).
+  // A refund that arrived before this charge is applied now (RV-lead-billing-p17-3), in the SAME unit
+  // as one that arrives after it (HUNT6-C-3): a Stripe amount is tax-inclusive whenever it was
+  // delivered, and the tax it is restated by is in the row inserted just above, in this transaction.
+  // `pending_refunds` records no provider total, which is why the unit may not be inferred from one.
   const [parked] = await tx<{ kind: SettlementEvent; refunded_cents: number | null }[]>`
     delete from public.pending_refunds
      where channel = ${period.channel} and provider_period_id = ${period.providerPeriodId} and family_id = ${familyId}
@@ -644,6 +772,7 @@ export async function recordBillingPeriod(
       period.providerPeriodId,
       parked.kind,
       parked.refunded_cents,
+      period.channel === 'stripe',
     );
   }
   return { id: row!.id, paidSlots, regularCents };
@@ -775,27 +904,23 @@ export type SettlementEvent = 'refund' | 'partial_refund' | 'chargeback' | 'char
  * BEFORE that migration has tax 0, which makes the ratio 1 and this an exact no-op; that is the
  * pre-BILL-R4-3 behaviour, not a bug.
  *
- * `providerChargeTotalCents` no longer scales anything; it only says whether the amount came from a
- * Charge whose total we know, which is what makes it a tax-inclusive figure worth converting. Null
- * for a RevenueCat store refund (no amount at all) and for a Stripe DISPUTE (whose `amount` is the
- * disputed part, not the charge total), and then nothing is converted and the cap alone applies,
- * exactly as before. A refund at or above the provider total took the whole charge back, so the cap
- * states it; a total no larger than the pre-tax charge carries no tax to strip.
+ * `amountIsTaxInclusive` says the amount is a provider figure stated INCLUDING tax, and it is
+ * threaded from the call site rather than inferred from anything that merely correlates with it
+ * (HUNT6-C-2, HUNT6-C-3). It is true for EVERY Stripe figure — a Charge's `amount_refunded`, a
+ * Dispute's `amount`, and a Stripe refund replayed from `pending_refunds` — because all three are
+ * parts of what the family paid; a Dispute states no charge total, and a parked row stores none, but
+ * neither fact says anything about the unit, and inferring the conversion from a total's presence
+ * left a dispute and an early-arriving refund recorded in a different unit from the refund beside
+ * them. It is false for the RevenueCat store path, whose refunds carry no amount at all. A refund of
+ * the whole charge converts to the whole charge, which is what the cap would have said anyway.
  */
 export function preTaxRefundCents(
   refundedCents: number,
-  providerChargeTotalCents: number | null,
+  amountIsTaxInclusive: boolean,
   chargedCents: number,
   taxCents: number,
 ): number {
-  if (
-    providerChargeTotalCents === null ||
-    !Number.isSafeInteger(providerChargeTotalCents) ||
-    providerChargeTotalCents <= chargedCents ||
-    refundedCents >= providerChargeTotalCents ||
-    !Number.isSafeInteger(taxCents) ||
-    taxCents <= 0
-  ) {
+  if (!amountIsTaxInclusive || !Number.isSafeInteger(taxCents) || taxCents <= 0) {
     return refundedCents;
   }
   return Math.min(
@@ -805,32 +930,55 @@ export function preTaxRefundCents(
 }
 
 /**
- * Refund/chargeback (and a won dispute): marks the period and records at most one donation
- * reversal (or reinstatement). A full `refund` with a provider amount below the charge is recorded
- * as partial (RV-lead-billing-p17-7). An event for a period we have not recorded yet is parked in
- * `pending_refunds` and applied when the period arrives (RV-lead-billing-p17-3). A `chargeback`
- * reverses the disputed amount, or the whole charge when the provider reports none (BILL-R1-1):
- * the revenue view and the admin case detail read `refunded_cents`, so a lost dispute must never
- * look like kept revenue. A `chargeback_reversed` (dispute won) gives that amount back, so the
- * period returns to settled/0 (and the $1 donation is reinstated) unless an earlier partial refund
- * remains; `refundedCents` is then the reversed amount, null meaning the whole charge.
- *
- * `providerChargeTotalCents` is the provider's own total for the charge the amount came from; it says
- * the amount is a tax-inclusive Charge figure, so it is restated in the unit of
- * `charged_amount_cents` before anything is decided by it — by the tax stored for this period's own
- * charge, never by that total (see preTaxRefundCents, BILL-R4-3 / HUNT5-C-2 / N1-TAX-APPORTION). A refund parked in `pending_refunds`
- * keeps the provider's figure and is applied with no total, so the cap alone bounds it (that table
- * records no provider total).
+ * What one period absorbed of a provider settlement event. `applied: false` means no such period is
+ * recorded (the event was parked, or a won dispute had nothing to give back).
  */
-export async function applyRefund(
+type PeriodSettlement =
+  | { readonly applied: false; readonly pending: boolean }
+  | {
+      readonly applied: true;
+      readonly adjusted: boolean;
+      /**
+       * What is LEFT of the caller's amount once this period's own bucket — its charge plus, when the
+       * amount is tax-inclusive, the tax stored on that charge — is exhausted, still in the caller's
+       * unit; never negative. Null when the event carried no amount at all, which means "the whole
+       * charge" for every period it reaches. This is what walks a refund on to the invoice's proration
+       * period (C-PRORATION-REVERSAL).
+       */
+      readonly leftoverCents: number | null;
+    };
+
+/**
+ * Refund/chargeback (and a won dispute) for the ONE period `providerPeriodId` names: marks it and
+ * records at most one donation reversal (or reinstatement). A full `refund` with a provider amount
+ * below the charge is recorded as partial (RV-lead-billing-p17-7). An event for a period we have not
+ * recorded yet is parked in `pending_refunds` and applied when the period arrives
+ * (RV-lead-billing-p17-3) — but only when `park`, because the second period of an invoice is absent
+ * from almost every invoice and its absence is not something to wait for. A `chargeback` reverses the
+ * disputed amount, or the whole charge when the provider reports none (BILL-R1-1): the revenue view
+ * and the admin case detail read `refunded_cents`, so a lost dispute must never look like kept
+ * revenue. A `chargeback_reversed` (dispute won) gives that amount back, so the period returns to
+ * settled/0 (and the $1 donation is reinstated) unless an earlier partial refund remains;
+ * `refundedCents` is then the reversed amount, null meaning the whole charge.
+ *
+ * `amountIsTaxInclusive` says the caller's amount is a provider figure stated INCLUDING sales tax, so
+ * it is restated in the unit of `charged_amount_cents` before anything is decided by it — by the tax
+ * stored for this period's own charge (see preTaxRefundCents, BILL-R4-3 / HUNT5-C-2 /
+ * N1-TAX-APPORTION / HUNT6-C-2). It is true for every Stripe amount, including a Dispute's and a
+ * Stripe refund replayed from `pending_refunds`, and false for the store channels, which report no
+ * amount. Every figure then holds one unit, so a chargeback that ADDS and a won dispute that
+ * SUBTRACTS round-trip: they are the same number.
+ */
+async function applySettlementToPeriod(
   tx: Tx,
   familyId: string,
   channel: BillingChannel,
   providerPeriodId: string,
   kind: SettlementEvent,
   refundedCents: number | null,
-  providerChargeTotalCents: number | null = null,
-): Promise<{ adjusted: boolean; pending?: boolean }> {
+  amountIsTaxInclusive: boolean,
+  park: boolean,
+): Promise<PeriodSettlement> {
   if (refundedCents !== null && (!Number.isSafeInteger(refundedCents) || refundedCents < 0)) {
     throw new RangeError('refundedCents must be null or a non-negative integer number of cents');
   }
@@ -847,7 +995,10 @@ export async function applyRefund(
      for update
   `;
   if (!current) {
-    if (kind === 'chargeback_reversed') return { adjusted: false };
+    // C-PRORATION-REVERSAL: a won dispute has nothing to give back, and a period that is not this
+    // invoice's primary one is simply not there on almost every invoice — parking either would leave a
+    // `pending_refunds` row that no future period can ever consume.
+    if (kind === 'chargeback_reversed' || !park) return { applied: false, pending: false };
     await tx`
       insert into public.pending_refunds (family_id, channel, provider_period_id, kind, refunded_cents)
       values (${familyId}, ${channel}, ${providerPeriodId}, ${kind}, ${refundedCents})
@@ -858,7 +1009,7 @@ export async function applyRefund(
             refunded_cents = greatest(public.pending_refunds.refunded_cents, excluded.refunded_cents)
         where public.pending_refunds.family_id = ${familyId}
     `;
-    return { adjusted: false, pending: true };
+    return { applied: false, pending: true };
   }
   // BILL-R4-3: state the provider's amount in the unit of the recorded charge before anything is
   // decided by it (a partial refund of a taxed charge is otherwise compared with, and written
@@ -871,9 +1022,22 @@ export async function applyRefund(
       ? null
       : preTaxRefundCents(
           refundedCents,
-          providerChargeTotalCents,
+          amountIsTaxInclusive,
           current.charged_amount_cents,
           current.tax_amount_cents,
+        );
+  // C-PRORATION-REVERSAL: what this period's own bucket cannot absorb, still in the caller's unit —
+  // its charge plus, when the amount is tax-inclusive, the tax stored on that charge, which together
+  // are the most of a provider figure this period can account for. Deterministic in the amount, so a
+  // chargeback and the won dispute that reverses it hand the next period the same number.
+  const leftoverCents =
+    refundedCents === null
+      ? null
+      : Math.max(
+          0,
+          refundedCents -
+            current.charged_amount_cents -
+            (amountIsTaxInclusive ? Math.max(0, current.tax_amount_cents) : 0),
         );
   const effective: SettlementEvent =
     kind === 'refund' && inCharge !== null && inCharge < current.charged_amount_cents
@@ -886,6 +1050,10 @@ export async function applyRefund(
   // dispute (chargeback_reversed) gives the reversed amount back: with Stripe's dispute `amount`
   // (always present on a Dispute object) an earlier genuine partial refund survives the win as
   // 'partially_refunded'; without an amount the whole charge is treated as disputed and restored.
+  // HUNT6-C-2: that round trip holds only because the dispute amount is restated in the same unit as
+  // the refund beside it (amountIsTaxInclusive above). While it was written tax-inclusive on a taxed
+  // charge, add-then-cap and subtract were different numbers, so the win erased the tax share of the
+  // disputed part from a refund the family had really received.
   // BILL-R2-4: every refunded/disputed figure is capped at charged_amount_cents. A provider reports
   // what the family paid INCLUDING sales tax, while the charge recorded here is the pre-tax
   // subscription amount; without the cap a fully refunded taxed renewal would book a refund larger
@@ -929,7 +1097,8 @@ export async function applyRefund(
   >`
     select id, amount_cents, payout_batch_id from public.donation_accruals where billing_period_id = ${period!.id}
   `;
-  if (!accrual) return { adjusted: false };
+  const settled = { applied: true, leftoverCents } as const;
+  if (!accrual) return { ...settled, adjusted: false };
   const existing = await tx<
     { idempotency_key: string }[]
   >`select idempotency_key from public.donation_adjustments where accrual_id = ${accrual.id}`;
@@ -943,14 +1112,82 @@ export async function applyRefund(
     existingAdjustmentKeys: new Set(existing.map((e) => e.idempotency_key)),
     providerState: { settlement: period!.settlement, refundedCents: period!.refunded_cents },
   });
-  if (!adjustment) return { adjusted: false };
+  if (!adjustment) return { ...settled, adjusted: false };
   const rows = await tx`
     insert into public.donation_adjustments (accrual_id, amount_cents, reason, idempotency_key)
     values (${accrual.id}, ${adjustment.amountCents}, ${adjustment.event}, ${adjustment.idempotencyKey})
     on conflict (idempotency_key) do nothing
     returning id
   `;
-  return { adjusted: rows.length > 0 };
+  return { ...settled, adjusted: rows.length > 0 };
+}
+
+/**
+ * A provider refund, chargeback or won dispute for ONE provider invoice/transaction, applied to EVERY
+ * period that invoice wrote.
+ *
+ * C-PRORATION-REVERSAL — exactly which rows a given provider refund touches. Stripe names the
+ * INVOICE (a Charge or a Dispute is resolved to it in webhooks.ts), and one invoice can hold two
+ * periods: its subscription charge and, when Stripe listed a mid-cycle item on it as pending, the
+ * ':proration' period that holds the money collected for that item (HUNT6-C-1, `prorationPeriodFor`).
+ * The amount is applied to the primary period first, in that period's own unit and capped at its
+ * charge; whatever is LEFT of the provider's amount above that period's bucket — its charge plus, for
+ * a tax-inclusive figure, the tax stored on it — then reaches the ':proration' period, capped at its
+ * charge. So:
+ *   - a refund that fits inside the primary period's bucket touches the primary row only;
+ *   - a FULL refund always reaches both, because the provider's amount is charge + pending net + the
+ *     invoice's WHOLE tax while the primary bucket holds the charge and only its own apportioned share
+ *     of that tax, so leftover = pending net + (whole tax − apportioned share) >= pending net;
+ *   - an event with no amount at all (a store refund, a dispute that states none) is "the whole
+ *     charge" on both rows;
+ *   - an invoice with no pending item has no second row, and the extra lookup finds nothing.
+ * While the match was the primary period id alone, a FULLY refunded renewal that had carried a
+ * deferred proration left that money in gross with nothing reversing it: clawed-back money reading as
+ * kept revenue, which is the direction every figure here is ordered to fail the other way.
+ *
+ * The leftover is deterministic in the provider's amount, so a chargeback that ADDS and the won
+ * dispute that SUBTRACTS hand the proration period the same number and round-trip on it exactly as
+ * they do on the primary. Nothing is ever parked against the derived id: its absence is the normal
+ * case, not an ordering to wait for. Returns whether a donation adjustment was written (only the
+ * primary period can carry an accrual: eligibility reads subscription periods).
+ */
+export async function applyRefund(
+  tx: Tx,
+  familyId: string,
+  channel: BillingChannel,
+  providerPeriodId: string,
+  kind: SettlementEvent,
+  refundedCents: number | null,
+  amountIsTaxInclusive = false,
+): Promise<{ adjusted: boolean; pending?: boolean }> {
+  const primary = await applySettlementToPeriod(
+    tx,
+    familyId,
+    channel,
+    providerPeriodId,
+    kind,
+    refundedCents,
+    amountIsTaxInclusive,
+    true,
+  );
+  if (!primary.applied) {
+    return primary.pending ? { adjusted: false, pending: true } : { adjusted: false };
+  }
+  // Already the derived row (nothing calls it that way today); never derive a third id from it.
+  if (providerPeriodId.endsWith(PRORATION_PERIOD_SUFFIX)) return { adjusted: primary.adjusted };
+  const leftover = primary.leftoverCents;
+  if (leftover !== null && leftover <= 0) return { adjusted: primary.adjusted };
+  const secondary = await applySettlementToPeriod(
+    tx,
+    familyId,
+    channel,
+    `${providerPeriodId}${PRORATION_PERIOD_SUFFIX}`,
+    kind,
+    leftover,
+    amountIsTaxInclusive,
+    false,
+  );
+  return { adjusted: primary.adjusted || (secondary.applied && secondary.adjusted) };
 }
 
 const TARGET_ELAPSED_MS = 35 * 24 * 3600 * 1000;

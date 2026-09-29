@@ -1,0 +1,42 @@
+-- 0940_sequence_public_default_global.sql
+-- Hardening round 6 (HUNT6-E-2), the residual of 0910_sequence_public_revoke.sql: 0910's second
+-- statement is `alter default privileges IN SCHEMA public revoke all on sequences from public`, and
+-- a per-schema revoke cannot cancel a PUBLIC entry held in the GLOBAL default. Postgres keeps the
+-- two in separate pg_default_acl rows — the global one has defaclnamespace = 0 — and merges them
+-- when it creates an object (get_user_default_acl, then aclmerge): the per-schema row can only ADD
+-- to the global one, so revoking there subtracts nothing the global row grants.
+--
+-- 0001_core_identity.sql:535-539 already wrote that rule down for functions and spelled its PUBLIC
+-- revoke globally because of it. Sequences were left with the per-schema spelling only, so on a
+-- project whose global default names PUBLIC — a hosted platform default, or any future
+-- `alter default privileges` written without `in schema` — every sequence created by a migration
+-- AFTER 0910 was handed back to every client role, `authenticated` included. That is HR4-0860-01 in
+-- full: `select setval('public.audit_events_id_seq', 1, false)` as `authenticated` makes every later
+-- append fail on audit_events_pkey until an operator repairs the sequence, which stops create_family,
+-- request_deletion (spec P4 "delete my data"), device pairing, activation and consent; on
+-- public.ai_usage_events_id_seq it stops settleSpend's cost insert, leaving the spend hold to hold
+-- the owner's AI budget to the end of the month (apps/api/src/jobs/spend-ceiling.ts).
+--
+-- This file adds the global spelling BESIDE 0910's per-schema one, not instead of it: the two rows
+-- are independent, so cancelling one leaves the other, and both have to be revoked. 0910 is left
+-- exactly as it shipped apart from its prose. What each statement cancels, plainly:
+--   * 0870:49  cancels, in the per-schema row, what it grants to anon and authenticated.
+--   * 0910:38  cancels, in the per-schema row, what it grants to PUBLIC.
+--   * the statement below cancels, in the GLOBAL row, what it grants to PUBLIC.
+-- None of the three touches a privilege already held on an existing sequence: 0870:44 and 0910:34 do
+-- that, and this file adds nothing there because 0910:34 already names PUBLIC.
+--
+-- Postgres' hard-wired default grants PUBLIC nothing on a sequence, so on a database that carries no
+-- global PUBLIC default this statement is a no-op and writes no pg_default_acl row at all. It is
+-- here for the database that does carry one. Applying it twice changes nothing.
+--
+-- supabase/tests/hardening_r2_db.test.ts plants the global default, applies 0910 alone (the
+-- sequence created next is still client-writable — the hole), then applies this file and requires the
+-- next sequence to carry nothing for a client role. Both default-privileges invariants in
+-- supabase/tests/schema_invariants.test.ts now match the global row too, so a global PUBLIC default
+-- that arrives later is reported in CI rather than filtered out by a namespace join.
+--
+-- Read `revoke` narrowly here, as in 0910: it cancels what the ROLE RUNNING THIS MIGRATION grants by
+-- default. A default privilege entry belonging to another grantor role (`alter default privileges
+-- for role <other>`) is that role's to cancel, and is not touched by the statement below.
+alter default privileges revoke all on sequences from public;

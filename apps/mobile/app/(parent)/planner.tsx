@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Pressable, Switch, Text, TextInput, View } from 'react-native';
 import {
   LEARNING_LIMITS,
@@ -25,8 +25,10 @@ import {
   Screen,
   Title,
   styles,
+  useLoad,
   useParentAccess,
 } from '../../src/family/ui.tsx';
+import { childPlanEditable } from '../../src/family/family-view.ts';
 import {
   WEEKDAY_OPTIONS,
   buildUpcomingView,
@@ -57,47 +59,47 @@ export default function PlannerScreen() {
   return <Planner api={access.api} />;
 }
 
-type Load<T> =
-  { status: 'loading' } | { status: 'error'; error: unknown } | { status: 'ready'; data: T };
-
-function useApiLoad<T>(load: () => Promise<T>, key: string) {
-  const [state, setState] = useState<Load<T>>({ status: 'loading' });
-  const [version, setVersion] = useState(0);
-  const reload = useCallback(() => setVersion((v) => v + 1), []);
-  useEffect(() => {
-    let active = true;
-    setState((s) => (s.status === 'ready' ? s : { status: 'loading' }));
-    load().then(
-      (data) => active && setState({ status: 'ready', data }),
-      (error: unknown) => active && setState({ status: 'error', error }),
-    );
-    return () => {
-      active = false;
-    };
-    // `load` closes over `key`; reloading is explicit through `version`.
-  }, [key, version]);
-  return { state, reload };
-}
-
+/**
+ * The screen loads through the shared `useLoad` (src/family/ui.tsx), like every other parent screen.
+ * It used to run its own hook whose effect depended on a literal path string and a manual counter, so
+ * a new client — which is what the parent gate publishes when the adult at the device has changed —
+ * re-rendered this screen without re-running a single load: the next adult read the previous family's
+ * children, subject toggles and practice schedule, with no request made at all (HUNT6-I-1). The whole
+ * HUNT5-H-1 fix rests on the screens keying their loads on the client, and this one did not.
+ *
+ * Re-loading on a new client is only half of it: the CHILD the screen is showing is a choice, and a
+ * choice made in one family means nothing in the next. Setting it once from an effect ("if it is null
+ * and a first child exists") left the previous family's child id in place across the load, and with
+ * that id in none of the new family's children the screen fell out of every branch it has: no
+ * loading, no error, no empty-family notice, no plan — a blank screen under the title for a family
+ * with one child, and a <Choice> holding a value that is not one of its options for a family with
+ * more. So the selection is DERIVED from the family that is loaded, on every render, and the screen's
+ * four states (loading / error / no children / one named child's plan) cover every case between them.
+ */
 function Planner({ api }: { api: ApiClient }) {
-  const family = useApiLoad(() => api.get('/v1/family', familyOverviewResponseSchema), 'family');
-  const [childId, setChildId] = useState<string | null>(null);
+  const loadFamily = useCallback(() => api.get('/v1/family', familyOverviewResponseSchema), [api]);
+  const family = useLoad(loadFamily);
+  /** What the parent last tapped. It says nothing about which family is loaded now. */
+  const [picked, setPicked] = useState<string | null>(null);
   const children = family.state.status === 'ready' ? family.state.data.children : [];
-  const firstChild = children[0]?.id ?? null;
-  useEffect(() => {
-    if (childId === null && firstChild !== null) setChildId(firstChild);
-  }, [childId, firstChild]);
+  // The pick counts only while the loaded family still has that child; otherwise the family's first
+  // child is the selection. Derived, so a load can never leave a selection the family cannot answer
+  // for: `childId` is either null (no children loaded) or one of `children`, which is what makes the
+  // <Choice> below always hold one of its own options and `child` always resolve when there are any.
+  const childId = children.some((c) => c.id === picked) ? picked : (children[0]?.id ?? null);
   const child = children.find((c) => c.id === childId) ?? null;
 
   return (
     <Screen>
       <Title>Practice planner</Title>
-      {family.state.status === 'loading' ? <Loading label="Loading your family" /> : null}
+      {family.state.status === 'idle' || family.state.status === 'loading' ? (
+        <Loading label="Loading your family" />
+      ) : null}
       {family.state.status === 'error' ? (
         <ErrorBox
           message={plannerError(family.state.error).message}
           needsPin={plannerError(family.state.error).needsPin}
-          onRetry={family.reload}
+          onRetry={() => void family.reload()}
         />
       ) : null}
       {family.state.status === 'ready' && children.length === 0 ? (
@@ -110,7 +112,7 @@ function Planner({ api }: { api: ApiClient }) {
           label="Child"
           options={children.map((c) => ({ value: c.id, label: c.nickname }))}
           value={childId}
-          onChange={setChildId}
+          onChange={setPicked}
         />
       ) : null}
       {child && family.state.status === 'ready' ? (
@@ -129,46 +131,71 @@ function ChildPlan({
   child: FamilyOverview['children'][number];
   family: FamilyOverview;
 }) {
+  // The API refuses every learning write for an archived profile (HUNT6-H-1), so no control for one is
+  // offered: the stored plan stays readable, which is what archiving promises.
+  const editable = childPlanEditable(child.status);
   const base = `/v1/children/${encodeURIComponent(child.id)}`;
-  const schedule = useApiLoad(
+  const loadSchedule = useCallback(
     () => api.get(`${base}/learning-schedule`, learningScheduleResponseSchema),
-    `${base}/schedule`,
+    [api, base],
   );
-  const subjects = useApiLoad(
+  const schedule = useLoad(loadSchedule);
+  const loadSubjects = useCallback(
     () => api.get(`${base}/subjects`, childSubjectsResponseSchema),
-    `${base}/subjects`,
+    [api, base],
   );
+  const subjects = useLoad(loadSubjects);
 
   return (
     <>
       <Heading>{child.nickname}</Heading>
+      {editable ? null : (
+        <Notice>
+          <Body>
+            {child.nickname} is archived, so their practice plan is read-only. Everything below is
+            what was planned; make them active again in Children to change it.
+          </Body>
+        </Notice>
+      )}
       {family.timezone ? (
         <Body muted>Times are in your family’s time zone: {family.timezone}.</Body>
       ) : null}
-      {subjects.state.status === 'loading' ? <Loading label="Loading subjects" /> : null}
+      {subjects.state.status === 'idle' || subjects.state.status === 'loading' ? (
+        <Loading label="Loading subjects" />
+      ) : null}
       {subjects.state.status === 'error' ? (
-        <ErrorBox message={plannerError(subjects.state.error).message} onRetry={subjects.reload} />
+        <ErrorBox
+          message={plannerError(subjects.state.error).message}
+          onRetry={() => void subjects.reload()}
+        />
       ) : null}
       {subjects.state.status === 'ready' ? (
         <SubjectToggles
           api={api}
           path={`${base}/subjects`}
+          editable={editable}
           subjects={subjects.state.data.subjects}
           onChanged={() => {
-            subjects.reload();
-            schedule.reload();
+            void subjects.reload();
+            void schedule.reload();
           }}
         />
       ) : null}
-      {schedule.state.status === 'loading' ? <Loading label="Loading the schedule" /> : null}
+      {schedule.state.status === 'idle' || schedule.state.status === 'loading' ? (
+        <Loading label="Loading the schedule" />
+      ) : null}
       {schedule.state.status === 'error' ? (
-        <ErrorBox message={plannerError(schedule.state.error).message} onRetry={schedule.reload} />
+        <ErrorBox
+          message={plannerError(schedule.state.error).message}
+          onRetry={() => void schedule.reload()}
+        />
       ) : null}
       {schedule.state.status === 'ready' ? (
         <ScheduleEditor
           api={api}
           path={`${base}/learning-schedule`}
           childName={child.nickname}
+          editable={editable}
           initial={schedule.state.data}
         />
       ) : null}
@@ -179,11 +206,14 @@ function ChildPlan({
 function SubjectToggles({
   api,
   path,
+  editable,
   subjects,
   onChanged,
 }: {
   api: ApiClient;
   path: string;
+  /** False for an archived child: PATCH /subjects is refused 422 CHILD_ARCHIVED (HUNT6-H-1). */
+  editable: boolean;
   subjects: readonly ChildSubject[];
   onChanged: () => void;
 }) {
@@ -207,6 +237,7 @@ function SubjectToggles({
     <Card>
       <Heading>Subjects</Heading>
       <Body muted>Subjects that are on get daily questions and a weekly review.</Body>
+      {editable ? null : <Body muted>These can’t be changed while this child is archived.</Body>}
       {problem ? <ErrorBox message={problem.message} needsPin={problem.needsPin} /> : null}
       {subjects.map((subject) => (
         <View
@@ -221,13 +252,15 @@ function SubjectToggles({
             {subject.generatedPractice ? '' : ' (no generated practice)'} ·{' '}
             {subject.enabled ? 'On' : 'Off'}
           </Text>
-          <Switch
-            accessibilityLabel={`${subject.displayName} practice`}
-            accessibilityState={{ checked: subject.enabled, disabled: busy !== null }}
-            value={subject.enabled}
-            disabled={busy !== null}
-            onValueChange={(value) => void toggle(subject, value)}
-          />
+          {editable ? (
+            <Switch
+              accessibilityLabel={`${subject.displayName} practice`}
+              accessibilityState={{ checked: subject.enabled, disabled: busy !== null }}
+              value={subject.enabled}
+              disabled={busy !== null}
+              onValueChange={(value) => void toggle(subject, value)}
+            />
+          ) : null}
         </View>
       ))}
     </Card>
@@ -326,11 +359,14 @@ function ScheduleEditor({
   api,
   path,
   childName,
+  editable,
   initial,
 }: {
   api: ApiClient;
   path: string;
   childName: string;
+  /** False for an archived child: PUT /learning-schedule is refused 422 CHILD_ARCHIVED (HUNT6-H-1). */
+  editable: boolean;
   initial: LearningScheduleResponse;
 }) {
   const [latest, setLatest] = useState(initial);
@@ -367,18 +403,52 @@ function ScheduleEditor({
     }
   };
 
+  const comingUp = (
+    <Card>
+      <Heading>Coming up</Heading>
+      <Body>{upcoming.dailyLine}</Body>
+      {upcoming.reviewLines.length === 0 ? (
+        <Body muted>No weekly reviews are scheduled yet.</Body>
+      ) : (
+        upcoming.reviewLines.map((line) => <Body key={line}>{line}</Body>)
+      )}
+      <Body muted>{upcoming.pointsLine}</Body>
+    </Card>
+  );
+
+  // An archived child's plan is shown, never offered for editing (HUNT6-H-1): the fields below are
+  // left out rather than disabled, so there is nothing to type into and nothing to lose on a Save the
+  // server would refuse.
+  if (!editable) {
+    return (
+      <>
+        {comingUp}
+        <Card>
+          <Heading>Weekly review and daily practice</Heading>
+          <Body>
+            Review {WEEKDAY_OPTIONS.find((day) => day.value === form.reviewWeekday)?.label ?? ''} at{' '}
+            {form.reviewLocalTime} ({zone}), {form.reviewQuestionsPerSubject} questions per subject.
+          </Body>
+          <Body>
+            Daily practice at {form.dailyLocalTime} ({zone}), {form.dailyQuestionCount} questions.
+          </Body>
+          {form.pauseEnabled ? (
+            <Body>
+              Paused from {form.pauseFrom} to {form.pauseTo}.
+            </Body>
+          ) : null}
+        </Card>
+        <Body muted>
+          Test dates, teacher spelling lists, skills and answer keys are in the Learning planner of
+          the parent portal.
+        </Body>
+      </>
+    );
+  }
+
   return (
     <>
-      <Card>
-        <Heading>Coming up</Heading>
-        <Body>{upcoming.dailyLine}</Body>
-        {upcoming.reviewLines.length === 0 ? (
-          <Body muted>No weekly reviews are scheduled yet.</Body>
-        ) : (
-          upcoming.reviewLines.map((line) => <Body key={line}>{line}</Body>)
-        )}
-        <Body muted>{upcoming.pointsLine}</Body>
-      </Card>
+      {comingUp}
 
       <Card>
         <Heading>Weekly review</Heading>
@@ -467,7 +537,13 @@ function ScheduleEditor({
           <ErrorBox message={result.message} needsPin={result.needsPin} />
         )
       ) : null}
-      <Button label={busy ? 'Saving…' : 'Save schedule'} busy={busy} onPress={() => void save()} />
+      {editable ? (
+        <Button
+          label={busy ? 'Saving…' : 'Save schedule'}
+          busy={busy}
+          onPress={() => void save()}
+        />
+      ) : null}
       <Body muted>
         Test dates, teacher spelling lists, skills and answer keys are in the Learning planner of
         the parent portal.

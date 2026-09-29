@@ -5,6 +5,7 @@ import {
   MODERATION_TIMEOUT_MS,
   moderationFlagged,
   PROMPTS,
+  PROPOSED_STAGE_COST_BUDGET_MICROS,
   PROPOSED_STAGE_LIMITS,
   providerModerationCodes,
   runStage,
@@ -665,9 +666,16 @@ export async function personalizeItems(
   // Admitted only when recorded spend + every live hold (scans included) + this stage's upper-bound
   // estimate stays within the owner's cap (RV-lead-jobs-ai-10). A refused or undecidable budget keeps
   // the reviewed bank items: the set is still delivered, without an AI call.
+  //
+  // The reservation is the stage's cost BUDGET and not its admission cap (HUNT6-D-CAP, F-HOLD): the
+  // budget is what every attempt TOGETHER may cost, including the one raised retry runStage sends
+  // after an answer cut off at `max_output_tokens`, while the cap bounds a single request. Reserving
+  // the cap left the hold below what the stage may spend — daily_set's cap is 350,000 micros and its
+  // two attempts may cost 483,240 — so the hold stopped bounding the spend, which is the only thing
+  // a hold is for. scan-process.ts's `spending()` sums the same table.
   let hold: string | null;
   try {
-    hold = await acquireSpendHold(deps, PROPOSED_STAGE_LIMITS[stage].maxCostMicros);
+    hold = await acquireSpendHold(deps, PROPOSED_STAGE_COST_BUDGET_MICROS[stage]);
   } catch (error) {
     if (error instanceof SpendCeilingReached) {
       deps.log({ level: 'warn', event: 'practice_ai_skipped', code: 'SPEND_CEILING' });
@@ -711,7 +719,11 @@ export async function personalizeItems(
       rates: options.rates ?? DEFAULT_RATE_TABLE_2026_09_18,
       gate,
       metadata: { stage },
-      // An upper bound of the request actually sent, so the stage never overshoots its hold (LJA-F4).
+      // An upper bound of the request actually sent, which is what runStage weighs against this
+      // stage's per-request ADMISSION cap: an oversized envelope is refused as STAGE_LIMIT before it
+      // reaches the provider (LJA-F4). It is no longer what keeps the stage inside its hold — since
+      // HUNT6-D-CAP the one raised retry is weighed against the stage BUDGET, which is the number
+      // reserved above, so the hold bounds the whole stage and this bound bounds one request.
       estimatedInputTokens: inputTokenUpperBound(prompt, input),
       ...(options.sleep ? { sleep: options.sleep } : {}),
     });

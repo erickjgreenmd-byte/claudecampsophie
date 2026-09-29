@@ -1306,3 +1306,545 @@ describe('bounded web scans (R2C-WEB-1)', () => {
     expect(puts).toHaveLength(0);
   });
 });
+
+/**
+ * HUNT6-H-2: HUNT5-F-5 gave honest copy to the two permanent codes the archive itself causes
+ * (CHILD_ARCHIVED, CHILD_NOT_ACTIVE) and `explainStatus` consults that table only for
+ * `failed_final`. Every other outcome on the same screen still told the parent to get a new scan —
+ * for a child whose profile makes a new scan impossible: POST /v1/assignments goes through
+ * `assertCanCollect` → `readPaidProfile`, which requires `status = 'active'` (apps/api/src/routes/
+ * homework.ts), the page offers no uploader for an archived child, and archiving revokes the child's
+ * sessions so the tablet cannot scan either. The rows are still listed, because GET /v1/assignments
+ * only drops a child under an open deletion. Synthetic names only.
+ */
+const ARCHIVED_FAMILY = {
+  ...family,
+  children: [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'archived' }],
+};
+
+const DRAFT_FAMILY = {
+  ...family,
+  children: [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'draft' }],
+};
+
+/** The outcomes whose advice was "scan again": the state itself, and three permanent codes. */
+function rescanAdviceList(): AssignmentListResponse {
+  return {
+    assignments: [
+      summary(RESCAN, 'needs_rescan'),
+      { ...summary(QUEUED, 'uploading'), id: QUEUED },
+      { ...summary(FINAL, 'failed_final'), errorCode: 'FORMAT_NEEDS_CONVERSION' },
+      { ...summary(RETRY, 'failed_final'), errorCode: 'SCAN_TOO_MANY_QUESTIONS' },
+      { ...summary(READY, 'failed_final'), errorCode: 'AI_PAUSED_TOO_LONG' },
+    ],
+    allowance: {
+      periodKey: 'pages:2026-09',
+      childPagesUsed: 12,
+      childPagesAllowed: 40,
+      familyPagesUsed: 20,
+      familyPagesAllowed: 80,
+    },
+  };
+}
+
+/** Every imperative this page used to print for those outcomes. None can be acted on. */
+const RESCAN_ADVICE =
+  /scan again with a clearer picture|start a new one|Scan the pages again|Send the pages again|Split it into two scans|start a new scan/i;
+
+describe('[HUNT6-H-2] no row tells a parent to rescan a child whose rescan the API refuses', () => {
+  it('replaces the rescan advice with the profile as the blocker for an archived child', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? ARCHIVED_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? rescanAdviceList()
+            : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    // The five rows really are on screen, so the absence below is not an empty page.
+    expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(5);
+    // The other half of the contradiction is on screen at the same time.
+    expect(
+      within(await screen.findByRole('region', { name: 'Scanning paused' })).getByText(
+        /new scans are not taken/i,
+      ),
+    ).toBeTruthy();
+    expect(within(scans).queryByText(RESCAN_ADVICE)).toBeNull();
+    // Each such row names the profile as the blocker and where the parent can act.
+    expect(within(scans).getAllByText(/profile was archived|profile is archived/i).length).toBe(5);
+    expect(within(scans).getAllByText(/Children page/i).length).toBe(5);
+    // What happened is still said: the copy replaces the advice, not the outcome.
+    expect(within(scans).getByText(/hard to read/i)).toBeTruthy();
+    expect(within(scans).getByText(/PDF or HEIC/i)).toBeTruthy();
+    expect(within(scans).getByText(/more questions than one check can handle/i)).toBeTruthy();
+  });
+
+  it('says "no paid slot" instead, for a draft profile a downgrade left behind', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? DRAFT_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? rescanAdviceList()
+            : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(5);
+    expect(within(scans).queryByText(RESCAN_ADVICE)).toBeNull();
+    expect(within(scans).getAllByText(/no paid slot/i).length).toBe(5);
+    expect(within(scans).queryByText(/profile was archived/i)).toBeNull();
+  });
+
+  it('keeps the rescan advice for an ACTIVE child, where a new scan is exactly the answer', async () => {
+    const { api } = fakeApi({
+      get: (path) => (path.startsWith('/v1/assignments?childId=') ? rescanAdviceList() : undefined),
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getByText(/scan again with a clearer picture/i)).toBeTruthy();
+    expect(within(scans).getByText(/Scan the pages again as JPEG or PNG/i)).toBeTruthy();
+    expect(within(scans).queryByText(/profile was archived/i)).toBeNull();
+  });
+
+  it('says it in the open scan’s detail panel too, not only in the list', async () => {
+    const rescanDetail: AssignmentDetailResponse = {
+      assignment: summary(RESCAN, 'needs_rescan'),
+      pages: [{ id: PAGE, pageNumber: 1, mimeType: 'image/jpeg' }],
+      questions: [],
+    };
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? ARCHIVED_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? { ...rescanAdviceList(), assignments: [summary(RESCAN, 'needs_rescan')] }
+            : path === `/v1/assignments/${RESCAN}`
+              ? rescanDetail
+              : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    await userEvent.click(within(scans).getByRole('button', { name: /Open scan/ }));
+    const panel = await screen.findByRole('region', { name: 'Scan details' });
+    expect(within(panel).queryByText(RESCAN_ADVICE)).toBeNull();
+    expect(within(panel).getByText(/profile was archived|profile is archived/i)).toBeTruthy();
+  });
+});
+
+/**
+ * G-H2: the round-6 fix for HUNT6-H-2 keyed the replacement on five KEYS, and `explainStatus` looks a
+ * `failed_final` row up by its CODE, never by its state — so a code in neither of the page's two
+ * tables fell through to STATUS_COPY.failed_final.explain and its "Please start a new scan with clear
+ * photos." These are the codes with no line of their own: PROCESSING_ERROR is the catch-all for any
+ * error that is neither PermanentFailure nor RetryableFailure and PROCESSING_TIMEOUT what a lost lock
+ * records (apps/api/src/jobs/scan-process.ts); AI_NOT_AVAILABLE is the consent/ZDR gate's refusal;
+ * NO_PAGES and SCAN_TOO_LARGE come from the pages themselves; STAGE_LIMIT and UNKNOWN_MODEL from the
+ * router; the per-stage *_REQUEST_REJECTED and *_OUTPUT_TRUNCATED codes from a refused or cut-off
+ * request; MODERATION_NOT_AVAILABLE from the fail-closed safety screen; STORAGE_READ_FAILED is a
+ * RETRYABLE code, recorded as-is when the last attempt runs out; and `null` is a row that recorded no
+ * code at all. Iterated rather than named one by one, because the property is "a code this page has no
+ * line for" — a fix that adds another handful of keys leaves the fall-through exactly where it was.
+ */
+const UNLISTED_FINAL_CODES: readonly (string | null)[] = [
+  'PROCESSING_ERROR',
+  'PROCESSING_TIMEOUT',
+  'AI_NOT_AVAILABLE',
+  'NO_PAGES',
+  'SCAN_TOO_LARGE',
+  'STAGE_LIMIT',
+  'UNKNOWN_MODEL',
+  'EXTRACT_REQUEST_REJECTED',
+  'CHECK_REQUEST_REJECTED',
+  'VERIFY_REQUEST_REJECTED',
+  'EXTRACT_OUTPUT_TRUNCATED',
+  'MODERATION_NOT_AVAILABLE',
+  'STORAGE_READ_FAILED',
+  null,
+];
+
+/** Distinct synthetic ids, because the list de-duplicates rows by id. */
+const finalId = (index: number): string =>
+  `f0a1b2c3-4d5e-4f6a-9b7c-8d9e0f1a2b${index.toString(16).padStart(2, '0')}`;
+
+function unlistedCodeList(): AssignmentListResponse {
+  return {
+    ...rescanAdviceList(),
+    assignments: UNLISTED_FINAL_CODES.map((errorCode, i) => ({
+      ...summary(finalId(i), 'failed_final'),
+      errorCode,
+    })),
+  };
+}
+
+describe('[G-H2] no outcome tells a non-active child’s parent to start a new scan', () => {
+  for (const [status, family_, blocker] of [
+    ['archived', ARCHIVED_FAMILY, /profile is archived/i],
+    ['draft', DRAFT_FAMILY, /no paid slot/i],
+  ] as const) {
+    it(`replaces the advice for every code the page has no line for (${status} child)`, async () => {
+      const { api } = fakeApi({
+        get: (path) =>
+          path === '/v1/family'
+            ? family_
+            : path.startsWith('/v1/assignments?childId=')
+              ? unlistedCodeList()
+              : undefined,
+      });
+      renderPage(<HomeworkPage />, { api });
+      const scans = await screen.findByRole('region', { name: 'Scans' });
+      // Every row really is on screen, so the absence below is not an empty page.
+      expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(
+        UNLISTED_FINAL_CODES.length,
+      );
+      expect(within(scans).queryAllByText(RESCAN_ADVICE)).toEqual([]);
+      // Each row still says what happened, and names the profile as the blocker instead.
+      expect(
+        within(scans).getAllByText(/could not be processed after several tries/i),
+      ).toHaveLength(UNLISTED_FINAL_CODES.length);
+      expect(within(scans).getAllByText(blocker)).toHaveLength(UNLISTED_FINAL_CODES.length);
+    });
+  }
+
+  it('keeps the generic advice for an ACTIVE child, where a new scan is the answer', async () => {
+    const { api } = fakeApi({
+      get: (path) => (path.startsWith('/v1/assignments?childId=') ? unlistedCodeList() : undefined),
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getAllByText(/Please start a new scan with clear photos/i)).toHaveLength(
+      UNLISTED_FINAL_CODES.length,
+    );
+  });
+
+  it('says it in the open scan’s detail panel too', async () => {
+    const processingError: AssignmentDetailResponse = {
+      assignment: { ...summary(RESCAN, 'failed_final'), errorCode: 'PROCESSING_ERROR' },
+      pages: [{ id: PAGE, pageNumber: 1, mimeType: 'image/jpeg' }],
+      questions: [],
+    };
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? ARCHIVED_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? { ...rescanAdviceList(), assignments: [processingError.assignment] }
+            : path === `/v1/assignments/${RESCAN}`
+              ? processingError
+              : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    await userEvent.click(within(scans).getByRole('button', { name: /Open scan/ }));
+    const panel = await screen.findByRole('region', { name: 'Scan details' });
+    expect(within(panel).queryAllByText(RESCAN_ADVICE)).toEqual([]);
+    expect(within(panel).getByText(/profile is archived/i)).toBeTruthy();
+  });
+});
+
+/**
+ * G-DRAFT: the line the page prints for a DRAFT child said "Give the profile a paid slot AGAIN",
+ * which asserts a slot this profile has never held — "Adding a child creates an uncharged draft"
+ * (apps/web/src/pages/app/ChildrenPage.tsx), and this page's own picker spells the same child
+ * "(no paid slot yet)". The two regions on screen have to name the same blocker and the same remedy.
+ */
+describe('[G-DRAFT] the draft child’s notice says what is true of a draft', () => {
+  it('never says the profile had a paid slot before, and agrees with the uploader region', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? DRAFT_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? rescanAdviceList()
+            : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    // The contradicting fact, from the page itself: this profile has never had a slot.
+    const picker = await screen.findByLabelText('Child');
+    expect(within(picker).getByRole('option').textContent).toMatch(/no paid slot yet/i);
+
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).queryAllByText(/paid slot again/i)).toEqual([]);
+    expect(within(scans).getAllByText(/unused paid slot/i)).toHaveLength(5);
+
+    // The other region says the same thing, and offers no uploader to contradict it.
+    const add = await screen.findByRole('region', { name: 'Add a scan' });
+    expect(
+      within(add).getByText(/needs a paid child slot before homework can be scanned/),
+    ).toBeTruthy();
+    expect(within(add).queryByRole('button')).toBeNull();
+    expect(within(add).getByRole('link', { name: 'Children page' })).toBeTruthy();
+  });
+});
+
+/**
+ * G-I3-WEB / L-037: the portal's deletion notice asserted the READER's own act. GET /v1/family
+ * computes `deletionPending` from the request's scope and target alone and never exposes
+ * deletion_requests.requested_by; any guardian may delete a child's data and a child-scope request
+ * leaves every other membership active, so the family's OTHER adult is served the same flag and was
+ * told they had asked for it. The mobile client was corrected this round (apps/mobile/app/(parent)/
+ * children.tsx); this is the same sentence on the portal.
+ */
+describe('[G-I3-WEB] the deletion notice does not claim the reader asked for it', () => {
+  it('names the open request instead of the reader', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? {
+              ...family,
+              children: [
+                {
+                  id: RILEY,
+                  nickname: 'Riley',
+                  gradeLevel: 3,
+                  ageBand: '8-10',
+                  status: 'archived',
+                  deletionPending: true,
+                },
+              ],
+            }
+          : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const notice = await screen.findByRole('region', { name: 'Data deletion under way' });
+    expect(notice.textContent).not.toMatch(/\byou asked\b/i);
+    expect(notice.textContent).toMatch(/deletion request covering Riley’s data is open/i);
+    // Still says what is happening and where a mistake is handled.
+    expect(within(notice).getByRole('link', { name: /privacy page/i })).toBeTruthy();
+    expect(within(notice).getByRole('link', { name: /contact support/i })).toBeTruthy();
+  });
+});
+
+/**
+ * G-NO-SCANS-COPY: the empty state of the Scans list said "No scans for {name} yet. Add one above,
+ * or {name} can scan homework in the PencilLift app on a paired phone or tablet". Both halves are
+ * false for a profile that is not active, and this page renders the refutation itself, two regions
+ * up: for an archived child there is no uploader AT ALL (WEBR4-10 replaced it with the "Scanning
+ * paused" notice), and for a draft child the "Add a scan" region prints `uploadBlockedReason` and
+ * offers no control — so there is nothing "above" to add from. The app half is no better: POST
+ * /v1/assignments goes through `readPaidProfile`, whose `entitled` requires `status = 'active'`
+ * (apps/api/src/routes/homework.ts), and archiving revokes the child's sessions, so no paired device
+ * can open a scan for either state. It is the same two-regions-disagree defect HUNT6-H-2 and G-H2
+ * closed for the rows of this very list, left standing in the branch that renders when there are no
+ * rows. Synthetic names only.
+ */
+/** No rows, and pages left to send: what blocks a scan here is the profile, nothing else. */
+function noScans(childPagesAllowed: number): AssignmentListResponse {
+  return {
+    assignments: [],
+    allowance: {
+      periodKey: 'pages:2026-09',
+      childPagesUsed: 0,
+      childPagesAllowed,
+      familyPagesUsed: 20,
+      familyPagesAllowed: 80,
+    },
+  };
+}
+
+function emptyListApi(overview: unknown, childPagesAllowed = 0) {
+  return fakeApi({
+    get: (path) =>
+      path === '/v1/family'
+        ? overview
+        : path.startsWith('/v1/assignments?childId=')
+          ? noScans(childPagesAllowed)
+          : undefined,
+  });
+}
+
+describe('[G-NO-SCANS-COPY] the empty scan list does not offer a blocked child two dead ends', () => {
+  it('says why nothing can be added for an archived child, where no uploader exists', async () => {
+    const { api } = emptyListApi(ARCHIVED_FAMILY);
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    // The refutation, from the page itself: there is no uploader above to add a scan from.
+    expect(screen.queryByRole('region', { name: 'Add a scan' })).toBeNull();
+    expect(
+      within(await screen.findByRole('region', { name: 'Scanning paused' })).getByText(
+        /new scans are not taken/i,
+      ),
+    ).toBeTruthy();
+    expect(within(scans).queryByText(/Add one above/i)).toBeNull();
+    expect(within(scans).queryByText(/paired phone or tablet/i)).toBeNull();
+    // What is true instead: the blocker, and where the parent can act on it.
+    expect(within(scans).getByText(/No scans for Riley/i)).toBeTruthy();
+    expect(within(scans).getByText(/profile is archived/i)).toBeTruthy();
+    expect(within(scans).getByRole('link', { name: 'Children page' })).toBeTruthy();
+  });
+
+  it('says why nothing can be added for a draft child, whose uploader is offered but blocked', async () => {
+    const { api } = emptyListApi(DRAFT_FAMILY);
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    // The refutation: the uploader region is there, and it offers no control to add a scan with.
+    const add = await screen.findByRole('region', { name: 'Add a scan' });
+    expect(within(add).getByText(/needs a paid child slot/i)).toBeTruthy();
+    expect(within(add).queryByRole('button')).toBeNull();
+    expect(within(scans).queryByText(/Add one above/i)).toBeNull();
+    expect(within(scans).queryByText(/paired phone or tablet/i)).toBeNull();
+    expect(within(scans).getByText(/No scans for Riley/i)).toBeTruthy();
+    expect(within(scans).getByText(/no paid slot/i)).toBeTruthy();
+    expect(within(scans).getByRole('link', { name: 'Children page' })).toBeTruthy();
+  });
+
+  it('keeps both offers for an ACTIVE child, where each one works', async () => {
+    const { api } = emptyListApi(
+      {
+        ...family,
+        children: [
+          { id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' },
+        ],
+      },
+      40,
+    );
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getByText(/Add one above/i)).toBeTruthy();
+    expect(within(scans).getByText(/paired phone or tablet/i)).toBeTruthy();
+    // And the uploader really is above it, with its control.
+    const add = await screen.findByRole('region', { name: 'Add a scan' });
+    expect(within(add).getByRole('button', { name: /Add a scan for Riley/i })).toBeTruthy();
+  });
+});
+
+/**
+ * G-LABEL: `STATUS_COPY.needs_rescan.label` is "Needs a new scan", printed unconditionally in the
+ * row header and as the detail panel's prefix — so after HUNT6-H-2 fixed the EXPLANATION beside it,
+ * an archived or draft child's panel reads "Needs a new scan: … A new scan can’t help while this
+ * child’s profile is archived". The label is the same imperative the explanation was corrected for,
+ * and it is printed for a profile POST /v1/assignments refuses (`readPaidProfile` requires
+ * `status = 'active'`) with its devices signed out. The outcome has to be named without asking for
+ * the one thing that cannot happen.
+ */
+function rescanOnlyList(): AssignmentListResponse {
+  return { ...rescanAdviceList(), assignments: [summary(RESCAN, 'needs_rescan')] };
+}
+
+const rescanDetailOnly: AssignmentDetailResponse = {
+  assignment: summary(RESCAN, 'needs_rescan'),
+  pages: [{ id: PAGE, pageNumber: 1, mimeType: 'image/jpeg' }],
+  questions: [],
+};
+
+function rescanApi(overview: unknown) {
+  return fakeApi({
+    get: (path) =>
+      path === '/v1/family'
+        ? overview
+        : path.startsWith('/v1/assignments?childId=')
+          ? rescanOnlyList()
+          : path === `/v1/assignments/${RESCAN}`
+            ? rescanDetailOnly
+            : undefined,
+  });
+}
+
+describe('[G-LABEL] the state label agrees with the explanation printed beside it', () => {
+  for (const [status, family_, blocker] of [
+    ['archived', ARCHIVED_FAMILY, /profile is archived/i],
+    ['draft', DRAFT_FAMILY, /no paid slot/i],
+  ] as const) {
+    it(`never labels the row "Needs a new scan" for a ${status} child`, async () => {
+      const { api } = rescanApi(family_);
+      renderPage(<HomeworkPage />, { api });
+      const scans = await screen.findByRole('region', { name: 'Scans' });
+      // The row is on screen, so the absence below is not an empty list.
+      expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(1);
+      expect(within(scans).queryByText(/Needs a new scan/i)).toBeNull();
+      // The outcome is still named, and the explanation still says why no scan can help.
+      expect(within(scans).getByText(/Couldn’t be read/i)).toBeTruthy();
+      expect(within(scans).getByText(/hard to read/i)).toBeTruthy();
+      expect(within(scans).getByText(blocker)).toBeTruthy();
+
+      // The detail panel prints the same label as its prefix, so it has to agree too.
+      await userEvent.click(within(scans).getByRole('button', { name: /Open scan/ }));
+      const panel = await screen.findByRole('region', { name: 'Scan details' });
+      expect(within(panel).queryByText(/Needs a new scan/i)).toBeNull();
+      expect(within(panel).getByText(/Couldn’t be read/i)).toBeTruthy();
+      expect(within(panel).getByText(blocker)).toBeTruthy();
+    });
+  }
+
+  it('keeps "Needs a new scan" for an ACTIVE child, where that is exactly the next step', async () => {
+    const { api } = rescanApi(family);
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getByText(/Needs a new scan/i)).toBeTruthy();
+    expect(within(scans).getByText(/scan again with a clearer picture/i)).toBeTruthy();
+    await userEvent.click(within(scans).getByRole('button', { name: /Open scan/ }));
+    const panel = await screen.findByRole('region', { name: 'Scan details' });
+    expect(within(panel).getByText(/Needs a new scan/i)).toBeTruthy();
+  });
+});
+
+/**
+ * G-DRAFT-COPY: `INACTIVE_CHILD_SCAN_COPY` is what `explainStatus` prints, WHOLE, for a
+ * `failed_final` row whose code is CHILD_NOT_ACTIVE — the code `assertActive` records when a paid-AI
+ * stage finds the profile no longer active (apps/api/src/jobs/scan-process.ts). That profile is a
+ * draft `releaseSlotlessProfiles` demoted, and it only demotes a child whose slot was released
+ * `'expired'` or `'downgrade'` (apps/api/src/services/billing-sync.ts): the family's paid capacity
+ * shrank. So "Give the profile a paid slot again on the Children page" promised, unconditionally, an
+ * action that page can only offer while the family has an unused slot — and this portal cannot sell
+ * capacity (WEB-R1-04). Its two sibling lines already hedge exactly that ("while a paid slot is
+ * free", "while one is free"), and the rows beside it on this very page print the hedged wording,
+ * so the same child's rows disagreed about the same remedy.
+ */
+function slotReleasedList(): AssignmentListResponse {
+  return {
+    ...rescanAdviceList(),
+    assignments: [{ ...summary(FINAL, 'failed_final'), errorCode: 'CHILD_NOT_ACTIVE' }],
+  };
+}
+
+describe('[G-DRAFT-COPY] the slot-released outcome offers the remedy that page really has', () => {
+  it('names an unused slot and keeps the hedge, instead of promising a slot back', async () => {
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? DRAFT_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? slotReleasedList()
+            : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    // What happened is still said, and so is the good news about the pages.
+    expect(within(scans).getByText(/no longer has a paid slot/i)).toBeTruthy();
+    expect(within(scans).getByText(/given back to your monthly allowance/i)).toBeTruthy();
+    // The remedy: the action the Children page offers a draft, with the hedge its siblings carry.
+    expect(within(scans).queryByText(/paid slot again/i)).toBeNull();
+    expect(within(scans).getByText(/unused paid slot/i)).toBeTruthy();
+    expect(within(scans).getByText(/while one is free/i)).toBeTruthy();
+  });
+
+  it('claims no history for a draft profile, in either direction, on any row', async () => {
+    // Both populations are real: a never-charged new profile, and one a downgrade or an expiry
+    // demoted. Every line this page prints for a draft has to be true of both.
+    const { api } = fakeApi({
+      get: (path) =>
+        path === '/v1/family'
+          ? DRAFT_FAMILY
+          : path.startsWith('/v1/assignments?childId=')
+            ? {
+                ...rescanAdviceList(),
+                assignments: [
+                  ...rescanAdviceList().assignments,
+                  {
+                    ...summary(QUEUED, 'failed_final'),
+                    id: finalId(0),
+                    errorCode: 'CHILD_NOT_ACTIVE',
+                  },
+                ],
+              }
+            : undefined,
+    });
+    renderPage(<HomeworkPage />, { api });
+    const scans = await screen.findByRole('region', { name: 'Scans' });
+    expect(within(scans).getAllByRole('button', { name: /Open scan/ })).toHaveLength(6);
+    expect(scans.textContent).not.toMatch(/\bnever\b/i);
+    expect(scans.textContent).not.toMatch(/paid slot (again|back)/i);
+  });
+});

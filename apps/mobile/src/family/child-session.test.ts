@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { childRefreshRequestSchema } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { STORAGE_KEYS, type SecureStorage } from '../lib/mode.ts';
 import { createChildSession } from './child-session.ts';
@@ -78,7 +79,6 @@ function setup(respond: (call: Call) => unknown, now = () => NOW) {
       };
     },
     now,
-    newRequestId: () => 'aaaaaaaa-0000-4000-8000-00000000000a',
   });
   return { storage, session, calls: pub.calls, authed };
 }
@@ -149,14 +149,14 @@ describe('child session', () => {
       {
         method: 'POST',
         path: '/v1/child/refresh',
-        // BUG-244: the refresh carries its own id, so the server can tell this device's retry of
-        // THIS refresh from a replay of a stolen token.
-        body: {
-          refreshToken: tokenResponse(1).refreshToken,
-          refreshRequestId: 'aaaaaaaa-0000-4000-8000-00000000000a',
-        },
+        // [repro] HUNT6-A-1: the device presents the stored refresh token and NOTHING else. The
+        // per-refresh request id BUG-244 added is gone, so the assertion below is not only about
+        // shape: childRefreshRequestSchema is a strict object without it, and a device that still
+        // sent one would be answered 400 by the route it is talking to.
+        body: { refreshToken: tokenResponse(1).refreshToken },
       },
     ]);
+    expect(() => childRefreshRequestSchema.parse(refreshes[0]?.body)).not.toThrow();
     expect(storage.data.get(STORAGE_KEYS.childRefreshToken)).toBe(tokenResponse(2).refreshToken);
   });
 
@@ -189,7 +189,6 @@ describe('child session', () => {
         publicApi: fakeApi(server).api,
         authedApi: () => fakeApi(() => ({ ok: true })).api,
         now: () => now,
-        newRequestId: () => 'aaaaaaaa-0000-4000-8000-00000000000a',
       });
     // Before the fix, the homework screens ran a second session beside the app's: same stored
     // refresh token, separate in-memory state.

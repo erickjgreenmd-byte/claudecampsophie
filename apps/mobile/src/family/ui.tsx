@@ -25,9 +25,11 @@ import {
   parentIdentityGeneration,
   parentStateStillCurrent,
   parentUnlockActive,
+  settleChildSpaceScreenPrivacy,
 } from '../lib/mode.ts';
 import { parentAuth, portalUrl } from '../lib/parent-auth.ts';
 import { secureStorage } from '../lib/secure-storage.ts';
+import { loadStateForRun, type LoadState } from './family-view.ts';
 import { answerGate, gateLock, openGate, type GateState } from './parental-gate.ts';
 import { modeEffects, parentApi, signOutParentOnDevice } from './runtime.ts';
 import { lockParentArea } from './unlock.ts';
@@ -345,7 +347,9 @@ export function useParentAccess(): ParentAccess {
    * re-gate there replaces the confirmation the parent just earned with a sign-in prompt. So a
    * screen in view when the session ends keeps rendering until it is re-checked (its focus, or the
    * app returning to the foreground); what it can no longer do is serve that state to a different
-   * adult.
+   * adult. "No longer" starts at the re-check: the state the gate publishes then is fresh, and
+   * `useLoad` drops the rows the previous adult's client fetched BEFORE running the new load rather
+   * than when it answers (HUNT6-I-2), so the refetch is not a window in which they stay readable.
    */
   useFocusEffect(check);
   return access;
@@ -367,7 +371,12 @@ export function LockParentAreaButton() {
       accessibilityLabel="Lock the parent area on this device"
       onPress={() => {
         setBusy(true);
-        void lockParentAreaOnDevice(secureStorage, modeEffects).finally(() => setBusy(false));
+        void lockParentAreaOnDevice(secureStorage, modeEffects)
+          // The parent is holding the device, so on a paired tablet the child home is on screen as
+          // soon as the lock finishes: the screen-privacy change the lock deferred is due now
+          // (HUNT6-I-4). On a parent-only device nothing is owed and this does nothing.
+          .then(() => settleChildSpaceScreenPrivacy(modeEffects))
+          .finally(() => setBusy(false));
       }}
     />
   );
@@ -501,20 +510,52 @@ export function SignOutButton() {
   );
 }
 
-/** Load helper with explicit loading/error/ready states and a reload. */
+/**
+ * Load helper with explicit loading/error/ready states and a reload.
+ *
+ * The state has an owner: the `load` that produced it (HUNT6-I-2). A screen's load is
+ * `useCallback(…, [api])`, and the parent gate publishes a new client when the adult at the device
+ * changed, so a load this hook has not run is a load whose rows it cannot vouch for and it shows none
+ * — it used to keep them, which left the previous adult's children on a handed-on tablet for the
+ * length of the new adult's request. A manual `reload()` passes the same load, so pull-to-refresh and
+ * the post-edit reloads do not flash. The rule itself is in src/family/family-view.ts, where it is
+ * tested; this suite cannot render the hook (react-native).
+ *
+ * Dropping the rows before the new fetch is only half of it, and the HUNT6-I-2 prose claimed the
+ * whole: an ANSWER also has an owner. The previous adult's request is still in flight when the new
+ * load starts, and `await load()` resolves whenever the network does, so without the ticket below
+ * that answer published the previous adult's rows as 'ready' UNDER the new adult's client — the same
+ * privacy harm, through the door the identity check does not watch. Every run takes a ticket and only
+ * the current ticket may publish; an older run's answer, and its error, are dropped. A manual
+ * `reload()` takes a ticket too, so the newest reload wins and its rows are the ones on screen.
+ */
 export function useLoad<T>(load: (() => Promise<T>) | null) {
-  const [state, setState] = useState<
-    | { status: 'idle' }
-    | { status: 'loading' }
-    | { status: 'error'; error: unknown }
-    | { status: 'ready'; data: T }
-  >({ status: 'idle' });
+  const [state, setState] = useState<LoadState<T>>({ status: 'idle' });
+  /** The load the state on screen was produced by; null until this hook has run one. */
+  const producedBy = useRef<(() => Promise<T>) | null>(null);
+  /** The most recent run. Only the run holding this number may publish what it fetched. */
+  const latestRun = useRef(0);
   const run = useCallback(async () => {
     if (!load) return;
-    setState((s) => (s.status === 'ready' ? s : { status: 'loading' }));
+    // This run's ticket, taken before anything can be awaited.
+    latestRun.current += 1;
+    const ticket = latestRun.current;
+    // Captured into a local BEFORE the setter, and the new owner recorded before it too: a state
+    // updater runs during the NEXT render, so an updater that read `producedBy.current` would read
+    // what the line below wrote and compare `load` with itself — it would keep the previous adult's
+    // rows in the one case this exists for. That is the same mistake the parent gate's first
+    // HUNT5-H-1 fix made (see the check in src/family/screens-r2.review.test.ts).
+    const producer = producedBy.current;
+    producedBy.current = load;
+    setState((s) => loadStateForRun(s, producer, load));
     try {
-      setState({ status: 'ready', data: await load() });
+      const data = await load();
+      // A run that is no longer the latest has been superseded while its request was in flight, so
+      // its rows are not the ones this screen may show (see the ticket in this hook's doc above).
+      if (latestRun.current !== ticket) return;
+      setState({ status: 'ready', data });
     } catch (error) {
+      if (latestRun.current !== ticket) return;
       setState({ status: 'error', error });
     }
   }, [load]);

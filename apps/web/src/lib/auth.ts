@@ -71,9 +71,25 @@ export interface AccountAuth {
 export type SignOutScope = 'local' | 'global';
 
 /**
- * WEB-R4-AUTH-2: a sign-out the auth service did not carry out. This browser's stored session has
- * been removed, but the server was never told, so the session may still be usable elsewhere and the
- * parent has to be told rather than shown a signed-out screen.
+ * WEB-R4-AUTH-2: a sign-out the auth service did not carry out. The server was never told, so the
+ * session may still be usable, and the parent has to be told rather than shown a signed-out screen.
+ *
+ * HUNT6-F-3: this report is about the SERVER and nothing else. The adapter also makes a best-effort
+ * removal of this origin's stored session, but this value cannot carry what that removal achieved: it
+ * removes one localStorage key, swallows any throw, and in a browser with site data blocked there is
+ * no stored key to remove in the first place. So a caller that would tell the parent this computer is
+ * signed out must READ the session (`currentSession()`) rather than infer it from this value — the
+ * earlier wording ("this browser's stored session has been removed") was read as that guarantee by
+ * the account-closure flow and spent as user-facing copy.
+ *
+ * HUNT6-F-PREMISE: the reason given for that rule was itself wrong, and the wrong reason is how the
+ * next author argues the read away. It said supabase-js returns its error before dropping its own
+ * in-memory copy. The pinned @supabase/auth-js 2.116.0 has no in-memory copy — `getSession()` re-reads
+ * storage on every call — and on the /logout-failure path it removes the stored session BEFORE
+ * returning the error; only a failed pre-flight refresh is returned with the stored token still there.
+ * What stands is the narrow reading above: this value is about the server, whatever the library did
+ * with storage. App.signout.test.tsx's [HUNT6-F-PREMISE] cases run both paths against the real
+ * library, so the rule rests on the library's behaviour rather than on a sentence about it.
  */
 export interface SignOutRefused {
   readonly serverNotTold: true;
@@ -98,8 +114,9 @@ export interface AuthAdapter {
    *
    * WEB-R4-AUTH-2: resolves with a `SignOutRefused` report when the auth service did not end the
    * session, and with nothing when it did. A caller that would otherwise present a signed-out screen
-   * must read the report (and may re-check `currentSession()`): the stored refresh token may still be
-   * usable server-side. See the Supabase adapter's signOut.
+   * must read the report: the stored refresh token may still be usable server-side. It must also
+   * re-read `currentSession()` before saying this browser is signed out — no report here establishes
+   * that (HUNT6-F-3). See the Supabase adapter's signOut.
    */
   signOut(scope?: SignOutScope): Promise<SignOutReport>;
   /** Present when real sign-in is available. */

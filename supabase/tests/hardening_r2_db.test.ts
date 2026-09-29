@@ -1049,15 +1049,57 @@ describe("[HR4-0860-01] the append-only ledgers' identity sequences are not clie
     // supabase/tests/core_identity.test.ts does for its column-grant probe.
     const fam = await seedFamily(db, { childCount: 0 });
     const sequenceGrants = () => db.sql<{ grantee: string; privilege_type: string }[]>`
-      select pg_get_userbyid(a.grantee) as grantee, a.privilege_type
+      select case when a.grantee = 0 then 'PUBLIC' else pg_get_userbyid(a.grantee) end as grantee,
+             a.privilege_type
         from pg_class c, aclexplode(c.relacl) a
        where c.relkind = 'S' and c.relnamespace = 'public'::regnamespace
          and c.relname = 'audit_events_id_seq'
-         and pg_get_userbyid(a.grantee) in ('anon', 'authenticated', 'pl_child')
+         and (a.grantee = 0
+              or pg_get_userbyid(a.grantee) in ('anon', 'authenticated', 'pl_child'))
        order by grantee, a.privilege_type`;
+    // What each client role can actually DO with the sequence: has_sequence_privilege accounts for
+    // a privilege held through PUBLIC and through role membership, which no grantee list can.
+    const effectiveSequencePrivileges = () => db.sql<
+      { role: string; usage: boolean; update: boolean }[]
+    >`
+      select r.role,
+             has_sequence_privilege(r.role, 'public.audit_events_id_seq', 'USAGE') as usage,
+             has_sequence_privilege(r.role, 'public.audit_events_id_seq', 'UPDATE') as update
+        from (values ('anon'), ('authenticated'), ('pl_child')) as r(role)
+       order by r.role`;
+    const holdsNothing = [
+      { role: 'anon', usage: false, update: false },
+      { role: 'authenticated', usage: false, update: false },
+      { role: 'pl_child', usage: false, update: false },
+    ];
     // Premise of the case: the revoke really happened, so nothing below passes because the role
-    // still holds USAGE.
+    // still holds USAGE — stated as what `authenticated` can do, not only as the grants that name it.
     expect(await sequenceGrants()).toEqual([]);
+    expect(await effectiveSequencePrivileges()).toEqual(holdsNothing);
+
+    // And the premise can fail for the one grant shape that hands `authenticated` USAGE without
+    // naming it: planted, caught, revoked again. aclexplode reports a grant to PUBLIC with
+    // grantee = 0, and pg_get_userbyid(0) is the string 'unknown (OID=0)', so an IN-list of role
+    // names cannot match it — the blindness HUNT5-D-3 found in the sibling query in
+    // supabase/tests/schema_invariants.test.ts, which this premise had repeated. Migration 0910
+    // is what keeps the planted state from arising; this plant is what makes the premise able to
+    // notice if it ever did.
+    await db.sql`grant usage, update on sequence public.audit_events_id_seq to public`;
+    try {
+      expect(await sequenceGrants()).toEqual([
+        { grantee: 'PUBLIC', privilege_type: 'UPDATE' },
+        { grantee: 'PUBLIC', privilege_type: 'USAGE' },
+      ]);
+      expect(await effectiveSequencePrivileges()).toEqual([
+        { role: 'anon', usage: true, update: true },
+        { role: 'authenticated', usage: true, update: true },
+        { role: 'pl_child', usage: true, update: true },
+      ]);
+    } finally {
+      await db.sql`revoke usage, update on sequence public.audit_events_id_seq from public`;
+    }
+    expect(await sequenceGrants()).toEqual([]);
+    expect(await effectiveSequencePrivileges()).toEqual(holdsNothing);
     try {
       await db.sql`grant insert on public.audit_events to authenticated`;
       await db.sql`create policy hr4_0860_01_probe_insert on public.audit_events
@@ -1115,6 +1157,21 @@ describe('[HR4-0860-01] migration 0910 takes the sequence privileges of PUBLIC a
       .map((r) => r.acl)
       .filter((acl) => acl.startsWith('='));
 
+  /**
+   * Default privileges for new sequences held in the GLOBAL pg_default_acl row (defaclnamespace = 0)
+   * and granted to PUBLIC. A per-schema row and the global row are separate, and Postgres merges
+   * them, so this is the half 0910's per-schema statement cannot reach (migration 0940).
+   */
+  const globalSequenceDefaults = async (tx: Tx): Promise<string[]> =>
+    (
+      await tx<{ acl: string }[]>`
+        select unnest(d.defaclacl)::text as acl
+          from pg_default_acl d
+         where d.defaclnamespace = 0 and d.defaclobjtype = 'S'`
+    )
+      .map((r) => r.acl)
+      .filter((acl) => acl.startsWith('='));
+
   /** What each client role effectively holds — a PUBLIC grant is held by every role there is. */
   const effective = (tx: Tx, sequence: string) => tx<
     { role: string; usage: boolean; update: boolean }[]
@@ -1132,6 +1189,9 @@ describe('[HR4-0860-01] migration 0910 takes the sequence privileges of PUBLIC a
     // that default before this schema was deployed) hands `authenticated` back the UPDATE that
     // setval() needs, which is the whole of HR4-0860-01. 0910 closes it in both shapes 0870 uses:
     // the existing sequences and the schema default for new ones.
+    //
+    // The schema default this case plants and checks is the PER-SCHEMA one, which is the only
+    // spelling 0910 revokes; the GLOBAL spelling is migration 0940's and the case below it.
     //
     // Asserting today's state would prove nothing — no PUBLIC grant exists in this schema either
     // way, and schema_invariants.test.ts already carries that standing guard. What bites is
@@ -1231,36 +1291,261 @@ describe('[HR4-0860-01] migration 0910 takes the sequence privileges of PUBLIC a
     expect(probes!.n).toBe(0);
   });
 
+  it('0940 cancels the GLOBAL PUBLIC default on sequences, which 0910 cannot', async () => {
+    // Per-schema default privileges are merged ADDITIVELY onto the global ones (Postgres
+    // get_user_default_acl -> aclmerge), so `alter default privileges in schema public revoke ...`
+    // removes entries from the per-schema pg_default_acl row only: it cannot subtract a PUBLIC entry
+    // held in the GLOBAL row, whose defaclnamespace is 0. 0001_core_identity.sql:535-539 wrote that
+    // rule down for functions and spelled its PUBLIC revoke globally because of it; 0910:38 is
+    // per-schema only, so on a project carrying a global PUBLIC default every sequence created by a
+    // migration AFTER 0910 still handed `authenticated` the UPDATE that setval() needs (HUNT6-E-2).
+    // 0940 is the global spelling, beside the per-schema one rather than instead of it.
+    //
+    // Both migrations' own text is applied, in order, to a schema carrying the planted global
+    // default, in a transaction that is rolled back. After 0910 alone the sequence created next is
+    // still client-writable — that is the hole, and it is asserted, not assumed; after 0940 it is
+    // not. Delete 0940's statement and the last two expectations go red.
+    const text0910 = await readFile(
+      fileURLToPath(new URL(`../migrations/${MIGRATION}`, import.meta.url)),
+      'utf8',
+    );
+    const text0940 = await readFile(
+      fileURLToPath(
+        new URL('../migrations/0940_sequence_public_default_global.sql', import.meta.url),
+      ),
+      'utf8',
+    );
+
+    let observed:
+      | {
+          planted: string[];
+          after0910Defaults: string[];
+          after0910Sequence: { role: string; usage: boolean; update: boolean }[];
+          after0940Defaults: string[];
+          after0940Sequence: { role: string; usage: boolean; update: boolean }[];
+        }
+      | undefined;
+    const rollback = new Error('rollback');
+    try {
+      await db.sql.begin(async (tx) => {
+        // Premise: the deployed schema carries no global PUBLIC default for sequences, so what the
+        // assertions below see is the plant and the migrations, nothing inherited.
+        expect(await globalSequenceDefaults(tx)).toEqual([]);
+
+        await tx`alter default privileges grant all on sequences to public`;
+        const planted = await globalSequenceDefaults(tx);
+
+        await tx.unsafe(text0910);
+        await tx`create sequence public.hr6_e2_after_0910_seq`;
+        const after0910Defaults = await globalSequenceDefaults(tx);
+        const after0910Sequence = await effective(tx, 'public.hr6_e2_after_0910_seq');
+
+        await tx.unsafe(text0940);
+        await tx`create sequence public.hr6_e2_after_0940_seq`;
+        observed = {
+          planted,
+          after0910Defaults,
+          after0910Sequence,
+          after0940Defaults: await globalSequenceDefaults(tx),
+          after0940Sequence: await effective(tx, 'public.hr6_e2_after_0940_seq'),
+        };
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+
+    // The plant is a PUBLIC entry in the global row: `=rwU/owner`, all three sequence privileges.
+    expect(observed!.planted).toHaveLength(1);
+    expect(observed!.planted[0]).toMatch(/^=rwU\//);
+
+    // The hole 0940 exists for: 0910's per-schema revoke leaves the global row untouched, and the
+    // next sequence inherits it, so every client role holds USAGE and UPDATE on it.
+    expect(observed!.after0910Defaults).toHaveLength(1);
+    expect(observed!.after0910Defaults[0]).toMatch(/^=rwU\//);
+    expect(observed!.after0910Sequence).toEqual([
+      { role: 'anon', usage: true, update: true },
+      { role: 'authenticated', usage: true, update: true },
+      { role: 'pl_child', usage: true, update: true },
+    ]);
+
+    // And what 0940 does about it: the global PUBLIC entry is gone, so a sequence created after it
+    // carries nothing for a client role.
+    expect(observed!.after0940Defaults).toEqual([]);
+    expect(observed!.after0940Sequence).toEqual([
+      { role: 'anon', usage: false, update: false },
+      { role: 'authenticated', usage: false, update: false },
+      { role: 'pl_child', usage: false, update: false },
+    ]);
+
+    // The plant is gone with the transaction, and the probe sequences never existed outside it.
+    await db.sql.begin(async (tx) => {
+      expect(await globalSequenceDefaults(tx)).toEqual([]);
+    });
+    const [probes] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from pg_class
+       where relkind = 'S' and relnamespace = 'public'::regnamespace
+         and relname like 'hr6_e2_%'`;
+    expect(probes!.n).toBe(0);
+  });
+
+  it('a revoke by a role that is not the grantor leaves the PUBLIC grant in place, silently', async () => {
+    // The fact 0910's header states about its own first statement, as an observable rather than as
+    // prose (HUNT6-E-3). PostgreSQL REVOKE removes only privileges granted BY the executing role or
+    // by a role it is a member of. On hosted Supabase a migration runs as `postgres`, which is not a
+    // superuser there, so a PUBLIC grant whose grantor is a platform role survives
+    // `revoke all on all sequences in schema ... from public` — and the statement reports success
+    // with no error and no warning, so the file commits and the deploy looks clean while
+    // `authenticated` still holds, through PUBLIC, the UPDATE that setval() needs.
+    //
+    // The harness connects as a cluster superuser, which can revoke anything, so this cannot be shown
+    // on public.* through db.sql: the fixture builds the three roles the situation needs — an owner
+    // (the role a migration acts as), a separate grantor holding GRANT OPTION, and PUBLIC as the
+    // grantee — in a scratch schema, and runs 0910:34's statement shape as the OWNER. Roles, schema
+    // and sequence are all created inside a transaction that is rolled back, so nothing outlives the
+    // case. Run the revoke as the grantor instead (or reset to the superuser first) and the grant is
+    // gone and this case is red: grantor identity is the whole of what it pins.
+    const owner = `${db.name}_hr6e3_owner`;
+    const grantor = `${db.name}_hr6e3_grantor`;
+    const probeAcl = async (tx: Tx): Promise<string> => {
+      const [row] = await tx<{ acl: string }[]>`
+        select coalesce(c.relacl::text, '') as acl
+          from pg_class c
+         where c.relkind = 'S' and c.relnamespace = 'hr6_e3'::regnamespace
+           and c.relname = 'probe'`;
+      return row!.acl;
+    };
+
+    let observed: { granted: string; afterOwnerRevoke: string; authUpdate: boolean } | undefined;
+    const rollback = new Error('rollback');
+    try {
+      await db.sql.begin(async (tx) => {
+        await tx.unsafe(`create role ${owner} nosuperuser nologin`);
+        await tx.unsafe(`create role ${grantor} nosuperuser nologin`);
+        await tx.unsafe(`create schema hr6_e3 authorization ${owner}`);
+        await tx.unsafe(`grant usage on schema hr6_e3 to ${grantor}`);
+
+        await tx.unsafe(`set local role ${owner}`);
+        await tx`create sequence hr6_e3.probe`;
+        await tx.unsafe(`grant all on sequence hr6_e3.probe to ${grantor} with grant option`);
+        await tx.unsafe('reset role');
+
+        // The grant this migration cannot take back: made by a role the migration role is not a
+        // member of, and given to PUBLIC.
+        await tx.unsafe(`set local role ${grantor}`);
+        await tx`grant usage, update on sequence hr6_e3.probe to public`;
+        await tx.unsafe('reset role');
+
+        await tx.unsafe(`set local role ${owner}`);
+        const granted = await probeAcl(tx);
+        await tx`revoke all on all sequences in schema hr6_e3 from public`;
+        const afterOwnerRevoke = await probeAcl(tx);
+        await tx.unsafe('reset role');
+
+        const [eff] = await tx<{ ok: boolean }[]>`
+          select has_sequence_privilege('authenticated', 'hr6_e3.probe', 'UPDATE') as ok`;
+        observed = { granted, afterOwnerRevoke, authUpdate: eff!.ok };
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+
+    // The planted grant is the bare-grantee form with the other role as grantor: `=wU/<grantor>`.
+    expect(observed!.granted).toContain(`=wU/${grantor}`);
+    // And the revoke changed the ACL not at all — no error was raised either, or the transaction
+    // would have thrown instead of reaching here.
+    expect(observed!.afterOwnerRevoke).toBe(observed!.granted);
+    // So `authenticated` still holds, through PUBLIC, the one privilege setval() needs.
+    expect(observed!.authUpdate).toBe(true);
+
+    // The roles and the schema went with the rolled-back transaction.
+    const [left] = await db.sql<{ n: number }[]>`
+      select count(*)::int as n from pg_roles where rolname in (${owner}, ${grantor})`;
+    expect(left!.n).toBe(0);
+    expect(
+      await db.sql<
+        { nspname: string }[]
+      >`select nspname from pg_namespace where nspname = 'hr6_e3'`,
+    ).toEqual([]);
+  });
+
   it('is idempotent, and 0870 is left exactly as it was', async () => {
     // Re-applying 0910 on a schema it has already been applied to changes nothing, so a re-run of
     // the migration set is safe. 0870 is another round's file and this item does not touch it: its
     // three named roles stay named there, and 0910 is additive.
+    //
+    // Both of 0910's statements are covered here, and both of 0870's. Snapshotting pg_default_acl
+    // alone watched only the object the SECOND statement touches, leaving the statement that does
+    // the revoking — 0910:34, over the relacl of every sequence in public — unasserted; and one
+    // `toContain` over 0870:44 left 0870:49 unpinned, so deleting it kept this case green while its
+    // name said otherwise (HUNT6-E-5).
     const text = await readFile(
       fileURLToPath(new URL(`../migrations/${MIGRATION}`, import.meta.url)),
       'utf8',
     );
-    const before = await db.sql<{ acl: string | null }[]>`
-      select unnest(d.defaclacl)::text as acl
-        from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
-       where n.nspname = 'public' and d.defaclobjtype = 'S'
-       order by acl`;
+    interface SequenceState {
+      acl: { relname: string; acl: string }[];
+      defaults: string[];
+    }
+    /** Everything 0910's two statements can change: sequence ACLs, then the per-schema default. */
+    const sequenceState = async (tx: Tx): Promise<SequenceState> => ({
+      acl: (
+        await tx<{ relname: string; acl: string }[]>`
+          select c.relname, coalesce(c.relacl::text, '') as acl
+            from pg_class c
+           where c.relkind = 'S' and c.relnamespace = 'public'::regnamespace
+           order by c.relname`
+      ).map((r) => ({ relname: r.relname, acl: r.acl })),
+      defaults: (
+        await tx<{ acl: string }[]>`
+          select unnest(d.defaclacl)::text as acl
+            from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+           where n.nspname = 'public' and d.defaclobjtype = 'S'
+           order by acl`
+      ).map((r) => r.acl),
+    });
+
+    // (a) On the deployed schema, where both statements have already run: applying the file again
+    // changes neither the sequence ACLs nor the schema default.
+    const before = await db.sql.begin((tx) => sequenceState(tx));
     await db.sql.begin(async (tx) => {
       await tx.unsafe(text);
     });
-    expect(
-      await db.sql<{ acl: string | null }[]>`
-        select unnest(d.defaclacl)::text as acl
-          from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
-         where n.nspname = 'public' and d.defaclobjtype = 'S'
-         order by acl`,
-    ).toEqual(before);
+    expect(await db.sql.begin((tx) => sequenceState(tx))).toEqual(before);
 
+    // (b) And on a schema where the statements DO something — the state the migration was written
+    // for: one application and two leave the same state, and it is the state that holds nothing for
+    // PUBLIC. A PUBLIC entry in a relacl is the bare-grantee form, '{=rwU/owner,...}'. Rolled back.
+    let twice: { first: SequenceState; second: SequenceState } | undefined;
+    const rollback = new Error('rollback');
+    try {
+      await db.sql.begin(async (tx) => {
+        await tx`grant all on all sequences in schema public to public`;
+        await tx`alter default privileges in schema public grant all on sequences to public`;
+        await tx.unsafe(text);
+        const first = await sequenceState(tx);
+        await tx.unsafe(text);
+        twice = { first, second: await sequenceState(tx) };
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+    expect(twice!.second).toEqual(twice!.first);
+    expect(twice!.first.acl.filter((r) => /[{,]=/.test(r.acl))).toEqual([]);
+    expect(twice!.first.defaults.filter((acl) => acl.startsWith('='))).toEqual([]);
+
+    // (c) 0870's two statements, the shapes 0910:26-27 says it mirrors, both pinned.
     const text0870 = await readFile(
       fileURLToPath(new URL('../migrations/0870_hardening_r4_db.sql', import.meta.url)),
       'utf8',
     );
     expect(text0870).toContain(
       'revoke all on all sequences in schema public from anon, authenticated, pl_child;',
+    );
+    expect(text0870).toContain(
+      'alter default privileges in schema public revoke all on sequences from anon, authenticated;',
     );
   });
 });
