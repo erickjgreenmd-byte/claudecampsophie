@@ -1,0 +1,281 @@
+{
+ "round": 6,
+ "base": "8201fa1",
+ "hunt_head": "b802686",
+ "hunt_run": "wf_69a04f5f-f6d",
+ "findings_file": "docs/hardening/round6-hunt-findings.json",
+ "headline_decision": "The BUG-244 child-refresh recovery is REMOVED, not repaired (HUNT6-A-1). It produced four findings in two days and its recorded residual understated the exposure: a captured request body inside the window is served repeatedly, each serving yielding a full rotating refresh token, so the real exposure is a self-renewing child session until the tablet's next refresh. BUG-244 returns to an accepted, documented open defect and owner action #45 is restored.",
+ "note": "Lead decisions taken BEFORE the fixers ran. Area file lists are disjoint and their union covers every file the FIXES need, computed from the finders' own fix_touches — lesson L-052 applied at planning time rather than discovered mid-round. Migration numbers are the lead's: 0920/0930 to R6-B, 0940 to R6-E, and 0880 is DELETED by R6-A. scripts/test-minimums.json is the lead's alone.",
+ "process_change": "Two failure shapes recurred through rounds 4, 5 and 6, and every fixer and checker must test for them BY NAME: (1) a guard that establishes a fact ADJACENT to the one its comment claims — so for each fix, state its premise in one sentence and say what observable fact establishes it; (2) a test that pins the SHAPE of a fix (a source grep, an object literal the test built, a wait on an assertion that cannot fail) rather than the property it exists for — so every test must be shown to go red when the fix is removed.",
+ "global_rules": [
+  "Reproduce first: a test that FAILS for the stated reason before any production change. Paste the failure.",
+  "Never weaken a test, an RLS policy, a consent/ZDR gate or a verification step to get a pass.",
+  "Approved prices ($39.99 first child + $9.99 each additional, 1-4 paid slots) and the six subjects are settled.",
+  "Money is integer cents; time is UTC instants plus IANA zones; domain code takes `now` as input.",
+  "JSON into Postgres is ${JSON.stringify(x)}::text::jsonb or tx.json(x), never a bare ::jsonb (L-006).",
+  "Mobile token sources come only from apps/mobile/src/lib/app-session.ts (L-007).",
+  "Do NOT touch a file outside your list, do not edit anything under docs/ or scripts/test-minimums.json, no repo-wide formatters, no git command that changes state.",
+  "State, for each fix, the one-line mutation that turns your test red again."
+ ],
+ "areas": {
+  "R6-A-child-refresh-REVERSAL": {
+   "findings": [
+    "HUNT6-A-1",
+    "HUNT6-A-2",
+    "HUNT6-A-4"
+   ],
+   "files": [
+    "apps/api/src/routes/child-auth.ts",
+    "apps/api/tests/mobile-r2.review.test.ts",
+    "apps/api/tests/auth.test.ts",
+    "packages/contracts/src/auth.ts",
+    "supabase/migrations/0880_child_refresh_idempotency.sql",
+    "supabase/tests/hardening_r1_db2.test.ts"
+   ],
+   "note": "You own the SERVER half of the reversal and the contract. The mobile half belongs to R6-H-mobile, which carries the same decision; do not touch apps/mobile.",
+   "lead_decisions": {
+    "HUNT6-A-1": "CONFIRMED, and the lead's decision is NOT another repair: REMOVE the BUG-244 recovery entirely and restore the pre-BUG-244 behaviour, where any presentation of a rotated child refresh token revokes the session. Reasoning, so it is auditable: the recovery's justification was that its exposure was tightly bounded, and this finding shows it is not. A recovery never marks the row it recovered, so the same captured request body is served repeatedly for the whole window, and EACH serving returns a full-lifetime rotating refresh token that then rotates down the ordinary path with no id, no window and no audit row. The two-minute bound limits when the attack can START, not how long it lasts: a captured body buys a self-renewing child session until the real tablet's next refresh, which for a tablet put away is overnight. Against that, the feature only avoids an occasional unpairing a parent can fix by minting a new pairing code. Child privacy is on the never-weaken list, and a logged request body is the realistic capture vector because logs are read later; before BUG-244 such a body was worthless. Four findings in two days against one feature (BUG-248, BUG-249, BUG-286, this) is the feature telling us something. Concretely: delete the recovery branch and RECOVERY_WINDOW_MS from child-auth.ts; delete the audit event it wrote; remove refreshRequestId from the contract; DELETE migration 0880 and its assertions in supabase/tests/hardening_r1_db2.test.ts (the column has never existed in any deployed database, since every Supabase owner action is still open, so an add-then-drop pair would make the schema history describe a feature no running database ever had) and say so in your report; keep and strengthen the tests that pin reuse -> revoke.",
+    "HUNT6-A-2": "SUPERSEDED by the A-1 reversal: with no recovery there is no recovery audit row. Delete it with the branch. Do NOT build the ops surface this finding contemplates.",
+    "HUNT6-A-4": "CONFIRMED. Fix the stale citation so it names the case that actually pins the rule."
+   }
+  },
+  "R6-B-privacy-deletion": {
+   "findings": [
+    "HUNT6-B-1",
+    "HUNT6-B-2",
+    "HUNT6-B-3",
+    "HUNT6-B-4",
+    "HUNT6-B-5",
+    "HUNT6-B-6"
+   ],
+   "files": [
+    "apps/api/src/routes/privacy.ts",
+    "apps/api/src/routes/family.ts",
+    "apps/api/tests/privacy-r2.review.test.ts",
+    "apps/api/tests/family-hardening-r4.review.test.ts",
+    "supabase/migrations/0890_deletion_slot_release.sql",
+    "supabase/migrations/0920_deletion_export_withdraw.sql",
+    "supabase/migrations/0930_deletion_lock_order.sql",
+    "supabase/tests/hardening_r5_db.test.ts"
+   ],
+   "migrations": "0920 and 0930 are reserved for you; add no others.",
+   "lead_decisions": {
+    "HUNT6-B-1": "CONFIRMED. Take the suggested fix: for each drainable kind union the oldest-first drain window with a newest-first window of the SAME size, so the total stays bounded at two pages per kind and nothing unresolved is absent unless that kind has more than 400 open rows. Rewrite the two places that currently over-claim.",
+    "HUNT6-B-2": "CONFIRMED, and it is the same class as BUG-240 and as 0890 itself: an effect living only in the Hono handler while `authenticated` can call the function directly. Migration 0920 is yours: move the export withdrawal into public.request_deletion beside the slot release. Keep the handler statement as an idempotent belt-and-braces. Prove the database half in supabase/tests/hardening_r5_db.test.ts by calling the function as the client role.",
+    "HUNT6-B-3": "CONFIRMED. Migration 0930 is yours: align 0890's lock order with the archive route's so the two cannot deadlock. State in the migration which order is canonical and why.",
+    "HUNT6-B-4": "CONFIRMED. Do not strip SQLSTATEs the app deliberately distinguishes; keep the transient codes visible so a retryable failure stays retryable.",
+    "HUNT6-B-5": "CONFIRMED. An assertion over an object literal the test itself built cannot fail (L-054). Assert against what the code produces.",
+    "HUNT6-B-6": "CONFIRMED. Make the premise test pin the claim in its name, or rename it to what it pins. State the mutation that turns your version red."
+   }
+  },
+  "R6-C-money": {
+   "findings": [
+    "HUNT6-C-1",
+    "HUNT6-C-2",
+    "HUNT6-C-3",
+    "HUNT6-C-4"
+   ],
+   "files": [
+    "apps/api/src/services/billing-sync.ts",
+    "apps/api/src/services/ops-metrics.ts",
+    "apps/api/src/routes/webhooks.ts",
+    "apps/api/tests/billing-r2.review.test.ts",
+    "apps/api/tests/billing-hardening.review.test.ts",
+    "supabase/tests/billing_tax.test.ts"
+   ],
+   "lead_decisions": {
+    "HUNT6-C-1": "CONFIRMED, and this is money a family paid that no month counts. Take the suggested fix: compute the pending proration NET and, when positive, record a SECOND period of kind 'proration' for it, so the collected money appears exactly once. L-053 decides it — the note, the definition, the SQL comment and the test all say it is counted; the code is what is wrong.",
+    "HUNT6-C-2": "CONFIRMED, and fix it together with C-3 by the shared remedy both name: replace applyRefund's providerChargeTotalCents-presence inference with an explicit amountIsTaxInclusive argument threaded from every call site (true for every Stripe Charge and Dispute figure, false for the RevenueCat path). A chargeback and its reversal must be in the same unit as the refund they adjust; integer cents throughout.",
+    "HUNT6-C-3": "CONFIRMED, same remedy as C-2. The parked-refund replay converts too, because the tax it needs is in the row just inserted in the same transaction. Delete the docstring's obsolete justification.",
+    "HUNT6-C-4": "CONFIRMED as a prose defect: the comment says the same-tax-rate assumption 'is recorded as an open item' and it is recorded nowhere. Say plainly in the comment that it is not tracked, and state the exact condition under which it bites. The lead records it in the ledger; you make the comment true."
+   }
+  },
+  "R6-D-ai-cost": {
+   "findings": [
+    "HUNT6-D-1",
+    "HUNT6-D-2",
+    "HUNT6-D-3",
+    "HUNT6-D-4",
+    "HUNT6-D-5",
+    "HUNT6-D-6"
+   ],
+   "files": [
+    "packages/ai/src/routing.ts",
+    "packages/ai/src/run.ts",
+    "packages/ai/src/run-truncation.test.ts",
+    "packages/ai/src/run-metering.test.ts",
+    "apps/api/tests/jobs-r2.review.test.ts",
+    "apps/api/src/jobs/dispatcher.ts",
+    "apps/api/src/jobs/scan-process.ts"
+   ],
+   "lead_decisions": {
+    "HUNT6-D-1": "CONFIRMED, and the lead RAISES the four sibling caps rather than leaving four stages promising a retry they cannot afford — the same reasoning already accepted for extraction and grading in BUG-252, and consistency matters more than my comfort with the number. Add the checked helper the finding proposes (fullRaiseCeiling(stage) from the stage's own rates, floor input and output budget), raise coaching, daily_set, thursday_bundle and followup to it, and add a test asserting EVERY stage's cap affords the full raise, so a new stage cannot be added below the line. These caps are guardrails, not spend: holds settle to actual usage, so the raise costs nothing on a call that succeeds and the exposure is a family near their monthly ceiling being asked to wait. REPORT the new per-stage numbers and the new worst-case hold for the lead to record in docs/Cost_Analysis.md; do not edit docs/.",
+    "HUNT6-D-2": "CONFIRMED. Rewrite all three places, not one, so the promise is stated the same way everywhere.",
+    "HUNT6-D-3": "CONFIRMED. The example contradicts the rule it illustrates; fix the comment.",
+    "HUNT6-D-4": "CONFIRMED. Make the claim true or drop it.",
+    "HUNT6-D-5": "CONFIRMED. Name the right figure, and drop the claim the figure does not support.",
+    "HUNT6-D-6": "CONFIRMED. A guard that checks the test source rather than the input the caller builds pins nothing (L-054). Assert on the input."
+   }
+  },
+  "R6-E-database": {
+   "findings": [
+    "HUNT6-E-1",
+    "HUNT6-E-2",
+    "HUNT6-E-3",
+    "HUNT6-E-4",
+    "HUNT6-E-5"
+   ],
+   "files": [
+    "supabase/migrations/0910_sequence_public_revoke.sql",
+    "supabase/migrations/0940_sequence_public_default_global.sql",
+    "supabase/tests/schema_invariants.test.ts",
+    "supabase/tests/hardening_r2_db.test.ts"
+   ],
+   "migrations": "0940 is reserved for you; add no others, and edit no migration but 0910.",
+   "lead_decisions": {
+    "HUNT6-E-1": "CONFIRMED, and it is this round's own blind spot repeating: a premise assertion blind to PUBLIC, in the case added to close exactly that. Fix it and state the mutation.",
+    "HUNT6-E-2": "CONFIRMED. Migration 0940 is yours: add the GLOBAL `alter default privileges revoke all on sequences from public;` beside the per-schema one, exactly as 0001 already does for functions, and correct 0910's prose to say which form cancels which. Then close the CI hole in BOTH default-privileges invariants so a global row is matched too.",
+    "HUNT6-E-3": "CONFIRMED. The migration claims more than the statement does; say what it does.",
+    "HUNT6-E-4": "CONFIRMED. Either add the plant that pins the arm or stop claiming no arm can be dropped (L-054).",
+    "HUNT6-E-5": "CONFIRMED. Make the case pin both facts, or make 0910 name what it really pins."
+   }
+  },
+  "R6-F-web-auth": {
+   "findings": [
+    "HUNT6-F-1",
+    "HUNT6-F-2",
+    "HUNT6-F-3",
+    "HUNT6-G-1",
+    "HUNT6-G-6",
+    "HUNT6-G-7"
+   ],
+   "files": [
+    "apps/web/src/lib/supabase-auth.ts",
+    "apps/web/src/lib/auth.ts",
+    "apps/web/src/components/SignOutControl.tsx",
+    "apps/web/src/App.signout.test.tsx",
+    "apps/web/src/pages/app/PrivacyControlsPage.tsx",
+    "apps/web/src/pages/app/PrivacyControlsPage.test.tsx",
+    "apps/web/src/pages/public/AccountDeletionPage.tsx",
+    "apps/web/src/pages/app/PinResetPage.race.test.tsx",
+    "apps/web/src/pages/admin/MfaPage.test.tsx",
+    "packages/contracts/src/account.ts"
+   ],
+   "lead_decisions": {
+    "HUNT6-F-1": "CONFIRMED. Advice a parent cannot act on is worse than none: a phone sign-out cannot end a session the server was never told about. Say what actually helps — change the password — and keep it short enough to read in the moment.",
+    "HUNT6-F-2": "CONFIRMED. Guard the field that carries the answer, not the wrapper around it.",
+    "HUNT6-F-3": "CONFIRMED, and it is the adapter half of G-1: do not report serverNotTold as if this origin's session were provably gone unless it is. Make the adapter establish the fact or stop implying it.",
+    "HUNT6-G-1": "CONFIRMED, HIGH, and the most serious finding in this area: the fix gates the session re-read on `unverified`, which only the catch sets, while the real adapter RESOLVES with the refusal — so the re-read never runs and the public page asserts 'This computer is signed out' over a session still readable in that tab. Drop the `unverified &&` guard so both refusal paths re-read, exactly as SignOutControl does; delete the paragraph arguing the in-memory copy can be ignored, because that copy is the fact the sentence is about; navigate with { replace: true }. The three tests that supply a live session and assert the page says it are locking the wrong behaviour IN — rewrite them to assert the opposite, and say in your report which assertions you inverted.",
+    "HUNT6-G-6": "CONFIRMED, and it is F-1 on the public page: give advice that can be followed there.",
+    "HUNT6-G-7": "CONFIRMED. The comment describes a mechanism the same fix removed."
+   }
+  },
+  "R6-G-web-pages": {
+   "findings": [
+    "HUNT6-G-2",
+    "HUNT6-G-3",
+    "HUNT6-G-4",
+    "HUNT6-G-5",
+    "HUNT6-G-8",
+    "HUNT6-H-1",
+    "HUNT6-H-2",
+    "HUNT6-H-3",
+    "HUNT6-H-4"
+   ],
+   "files": [
+    "apps/web/src/pages/app/ChildrenPage.tsx",
+    "apps/web/src/pages/app/ChildrenPage.archive.test.tsx",
+    "apps/web/src/pages/app/ChildrenPage.profile.test.tsx",
+    "apps/web/src/pages/app/FamilyDashboardPage.tsx",
+    "apps/web/src/pages/app/FamilyDashboardPage.save.test.tsx",
+    "apps/web/src/pages/app/LearningPlannerPage.tsx",
+    "apps/web/src/pages/app/HomeworkPage.tsx",
+    "apps/web/src/pages/app/HomeworkPage.test.tsx",
+    "apps/web/src/pages/app/RewardsPage.tsx",
+    "apps/web/src/pages/app/RewardsPage.test.tsx",
+    "apps/web/src/pages/app/ArchivedChildCopy.test.tsx",
+    "apps/web/src/components/learning/SubjectsSection.tsx",
+    "apps/web/src/components/learning/ScheduleSection.tsx",
+    "apps/web/src/components/learning/TestDatesSection.tsx",
+    "apps/web/src/components/learning/StudyMaterialSection.tsx",
+    "apps/web/src/components/learning/PracticeSetsSection.tsx",
+    "apps/web/src/components/learning/ArchivedChildSections.test.tsx",
+    "packages/contracts/src/privacy.ts"
+   ],
+   "lead_decisions": {
+    "HUNT6-G-2": "CONFIRMED. One helper decides the sentence for every surface (L-037): give childStatusLabel the deletionPending branch, and sweep the other printers the finding names — RewardsPage and the mobile family view — in the same pass. A parent must never read 'history only' about history that is being deleted.",
+    "HUNT6-G-3": "CONFIRMED. Synchronising on an assertion that cannot fail lets the test pass before the thing it tests has happened (L-054). Synchronise on the observable change.",
+    "HUNT6-G-4": "CONFIRMED, same shape as G-3.",
+    "HUNT6-G-5": "CONFIRMED. Guard the archive confirmation on status too; one status change closes every open control on the card.",
+    "HUNT6-G-8": "CONFIRMED. A Save disabled for a value the parent can see and did not change is a dead end; re-enable it or say why it is off.",
+    "HUNT6-H-1": "CONFIRMED. Thread the child's status into the four editing sections as this round already did for practice sets, and render them read-only for an ARCHIVED child while keeping the stored values visible. Keep DRAFT editable — the API keeps a draft writable on purpose. The mobile planner has the identical unguarded PATCH; it belongs to R6-H-mobile, which has it in its brief.",
+    "HUNT6-H-2": "CONFIRMED. Give explainStatus the child's status and stop telling a parent to rescan for a child whose rescan the API refuses. Keep the new copy in the contract beside the two strings added last round so both clients say the same thing.",
+    "HUNT6-H-3": "CONFIRMED. The docstring and the inline comment both describe a branch the code does not take.",
+    "HUNT6-H-4": "CONFIRMED. A draft child that never had a slot is not 'doesn't have a paid slot YET' once the family has none to give; say what is true."
+   }
+  },
+  "R6-H-mobile": {
+   "findings": [
+    "HUNT6-A-3",
+    "HUNT6-A-5",
+    "HUNT6-I-1",
+    "HUNT6-I-2",
+    "HUNT6-I-3",
+    "HUNT6-I-4",
+    "HUNT6-J-1",
+    "HUNT6-J-2",
+    "HUNT6-J-3",
+    "HUNT6-J-4",
+    "HUNT6-J-5",
+    "HUNT6-J-6",
+    "HUNT6-J-7"
+   ],
+   "files": [
+    "apps/mobile/src/family/child-session.ts",
+    "apps/mobile/src/family/child-session.test.ts",
+    "apps/mobile/src/family/child-session-r2.review.test.ts",
+    "apps/mobile/src/family/runtime.ts",
+    "apps/mobile/src/family/ui.tsx",
+    "apps/mobile/src/family/family-view.ts",
+    "apps/mobile/src/family/family-view.test.ts",
+    "apps/mobile/src/family/screens-r2.review.test.ts",
+    "apps/mobile/src/family/screens.test.ts",
+    "apps/mobile/src/family/children-screen.test.ts",
+    "apps/mobile/src/lib/mode.ts",
+    "apps/mobile/src/lib/mode.test.ts",
+    "apps/mobile/src/lib/mode-r2.review.test.ts",
+    "apps/mobile/src/lib/app-session.ts",
+    "apps/mobile/src/lib/app-session.test.ts",
+    "apps/mobile/src/lib/parent-auth.ts",
+    "apps/mobile/src/lib/parent-auth.test.ts",
+    "apps/mobile/src/privacy/parent-privacy.ts",
+    "apps/mobile/src/privacy/parent-privacy.test.ts",
+    "apps/mobile/src/homework/upload.ts",
+    "apps/mobile/src/homework/upload.test.ts",
+    "apps/mobile/src/homework/scan-screen.test.ts",
+    "apps/mobile/app/(parent)/privacy.tsx",
+    "apps/mobile/app/(parent)/children.tsx",
+    "apps/mobile/app/(parent)/planner.tsx",
+    "apps/mobile/app/(parent)/rewards.tsx",
+    "apps/mobile/app/(child)/scan.tsx",
+    "apps/mobile/app/(child)/home.tsx"
+   ],
+   "note": "You own the MOBILE half of the BUG-244 reversal (HUNT6-A-1, whose full decision is in R6-A's brief): remove the request-id machinery — the per-refresh id, its secure-storage key, its parser and its mint/clear plumbing — so the device simply presents its stored refresh token, as before BUG-244. HUNT6-A-3 and HUNT6-A-5 are closed by that removal. Also yours: the mobile planner's unguarded subject PATCH that HUNT6-H-1 names on the web side.",
+   "lead_decisions": {
+    "HUNT6-A-3": "CLOSED BY THE A-1 REVERSAL, on the mobile side (R6-H-mobile owns it): the comment is untrue because the mechanism it describes is being removed. No separate fix.",
+    "HUNT6-A-5": "CLOSED BY THE A-1 REVERSAL (R6-H-mobile owns it): the stored-request parser and its guard go with the request-id machinery, so the case that could not reach the guard goes too. If any part of the parser survives your removal, the missing fixture must be added rather than left.",
+    "HUNT6-I-1": "CONFIRMED, HIGH. The identity fix rests on a premise about the screens — 'they key their load on the client' — and the Practice planner does not, so publishing fresh state changes nothing there and the next adult keeps the previous family's children, subjects and schedule. Key the planner's loads on the client, AND add the assertion that was missing: a source-level check over every parent screen that its loader invalidates on the client, so the next screen added cannot opt out silently. This is L-037 in its purest form — verified on one surface, assumed for the rest.",
+    "HUNT6-I-2": "CONFIRMED. useLoad preserves a ready state across a load-identity change, so the previous adult's rows stay on screen for up to the request timeout. Make the state's owner explicit inside useLoad: when `load` changes identity, drop to loading; a manual reload keeps today's no-flash behaviour because its identity is unchanged.",
+    "HUNT6-I-3": "CONFIRMED. Do not tell the family's other adult that THEY asked for the deletion.",
+    "HUNT6-I-4": "CONFIRMED. A background lock must not switch adult screen privacy OFF; that is the state the next adult depends on.",
+    "HUNT6-J-1": "CONFIRMED, and it is the lead's own hand-written fix from the same day, inert: every step that could leave the device signed in swallows its failure, so the flag means 'no keychain write threw'. Make the sign-out REPORT what it did — have parent-auth return supabase's {error} instead of dropping it, propagate it through the mode helper instead of .catch(() => undefined), and return the outcomes of the two best-effort clears — keeping the 'nothing may stop the sign-out' behaviour and only stopping the hiding. Then replace the source-grep test with one that runs the helper: a test that greps for a ternary passes whatever the helper hides (L-054).",
+    "HUNT6-J-2": "CONFIRMED. Keep the screen busy across the whole operation so a second 'Delete my account' cannot be pressed into a live window of up to three network calls, and so the parent gets immediate acknowledgement.",
+    "HUNT6-J-3": "CONFIRMED. Do not tell a parent to change a password that no longer exists.",
+    "HUNT6-J-4": "CONFIRMED, and it is the same premise error as the cancel fix: a missing local attempt is not proof the server has nothing. Say what is known.",
+    "HUNT6-J-5": "CONFIRMED. Restore the JSDoc to the function it documents.",
+    "HUNT6-J-6": "CONFIRMED. The state's own doc repeats the claim the fix removed from the screen.",
+    "HUNT6-J-7": "CONFIRMED. Delete the dead catch, or make it reachable; dead error handling reads as live to the next author."
+   }
+  }
+ }
+}
