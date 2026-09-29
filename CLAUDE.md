@@ -43,4 +43,5 @@ Spec: `PencilLift_Claude_Code_Master_Prompt.md` **Revision 8** (authoritative, p
 `docs/ECC_Capabilities.md` · `docs/ECC_Runs.md` · `docs/Connections.md` · `docs/Owner_Actions.md` ·
 `docs/Test_Evidence.md` · `docs/Cost_Analysis.md` · `docs/Threat_Model.md` ·
 `docs/Deployment_Runbook.md` · `docs/Release_Readiness.md` · `docs/Provider_Capability_Matrix.md` ·
-`docs/Beta_Readiness.md`
+`docs/Beta_Readiness.md` ·
+`docs/design/Consent_Design.md` · `docs/design/Stitch_Brief.md`
