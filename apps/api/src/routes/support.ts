@@ -20,6 +20,7 @@ import {
 import { readJson } from '../app.ts';
 import type { Tx } from '../db.ts';
 import { loadSupportPolicy } from '../services/ops-metrics.ts';
+import { PRORATION_PERIOD_SUFFIX } from '../services/billing-sync.ts';
 import { ApiError, businessRule } from '../errors.ts';
 import { currentFamilyId, requireParent } from '../middleware/auth.ts';
 import type { AppEnv } from '../middleware/context.ts';
@@ -46,6 +47,8 @@ interface PeriodRow {
   period_id: string | null;
   channel: SupportBillingPeriod['channel'] | null;
   provider_period_id: string | null;
+  /** Aliased: `kind` on a case row is the CASE's kind, and CaseRow extends this one. */
+  period_kind: SupportBillingPeriod['kind'] | null;
   period_start: Date | null;
   period_end: Date | null;
   paid_slots: number | null;
@@ -72,6 +75,7 @@ function periodBody(r: PeriodRow): SupportBillingPeriod | null {
     r.period_id === null ||
     r.channel === null ||
     r.provider_period_id === null ||
+    r.period_kind === null ||
     r.period_start === null ||
     r.period_end === null ||
     r.paid_slots === null ||
@@ -85,6 +89,12 @@ function periodBody(r: PeriodRow): SupportBillingPeriod | null {
     id: r.period_id,
     channel: r.channel,
     providerPeriodId: r.provider_period_id,
+    kind: r.period_kind,
+    // Derived rows are the ones billing-sync synthesised from another invoice's line, and it marks
+    // them with PRORATION_PERIOD_SUFFIX when it does. Reported here so no client parses the id.
+    derivedFromProviderPeriodId: r.provider_period_id.endsWith(PRORATION_PERIOD_SUFFIX)
+      ? r.provider_period_id.slice(0, -PRORATION_PERIOD_SUFFIX.length)
+      : null,
     periodStart: r.period_start.toISOString(),
     periodEnd: r.period_end.toISOString(),
     paidSlots: r.paid_slots,
@@ -116,8 +126,8 @@ async function loadCases(tx: Tx, familyId: string, id?: string): Promise<CaseRow
   return tx<CaseRow[]>`
     select c.id, c.kind, c.status, c.subject, c.body, c.resolution, c.created_at, c.updated_at, c.resolved_at,
            (select count(*)::int from public.support_case_messages m where m.case_id = c.id) as message_count,
-           p.id as period_id, p.channel, p.provider_period_id, p.period_start, p.period_end, p.paid_slots,
-           p.charged_amount_cents, p.refunded_cents, p.settlement
+           p.id as period_id, p.channel, p.provider_period_id, p.kind as period_kind, p.period_start,
+           p.period_end, p.paid_slots, p.charged_amount_cents, p.refunded_cents, p.settlement
       from public.support_cases c
       left join public.billing_periods p
         on p.channel = c.channel and p.provider_period_id = c.provider_period_id and p.family_id = c.family_id
@@ -163,7 +173,6 @@ function caseId(c: Ctx): string {
 export function supportRoutes(): Hono<AppEnv> {
   const r = new Hono<AppEnv>();
 
-  // The family's provider billing periods, for the refund-request picker (empty without a purchase).
   // What a parent may know of the owner's policy: the refund window and the response targets.
   r.get('/support/policy', requireParent, async (c) => {
     const { policy } = await c.var.deps.db.asService((tx) => loadSupportPolicy(tx));
@@ -174,17 +183,33 @@ export function supportRoutes(): Hono<AppEnv> {
     });
   });
 
+  // HUNT7-C-3: every row the family has, with its `kind`, because one invoice can write two of them.
+  // A renewal that carried a deferred mid-cycle change is recorded as its subscription charge PLUS a
+  // derived '<invoice>:proration' row spread from it, which inherits the same period_start,
+  // period_end, paid_slots and settled_at. Both are the family's own money and both stay pickable (a
+  // mid-cycle invoice billed on its own is a real charge a parent may want refunded, so filtering the
+  // kind out would hide one), so what the list owes the parent is the label and a stable order: the
+  // tie between two rows sharing a period_start was broken by `id`, a random uuid, so half the time
+  // the $10 derived row came above the $39.99 charge in a list described as newest-first. Ordered by
+  // amount within a start date, the charge is never below the item billed with it.
   r.get('/support/billing-periods', requireParent, async (c) => {
     const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     const rows = await deps.db.asParent(
       parent,
       (tx) => tx<PeriodRow[]>`
-        select id as period_id, channel, provider_period_id, period_start, period_end, paid_slots,
-               charged_amount_cents, refunded_cents, settlement
+        select id as period_id, channel, provider_period_id, kind as period_kind, period_start,
+               period_end, paid_slots, charged_amount_cents, refunded_cents, settlement
           from public.billing_periods
          where family_id = ${familyId}
-         order by period_start desc, id desc
+         -- Newest period first, and within one period the charge BEFORE the rows billed with it.
+         -- The tie-break is the provider id, not the row's uuid (HUNT7-C-3): a derived row shares its
+         -- parent's period_start, so a random-uuid tie-break put the $10 mid-cycle row above the
+         -- $49.98 charge about half the time, in a list the parent reads as newest-first. Splitting on
+         -- ':' groups a derived row with its parent, and the full id then puts the parent first
+         -- because 'in_X' sorts before 'in_X:proration'.
+         order by period_start desc, split_part(provider_period_id, ':', 1) asc,
+                  provider_period_id asc
          limit 60
       `,
     );

@@ -472,19 +472,28 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     const closed = fakeApi({ send: () => ({ status: 'closed', signOut: true }) });
     expect(await closeAccountAction(closed.api, false)).toMatchObject({ status: 'error' });
     expect(closed.calls).toHaveLength(0);
-    expect(await closeAccountAction(closed.api, true)).toEqual({
-      status: 'closed',
-      message: expect.stringMatching(/account is closed and this device is signed out/i) as string,
-    });
+    // HUNT7-K-4: the success statuses carry no message of their own. Round 6 moved the decision of
+    // what the parent reads into `runAccountClosure`, which passes only `result.status` to
+    // `accountClosedDeviceMessage` — while this function went on building the unconditional 'Your
+    // PencilLift account is closed and this device is signed out.' that nothing renders, and this
+    // assertion pinned that sentence as required output. It would have stayed green if
+    // `accountClosedDeviceMessage` were reverted to printing it unconditionally, which is the one thing
+    // it exists to prevent; the sentence is asserted where it is now decided, above.
+    expect(await closeAccountAction(closed.api, true)).toEqual({ status: 'closed' });
     expect(closed.calls).toEqual([
       { method: 'POST', path: '/v1/account/close', body: { confirm: true } },
     ]);
 
     const pending = fakeApi({ send: () => ({ status: 'pending', signOut: true }) });
-    expect(await closeAccountAction(pending.api, true)).toMatchObject({
-      status: 'pending',
-      message: expect.stringMatching(/closes automatically once your family account/i) as string,
-    });
+    expect(await closeAccountAction(pending.api, true)).toEqual({ status: 'pending' });
+
+    // And the copy is not reachable by field access from here either: an error keeps its message,
+    // because the 'refused' step is what shows it.
+    const source = readFileSync(join(import.meta.dirname, 'parent-privacy.ts'), 'utf8');
+    const body = /export async function closeAccountAction\(([\s\S]*?)\n\}/.exec(source)?.[1] ?? '';
+    expect(body).not.toBe('');
+    expect(body).not.toMatch(/ACCOUNT_CLOSE_COPY\.(closed|pending)\b/);
+    expect(body).toMatch(/ACCOUNT_CLOSE_COPY\.familyDeletionRequired/);
 
     const owner = fakeApi({
       send: () =>

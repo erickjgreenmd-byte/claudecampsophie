@@ -157,8 +157,15 @@ export const STORE_FEE_RATES_NOTES: readonly string[] = [
   // narrower claim is true — a proration LINE on a renewal invoice is not part of THAT renewal's
   // charge (BILL-R2-4) — while the money is counted in the month it settles either way: on its own
   // invoice when Stripe bills it at once, and as the renewal's ':proration' period when Stripe lists
-  // it there as pending. Every note is at most 400 characters (packages/contracts/src/admin-ops.ts)
-  // and the owner reads it verbatim under the figures, so it stays short: the detail is here.
+  // it there as pending.
+  // HUNT7-C-4: "in that same pre-tax unit" is a promise about BOTH rows of such an invoice, and it
+  // holds because the ':proration' row carries its own apportioned share of the invoice's tax
+  // (prorationPeriodFor) and the leftover that reaches it is restated by that share, exactly as the
+  // subscription row's figure is. While that row stored tax 0 the conversion short-circuited and the
+  // provider's tax-inclusive cents were written straight against its pre-tax charge, so this sentence
+  // was true of one of the two rows. Every note is at most 400 characters
+  // (packages/contracts/src/admin-ops.ts) and the owner reads it verbatim under the figures, so it
+  // stays short: the detail is here.
   "Gross is the money collected for the subscription: US sales tax (a state's money) and anything paid from a Stripe credit balance are never revenue; a mid-cycle proration charge is collected money, counted in the month it settles, whether Stripe bills it at once or on the next renewal. A refund, a chargeback and a won dispute are all recorded in that same pre-tax unit, capped at the charge.",
 ];
 

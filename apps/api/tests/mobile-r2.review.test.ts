@@ -283,20 +283,31 @@ describe('reuse of a rotated refresh token revokes the session at once', () => {
 });
 
 /**
- * [repro] HUNT6-A-1. The BUG-244 recovery is REMOVED, not repaired: a captured refresh request body
- * must buy an attacker nothing ONCE THE TOKEN IN IT HAS BEEN ROTATED, which means the request must
- * carry no recovery id — nothing a capture can present to be taken for the rightful retry. That is
- * the whole of what the removal restores, and the premise is stated that narrowly on purpose, this
- * being the reversal of a feature whose recorded residual over-claimed: a body captured BEFORE the
- * device's own request reaches the server carries a LIVE refresh token, and whoever presents it
- * first wins. That race predates BUG-244, survives its removal, and is not what is pinned here.
+ * [repro] HUNT6-A-1. The BUG-244 recovery is REMOVED, not repaired: the refresh request carries no
+ * recovery id — nothing a capture can present to be taken for the rightful retry.
  *
- * The recovery never marked the row its id consumed, so the SAME captured body was served for the
- * whole window, and each serving returned a full-lifetime rotating refresh token that then rotated
- * down the ordinary path with no id, no window and no audit row: one captured body was a
- * self-renewing child session until the tablet's own next refresh, which for a tablet put away is
- * overnight. Against that the feature only avoided an occasional unpairing a parent can undo with a
- * new pairing code, so BUG-244 goes back to an accepted, documented open defect.
+ * What that buys is stated exactly here, because the recorded residual of this very reversal
+ * over-claimed once already: round 6 wrote — in this docstring, in the route's own comment and in the
+ * three records the owner signs off from — that a captured body "must buy an attacker nothing once
+ * the token in it has been rotated". That is false, and HUNT7-A-3 filed it. The truth, in three
+ * parts, is what the cases below pin:
+ *
+ * 1. What the removal takes away, and all it takes away: a body whose token has been rotated can no
+ *    longer OBTAIN TOKENS. The recovery served such a body — for the whole window, and repeatedly,
+ *    because nothing marked the row a recovery had consumed — and each serving returned a
+ *    full-lifetime rotating refresh token that then rotated down the ordinary path with no id, no
+ *    window and no audit row: one captured body was a self-renewing child session until the tablet's
+ *    own next refresh, which for a tablet put away is overnight.
+ * 2. What such a body still does: presenting it is an ACTION, not a no-op, and nothing authenticates
+ *    the presenter. Its first presentation ends that child's live session and un-lists the tablet, so
+ *    the child is told to ask a grown-up and a parent completes a PIN step-up, mints a new pairing
+ *    code and re-enters its 8 symbols. That is one unpairing per captured body, at an instant its
+ *    holder chooses while that session lives. It is this revocation working — the theft signal — so
+ *    it is BUG-244's accepted cost, not a case to serve; what round 7 bounds is only the write
+ *    amplification of repeat presentations (the second case below).
+ * 3. What is NOT pinned here because it predates BUG-244 and survives its removal: a body captured
+ *    BEFORE the device's own request reaches the server carries a LIVE refresh token, and whoever
+ *    presents it first wins.
  */
 describe('the refresh request carries no recovery id at all (BUG-244 reopened, HUNT6-A-1)', () => {
   it('[repro] a captured refresh body is refused outright, however right the id it carries', async () => {
@@ -402,6 +413,65 @@ describe('the refresh request carries no recovery id at all (BUG-244 reopened, H
     expect(
       (await sessionRow(device.fam.familyId, 'Claimed replacement tablet')).revoke_reason,
     ).toBe('refresh_token_reuse');
+  });
+
+  /**
+   * [repro] HUNT7-A-3, part 2 of the docstring above, and the case the record has to agree with.
+   * Written first as the round-6 claim — `expect(...revoke_reason).toBeNull()` for a body whose token
+   * has rotated — where it failed with "expected 'refresh_token_reuse' to be null". So it is asserted
+   * the other way up: the replay obtains nothing AND ends the session. A different cf-connecting-ip
+   * is the point — the presenter is not the tablet, nothing authenticates it, and the per-network
+   * limit is the only one it meets.
+   */
+  it('[repro] a captured body obtains no token after its rotation, and still ends the session', async () => {
+    const device = await pairedDevice('Captured body tablet');
+    // The tablet's own refresh rotates the token, so the attacker's copy of the ORIGINAL body is now
+    // the thing the record called worthless.
+    await json<{ refreshToken: string }>(await refresh(device.refreshToken));
+    const replayed = await api.request('/v1/child/refresh', {
+      method: 'POST',
+      headers: { 'cf-connecting-ip': '2001:db8:ffff::9' },
+      body: { refreshToken: device.refreshToken },
+    });
+    // Nothing obtained: no access token, no refresh token.
+    expect(replayed.status).toBe(401);
+    expect(
+      await json<{ accessToken?: string; refreshToken?: string }>(replayed),
+    ).not.toHaveProperty('refreshToken');
+    // But not nothing done: the child's live session is over and the tablet is no longer listed as
+    // connected, so a grown-up has to pair it again.
+    expect((await sessionRow(device.fam.familyId, 'Captured body tablet')).revoke_reason).toBe(
+      'refresh_token_reuse',
+    );
+    expect(
+      (await devices(device.parentToken, 'Captured body tablet'))[0]!.revokedAt,
+    ).not.toBeNull();
+  });
+
+  /**
+   * HUNT7-A-3, the one code change round 7 makes here: the audit row records a REVOCATION, so a
+   * session already revoked adds none. Unguarded, a holder of one captured body appended a row per
+   * request to a table nothing prunes (the per-session rate limit is only reached on the success
+   * path), which is a bound on write amplification and not on detection — every presentation is
+   * still refused and the revocation still stands.
+   */
+  it('replaying a spent body again revokes nothing more and adds no second audit row', async () => {
+    const device = await pairedDevice('Replay loop tablet');
+    await json<{ refreshToken: string }>(await refresh(device.refreshToken));
+    // The first replay is the one that ends the session; the three after it find it already ended.
+    expect((await refresh(device.refreshToken)).status).toBe(401);
+    const ended = await sessionRow(device.fam.familyId, 'Replay loop tablet');
+    expect(ended.revoke_reason).toBe('refresh_token_reuse');
+    for (let i = 0; i < 3; i += 1) expect((await refresh(device.refreshToken)).status).toBe(401);
+    // Nothing more is revoked: the instant the first replay stamped is the instant that stands, so a
+    // captured body is one unpairing and not a repeatable one.
+    expect(await sessionRow(device.fam.familyId, 'Replay loop tablet')).toEqual(ended);
+    // This is the assertion that pins the guard: unguarded, the four refusals wrote four rows.
+    expect(
+      (await auditActions(device.fam.familyId)).filter(
+        (a) => a === 'child_session.revoked_token_reuse',
+      ),
+    ).toHaveLength(1);
   });
 });
 

@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react';
 import { Pressable, Switch, Text, TextInput, View } from 'react-native';
+import { router } from 'expo-router';
 import {
   LEARNING_LIMITS,
   childSubjectResponseSchema,
@@ -28,7 +29,7 @@ import {
   useLoad,
   useParentAccess,
 } from '../../src/family/ui.tsx';
-import { childPlanEditable } from '../../src/family/family-view.ts';
+import { childPickerSuffix, childPlanEditable } from '../../src/family/family-view.ts';
 import {
   WEEKDAY_OPTIONS,
   buildUpcomingView,
@@ -110,7 +111,12 @@ function Planner({ api }: { api: ApiClient }) {
       {children.length > 1 && childId !== null ? (
         <Choice
           label="Child"
-          options={children.map((c) => ({ value: c.id, label: c.nickname }))}
+          // The state a child is in is named in the option, not left for the parent to find after
+          // choosing (HUNT7-J-2), the way the portal's picker names it.
+          options={children.map((c) => ({
+            value: c.id,
+            label: `${c.nickname}${childPickerSuffix(c)}`,
+          }))}
           value={childId}
           onChange={setPicked}
         />
@@ -122,7 +128,61 @@ function Planner({ api }: { api: ApiClient }) {
   );
 }
 
+/**
+ * Which plan view this child gets. A wrapper with no hooks of its own, like the portal's
+ * `ChildPlanner`: a family reload can flip `deletionPending` for the child on screen, and branching
+ * inside the component that holds the loads would change how many hooks a render runs.
+ */
 function ChildPlan({
+  api,
+  child,
+  family,
+}: {
+  api: ApiClient;
+  child: FamilyOverview['children'][number];
+  family: FamilyOverview;
+}) {
+  // A child whose data deletion is under way has no plan to show and nothing to load (HUNT7-J-2):
+  // `ownedChild` (apps/api/src/routes/learning.ts) excludes a requested or processing deletion request
+  // from BOTH access modes and throws NOT_FOUND before it looks at the archived flag, so GET /subjects
+  // and GET /learning-schedule both answer 404 — while GET /v1/family deliberately keeps listing the
+  // child, so this screen selects them by default in a one-child family. Without this branch the
+  // parent was told the plan was kept and read-only, told to make the child active again in Children
+  // (which that screen and the API both refuse for them), and then told twice that the child was not
+  // found. Same notice and same two routes as the Children screen and the portal's planner (HUNT5-F-2).
+  if (child.deletionPending === true) {
+    return <DeletionPendingPlan nickname={child.nickname} />;
+  }
+  return <ChildPlanSections api={api} child={child} family={family} />;
+}
+
+function DeletionPendingPlan({ nickname }: { nickname: string }) {
+  return (
+    <>
+      <Heading>{nickname}</Heading>
+      <Notice>
+        <Body>
+          Data deletion under way. A deletion request covering {nickname}’s data is open. Processing
+          has already stopped, so no practice is prepared or released for them and their plan is not
+          kept. Deletion can’t be undone from the app: if you did not mean it, contact support
+          straight away.
+        </Body>
+        <Button
+          label="Privacy and data"
+          secondary
+          onPress={() => router.push('/(parent)/privacy')}
+        />
+        <Button
+          label="Contact support"
+          secondary
+          onPress={() => router.push('/(parent)/support')}
+        />
+      </Notice>
+    </>
+  );
+}
+
+function ChildPlanSections({
   api,
   child,
   family,
@@ -150,10 +210,19 @@ function ChildPlan({
     <>
       <Heading>{child.nickname}</Heading>
       {editable ? null : (
+        // HUNT7-J-3: "Everything below is what was planned" does not cover a heading about the future.
+        // The API computes the daily state and the next review instants for an archived profile too —
+        // `dailyPracticeState` and `nextReviewReleases` never look at the status
+        // (apps/api/src/routes/learning.ts) — while archiving revoked the child's sessions and devices
+        // (apps/api/src/routes/family.ts), so nothing below is released to them. Both halves of the
+        // portal's copy are carried here, and the activation names its condition, because `childRows`
+        // only offers it while a paid slot is unused (src/family/family-view.ts).
         <Notice>
           <Body>
-            {child.nickname} is archived, so their practice plan is read-only. Everything below is
-            what was planned; make them active again in Children to change it.
+            {child.nickname}’s profile is archived, so no new practice is prepared or released for
+            them. What was planned and practised stays readable, and can’t be changed while the
+            profile is archived; the times below are what the schedule would produce if the profile
+            were active again. Make them active again in Children while a paid slot is free.
           </Body>
         </Notice>
       )}
@@ -191,13 +260,20 @@ function ChildPlan({
         />
       ) : null}
       {schedule.state.status === 'ready' ? (
-        <ScheduleEditor
-          api={api}
-          path={`${base}/learning-schedule`}
-          childName={child.nickname}
-          editable={editable}
-          initial={schedule.state.data}
-        />
+        <>
+          {/* Built from the schedule that is LOADED, not from the editor's captured copy (HUNT7-J-6):
+              the editor seeds its state from `initial` once, so a reload after a subject toggle — the
+              one change `nextReviewReleases` depends on — could not reach this card. */}
+          <ComingUp data={schedule.state.data} childName={child.nickname} />
+          <ScheduleEditor
+            api={api}
+            path={`${base}/learning-schedule`}
+            childName={child.nickname}
+            editable={editable}
+            initial={schedule.state.data}
+            onSaved={() => void schedule.reload()}
+          />
+        </>
       ) : null}
     </>
   );
@@ -355,12 +431,36 @@ function Field({
   );
 }
 
+/** What the child's next daily practice and weekly reviews are, in the family's time zone. */
+function ComingUp({ data, childName }: { data: LearningScheduleResponse; childName: string }) {
+  const upcoming = buildUpcomingView(data, childName);
+  return (
+    <Card>
+      <Heading>Coming up</Heading>
+      <Body>{upcoming.dailyLine}</Body>
+      {upcoming.reviewLines.length === 0 ? (
+        <Body muted>No weekly reviews are scheduled yet.</Body>
+      ) : (
+        upcoming.reviewLines.map((line) => <Body key={line}>{line}</Body>)
+      )}
+      <Body muted>{upcoming.pointsLine}</Body>
+    </Card>
+  );
+}
+
+/**
+ * The stored plan and, while it is editable, the form that changes it. `latest` and `form` are EDIT
+ * state: they are seeded from `initial` once, which is why the "Coming up" card above is rendered from
+ * the loaded schedule instead of from them (HUNT7-J-6), and why a save asks its owner to re-read the
+ * schedule rather than leaving that card behind.
+ */
 function ScheduleEditor({
   api,
   path,
   childName,
   editable,
   initial,
+  onSaved,
 }: {
   api: ApiClient;
   path: string;
@@ -368,6 +468,8 @@ function ScheduleEditor({
   /** False for an archived child: PUT /learning-schedule is refused 422 CHILD_ARCHIVED (HUNT6-H-1). */
   editable: boolean;
   initial: LearningScheduleResponse;
+  /** A saved schedule changes what is coming up, so the card above is re-read from the server. */
+  onSaved: () => void;
 }) {
   const [latest, setLatest] = useState(initial);
   const [form, setForm] = useState<PlannerForm>(() => scheduleToPlannerForm(initial.schedule));
@@ -377,7 +479,6 @@ function ScheduleEditor({
     { ok: true; message: string } | { ok: false; message: string; needsPin: boolean } | null
   >(null);
   const zone = latest.timezone;
-  const upcoming = buildUpcomingView(latest, childName);
   const set = <K extends keyof PlannerForm>(key: K, value: PlannerForm[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
 
@@ -396,6 +497,7 @@ function ScheduleEditor({
       setLatest(saved);
       setForm(scheduleToPlannerForm(saved.schedule));
       setResult({ ok: true, message: `Schedule saved for ${childName}.` });
+      onSaved();
     } catch (error) {
       setResult({ ok: false, ...plannerError(error) });
     } finally {
@@ -403,26 +505,12 @@ function ScheduleEditor({
     }
   };
 
-  const comingUp = (
-    <Card>
-      <Heading>Coming up</Heading>
-      <Body>{upcoming.dailyLine}</Body>
-      {upcoming.reviewLines.length === 0 ? (
-        <Body muted>No weekly reviews are scheduled yet.</Body>
-      ) : (
-        upcoming.reviewLines.map((line) => <Body key={line}>{line}</Body>)
-      )}
-      <Body muted>{upcoming.pointsLine}</Body>
-    </Card>
-  );
-
   // An archived child's plan is shown, never offered for editing (HUNT6-H-1): the fields below are
   // left out rather than disabled, so there is nothing to type into and nothing to lose on a Save the
   // server would refuse.
   if (!editable) {
     return (
       <>
-        {comingUp}
         <Card>
           <Heading>Weekly review and daily practice</Heading>
           <Body>
@@ -448,8 +536,6 @@ function ScheduleEditor({
 
   return (
     <>
-      {comingUp}
-
       <Card>
         <Heading>Weekly review</Heading>
         <Choice

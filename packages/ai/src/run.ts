@@ -2,6 +2,7 @@ import { err, ok, type Result } from '@pencillift/domain';
 import {
   canAttempt,
   computeOperationCostMicros,
+  DEFAULT_RATE_TABLE_2026_09_18,
   estimateUpperBoundCostMicros,
   type AiStage,
   type StageLimits,
@@ -11,6 +12,7 @@ import type { ResponsesClient } from './client.ts';
 import { checkChildDataGate, type ChildDataGateInput } from './gate.ts';
 import type { InputPart, PromptDefinition } from './prompts.ts';
 import {
+  fullRaiseCeiling,
   OUTPUT_TRUNCATED_BUDGET_MULTIPLE,
   PROPOSED_STAGE_COST_BUDGET_MICROS,
   STAGE_MODELS,
@@ -238,6 +240,31 @@ export async function runStage<S extends z.ZodType>(
     throw new RangeError(
       `${prompt.stage}: per-request admission cap ${limits.maxCostMicros} is above the stage budget ${maxStageCostMicros}`,
     );
+  }
+  // HUNT7-B-5: `defineStageCostBudgets` proved at import that every recorded budget affords the ONE
+  // full raise — priced at DEFAULT_RATE_TABLE_2026_09_18, the object it prices against and the object
+  // every production caller passes (`options.rates ?? DEFAULT_RATE_TABLE_2026_09_18` in
+  // scan-process.ts and learning-jobs.ts). A caller handing in ANY other table would be spending at
+  // prices that check never saw, which is the one input to the invariant it is blind to, so the
+  // ceiling is re-derived here at the rates this call will really be billed at and a budget below it
+  // is refused instead of promising a raise the stage cannot pay for (BUG-260/BUG-309). A table equal
+  // to the default by value is re-derived too and passes, so only a real price change is refused.
+  if (rates !== DEFAULT_RATE_TABLE_2026_09_18 && limits.maxAttempts >= 2) {
+    // A table that cannot price this stage's model at all is answered by the loop's own UNKNOWN_MODEL
+    // result below — a code the caller already handles, with no spend — and not by this check.
+    const priceable = estimateUpperBoundCostMicros(rates, {
+      modelId: STAGE_MODELS[prompt.stage],
+      inputTokens: 1,
+      maxOutputTokens: 1,
+    }).ok;
+    const ceiling = priceable
+      ? fullRaiseCeiling(prompt.stage, limits.maxOutputTokens, rates)
+      : maxStageCostMicros;
+    if (maxStageCostMicros < ceiling) {
+      throw new RangeError(
+        `${prompt.stage}: stage budget ${maxStageCostMicros} is below its full-raise ceiling ${ceiling} at rate table ${rates.version}`,
+      );
+    }
   }
   const gate = checkChildDataGate({ ...options.gate, providerIsMock: client.isMock });
   if (!gate.ok)

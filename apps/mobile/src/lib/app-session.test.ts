@@ -5,11 +5,13 @@ import { parentTokenSource, stepUpTokenSource } from '../family/parent-session.t
 import { parentPrivacyTokenSource } from '../privacy/session.ts';
 import { parentRewardsTokenSource } from '../rewards/session.ts';
 import {
+  childSpaceOwesScreenPrivacy,
   enterParentMode,
   forgetParentUnlock,
   parentIdentityGeneration,
   parentStateStillCurrent,
   parentUnlockActive,
+  settleChildSpaceScreenPrivacy,
   STORAGE_KEYS,
   whileStorePurchaseOpen,
 } from './mode.ts';
@@ -25,13 +27,24 @@ const fake = vi.hoisted(() => ({
   storeForgets: 0,
   /** Every screen-privacy change the session layer made, in order (MOB-R2-05, HUNT6-I-4). */
   privacy: [] as boolean[],
+  /** What AppState.currentState answers; the listener below moves it, as react-native does. */
+  appState: 'active',
   appStateListener: null as null | ((next: string) => void),
 }));
 
 vi.mock('react-native', () => ({
   AppState: {
+    get currentState() {
+      return fake.appState;
+    },
     addEventListener: (_event: string, listener: (next: string) => void) => {
-      fake.appStateListener = listener;
+      // A change event is delivered with AppState.currentState ALREADY at the new value, so a test
+      // that fires 'background' then 'active' models what the OS does: by the time anything reacts to
+      // the first event, the app is in the foreground again (HUNT7-A-1).
+      fake.appStateListener = (next: string) => {
+        fake.appState = next;
+        listener(next);
+      };
       return { remove: () => undefined };
     },
   },
@@ -91,7 +104,7 @@ vi.mock('./secure-storage.ts', () => ({
 
 const { initAppSession, parentSourceOutsideChildMode } = await import('./app-session.ts');
 
-afterEach(() => {
+afterEach(async () => {
   fake.keychain.clear();
   fake.userId = null;
   fake.relocks = 0;
@@ -99,7 +112,11 @@ afterEach(() => {
   fake.unlockScreens = 0;
   fake.storeForgets = 0;
   fake.privacy = [];
+  fake.appState = 'active';
   forgetParentUnlock();
+  // The deferred child-space screen-privacy change is module state (HUNT6-I-4): draining it with a
+  // no-op effect leaves each case independent of the order the others ran in.
+  await settleChildSpaceScreenPrivacy({ setScreenPrivacy: () => Promise.resolve() });
 });
 
 /** The clock is pinned (L-027): the unlock window below is measured from this instant. */
@@ -281,6 +298,32 @@ describe('leaving the app locks the parent area on the device too (MOB-R2-01)', 
       fake.appStateListener?.('active');
       await settle();
       expect(fake.privacy).toEqual([false]);
+    } finally {
+      stop();
+    }
+  });
+
+  /**
+   * HUNT7-A-1. The debt is recorded at the END of the lock, after three awaited keychain round trips
+   * (the mode read, the pairing read, the mode write), while the 'active' handler is synchronous and
+   * returns at once. So on a quick foreground return — the app switcher, the notification shade, a
+   * dismissed call, an Android onPause/onResume pair — 'active' arrived while that chain was still
+   * pending: the settle found nothing owed, and the debt was recorded after it. The child was then
+   * handed back a tablet whose own space refused screenshots, screen recording and casting until the
+   * app was backgrounded and foregrounded again, which is MOB-R2-05 / BUG-287 / HUNT5-G-4 exactly.
+   */
+  it('[repro] a foreground return inside the lock still gets the child space its screen privacy', async () => {
+    const stop = initAppSession();
+    try {
+      fake.keychain.set(STORAGE_KEYS.childRefreshToken, 'child-refresh-mock');
+      await unlocked();
+      // No settle between the two events: the lock is still in flight when the app is back.
+      fake.appStateListener?.('background');
+      fake.appStateListener?.('active');
+      await settle();
+      expect(fake.keychain.get(STORAGE_KEYS.mode)).toBe('child');
+      expect(fake.privacy).toEqual([false]);
+      expect(childSpaceOwesScreenPrivacy()).toBe(false);
     } finally {
       stop();
     }

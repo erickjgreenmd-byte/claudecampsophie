@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   createMockModerationClient,
@@ -972,6 +973,116 @@ describe('AI personalization (mock client; AC_LEARNING_06, AC_GRADING_07/08)', (
       });
     } finally {
       await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
+  });
+
+  /**
+   * HUNT7-B-2. `personalizeItems` takes `stage: 'daily_set' | 'thursday_bundle'`, and the thursday arm
+   * is a live production path: `generateThursdayReview` is a registered handler, the tick enqueues it
+   * and it personalizes with `'thursday_bundle'`. So there are TWO personalization holds, 483,240 and
+   * 933,600 micro-USD, and the larger is the biggest single hold in the product — which the owner's
+   * cost record, written from the daily_set arm alone, named as 483,240 and understated by 93%. A
+   * ceiling sized with the smaller figure in mind refuses this hold at `acquireSpendHold` and the
+   * child silently gets the un-personalized bank items.
+   *
+   * The twin of the daily_set case above, on the OTHER arm of the same parameter, so the number is
+   * pinned by a run and not by prose. Labeled mock provider; synthetic bank items only.
+   */
+  it('the thursday review hold reserves thursday_bundle’s BUDGET, the larger of the two (HUNT7-B-2)', async () => {
+    const fam = await family();
+    await consent(fam);
+    const adminId = await seedOwnerAdmin(api.db);
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS, PROPOSED_STAGE_LIMITS } =
+      await import('@pencillift/ai');
+    const admissionCap = PROPOSED_STAGE_LIMITS.thursday_bundle.maxCostMicros;
+    const stageBudget = PROPOSED_STAGE_COST_BUDGET_MICROS.thursday_bundle;
+    // The claim the doc figure contradicted: this arm's hold is the larger of the two, so it is the
+    // peak reservation the owner has to size the monthly ceiling against.
+    expect(stageBudget).toBeGreaterThan(PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set);
+    expect(stageBudget).toBeGreaterThan(admissionCap);
+    const totals = async () => {
+      const [row] = await api.db.sql<{ spent: string; held: string }[]>`
+        select coalesce((select sum(cost_micros) from public.ai_usage_events), 0)::text as spent,
+               coalesce((select sum(micros) from private.ai_spend_holds
+                          where expires_at > ${api.now.value}), 0)::text as held`;
+      return { spent: BigInt(row!.spent), held: BigInt(row!.held) };
+    };
+    const before = await totals();
+    const ceiling = before.spent + before.held + BigInt(stageBudget);
+    await api.db.sql`
+      insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
+      values ('global', '2026-09', ${ceiling.toString()}::bigint, ${adminId})`;
+    let heldWhileRunning = -1n;
+    const client = createMockResponsesClient(async (request) => {
+      heldWhileRunning = (await totals()).held - before.held;
+      return {
+        kind: 'incomplete' as const,
+        usage: {
+          inputTokens: 1_700,
+          cachedInputTokens: 0,
+          outputTokens: request.maxOutputTokens,
+        },
+        modelId: 'gpt-6-astra',
+        latencyMs: 20,
+        reason: 'max_output_tokens' as const,
+      };
+    });
+    try {
+      const out = await personalizeItems(
+        deps,
+        { ai: client, moderation: createMockModerationClient(), sleep: () => Promise.resolve() },
+        await context(fam),
+        wordProblems,
+        'thursday_bundle',
+        ['math.word_problems'],
+      );
+      const budgets = client.requests.map((r) => r.maxOutputTokens);
+      expect(budgets).toHaveLength(2);
+      expect(budgets[0]).toBe(PROPOSED_STAGE_LIMITS.thursday_bundle.maxOutputTokens);
+      expect(budgets[1]!).toBeGreaterThan(budgets[0]!);
+      // What this arm reserves: thursday_bundle's own budget, 933,600 and not daily_set's 483,240 and
+      // not the 700,000 admission cap.
+      expect(heldWhileRunning).toBe(BigInt(stageBudget));
+      const [row] = await api.db.sql<{ micros: string; n: number }[]>`
+        select coalesce(sum(cost_micros), 0)::text as micros, count(*)::int as n
+          from public.ai_usage_events where family_id = ${fam.familyId} and stage = 'thursday_bundle'`;
+      expect(row!.n).toBe(2);
+      // The two attempts really cost more than the cap, and the hold still bounds them.
+      expect(BigInt(row!.micros)).toBeGreaterThan(BigInt(admissionCap));
+      expect(BigInt(row!.micros)).toBeLessThanOrEqual(heldWhileRunning);
+      expect((await totals()).spent).toBeLessThanOrEqual(ceiling);
+      // A truncated answer keeps the reviewed bank items; the bundle is still delivered.
+      expect(out.items).toEqual(wordProblems);
+      expect(out.intro).toBeNull();
+    } finally {
+      await api.db.sql`delete from public.spend_budgets where period_key = '2026-09'`;
+    }
+  });
+
+  /**
+   * HUNT7-B-2, the prose half. The comment this hold was written under illustrates the fix with
+   * daily_set's pair alone ("daily_set's cap is 350,000 micros and its two attempts may cost
+   * 483,240"), which is how the owner's record came to name 483,240 as the largest hold in the
+   * product. Both arms and both figures have to be here, derived from the table, so the peak cannot
+   * be re-derived from a one-stage example again.
+   */
+  it('the hold’s own comment names both personalization stages and both budgets (HUNT7-B-2)', async () => {
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS } = await import('@pencillift/ai');
+    const source = readFileSync(new URL('../src/jobs/learning-jobs.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("  // The reservation is the stage's cost BUDGET");
+    const end = source.indexOf('let hold: string | null;', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // Unwrapped before matching: a sentence the formatter split over two comment lines must still be
+    // readable to a regex (HUNT7-B-7, the L-054 shape).
+    const note = source
+      .slice(start, end)
+      .replace(/\s*\/\/\s*/g, ' ')
+      .replace(/\s+/g, ' ');
+    const grouped = (n: number) => n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    for (const stage of ['daily_set', 'thursday_bundle'] as const) {
+      expect(note, stage).toContain(stage);
+      expect(note, stage).toContain(grouped(PROPOSED_STAGE_COST_BUDGET_MICROS[stage]));
     }
   });
 

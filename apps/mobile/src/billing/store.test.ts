@@ -204,6 +204,36 @@ describe('revenuecat.ts store identity (RV-billing-7; labeled native mocks)', ()
     expect(native.purchases.logOut).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * HUNT7-K-1. `forgetStoreIdentity` ended in `Purchases.logOut().catch(() => undefined)`, so the
+   * boolean `clearDeviceAdultSecrets` built from it (src/family/runtime.ts) proved that a module-local
+   * map had been cleared and the identity mutex had resolved — not that the store SDK had forgotten
+   * the closed account's app user id. The closure screen's caveat rests on that flag.
+   *
+   * The second call matters as much as the first: on the closure path this function runs TWICE (the
+   * sign-out's adult-cache clearer runs one, `clearDeviceAdultSecrets` the other), and by the second
+   * call `identifiedAs` is already null, so an answer computed from that alone would report success
+   * for a device whose SDK is still bound.
+   */
+  it('[repro] a refused logOut is reported, and stays reported until a later bind succeeds', async () => {
+    const { revenuecat } = await load();
+    await revenuecat.identifyStoreAccount('fam_dddddddddddddddddddddddd');
+    native.purchases.logOut.mockImplementationOnce(() =>
+      Promise.reject(new Error('the store SDK could not be reached')),
+    );
+    expect(await revenuecat.forgetStoreIdentity()).toBe(false);
+    expect(await revenuecat.forgetStoreIdentity()).toBe(false);
+    // A successful bind replaces the identity the SDK was left holding, so it is genuinely gone.
+    await revenuecat.identifyStoreAccount('fam_eeeeeeeeeeeeeeeeeeeeeeee');
+    expect(await revenuecat.forgetStoreIdentity()).toBe(true);
+  });
+
+  it('a device that was never bound has no identity to fail to forget', async () => {
+    const { revenuecat } = await load();
+    expect(await revenuecat.forgetStoreIdentity()).toBe(true);
+    expect(native.purchases.logOut).not.toHaveBeenCalled();
+  });
+
   it('uses only this platform’s public key: an Android key on iOS leaves purchases off', async () => {
     native.extra.revenueCatIosKey = 'goog_AbCdEf1234567890';
     try {

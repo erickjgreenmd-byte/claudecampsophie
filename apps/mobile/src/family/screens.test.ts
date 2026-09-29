@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { childPickerSuffix } from './family-view.ts';
 
 /**
  * The Expo screens import react-native, which this pure-logic suite cannot render (see
@@ -151,6 +152,35 @@ describe('parent screens need the PIN after a restart (MOB-R1-09)', () => {
     );
   });
 
+  /**
+   * HUNT7-J-7. The privacy screen's own loader takes a ticket so that "a load superseded while its
+   * request was in flight publishes nothing" — but it took it AFTER the `!api` return, so a run that
+   * found no client set 'not_connected' while leaving the ticket pointing at the PREVIOUS run. An
+   * earlier load still in flight then satisfied the ticket check and published `{status:'ready'}` over
+   * that honest state: on a device whose parent session has just been revoked elsewhere (the portal's
+   * "sign out everywhere", a password change), the signed-out family's children, exports and safety
+   * reports repainted, because the gate deliberately does not re-check on `parentAuth.watch`. The
+   * ticket is taken first now, as `useLoad` takes it before anything can be awaited.
+   */
+  it('[repro] the privacy screen takes its load ticket before either early return', () => {
+    const privacy = screen('(parent)', 'privacy.tsx');
+    const body =
+      /const load = useCallback\(async \(\) => \{([^]*?)\n {2}\}, \[api\]\);/.exec(privacy)?.[1] ??
+      '';
+    expect(body).not.toBe('');
+    const at = (needle: string) => {
+      const index = body.indexOf(needle);
+      expect(index, needle).toBeGreaterThan(-1);
+      return index;
+    };
+    const bump = at('latestLoad.current += 1;');
+    const ticket = at('const ticket = latestLoad.current;');
+    expect(ticket).toBeGreaterThan(bump);
+    // Every entry into `load` supersedes what is in flight, including the two that publish nothing.
+    expect(ticket).toBeLessThan(at('if (closureStarted.current) return;'));
+    expect(ticket).toBeLessThan(at('if (!api) {'));
+  });
+
   it('the welcome screen sends a paired device into child mode explicitly', () => {
     const welcome = screen('index.tsx');
     expect(welcome).toMatch(
@@ -196,5 +226,131 @@ describe('the planner offers no write an archived child cannot take (HUNT6-H-1)'
   it('says why, and points at the screen that can change it back', () => {
     expect(planner).toMatch(/archived/i);
     expect(planner).toMatch(/in Children/);
+  });
+});
+
+/**
+ * HUNT7-J-2. `ownedChild` (apps/api/src/routes/learning.ts) excludes a child covered by a
+ * requested/processing deletion request from BOTH access modes and throws NOT_FOUND before the archived
+ * check, so GET /v1/children/:id/subjects and GET /v1/children/:id/learning-schedule both answer 404
+ * for them — while GET /v1/family deliberately still lists the child, so this screen selects them by
+ * default in a one-child family. The screen had no branch for it: `request_deletion` archives the child
+ * (migration 0890), so the parent was told the plan "is read-only. Everything below is what was
+ * planned", told to "make them active again in Children" — an activation the Children screen and the
+ * API both refuse — and then told twice that the child "was not found. Pull to refresh.", on a screen
+ * whose <Screen> ScrollView has no RefreshControl. The web planner has had this branch since round 5
+ * (HUNT5-F-2).
+ */
+describe('the planner says nothing false about a child being deleted (HUNT7-J-2)', () => {
+  const planner = screen('(parent)', 'planner.tsx');
+  const at = (needle: string) => {
+    const index = planner.indexOf(needle);
+    expect(index, needle).toBeGreaterThan(-1);
+    return index;
+  };
+
+  it('[repro] branches on the flag before it computes editability or loads anything', () => {
+    // The branch is in a wrapper with no hooks of its own, so a family reload that flips the flag for
+    // the child on screen swaps components instead of changing how many hooks a render runs.
+    expect(planner).toMatch(
+      /if \(child\.deletionPending === true\) \{\s*return <DeletionPendingPlan/,
+    );
+    expect(at('child.deletionPending === true')).toBeLessThan(
+      at('const editable = childPlanEditable(child.status)'),
+    );
+    expect(at('child.deletionPending === true')).toBeLessThan(at('useLoad(loadSchedule)'));
+    // And the notice component itself asks the API for nothing.
+    const notice =
+      /function DeletionPendingPlan\(\{[^}]*\}: \{[^}]*\}\) \{([\s\S]*?)\n\}/.exec(planner)?.[1] ??
+      '';
+    expect(notice).not.toBe('');
+    expect(notice).not.toMatch(/useLoad|api\.(get|send)/);
+    // The Children screen's words, so the two surfaces say the same thing about the same flag, and the
+    // requester-neutral form HUNT6-I-3 settled on ("covering", never "you asked for").
+    expect(notice).toMatch(/Data deletion under way/);
+    expect(notice).toMatch(/request covering \{nickname\}/);
+    expect(notice).not.toMatch(/\byou asked\b/i);
+    expect(notice).not.toMatch(/read-only|was planned|active again/i);
+    expect(notice).not.toMatch(/pull to refresh/i);
+    // …and the two routes that can actually help, as on the Children screen.
+    expect(notice).toMatch(/router\.push\('\/\(parent\)\/privacy'\)/);
+    expect(notice).toMatch(/router\.push\('\/\(parent\)\/support'\)/);
+  });
+
+  it('names the state in the child picker, so it is known before the plan is opened', () => {
+    expect(planner).toMatch(/childPickerSuffix\(c\)/);
+    // The rule itself is pure (src/family/family-view.ts). It lives with the other view models rather
+    // than beside this screen, so its cases are asserted here, where the finding that asked for it is.
+    expect(childPickerSuffix({ status: 'archived', deletionPending: true })).toBe(
+      ' (data deletion under way)',
+    );
+    // The flag is tested first: request_deletion archives a child-scope target (migration 0890), so
+    // such a child reads as archived too, and "archived" is the more comforting of the two words.
+    expect(childPickerSuffix({ status: 'archived' })).toBe(' (archived — plan is read-only)');
+    expect(childPickerSuffix({ status: 'draft' })).toBe(' (no paid slot)');
+    expect(childPickerSuffix({ status: 'active' })).toBe('');
+    expect(childPickerSuffix({ status: 'active', deletionPending: true })).toBe(
+      ' (data deletion under way)',
+    );
+  });
+});
+
+/**
+ * HUNT7-J-3. The archived read-only view renders "Coming up" first, and those values are computed live
+ * by the API for an archived profile too: `dailyPracticeState` and `nextReviewReleases` never look at
+ * the status (apps/api/src/routes/learning.ts), so the parent read "Today's daily practice is
+ * available." and "Mathematics: Thu 16:00 (weekly review)" for a child whose sessions and devices were
+ * revoked when they were archived (apps/api/src/routes/family.ts). "Everything below is what was
+ * planned" does not cover a heading about the future: HUNT5-F-10 judged the same hedge insufficient on
+ * the web planner and added the two halves this notice now carries.
+ */
+describe('the archived planner promises no practice an archived child gets (HUNT7-J-3)', () => {
+  const planner = screen('(parent)', 'planner.tsx');
+  /**
+   * The archived branch's own copy: comments stripped, because a comment recording the sentence that
+   * was wrong is not copy, and folded onto one line, because a sentence broken across two JSX lines
+   * would otherwise slip past every match below.
+   */
+  const notice = (/\{editable \? null : \(([\s\S]*?)\n {6}\)\}/.exec(planner)?.[1] ?? '')
+    .replace(/\{?\/\*[\s\S]*?\*\/\}?/g, ' ')
+    .replace(/^[ \t]*\/\/.*$/gm, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  it('[repro] says no new practice is prepared, and that the times are conditional', () => {
+    expect(notice).not.toBe('');
+    expect(notice).toMatch(/no new practice is prepared or released/i);
+    expect(notice).toMatch(/would produce if the profile were active again/i);
+    // The claim the web client removed for the same reason: the times below contradict it.
+    expect(notice).not.toMatch(/Everything below is what was planned/i);
+  });
+
+  it('names the condition on the activation it points at', () => {
+    // `childRows` only offers activation while `unusedPaidSlots(family) > 0` (src/family/family-view.ts),
+    // so "make them active again in Children" full stop sent the parent to a control that may not be
+    // there.
+    expect(notice).toMatch(/in Children/);
+    expect(notice).toMatch(/while a paid slot is free/i);
+  });
+});
+
+/**
+ * HUNT7-J-6. `onChanged` reloads the schedule after a subject toggle so the releases follow, and the
+ * reload could not reach the screen: `ScheduleEditor` seeded `const [latest, setLatest] = useState(initial)`
+ * once and had no key, so React reused the instance and ignored the new prop. `nextReviewReleases` is
+ * computed from the child's ENABLED subjects, i.e. it is exactly the field that toggle changes — the
+ * parent turned Mathematics off and went on being shown its next weekly review, and the GET was spent
+ * for nothing. Only a save updated it, through `setLatest(saved)`.
+ */
+describe('the planner’s Coming up card follows the schedule it loaded (HUNT7-J-6)', () => {
+  const planner = screen('(parent)', 'planner.tsx');
+
+  it('[repro] the card is built from the loaded schedule, not from the editor’s captured copy', () => {
+    expect(planner).toMatch(/<ComingUp data=\{schedule\.state\.data\}/);
+    expect(planner).not.toMatch(/buildUpcomingView\(latest/);
+    // The editor keeps `latest` for the form and the zone only, and a save re-reads the schedule so the
+    // card follows that too.
+    expect(planner).toMatch(/onSaved: \(\) => void|onSaved\(\)/);
+    expect(planner).toMatch(/onSaved=\{\(\) => void schedule\.reload\(\)\}/);
   });
 });

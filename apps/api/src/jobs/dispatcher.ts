@@ -1,4 +1,6 @@
+import { MODERATION_BATCH_CAP, MODERATION_TIMEOUT_MS, PROPOSED_STAGE_LIMITS } from '@pencillift/ai';
 import { addMonths, calendarMonthOf } from '@pencillift/domain';
+import type { AiStage } from '@pencillift/domain/quotas';
 import { MOCK_ENVIRONMENTS } from '../config.ts';
 import { stateRequestInstant, type Tx } from '../db.ts';
 import type { AppDeps } from '../middleware/context.ts';
@@ -82,7 +84,7 @@ const TICK_CLAIM_BUDGET_MS = 10 * 60_000;
  * claim work it has no time to finish. HUNT6-D-3: the example used to name a billing-store sync,
  * which has not run in front of the ledger since JOBS-R2-04 moved the sweep behind it.
  */
-const TICK_WALL_LIMIT_MS = 15 * 60_000;
+export const TICK_WALL_LIMIT_MS = 15 * 60_000;
 /**
  * Wall time the LEDGER may not claim into: a job is claimed only while its worst case still fits
  * TICK_WALL_LIMIT_MS minus this (R4-JOBS-4).
@@ -105,14 +107,94 @@ const TICK_WALL_LIMIT_MS = 15 * 60_000;
  * it, and entitlement staleness is measured in days, so one tick does not have to reach all 25
  * families.
  */
-const TICK_TRAILING_RESERVE_MS = 2 * 60_000;
+export const TICK_TRAILING_RESERVE_MS = 2 * 60_000;
+/**
+ * The worst case, in wall time, one AI stage may take: every attempt timing out at the stage's own
+ * `timeoutMs`, plus the backoff run.ts sleeps after each (min(8 s, 500 ms x 2^(n-1))). DERIVED from
+ * PROPOSED_STAGE_LIMITS rather than asserted (HUNT7-B-3), so a raised timeout or attempt count moves
+ * the claim filter and the scan's own budget with it instead of leaving a stale hypothesis behind.
+ */
+export function aiStageWorstCaseMs(stage: AiStage): number {
+  const { maxAttempts, timeoutMs } = PROPOSED_STAGE_LIMITS[stage];
+  let ms = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    ms += timeoutMs + Math.min(8_000, 500 * 2 ** (attempt - 1));
+  }
+  return ms;
+}
+
+/**
+ * What ONE COACHED question may take at worst: the coaching stage (both attempts timing out) plus the
+ * provider moderation of the packet it produces.
+ */
+export const SCAN_FEEDBACK_WORST_CASE_MS = aiStageWorstCaseMs('coaching') + MODERATION_TIMEOUT_MS;
+
+/**
+ * What ONE RUBRIC-LABELLED question may take at worst, which is a tenth of the above and is a
+ * SEPARATE bound for a reason (HUNT7-B-3, the checker's finding on its own first fix): rubric feedback
+ * calls no AI stage at all, only `moderatedCriteria`'s single moderation call
+ * (scan-process.ts `rubricFeedback`). Gating it on the coaching figure refused labels whenever less
+ * than SCAN_FEEDBACK_WORST_CASE_MS remained — up to 91,500 ms of budget that the rubric step could
+ * have used and that nothing else in the run can spend, because the three fixed stages and the screen
+ * are already finished by the time the feedback loop runs.
+ */
+export const SCAN_RUBRIC_WORST_CASE_MS = MODERATION_TIMEOUT_MS;
+
+/**
+ * Questions the pre-grading safety screen is budgeted to moderate in one run. Grading refuses a
+ * worksheet of more than about 149 questions of average length on cost (STAGE_LIMIT, zero provider
+ * calls — see EXTRACTION_GRADING_COST_MICROS in packages/ai/src/routing.ts), so a scan with many more
+ * than this ends before any feedback is generated; this is the next whole moderation batch above that
+ * refusal point.
+ */
+const SCAN_SCREENED_QUESTIONS = 160;
+/** The screen sends the child's answers in batches of at most MODERATION_BATCH_CAP, one call each. */
+const SCAN_SCREENING_MODERATION_CALLS = Math.ceil(SCAN_SCREENED_QUESTIONS / MODERATION_BATCH_CAP);
+
+/**
+ * The wall time a scan's AI and moderation work may use, and the worst case the ledger declares for
+ * `scan_process` below. DERIVED from PROPOSED_STAGE_LIMITS and MODERATION_TIMEOUT_MS: extraction,
+ * grading and verification at `aiStageWorstCaseMs` each, the safety screen's moderation batches, and
+ * room for one more coached question after all of those have timed out in full.
+ *
+ * It is a bound the code keeps, not a hypothesis about it (HUNT7-B-3): scan-process.ts's feedback loop
+ * starts a tutor call only while SCAN_FEEDBACK_WORST_CASE_MS still fits inside this budget and a
+ * rubric moderation call only while SCAN_RUBRIC_WORST_CASE_MS does, both measured from the handler's
+ * own start. A coached question past its gate gets the reviewed template instead — the same
+ * degradation as the owner's spend ceiling. A rubric question past its gate gets NO labels, which is
+ * not a degradation but a loss, so the assignment is sent to parent review rather than reported
+ * `ready`: a grown-up is told to look instead of a child quietly getting less.
+ *
+ * What makes the gate bite is cumulative ELAPSED time, whatever consumed it — not "calls timing out"
+ * specifically. A slow database, a slow storage read or a long safety screen reach it just as well,
+ * which is why the loss case above is handled rather than assumed away.
+ *
+ * What it does NOT bound, stated so the next reader does not have to find out: the database
+ * statements, the storage reads and the image work, none of which has a deadline in this pipeline — a
+ * hung Postgres or storage read can still carry a scan past the wall. Nor are the three fixed stages
+ * and the screen themselves stopped by it; they are what the number is BUILT from, so a worksheet with
+ * more than SCAN_SCREENED_QUESTIONS questions that grading still admits pays for the extra moderation
+ * batches on top, which eats into TICK_TRAILING_RESERVE_MS rather than into the wall. The gate then
+ * gives coaching nothing, which is the arithmetic working, not failing.
+ */
+export const SCAN_AI_WALL_BUDGET_MS =
+  aiStageWorstCaseMs('extraction') +
+  aiStageWorstCaseMs('grading') +
+  aiStageWorstCaseMs('verification') +
+  SCAN_SCREENING_MODERATION_CALLS * MODERATION_TIMEOUT_MS +
+  SCAN_FEEDBACK_WORST_CASE_MS;
+
 /**
  * The worst case, in wall time, a job of this kind may need. A job is not claimed unless that much
  * of the invocation is left, so a kill mid-run (which spends an attempt and leaves the job invisible
- * until its 20-minute lease expires) is not how a long job usually ends. A scan is the longest:
- * extraction, grading and verification plus up to two 45-second coaching calls per wrong answer.
+ * until its 20-minute lease expires) is not how a long job ends. A scan is the longest, and its
+ * number is SCAN_AI_WALL_BUDGET_MS above — derived from the stage limits and enforced by the scan
+ * itself, so the declaration and the run are the same number and not two (HUNT7-B-3: the declaration
+ * used to be 7 minutes, which the pipeline's own timeouts passed with a single coached question).
  */
-const JOB_WORST_CASE_MS: Readonly<Record<string, number>> = { scan_process: 7 * 60_000 };
+export const JOB_WORST_CASE_MS: Readonly<Record<string, number>> = {
+  scan_process: SCAN_AI_WALL_BUDGET_MS,
+};
 const DEFAULT_JOB_WORST_CASE_MS = 60_000;
 /**
  * Signed upload URLs are honoured for two hours (Supabase fixes the lifetime server-side); one more
@@ -746,9 +828,10 @@ export async function runJobs(
     const elapsed = deps.clock().getTime() - tickStart.getTime();
     if (elapsed > TICK_CLAIM_BUDGET_MS) break;
     // Only kinds whose worst case still fits the rest of the invocation (JOBS-R2-07), and never into
-    // its last TICK_TRAILING_RESERVE_MS (R4-JOBS-4). That bounds the LEDGER; it does not hand the
-    // steps behind it that time, because `elapsed` is measured from the TICK's start and no step in
-    // front of the ledger has a deadline (HUNT6-D-2, same wording as the constant's own docstring).
+    // its last TICK_TRAILING_RESERVE_MS (R4-JOBS-4). The declaration compared here is derived from the
+    // stage limits and enforced by the job itself (HUNT7-B-3, JOB_WORST_CASE_MS). What that bounds is
+    // the LEDGER; it does not hand the steps behind it that time, because `elapsed` is measured from
+    // the TICK's start and no step in front of the ledger has a deadline (HUNT6-D-2).
     const remaining = TICK_WALL_LIMIT_MS - TICK_TRAILING_RESERVE_MS - elapsed;
     const claimable = kinds.filter(
       (kind) => (JOB_WORST_CASE_MS[kind] ?? DEFAULT_JOB_WORST_CASE_MS) <= remaining,
@@ -1307,10 +1390,16 @@ export async function runScheduledTick(
     0,
     async () =>
       (
-        await deps.db.asService(
-          (tx) => tx<{ n: number }[]>`
-            select app.prune_terminal_jobs(make_interval(days => ${JOB_RETENTION_DAYS})) as n`,
-        )
+        await deps.db.asService(async (tx) => {
+          // `app.prune_terminal_jobs` compares `updated_at` against `app.request_instant()`, which
+          // falls back to the DATABASE's now() when no clock is stated. This step is nothing BUT a
+          // date comparison, so leaving it on the wall clock made the horizon depend on which clock
+          // you asked — the tick's or Postgres's — and made a test that ages its fixtures from the
+          // pinned clock start failing on a date rather than on a change (L-027).
+          await stateRequestInstant(tx, now);
+          return tx<{ n: number }[]>`
+            select app.prune_terminal_jobs(make_interval(days => ${JOB_RETENTION_DAYS})) as n`;
+        })
       )[0]?.n ?? 0,
   );
   const learningJobsEnqueued = await step('learning_enqueue', 0, async () => {
@@ -1328,11 +1417,15 @@ export async function runScheduledTick(
   // a family is actually waiting on — a scan, a safety email, an export — is in the ledger. A store
   // that answers slowly now delays only itself; entitlement staleness is measured in days, so a sweep
   // that misses the end of a tick loses nothing. The LEDGER alone cannot starve it: no job is claimed
-  // that would run past TICK_WALL_LIMIT_MS − TICK_TRAILING_RESERVE_MS (R4-JOBS-4). That is the whole
-  // guarantee: every step BEFORE the ledger is unbounded in wall time (see TICK_WALL_LIMIT_MS — an
-  // inactivity sweep sends up to 50 emails with a 10 s timeout each; the scan-retention purge and the
-  // late-upload pass each remove up to 500 storage objects), so a long enough one still leaves this
-  // step nothing and `entitlementsReconciled` 0 on such a tick is not by itself a defect. This step is
+  // that would run past TICK_WALL_LIMIT_MS − TICK_TRAILING_RESERVE_MS (R4-JOBS-4), and for the longest
+  // job — a scan — that declaration is now derived from the stage limits AND enforced by the scan's own
+  // wall budget, so it bounds the run and not just the estimate (HUNT7-B-3); what it still does not
+  // cover is a database statement or a storage read that hangs, since nothing in this pipeline puts a
+  // deadline on those. Past the ledger, every step BEFORE it is unbounded in wall time (see
+  // TICK_WALL_LIMIT_MS — an inactivity sweep sends up to 50 emails with a 10 s timeout each; the
+  // scan-retention purge and the late-upload pass each remove up to 500 storage objects), so a long
+  // enough one still leaves this step nothing and `entitlementsReconciled` 0 on such a tick is not by
+  // itself a defect. This step is
   // the only caller of the billing store in a tick; nothing in front of the ledger touches it
   // (HUNT6-D-3, which is why the example above names the purges). Guaranteeing it a slice would take a
   // deadline check on the steps in front of the ledger, which none of them has (HUNT5-C-5).

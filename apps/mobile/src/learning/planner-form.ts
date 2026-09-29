@@ -234,7 +234,10 @@ export function plannerError(error: unknown): { message: string; needsPin: boole
     };
   }
   if (error.code === 'NOT_FOUND') {
-    return { message: 'That child or subject was not found. Pull to refresh.', needsPin: false };
+    // "Pull to refresh." named a gesture this message's only screen does not have (HUNT7-J-2):
+    // app/(parent)/planner.tsx renders inside <Screen>, whose ScrollView carries no RefreshControl.
+    // Its ErrorBoxes pass `onRetry`, so "Try again" is the control the parent can actually see.
+    return { message: 'That child or subject was not found. Try again.', needsPin: false };
   }
   // Validation and conflict messages are written for adults and safe to show.
   if (error.code === 'VALIDATION_FAILED' || error.code === 'CONFLICT') {

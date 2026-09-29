@@ -35,12 +35,13 @@ import {
   type ScanSession,
 } from '../../src/homework/scan-session.ts';
 import {
+  CHILD_STOPPING_MESSAGE,
   ScanCancelledError,
   ScanStoppedError,
   cancelScan,
   childUploadMessage,
   newAttempt,
-  stoppedScanOutcome,
+  runStoppedScan,
   uploadScan,
   type UploadAttempt,
   type UploadProgress,
@@ -60,6 +61,12 @@ import {
 type UploadState =
   | { kind: 'idle' }
   | { kind: 'running'; progress: UploadProgress }
+  /**
+   * The child has tapped "Stop sending" and the cancel is on its way (HUNT7-K-2). Its own state, not a
+   * flag on 'running': the progress line and the Stop button must both go the moment they tap, because
+   * the send is already aborted on this device and that POST can take twenty seconds to answer.
+   */
+  | { kind: 'stopping' }
   | { kind: 'error'; message: string }
   | { kind: 'done'; assignmentId: string };
 
@@ -109,6 +116,9 @@ export default function ScanScreen() {
   }, []);
 
   const running = upload.kind === 'running';
+  // While a scan is on its way OUT or being stopped, nothing else on the page is offered: no new
+  // pages, no reordering, and above all no second Send.
+  const sending = running || upload.kind === 'stopping';
 
   // Android/Fire hardware Back while the camera is open closes only the camera (MOB-R1-07); the
   // pages already added stay. On iOS this listener is a no-op.
@@ -283,9 +293,16 @@ export default function ScanScreen() {
         // is told what is true and the SAME attempt is kept, so "Try again" reports that one scan
         // instead of creating a second assignment, a second page charge and a second job for the
         // same homework.
-        const outcome = stoppedScanOutcome(await cancelScan(childApi, attemptRef.current));
-        if (!outcome.keepAttempt) attemptRef.current = newAttempt(newKey);
-        setUpload({ kind: 'error', message: outcome.message });
+        // The tap is acknowledged before the cancel goes out (HUNT7-K-2): the order lives in
+        // src/homework/upload.ts, where it is run in a test rather than grepped out of this screen.
+        await runStoppedScan(childApi, attemptRef.current, (step) => {
+          if (step.kind === 'stopping') {
+            setUpload({ kind: 'stopping' });
+            return;
+          }
+          if (!step.outcome.keepAttempt) attemptRef.current = newAttempt(newKey);
+          setUpload({ kind: 'error', message: step.outcome.message });
+        });
       } else if (error instanceof ScanStoppedError) {
         // The server scan was stopped (e.g. by a grown-up): "Try again" sends a new scan.
         attemptRef.current = newAttempt(newKey);
@@ -376,7 +393,7 @@ export default function ScanScreen() {
           <Text style={styles.body}>Lay the page flat in good light so every word shows.</Text>
         </View>
 
-        {!running ? (
+        {!sending ? (
           <View style={styles.row}>
             <Button
               label="Take a photo"
@@ -448,7 +465,7 @@ export default function ScanScreen() {
                         ⚠ {problem}
                       </Text>
                     ) : null}
-                    {!running ? (
+                    {!sending ? (
                       <View style={styles.row}>
                         <SmallButton
                           label="Up"
@@ -514,13 +531,21 @@ export default function ScanScreen() {
           </View>
         ) : null}
 
+        {upload.kind === 'stopping' ? (
+          // No progress bar and no Stop button: the one control on screen must not be the one that
+          // has already been pressed and can do nothing more (HUNT7-K-2).
+          <View style={styles.card} accessibilityLiveRegion="polite">
+            <Text style={styles.body}>{CHILD_STOPPING_MESSAGE}</Text>
+          </View>
+        ) : null}
+
         {upload.kind === 'error' ? (
           <Text style={styles.noticeText} accessibilityRole="alert">
             {upload.message}
           </Text>
         ) : null}
 
-        {!running && session.pages.length > 0 ? (
+        {!sending && session.pages.length > 0 ? (
           <Button
             label={upload.kind === 'error' ? 'Try again' : 'Send my homework'}
             onPress={() => void send()}

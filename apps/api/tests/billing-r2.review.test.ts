@@ -1455,14 +1455,17 @@ describe('HUNT6-C-1: a renewal’s pending proration is money collected, so it i
       charged_amount_cents: 3999,
       tax_amount_cents: 329,
     });
-    // ...and the 1000 the same invoice collected for the pending item is its own 'proration' period.
-    // It carries no tax of its own: tax is never revenue, and a refund of this invoice is recorded
-    // against the subscription period, which is the row that holds the provider's figure.
+    // ...and the 1000 the same invoice collected for the pending item is its own 'proration' period,
+    // carrying the rest of that apportionment: floor(412 × 1000 ÷ 4999) = 82. HUNT7-C-4: not 0. A
+    // refund of this invoice reaches THIS row too (C-PRORATION-REVERSAL walks the leftover onto it),
+    // and the leftover is a provider figure stated including tax like every other, so the row needs
+    // its own share to restate it in its charge's unit. Each share is floored, so the two together
+    // (329 + 82) never exceed the tax the invoice really levied.
     expect(rows[1]).toMatchObject({
       provider_period_id: `${invoiceId}:proration`,
       kind: 'proration',
       charged_amount_cents: 1000,
-      tax_amount_cents: 0,
+      tax_amount_cents: 82,
     });
     // Gross is exactly what the invoice collected less the state's tax: 5411 − 412. Before the fix it
     // was 3999 and the other $10 the family paid appeared in no month at all.
@@ -1705,10 +1708,12 @@ describe('C-PRORATION-REVERSAL: a provider refund reaches BOTH periods of one in
         kind: string;
         settlement: string;
         charged_amount_cents: number;
+        tax_amount_cents: number;
         refunded_cents: number;
       }[]
     >`
-      select provider_period_id, kind, settlement, charged_amount_cents, refunded_cents
+      select provider_period_id, kind, settlement, charged_amount_cents, tax_amount_cents,
+             refunded_cents
         from public.billing_periods
        where provider_period_id in (${invoiceId}, ${`${invoiceId}:proration`})
        order by provider_period_id`;
@@ -1719,6 +1724,8 @@ describe('C-PRORATION-REVERSAL: a provider refund reaches BOTH periods of one in
     ref: string,
     amountRefunded: number,
     full: boolean,
+    /** What the Charge totals; 5411 is the taxed fixture, 4999 the untaxed one below. */
+    chargeTotal = 5411,
   ): unknown => ({
     id: `evt_${randomUUID()}`,
     type: 'charge.refunded',
@@ -1726,7 +1733,7 @@ describe('C-PRORATION-REVERSAL: a provider refund reaches BOTH periods of one in
       object: {
         id: chargeId,
         object: 'charge',
-        amount: 5411,
+        amount: chargeTotal,
         amount_refunded: amountRefunded,
         refunded: full,
         currency: 'usd',
@@ -1883,6 +1890,252 @@ describe('C-PRORATION-REVERSAL: a provider refund reaches BOTH periods of one in
     const after = await stripeRevenue();
     expect(after.refunds - before.refunds).toBe(0);
     expect(after.gross - before.gross).toBe(4999);
+  });
+
+  /**
+   * The same renewal with NO sales tax, so every figure below is an exact integer in one unit: $39.99
+   * of subscription plus a $10 mid-cycle item Stripe left pending, and the family paid 4999.
+   */
+  const untaxedRenewalWithDeferredProration = (
+    invoiceId: string,
+    ref: string,
+    start: number,
+  ): unknown =>
+    stripeInvoicePaid(invoiceId, ref, start, {
+      subtotal: 4999,
+      tax: 0,
+      amountPaid: 4999,
+      lines: [
+        {
+          period: { start: start - 86400, end: start },
+          price: { id: 'price_family_1' },
+          proration: true,
+          amount: 1000,
+        },
+        {
+          period: { start, end: start + 30 * 86400 },
+          price: { id: 'price_family_1' },
+          amount: 3999,
+        },
+      ],
+    });
+
+  const disputeEvent = (
+    chargeId: string,
+    ref: string,
+    amount: number,
+    status: 'needs_response' | 'won',
+  ): unknown => ({
+    id: `evt_${randomUUID()}`,
+    type: status === 'won' ? 'charge.dispute.closed' : 'charge.dispute.created',
+    data: {
+      object: {
+        id: `dp_r7_${randomUUID()}`,
+        object: 'dispute',
+        amount,
+        currency: 'usd',
+        charge: chargeId,
+        payment_intent: `pi_${randomUUID()}`,
+        reason: 'fraudulent',
+        status,
+        metadata: { billing_ref: ref },
+      },
+    },
+  });
+
+  it('[HUNT7-C-1] a chargeback after a partial refund spills what the primary bucket has LEFT, not nothing', async () => {
+    api.now.value = SEPTEMBER;
+    const before = await stripeRevenue();
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-16T00:00:00Z') / 1000;
+    const invoiceId = `in_r7_spill_${randomUUID()}`;
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    expect(
+      (await postStripe(untaxedRenewalWithDeferredProration(invoiceId, ref, start))).status,
+    ).toBe(200);
+    expect((await stripeRevenue()).gross - before.gross).toBe(4999);
+
+    // $10 back first. `Charge.amount_refunded` is CUMULATIVE, so it is measured against the primary
+    // period's whole bucket (3999) and fits inside it: nothing spills.
+    expect(
+      (await postStripe(chargeRefunded(chargeId, invoiceId, ref, 1000, false, 4999))).status,
+    ).toBe(200);
+    const refunded = await bothPeriods(invoiceId);
+    expect(refunded[0]).toMatchObject({ settlement: 'partially_refunded', refunded_cents: 1000 });
+    expect(refunded[1]).toMatchObject({ settlement: 'settled', refunded_cents: 0 });
+
+    // The family then disputes the 3999 they did NOT get back. A dispute amount is INCREMENTAL: it
+    // states only the newly disputed part and is added on top. The primary period has 3999 − 1000 =
+    // 2999 of room left, so 1000 of the dispute belongs to the ':proration' row — which is where the
+    // other $10 the family paid is recorded. Measured against the bucket's SIZE the leftover was 0,
+    // the cap swallowed the excess, and 1000 cents of clawed-back money stayed in gross as revenue.
+    expect((await postStripe(disputeEvent(chargeId, ref, 3999, 'needs_response'))).status).toBe(
+      200,
+    );
+    const disputed = await bothPeriods(invoiceId);
+    expect(disputed[0]).toMatchObject({ settlement: 'chargeback', refunded_cents: 3999 });
+    expect(disputed[1]).toMatchObject({
+      provider_period_id: `${invoiceId}:proration`,
+      settlement: 'chargeback',
+      refunded_cents: 1000,
+    });
+    // Every cent the family paid is now back with them, so the month keeps nothing of this invoice.
+    const after = await stripeRevenue();
+    expect(after.refunds - before.refunds).toBe(4999);
+    expect(after.gross - before.gross - (after.refunds - before.refunds)).toBe(0);
+  });
+
+  it('[HUNT7-C-2] winning that dispute gives back only what the dispute added, so the real refund survives and the $1 is not reinstated', async () => {
+    api.now.value = SEPTEMBER;
+    const before = await stripeRevenue();
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const [school] = await api.db.sql<{ id: string }[]>`
+      insert into public.schools (name, status) values ('R7 Cedar Elementary', 'active') returning id`;
+    await api.db.sql`
+      insert into public.family_school_designations (family_id, school_id, effective_from, created_by)
+      values (${fam.familyId}, ${school!.id}, '2026-08-01', ${fam.ownerId})`;
+    const start = Date.parse('2026-09-17T00:00:00Z') / 1000;
+    const invoiceId = `in_r7_roundtrip_${randomUUID()}`;
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    expect(
+      (await postStripe(untaxedRenewalWithDeferredProration(invoiceId, ref, start))).status,
+    ).toBe(200);
+
+    /** This family's donation adjustments, oldest first: −100 is a reversal, +100 a reinstatement. */
+    const adjustments = async (): Promise<number[]> => {
+      const rows = await api.db.sql<{ amount_cents: number }[]>`
+        select a.amount_cents from public.donation_adjustments a
+          join public.donation_accruals c on c.id = a.accrual_id
+         where c.family_id = ${fam.familyId}
+         order by a.created_at, a.id`;
+      return rows.map((r) => r.amount_cents);
+    };
+
+    // The full-price month earns the school its $1 before anything goes wrong.
+    await runDonationAccrual(api.apiDb, '2026-09', api.config.programTimezone);
+    const [accrued] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.donation_accruals where family_id = ${fam.familyId}`;
+    expect(accrued!.n).toBe(1);
+    expect(await adjustments()).toEqual([]);
+
+    // A genuine $10 refund reverses the dollar, then the un-refunded 3999 is disputed and WON.
+    expect(
+      (await postStripe(chargeRefunded(chargeId, invoiceId, ref, 1000, false, 4999))).status,
+    ).toBe(200);
+    expect(await adjustments()).toEqual([-100]);
+    expect((await postStripe(disputeEvent(chargeId, ref, 3999, 'needs_response'))).status).toBe(
+      200,
+    );
+    expect((await postStripe(disputeEvent(chargeId, ref, 3999, 'won'))).status).toBe(200);
+
+    // The win returns exactly what the dispute added — 2999 on the primary row and 1000 on the
+    // ':proration' row — and leaves the family's real refund on the record. While the win subtracted
+    // the whole converted amount from a figure the cap had clipped, the primary row went back to
+    // 'settled' with refunded_cents 0: the parent's own support case then told them the store had
+    // reported no refund at all, and the school's $1 was reinstated for a month they were partly
+    // refunded for.
+    const won = await bothPeriods(invoiceId);
+    expect(won[0]).toMatchObject({
+      provider_period_id: invoiceId,
+      settlement: 'partially_refunded',
+      refunded_cents: 1000,
+    });
+    expect(won[1]).toMatchObject({
+      provider_period_id: `${invoiceId}:proration`,
+      settlement: 'settled',
+      refunded_cents: 0,
+    });
+    const after = await stripeRevenue();
+    expect(after.refunds - before.refunds).toBe(1000);
+    expect(after.gross - before.gross).toBe(4999);
+    // No reinstatement: the period is not settled in full, so P17 keeps the dollar reversed.
+    expect(await adjustments()).toEqual([-100]);
+  });
+
+  it('[HUNT7-C-4] both rows of one invoice carry their own floored share of its tax', async () => {
+    api.now.value = SEPTEMBER;
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-18T00:00:00Z') / 1000;
+    const invoiceId = `in_r7_shares_${randomUUID()}`;
+    expect((await postStripe(renewalWithDeferredProration(invoiceId, ref, start))).status).toBe(
+      200,
+    );
+    // The invoice's 412 of tax is apportioned to the two charges it was added to, each share FLOORED
+    // so no row ever stores more tax than was really levied on it (N1-TAX-APPORTION): 329 on the
+    // 3999 and 82 on the 1000, and 329 + 82 <= 412 because both are floored. The second row's share
+    // is not 0: the amount that reaches it is the LEFTOVER of a provider figure, which is stated
+    // including tax like every other, so the row needs its own share to restate it.
+    const paid = await bothPeriods(invoiceId);
+    expect(paid[0]).toMatchObject({ charged_amount_cents: 3999, tax_amount_cents: 329 });
+    expect(paid[1]).toMatchObject({ charged_amount_cents: 1000, tax_amount_cents: 82 });
+    expect(paid[0]!.tax_amount_cents + paid[1]!.tax_amount_cents).toBeLessThanOrEqual(412);
+  });
+
+  it('[HUNT7-C-4] a partial refund that spills is recorded on the proration row in that row’s own unit', async () => {
+    api.now.value = SEPTEMBER;
+    const before = await stripeRevenue();
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const ref = await billingRef(fam);
+    const start = Date.parse('2026-09-18T00:00:00Z') / 1000;
+    const invoiceId = `in_r7_unit_${randomUUID()}`;
+    const chargeId = `ch_${randomUUID()}`;
+    api.providers.stripe.chargeInvoices.set(chargeId, invoiceId);
+    expect((await postStripe(renewalWithDeferredProration(invoiceId, ref, start))).status).toBe(
+      200,
+    );
+    // $44 back of the 5411 paid. The primary period's bucket is its charge plus its own tax share
+    // (3999 + 329 = 4328), so 72 of the provider's figure is left over — and 72 tax-INCLUSIVE cents
+    // are 67 of the proration charge's pre-tax cents (the exact pre-tax spill is 66; the floored tax
+    // share puts the recorded refund at or above it, never below). Written straight in, they recorded
+    // 72 cents of refund against a pre-tax charge: the owner's refunds column in one unit and the
+    // charge in another, on the one row whose stated purpose is to hold pre-tax collected money.
+    expect((await postStripe(chargeRefunded(chargeId, invoiceId, ref, 4400, false))).status).toBe(
+      200,
+    );
+    const rows = await bothPeriods(invoiceId);
+    expect(rows[0]).toMatchObject({ settlement: 'partially_refunded', refunded_cents: 3999 });
+    expect(rows[1]).toMatchObject({ settlement: 'partially_refunded', refunded_cents: 67 });
+    const after = await stripeRevenue();
+    expect(after.refunds - before.refunds).toBe(4066);
+  });
+
+  it('[HUNT7-C-1] the walk’s docstring says which provider figures are cumulative and which are incremental', () => {
+    const src = readFileSync(new URL('../src/services/billing-sync.ts', import.meta.url), 'utf8');
+    // The block that states the provider's amount in the row's unit and works out what is left over,
+    // bracketed by the two statements around it so the slice survives a rewording of its own opening.
+    const from = src.indexOf('  const inCharge =');
+    const to = src.indexOf('  const effective: SettlementEvent =');
+    expect(from).toBeGreaterThan(0);
+    expect(to).toBeGreaterThan(from);
+    const comment = src.slice(from, to);
+    // The false claim: one expression served a cumulative figure and an incremental one, and the
+    // comment described only the bucket's SIZE.
+    expect(comment).not.toMatch(/are the most of a provider figure this period can account for/);
+    expect(comment).toMatch(/\bcumulative(ly)?\b/i);
+    expect(comment).toMatch(/\bincremental(ly)?\b/i);
+    expect(comment).toMatch(/still has room|has LEFT|left of/i);
+    // And it names which provider figure is which, not just that the two differ.
+    expect(comment).toMatch(/amount_refunded/);
+    expect(comment).toMatch(/Dispute's `amount`/);
+  });
+
+  it('[HUNT7-C-4] prorationPeriodFor justifies its tax by the unit of the amount that reaches the row', () => {
+    const src = readFileSync(new URL('../src/services/billing-sync.ts', import.meta.url), 'utf8');
+    const from = src.indexOf(' * The second billing period a renewal');
+    const to = src.indexOf('export function prorationPeriodFor');
+    expect(from).toBeGreaterThan(0);
+    expect(to).toBeGreaterThan(from);
+    const docstring = src.slice(from, to);
+    // The false justification: the row's CHARGE is pre-tax, but the figure that reaches the row is
+    // the leftover, which is the provider's tax-inclusive amount.
+    expect(docstring).not.toMatch(/It carries no tax/);
+    expect(docstring).toMatch(/tax-inclusive/);
+    expect(docstring).toMatch(/apportioned|its own share/);
   });
 });
 

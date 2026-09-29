@@ -1,8 +1,11 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  AI_STAGES,
   canAttempt,
   DEFAULT_RATE_TABLE_2026_09_18,
   estimateUpperBoundCostMicros,
+  type AiStage,
 } from '@pencillift/domain/quotas';
 import { createMockResponsesClient, type ResponsesResult } from './client.ts';
 import { dataEnvelope, PROMPTS } from './prompts.ts';
@@ -223,5 +226,187 @@ describe('a refused request is not sent again (JOBS-R1-02)', () => {
       expect(client.requests).toHaveLength(1);
       if (!out.result.ok) expect(out.result.error.code).toBe('PROVIDER_FAILED');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HUNT7-B-1: the stage BUDGET is the cumulative bound for EVERY attempt after the first
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * HUNT7-B-1. run.ts weighs attempt 1 against the per-request ADMISSION cap and every attempt after
+ * it against the stage BUDGET (run.ts's `attempt === 1 ? limits : { ...limits, maxCostMicros:
+ * maxStageCostMicros }`), whatever ended the earlier attempt — a truncated answer, a client-side
+ * timeout, a 5xx or a validation rejection alike. That is the code the lead kept: a spend hold
+ * reserves the budget, so the budget is what the stage may spend, and a second try after a
+ * transient failure is what gets a child a real hint instead of a template.
+ *
+ * What it is NOT is "a reservation and not money". For the five stages whose budget is above their
+ * cap there is a band of input sizes in which the second attempt is now made and billed where the
+ * single pre-split number refused it, and these cases compute that band from the production tables
+ * and require routing.ts to state it — so the constant's own docstring cannot go back to saying the
+ * split moves no money.
+ */
+function largestSatisfying(predicate: (n: number) => boolean): number {
+  let low = 1;
+  // Ten million estimated input tokens is past every stage's admission cap at every rate row here,
+  // so the answer is bracketed.
+  let high = 10_000_000;
+  let best = 0;
+  while (low <= high) {
+    const mid = low + Math.floor((high - low) / 2);
+    if (predicate(mid)) {
+      best = mid;
+      low = mid + 1;
+    } else high = mid - 1;
+  }
+  return best;
+}
+
+/** The upper-bound estimate of one attempt of `stage` at its configured output budget. */
+function estimateAt(stage: AiStage, inputTokens: number): number {
+  const estimate = estimateUpperBoundCostMicros(DEFAULT_RATE_TABLE_2026_09_18, {
+    modelId: STAGE_MODELS[stage],
+    inputTokens,
+    maxOutputTokens: PROPOSED_STAGE_LIMITS[stage].maxOutputTokens,
+  });
+  if (!estimate.ok) throw new Error(`${stage} has no rate row`);
+  return estimate.value;
+}
+
+/**
+ * The estimated-input band in which the cap/budget split bought a stage a SECOND billed attempt
+ * after a failure the provider never reported usage for. Such an attempt is metered at the full
+ * upper bound it was admitted with (JOBS-R1-03), so `spent` equals its estimate exactly and the
+ * loop weighs 2 x estimate: over the ADMISSION cap, still inside the stage BUDGET. Both edges are
+ * searched with the production estimator, so the band moves when the owner's numbers move.
+ */
+function secondAttemptBand(stage: AiStage): { readonly from: number; readonly to: number } | null {
+  const limits = PROPOSED_STAGE_LIMITS[stage];
+  const budget = PROPOSED_STAGE_COST_BUDGET_MICROS[stage];
+  if (limits.maxAttempts < 2 || budget <= limits.maxCostMicros) return null;
+  // Attempt 1 has to be admitted at all: that is the cap, on this one request.
+  const admitted = largestSatisfying((e) => estimateAt(stage, e) <= limits.maxCostMicros);
+  // Up to here the cap alone would have admitted the second attempt too, so the split changed
+  // nothing; one token past it the old single number ended the stage after one attempt.
+  const capAdmitsTwo = largestSatisfying((e) => 2 * estimateAt(stage, e) <= limits.maxCostMicros);
+  const budgetAdmitsTwo = largestSatisfying((e) => 2 * estimateAt(stage, e) <= budget);
+  const from = capAdmitsTwo + 1;
+  const to = Math.min(budgetAdmitsTwo, admitted);
+  return to >= from ? { from, to } : null;
+}
+
+/** 2501 -> "2,501": the form routing.ts writes its numbers in. */
+function grouped(n: number): string {
+  return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/**
+ * The docstring of PROPOSED_STAGE_COST_BUDGET_MICROS, unwrapped: comment markers stripped and
+ * whitespace collapsed BEFORE matching, because a sentence the formatter split over two lines must
+ * still be readable to a regex — otherwise a prose guard passes on the claim it cannot see
+ * (HUNT7-B-7, the L-054 shape).
+ */
+function budgetTableDocstring(): string {
+  const source = readFileSync(new URL('./routing.ts', import.meta.url), 'utf8');
+  const from = source.indexOf(' * The budget for a STAGE AS A WHOLE');
+  const to = source.indexOf('export const PROPOSED_STAGE_COST_BUDGET_MICROS');
+  if (from < 0 || to < from) throw new Error('routing.ts no longer documents the budget table');
+  return source
+    .slice(from, to)
+    .replace(/\s*\*\s*/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+const BAND_STAGES = AI_STAGES.filter((stage) => secondAttemptBand(stage) !== null);
+
+describe('the stage budget bounds every attempt after the first (HUNT7-B-1)', () => {
+  it('opens a second billed attempt for exactly the stages whose budget is above their cap', () => {
+    expect(BAND_STAGES).toEqual([
+      'coaching',
+      'followup',
+      'daily_set',
+      'thursday_bundle',
+      'semantic_check',
+    ]);
+    for (const stage of BAND_STAGES) {
+      expect(PROPOSED_STAGE_COST_BUDGET_MICROS[stage], stage).toBeGreaterThan(
+        PROPOSED_STAGE_LIMITS[stage].maxCostMicros,
+      );
+    }
+    // And for no other stage: where the two numbers are equal, the split cannot have moved money.
+    for (const stage of AI_STAGES.filter((s) => !BAND_STAGES.includes(s))) {
+      const limits = PROPOSED_STAGE_LIMITS[stage];
+      expect(
+        limits.maxAttempts < 2 || PROPOSED_STAGE_COST_BUDGET_MICROS[stage] === limits.maxCostMicros,
+        stage,
+      ).toBe(true);
+    }
+  });
+
+  it('really bills a coaching stage twice inside that band, and once one token past it', async () => {
+    const band = secondAttemptBand('coaching')!;
+    const limits = PROPOSED_STAGE_LIMITS.coaching;
+    const budget = PROPOSED_STAGE_COST_BUDGET_MICROS.coaching;
+    const run = (estimatedInputTokens: number) =>
+      runStage({
+        prompt: PROMPTS.coaching,
+        input: [dataEnvelope({})],
+        // Every attempt is a 5xx: the provider may have run and billed it, so it is metered at the
+        // full upper bound it was admitted with and `spent` is exactly that estimate.
+        client: createMockResponsesClient(() => errorResult(503)),
+        limits,
+        rates: DEFAULT_RATE_TABLE_2026_09_18,
+        gate,
+        metadata: { stage: 'coaching' },
+        estimatedInputTokens,
+        sleep: () => Promise.resolve(),
+      });
+    const inside = await run(band.to);
+    expect(inside.attempts).toHaveLength(2);
+    for (const attempt of inside.attempts) expect(attempt.usageEstimated).toBe(true);
+    const spent = inside.attempts.reduce((n, a) => n + a.costMicros, 0);
+    // The whole point: this stage spent MORE than the number that used to bound the whole stage,
+    // and no more than the budget the caller's hold reserved.
+    expect(spent).toBeGreaterThan(limits.maxCostMicros);
+    expect(spent).toBeLessThanOrEqual(budget);
+    // One estimated input token past the band the budget has no room either, and the stage stops
+    // after the one attempt — so the band's upper edge is the budget's and not the cap's.
+    const past = await run(band.to + 1);
+    expect(past.attempts).toHaveLength(1);
+  });
+
+  it('routing.ts states that band instead of calling the budget a reservation only', () => {
+    const doc = budgetTableDocstring();
+    // The load-bearing half: what the number bounds, and that it is spend and not only a hold.
+    expect(doc).toMatch(/every attempt after the first/i);
+    expect(doc).toMatch(/cumulative/i);
+    expect(doc).toMatch(/second billed/i);
+    // And the band itself, per stage, in the figures these cases compute.
+    for (const stage of BAND_STAGES) {
+      const band = secondAttemptBand(stage)!;
+      expect(doc, stage).toContain(`${stage} ${grouped(band.from)}..${grouped(band.to)}`);
+    }
+  });
+});
+
+/**
+ * HUNT7-B-2. The same docstring said the budget is what learning-jobs.ts "reserves for the
+ * personalization stage", singular, while `personalizeItems` takes
+ * `stage: 'daily_set' | 'thursday_bundle'` and both arms are live — two holds, 483,240 and 933,600
+ * micro-USD. The owner's cost record was written from that sentence and named the smaller one as the
+ * largest hold in the product, understating the peak by 93%.
+ */
+describe('both personalization stages are named beside their holds (HUNT7-B-2)', () => {
+  it('names each arm and its own budget, from the table', () => {
+    const doc = budgetTableDocstring();
+    for (const stage of ['daily_set', 'thursday_bundle'] as const) {
+      expect(doc, stage).toContain(stage);
+      expect(doc, stage).toContain(grouped(PROPOSED_STAGE_COST_BUDGET_MICROS[stage]));
+    }
+    // And which of the two is the peak the owner has to size a ceiling against.
+    expect(PROPOSED_STAGE_COST_BUDGET_MICROS.thursday_bundle).toBeGreaterThan(
+      PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set,
+    );
   });
 });

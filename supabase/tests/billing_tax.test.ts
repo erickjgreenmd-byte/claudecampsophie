@@ -20,6 +20,16 @@ import { childClaims, seedFamily, type SeededFamily } from './fixtures.ts';
  * the rest of `billing_periods` is — a family member reads their own rows, another family reads
  * nothing, a child and `anon` read nothing at all, and no client role may write it. Synthetic data
  * only; the amounts below are the approved prices.
+ *
+ * Migration 0950 (hardening round 7, finding HUNT7-C-2) adds `chargeback_cents` beside it, on the
+ * same terms. A chargeback ADDS the disputed amount to `refunded_cents` and caps it at the charge,
+ * while a won dispute SUBTRACTS the whole amount back out, so on any invoice where an earlier refund
+ * had already used part of the charge the cap clipped the addition and the subtraction erased a real
+ * refund the family had received — the row went back to settled with nothing refunded, the parent's
+ * own support case then said the store had reported no refund, and P17 reinstated the school's $1 for
+ * a month that was partly refunded. What the dispute added is not recoverable from one column once it
+ * has been clipped, so it is stored: `chargeback_cents` is the part of `refunded_cents` that an open
+ * dispute contributed, and the reversal gives back exactly that.
  */
 
 let db: TestDb;
@@ -180,5 +190,130 @@ describe('[HUNT5-C-2] tax_amount_cents inherits billing_periods’ RLS and grant
       select policyname, cmd from pg_policies
        where schemaname = 'public' and tablename = 'billing_periods'`;
     expect(policies).toEqual([{ policyname: 'billing_periods_member_read', cmd: 'SELECT' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HUNT7-C-2: the dispute's own contribution, stored so a won dispute cannot erase a real refund
+// ---------------------------------------------------------------------------------------------
+
+/** One settled Stripe renewal for `fam` with the refund figures stated directly. */
+async function recordSettlement(refunded: number, chargeback: number): Promise<string> {
+  const providerPeriodId = `in_cb_${randomUUID()}`;
+  const [row] = await db.sql<{ id: string }[]>`
+    insert into public.billing_periods (family_id, channel, provider_period_id, kind, period_start,
+      period_end, paid_slots, regular_amount_cents, charged_amount_cents, settlement, settled_at,
+      refunded_cents, chargeback_cents)
+    values (${fam.familyId}, 'stripe', ${providerPeriodId}, 'subscription_period', now(),
+      now() + interval '1 month', 1, 3999, 3999, 'chargeback', now(), ${refunded}, ${chargeback})
+    returning id`;
+  return row!.id;
+}
+
+async function chargebackOf(id: string): Promise<number> {
+  const [row] = await db.sql<{ chargeback_cents: number }[]>`
+    select chargeback_cents from public.billing_periods where id = ${id}`;
+  return row!.chargeback_cents;
+}
+
+describe('[HUNT7-C-2] public.billing_periods.chargeback_cents', () => {
+  it('exists as a not-null integer column defaulting to 0', async () => {
+    const [column] = await db.sql<
+      {
+        data_type: string;
+        is_nullable: string;
+        column_default: string | null;
+      }[]
+    >`
+      select data_type, is_nullable, column_default
+        from information_schema.columns
+       where table_schema = 'public' and table_name = 'billing_periods'
+         and column_name = 'chargeback_cents'`;
+    // Integer cents, never a float: money in this schema is always an exact integer of cents.
+    expect(column).toMatchObject({ data_type: 'integer', is_nullable: 'NO' });
+    expect(column!.column_default).toMatch(/^0$/);
+  });
+
+  it('defaults to 0 for a period written without it, so every pre-0950 row reads as undisputed', async () => {
+    // Exactly the shape of every row recorded before this migration: the insert names no column.
+    const id = await recordPeriod();
+    expect(await chargebackOf(id)).toBe(0);
+  });
+
+  it('stores the part of a refund figure that a dispute contributed', async () => {
+    // A $10 refund the family really received, then a dispute of the un-refunded 2999 on top.
+    const id = await recordSettlement(3999, 2999);
+    expect(await chargebackOf(id)).toBe(2999);
+    // Winning the dispute gives back exactly that, leaving the genuine refund on the record.
+    await db.sql`
+      update public.billing_periods
+         set refunded_cents = refunded_cents - chargeback_cents, chargeback_cents = 0,
+             settlement = 'partially_refunded'
+       where id = ${id}`;
+    const [after] = await db.sql<{ refunded_cents: number; chargeback_cents: number }[]>`
+      select refunded_cents, chargeback_cents from public.billing_periods where id = ${id}`;
+    expect(after).toEqual({ refunded_cents: 1000, chargeback_cents: 0 });
+  });
+
+  it('refuses a negative dispute contribution', async () => {
+    await expect(recordSettlement(1000, -1)).rejects.toThrow(
+      /billing_periods_chargeback_cents_non_negative/,
+    );
+  });
+
+  it('refuses a dispute contribution larger than the refund figure it is part of', async () => {
+    // The invariant the arithmetic maintains: refunded_cents = the genuine refund + what the open
+    // dispute added, so the dispute's part can never exceed the total it is a part of. Without it a
+    // reversal could subtract more than was ever added and drive the figure below the real refund.
+    await expect(recordSettlement(1000, 1001)).rejects.toThrow(
+      /billing_periods_chargeback_cents_within_refund/,
+    );
+    const id = await recordSettlement(1000, 1000);
+    await expect(
+      db.sql`update public.billing_periods set refunded_cents = 999 where id = ${id}`,
+    ).rejects.toThrow(/billing_periods_chargeback_cents_within_refund/);
+    expect(await chargebackOf(id)).toBe(1000);
+  });
+});
+
+describe('[HUNT7-C-2] chargeback_cents inherits billing_periods’ RLS and grants', () => {
+  it('a family member reads the dispute figure on their own period', async () => {
+    const id = await recordSettlement(3999, 2999);
+    const rows = await db.asParent(
+      fam.ownerId,
+      (tx) => tx<{ chargeback_cents: number }[]>`
+        select chargeback_cents from public.billing_periods where id = ${id}`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.chargeback_cents).toBe(2999);
+  });
+
+  it('another family reads no row, so none of its dispute figure', async () => {
+    const id = await recordSettlement(3999, 2999);
+    const rows = await db.asParent(
+      other.ownerId,
+      (tx) => tx`select chargeback_cents from public.billing_periods where id = ${id}`,
+    );
+    expect(rows).toHaveLength(0);
+  });
+
+  it('a child and anon cannot select the column at all', async () => {
+    await expect(
+      db.asChild(childClaims(fam), (tx) => tx`select chargeback_cents from public.billing_periods`),
+    ).rejects.toThrow(/permission denied/);
+    await expect(
+      db.asAnon((tx) => tx`select chargeback_cents from public.billing_periods`),
+    ).rejects.toThrow(/permission denied/);
+  });
+
+  it('a parent cannot write it: a family may not restate a dispute on its own charge', async () => {
+    const id = await recordSettlement(3999, 2999);
+    await expect(
+      db.asParent(
+        fam.ownerId,
+        (tx) => tx`update public.billing_periods set chargeback_cents = 0 where id = ${id}`,
+      ),
+    ).rejects.toThrow(/permission denied/);
+    expect(await chargebackOf(id)).toBe(2999);
   });
 });

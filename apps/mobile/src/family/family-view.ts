@@ -77,6 +77,26 @@ export function childPlanEditable(status: FamilyChild['status']): boolean {
   return status !== 'archived';
 }
 
+/**
+ * How a child is named in a picker that offers more than one (the same job as the portal's
+ * `childPickerSuffix`, apps/web/src/pages/app/ChildrenPage.tsx). A state that changes what the screen
+ * behind the picker can do belongs in the option itself, so the parent is not left to discover it
+ * after choosing — above all a deletion under way, for which the learning reads answer NOT_FOUND
+ * (HUNT7-J-2).
+ *
+ * The flag is tested FIRST, before the status: `request_deletion` archives a child-scope target
+ * (migration 0890), so such a child reads as archived here too, and "archived" is the more comforting
+ * of the two words.
+ */
+export function childPickerSuffix(
+  child: Pick<FamilyChild, 'status'> & { readonly deletionPending?: boolean | undefined },
+): string {
+  if (child.deletionPending === true) return ' (data deletion under way)';
+  if (child.status === 'archived') return ' (archived — plan is read-only)';
+  if (child.status === 'draft') return ' (no paid slot)';
+  return '';
+}
+
 export interface ChildRow {
   readonly id: string;
   readonly nickname: string;

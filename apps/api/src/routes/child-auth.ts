@@ -237,14 +237,23 @@ export function childAuthRoutes(): Hono<AppEnv> {
           allowTestProvider: acceptsTestProviderConsent(deps.config.environment),
         });
       if (row.used_at) {
-        // Reuse of a rotated token signals theft: revoke the whole session (spec P3), at once and
-        // without any grace window. Rotation is the only way a token becomes used, so a second
-        // presentation means two parties hold it. tests/auth.test.ts > 'refresh tokens rotate and
-        // reuse revokes the session' is the case that pins this rule.
+        // This token has already been rotated, so it must never be served again: revoke the whole
+        // session (spec P3), at once and without any grace window. What the guard establishes is
+        // only that — the rotation below is the one thing that sets `used_at`, so a second
+        // presentation means the token was presented twice. It does NOT establish that two parties
+        // hold it (HUNT7-A-4): the second presenter is either a second holder or the rightful holder
+        // retrying after a response that never arrived, and the server cannot tell them apart, so it
+        // fails closed and treats it as theft. The one-party case is a green test with no attacker in
+        // it — apps/mobile/src/family/child-session-r2.review.test.ts > '[repro] a retry after a
+        // lost answer presents the spent token, and the tablet is unpaired'. tests/auth.test.ts >
+        // 'refresh tokens rotate and reuse revokes the session' is the case that pins this rule.
         //
-        // BUG-244 is an ACCEPTED OPEN defect again (owner action #45): this also fires when a
-        // rotation's response is lost on the way back to the tablet, so one dropped HTTP response
-        // unpairs a child's device and the parent has to mint a new pairing code.
+        // BUG-244 is an ACCEPTED OPEN defect again (owner action #45) and it is exactly that second
+        // case: one dropped HTTP response unpairs a child's device, after which a grown-up completes
+        // a PIN step-up, mints a new pairing code (POST /children/:childId/pairing-code calls
+        // assertRecentUnlock, routes/family.ts) and re-enters its 8 symbols on the tablet before the
+        // child can work again. It is not an unpairing anyone can undo in one tap; no surface offers
+        // a re-pair action at all.
         //
         // Round 5 served that retry — an id per refresh the tablet kept across its own retries, a
         // two-minute window, an unclaimed replacement — and round 6 REMOVED it rather than repairing
@@ -254,28 +263,60 @@ export function childAuthRoutes(): Hono<AppEnv> {
         // at all, which then rotated on down the ordinary path below — no id, no window, no audit
         // row. So the window bounded when a replay could START, not how long it lasted: a captured
         // body bought a self-renewing child session until the tablet's own next refresh, which for a
-        // tablet put away is overnight. A logged request body is the realistic capture vector,
-        // because logs are read later.
+        // tablet put away is overnight. Capture is by a log a body passed through, read later; this
+        // service is not that log (app.ts records event, requestId, status and durationMs only), so
+        // the vector is a proxy or middlebox in front of it.
         //
-        // What the removal restores is worth stating exactly, since over-claiming a residual is what
-        // this reversal is FOR: a captured body is worthless again ONCE THE TOKEN IN IT HAS BEEN
-        // ROTATED — the property the recovery sold, and the only one it took away. A body captured
-        // BEFORE the device's own request reaches the server still carries a live refresh token, and
-        // whoever presents it first wins; that was as true before BUG-244 as it is now and nothing
-        // here touches it (the loser of that race then presents a rotated token, so THIS branch ends
-        // the session for both — detection, not prevention). Against that bounded gain the
-        // feature only avoided an occasional unpairing a parent can undo in one tap, and child
-        // privacy is not weakened for that trade.
+        // What the removal restores has to be stated EXACTLY, because over-claiming a residual is the
+        // failure this reversal exists to correct and the round-6 wording here committed it
+        // (HUNT7-A-3, which read this comment, not a code regression: between 1cfebcc and 5ba16c3
+        // this file changed in its comments only). A body captured after its token has been rotated
+        // can no longer OBTAIN TOKENS — that is the property the recovery sold, and the only one the
+        // removal takes back. It is NOT worthless, and nothing here authenticates the presenter:
+        //   * the first presentation of it ENDS that child's live session and un-lists the device, so
+        //     the child is told to ask a grown-up and a parent pays the re-pairing cost above. One
+        //     captured body is therefore one unpairing, at an instant its holder chooses for as long
+        //     as that session lives (migration 0850 keeps every token of a live session, however
+        //     old), and the only limit reached before this branch is childRefreshPerNetwork;
+        //   * no later presentation of the same body can end that session again — it is already
+        //     revoked, so the update below matches no row and the audit insert is skipped, leaving
+        //     only the idempotent device stamp, which can set nothing the parent's list should not
+        //     already show. The body never carries the tokens of the session a parent re-pairs, and it
+        //     obtains no token, so it reads nothing of the child's either.
+        // That is the residual owner action #45 accepts. It is this revocation working as intended —
+        // the theft signal — so it is bounded here, never served.
+        //
+        // A body captured BEFORE the device's own request reaches the server still carries a live
+        // refresh token, and whoever presents it first wins; that was as true before BUG-244 as it is
+        // now and nothing here touches it (the loser of that race then presents a rotated token, so
+        // THIS branch ends the session for both — detection, not prevention).
         //
         // A time window ALONE was rejected before BUG-244 and is still rejected: inside it a
         // replayer looks exactly like the rightful holder, so it would hand out a live child session
         // in the case it exists to help. Anything that reopens this needs to bound what a captured
         // body buys, not just when it may be presented.
-        await tx`update public.child_sessions set revoked_at = ${now}, revoke_reason = 'refresh_token_reuse' where id = ${row.session_id} and revoked_at is null`;
-        await tx`
-          insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
-          values (${row.family_id}, 'system', 'child_session.revoked_token_reuse', 'child_session', ${row.session_id})
-        `;
+        const revoked =
+          await tx`update public.child_sessions set revoked_at = ${now}, revoke_reason = 'refresh_token_reuse' where id = ${row.session_id} and revoked_at is null`;
+        // One row per revocation, not per presentation (HUNT7-A-3). The row records that this session
+        // was revoked for reuse, and a session already revoked is not revoked twice: besides the id —
+        // read from the token row locked above, so the session exists — `revoked_at is null` is the
+        // update's only predicate, so zero rows affected means precisely that it was already revoked.
+        // Unguarded, one captured body appends to audit_events, which nothing prunes, once per request
+        // for as long as the token row lives, because the per-session rate limit is only reached on
+        // the success path below. The refusal and the revocation do not depend on this insert: the
+        // branch returns { kind: 'reused' } and the route answers UNAUTHENTICATED from that alone.
+        // Say the trade plainly: a rotated token presented against a session some OTHER path already
+        // ended (logout, a parent's disconnect, consent withdrawal, deletion) now records nothing
+        // either — there is no revocation to record, and it is refused just the same. What is lost is a
+        // row about a session already dead, in a table no PencilLift surface reads (every reference to
+        // audit_events under apps/*/src is a write); what is bought is that no unauthenticated caller
+        // can grow it at will.
+        if (revoked.count > 0) {
+          await tx`
+            insert into public.audit_events (family_id, actor_kind, action, target_type, target_id)
+            values (${row.family_id}, 'system', 'child_session.revoked_token_reuse', 'child_session', ${row.session_id})
+          `;
+        }
         // The session is over, so the parent's list must stop calling the device connected
         // (HUNT4-MOB-4).
         await stampDeviceWhenNoLiveSession(tx, row.session_id);

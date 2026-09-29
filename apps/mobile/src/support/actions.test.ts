@@ -50,6 +50,8 @@ function detail(overrides: Partial<SupportCaseDetail> = {}): SupportCaseDetail {
       id: PERIOD_ID,
       channel: 'play_store',
       providerPeriodId: 'GPA.synthetic-001',
+      kind: 'subscription_period',
+      derivedFromProviderPeriodId: null,
       periodStart: '2026-09-01T00:00:00.000Z',
       periodEnd: '2026-10-01T00:00:00.000Z',
       paidSlots: 1,

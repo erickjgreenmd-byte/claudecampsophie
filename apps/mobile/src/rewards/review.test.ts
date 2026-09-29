@@ -130,3 +130,47 @@ describe('rewards review probes (mobile, held up)', () => {
     expect(text).not.toMatch(/\$|\b(cash|money|wallet|dollars?|buy|purchase|pay|paid|shop)\b/i);
   });
 });
+
+/**
+ * HUNT7-J-4. The parent Rewards screen owns its fetch instead of using the shared `useLoad`, and round
+ * 6 gave it only the first half of HUNT6-I-2: `setState({status:'loading'})` before the load, so the
+ * previous adult's rows go before the request — but no run ticket, so whichever request ANSWERS last
+ * publishes. `useLoad` (src/family/ui.tsx) and the privacy screen both got the ticket in that same
+ * commit; this screen did not, and nothing pinned either half of it here.
+ *
+ * Four callers can overlap: the mount/identity effect, pull-to-refresh, the error retry and the reload
+ * after a decision. The last is the reachable one — `decide` clears `busy` BEFORE awaiting the reload,
+ * so every button is live again while it is in flight, and approving a second card starts a second
+ * decision and a second reload. Reload #1 answering after reload #2 restores the list as it was before
+ * the second decision, with Approve/Decline on a request the server has already decided: exactly the
+ * state the reload at RV-rewards-7 exists to prevent. The same unguarded publish serves the previous
+ * family's child nicknames and point balances to the next adult at a handed-on tablet, since the gate
+ * publishes a new client for a new adult while the old client's request is still out.
+ *
+ * A source pin, in the style of the `useLoad` block in src/family/screens-r2.review.test.ts: this
+ * screen imports react-native, which the project cannot render (see the file header).
+ */
+describe('the parent rewards screen publishes only its newest load (HUNT7-J-4)', () => {
+  const src = code(parentRewardsScreen);
+
+  it('[repro] the ticket is taken before the await and checked before every publish', () => {
+    expect(src).toMatch(/const latestLoad = useRef\(0\)/);
+    expect(src).toMatch(/latestLoad\.current \+= 1;\s*const ticket = latestLoad\.current;/);
+    expect(src).toMatch(
+      /const data = await loadRewardsOverview\(api\);\s*if \(latestLoad\.current !== ticket\) return;\s*setState\(\{ status: 'ready', data \}\);/,
+    );
+    // The error is a publish too: showing a superseded load's failure is the same lie about whose load
+    // it is, and it would replace the rows the current adult's load is about to deliver.
+    expect(src).toMatch(/\} catch \(error\) \{\s*if \(latestLoad\.current !== ticket\) return;/);
+    // The unguarded publish itself: awaiting inside the setter leaves no place to check the ticket.
+    expect(src).not.toMatch(
+      /setState\(\{ status: 'ready', data: await loadRewardsOverview\(api\) \}\)/,
+    );
+  });
+
+  it('keeps the other half: the rows go before the fetch, not when it answers (HUNT6-I-2)', () => {
+    expect(src).toMatch(/setState\(\{ status: 'loading' \}\);\s*void load\(\);/);
+    // And the load is keyed on the gate's client, which is what makes a new adult re-run it.
+    expect(src).toMatch(/\}, \[api\]\);/);
+  });
+});

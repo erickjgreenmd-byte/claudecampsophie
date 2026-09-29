@@ -113,7 +113,18 @@ export function initAppSession(): () => void {
       // The whole lock, not only the server relock: the open parent screen and its data go too.
       // On a paired family tablet this also returns the device to the child's space
       // (MOB-R4-LOCK-01), so backgrounding cannot strand a child on the PIN screen.
-      await lockParentAreaOnDevice(secureStorage, modeEffects);
+      const owed = await lockParentAreaOnDevice(secureStorage, modeEffects);
+      // The lock reaches that debt only after three awaited keychain round trips, while the 'active'
+      // branch above is synchronous: on a quick foreground return — the app switcher, the notification
+      // shade, a dismissed call, an Android onPause/onResume pair — 'active' has already been and gone,
+      // found nothing owed, and the debt was recorded after it. The child was then handed back a tablet
+      // whose own space refused screenshots, recording and casting until the next cycle (HUNT7-A-1,
+      // MOB-R2-05/BUG-287). So the settle is offered here too, on the one fact that makes it safe and
+      // the only one AppState can state now: the app is in the foreground AT THIS MOMENT. A device
+      // still on its way out leaves the adult frame protected, which is HUNT6-I-4 unchanged.
+      if (owed && AppState.currentState === 'active') {
+        await settleChildSpaceScreenPrivacy(modeEffects);
+      }
     });
   });
 

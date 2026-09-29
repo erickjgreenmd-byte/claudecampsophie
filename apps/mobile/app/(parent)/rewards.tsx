@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -62,10 +62,29 @@ function RewardApprovals({ api }: { api: ApiClient }) {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
+  /** The most recent load. Only the load holding this number may publish what it fetched. */
+  const latestLoad = useRef(0);
+
   const load = useCallback(async () => {
+    // Every run takes a ticket before anything is awaited, and only the current ticket may publish —
+    // the rows and the error alike (HUNT7-J-4). This screen owns its fetch instead of using the shared
+    // `useLoad`, and it was given only the first half of HUNT6-I-2 (the rows go before the request):
+    // whichever request ANSWERED last used to win. Four callers can overlap — this effect,
+    // pull-to-refresh, the error retry and the reload after a decision — and the last needs no unlucky
+    // timing: `decide` clears `busy` before awaiting its reload, so a parent approving a second card
+    // starts a second decision and a second load while the first is still out. Reload #1 answering
+    // after reload #2 put the pre-decision list back, with Approve/Decline live on a request the
+    // server has already decided, which is the state that reload exists to prevent (RV-rewards-7). On
+    // a handed-on tablet the same door published the previous family's child nicknames and point
+    // balances — fetched with the previous adult's bearer — under the new adult's client.
+    latestLoad.current += 1;
+    const ticket = latestLoad.current;
     try {
-      setState({ status: 'ready', data: await loadRewardsOverview(api) });
+      const data = await loadRewardsOverview(api);
+      if (latestLoad.current !== ticket) return;
+      setState({ status: 'ready', data });
     } catch (error) {
+      if (latestLoad.current !== ticket) return;
       const problem = parentActionError(error);
       setState({ status: 'error', message: problem.message, needsPin: problem.needsPin });
     }

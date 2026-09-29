@@ -14,7 +14,14 @@ import {
   seedOwnerAdmin,
   type SeededFamily,
 } from '@pencillift/db/testing/fixtures';
-import { runJobs, type JobDeps, type JobHandler } from '../src/jobs/dispatcher.ts';
+import {
+  runJobs,
+  SCAN_AI_WALL_BUDGET_MS,
+  SCAN_FEEDBACK_WORST_CASE_MS,
+  SCAN_RUBRIC_WORST_CASE_MS,
+  type JobDeps,
+  type JobHandler,
+} from '../src/jobs/dispatcher.ts';
 import {
   computePromptKey,
   createScanProcessHandler,
@@ -1069,15 +1076,18 @@ describe('scan hardening (RV-lead-jobs-ai-2, -3, -9, -10, -19)', () => {
   it('the spend ceiling pauses a scan without spending an attempt; the rerun grades the stored questions', async () => {
     const scan = await queuedScan({ pages: 1, maxAttempts: 1 });
     const adminId = await seedOwnerAdmin(api.db);
-    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS } = await import('@pencillift/ai');
     const recorded = async () => {
       const [row] = await api.db.sql<{ micros: string }[]>`
         select coalesce(sum(cost_micros), 0)::text as micros from public.ai_usage_events`;
       return BigInt(row!.micros);
     };
-    // Room for exactly one stage: the owner's cap is recorded spend plus the extraction's upper-bound
-    // estimate, so extraction is admitted and grading + verification would cross the cap.
-    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_LIMITS.extraction.maxCostMicros);
+    // Room for exactly one stage: the owner's cap is recorded spend plus what the extraction group
+    // RESERVES, which is the stage's cost BUDGET and not its per-request admission cap (HUNT7-B-8 —
+    // `spending()` sums the budget table, and the two numbers coincide for these three stages today,
+    // so building the ceiling from the caps was green for the wrong reason). Grading + verification
+    // would then cross the cap.
+    const cap = (await recorded()) + BigInt(PROPOSED_STAGE_COST_BUDGET_MICROS.extraction);
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
       values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;
@@ -1142,6 +1152,153 @@ describe('scan hardening (RV-lead-jobs-ai-2, -3, -9, -10, -19)', () => {
     ]);
     expect((await feedback(scan.assignmentId)).map((f) => f.kind)).toEqual(['template_fallback']);
     expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+  });
+
+  /**
+   * HUNT7-B-3. The ledger claims a scan only while SCAN_AI_WALL_BUDGET_MS of the invocation is left,
+   * but nothing held the run to that declaration: the coaching loop runs once per wrong answer with no
+   * cap and no clock, so a worksheet of several wrong answers whose tutor calls each timed out ran
+   * past it and could be killed at the wall — an attempt spent, the row left `running` behind a
+   * 20-minute lease, and the parent's assignment stuck in "being checked" for twenty minutes.
+   *
+   * Here the FIRST tutor call burns the whole declared budget (the labeled mock moves the job clock),
+   * so the second wrong answer has no room for one. It gets the reviewed template instead — the same
+   * degradation as the owner's spend ceiling — and the scan ends in a state the family can see.
+   */
+  it('stops calling the tutor once the wall time the job was claimed with is gone (HUNT7-B-3)', async () => {
+    const scan = await queuedScan({ pages: 2 });
+    const client = hooked(scriptedModel({ questions: WORKSHEET }), (r) => {
+      // One tutor call that times out on every attempt would eat this much of the invocation.
+      if (r.outputName === 'child_coaching_packet') {
+        api.now.value = new Date(api.now.value.getTime() + SCAN_AI_WALL_BUDGET_MS);
+      }
+      return Promise.resolve();
+    });
+    try {
+      await runJobs(deps, handlerFor(client));
+    } finally {
+      api.now.value = new Date('2026-09-24T15:00:00Z');
+    }
+    // Two wrong answers, but only ONE tutor call: the second question's is past the declaration.
+    expect(client.requests.filter((r) => r.outputName === 'child_coaching_packet')).toHaveLength(1);
+    expect(
+      api.logs.some((l) => l.event === 'scan_feedback_skipped' && l.code === 'WALL_BUDGET'),
+    ).toBe(true);
+    // The child still gets something for it, and never an unchecked hint.
+    const spelling = (await feedback(scan.assignmentId)).filter((f) =>
+      f.prompt_text.startsWith('Spell the word'),
+    );
+    expect(spelling.map((f) => f.kind)).toEqual(['template_fallback']);
+    expect(spelling[0]!.body).toBe(TEMPLATE_FALLBACK);
+    // And the scan finishes: the gate costs hints, never the results or the allowance.
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+    expect(await reservation(scan.reservationId)).toMatchObject({ status: 'committed' });
+    expect(await results(scan.assignmentId)).toHaveLength(4);
+  });
+
+  /** One coached question and one written-work question, so both feedback steps run in one scan. */
+  const WALL_BUDGET_WORKSHEET: ScriptedQuestion[] = [
+    {
+      page: 1,
+      number: '1',
+      prompt: 'Spell the word for a baby cat.',
+      answer: 'kiten',
+      kind: 'spelling',
+      subject: 'spelling_vocabulary',
+      key: 'kitten',
+      primary: { verdict: 'incorrect', confidence: 'high' },
+      verifier: { verdict: 'incorrect', confidence: 'medium' },
+      coaching: 'safe',
+    },
+    {
+      page: 1,
+      number: '2',
+      prompt: 'Write two sentences about your favorite animal.',
+      answer: 'I like dogs. They are fun',
+      kind: 'writing',
+      subject: 'grammar_writing',
+      key: '',
+      primary: { verdict: 'rubric', confidence: 'medium' },
+      verifier: { verdict: 'rubric', confidence: 'medium' },
+      rubric: [
+        { criterion: 'Uses complete sentences', met: true, note: 'Both sentences have a subject.' },
+        { criterion: 'Gives a reason for the opinion.', met: false, note: 'n/a' },
+      ],
+    },
+  ];
+
+  /**
+   * HUNT7-B-3, second pass — the defect the CHECKER found in the first fix of it, now closed.
+   *
+   * The first fix gated BOTH provider-calling feedback steps on SCAN_FEEDBACK_WORST_CASE_MS. That is
+   * coaching's figure (two 45 s stage timeouts plus one moderation call, 101,500 ms) and rubric work is
+   * one moderation call (10,000 ms), so labels were refused with up to 91,500 ms of budget left that
+   * nothing else in the run can spend — the three fixed stages and the safety screen are already
+   * finished by the time the feedback loop runs. Worse, the rubric arm had no fallback: it simply
+   * skipped, so a written-work question lost its labels entirely while the assignment was still
+   * delivered `ready`, telling the parent the work had been checked when part of it had not.
+   *
+   * Both halves are pinned here: the step is gated on its OWN worst case, and when even that does not
+   * fit the assignment goes to a grown-up instead of reporting `ready`.
+   */
+  it('rubric labels are gated on ONE moderation call, not on coaching’s worst case (HUNT7-B-3)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    const client = hooked(scriptedModel({ questions: WALL_BUDGET_WORKSHEET }), (r) => {
+      // Leave more than the rubric step needs and less than a coached question needs.
+      if (r.outputName === 'independent_verification') {
+        api.now.value = new Date(
+          api.now.value.getTime() + (SCAN_AI_WALL_BUDGET_MS - SCAN_RUBRIC_WORST_CASE_MS - 1_000),
+        );
+      }
+      return Promise.resolve();
+    });
+    expect(SCAN_RUBRIC_WORST_CASE_MS).toBeLessThan(SCAN_FEEDBACK_WORST_CASE_MS);
+    try {
+      await runJobs(deps, handlerFor(client));
+    } finally {
+      api.now.value = new Date('2026-09-24T15:00:00Z');
+    }
+    // The coached question cannot afford its stage, so it degrades to the reviewed template.
+    expect(client.requests.filter((r) => r.outputName === 'child_coaching_packet')).toEqual([]);
+    const rows = await feedback(scan.assignmentId);
+    const spelling = rows.filter((f) => f.prompt_text.startsWith('Spell the word'));
+    expect(spelling.map((f) => f.kind)).toEqual(['template_fallback']);
+    // The written-work question CAN afford its one moderation call, so it keeps its labels. This is
+    // the 91,500 ms the first fix threw away.
+    const writing = rows.filter((f) => f.prompt_text.startsWith('Write two sentences'));
+    // The rubric label kinds childRubricFeedback produces — named exactly, so a run that fell back to
+    // the coached template (or wrote nothing) fails here rather than passing on a non-empty list.
+    expect(writing.map((f) => f.kind).sort()).toEqual(['encouragement', 'method_step']);
+    // Nothing was lost, so the scan is delivered as finished.
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'ready' });
+  });
+
+  it('a written-work question the wall budget cannot label sends the scan to a grown-up, never `ready` (HUNT7-B-3)', async () => {
+    const scan = await queuedScan({ pages: 1 });
+    // The whole budget is gone, so not even one moderation call fits.
+    const client = hooked(scriptedModel({ questions: WALL_BUDGET_WORKSHEET }), (r) => {
+      if (r.outputName === 'independent_verification') {
+        api.now.value = new Date(api.now.value.getTime() + SCAN_AI_WALL_BUDGET_MS);
+      }
+      return Promise.resolve();
+    });
+    try {
+      await runJobs(deps, handlerFor(client));
+    } finally {
+      api.now.value = new Date('2026-09-24T15:00:00Z');
+    }
+    const rows = await feedback(scan.assignmentId);
+    // The coached question still degrades to the template — that path is unchanged and is fine.
+    expect(
+      rows.filter((f) => f.prompt_text.startsWith('Spell the word')).map((f) => f.kind),
+    ).toEqual(['template_fallback']);
+    // The written-work question genuinely has no labels: the budget really is gone and there is no
+    // template to stand in for a rubric. What must NOT happen is the scan claiming it was checked.
+    expect(rows.filter((f) => f.prompt_text.startsWith('Write two sentences'))).toEqual([]);
+    expect(await assignment(scan.assignmentId)).toMatchObject({ status: 'needs_parent_review' });
+    expect(
+      api.logs.some((l) => l.event === 'scan_rubric_skipped' && l.code === 'WALL_BUDGET'),
+    ).toBe(true);
   });
 
   it('a retry after a stored extraction grades the same questions, whatever the new labels would be', async () => {
@@ -2017,7 +2174,7 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
   it('a request larger than its stage budget is refused before it is sent; recorded spend never passes the cap (LJA-F4)', async () => {
     const scan = await queuedScan({ pages: 1 });
     const adminId = await seedOwnerAdmin(api.db);
-    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS } = await import('@pencillift/ai');
     // 150 questions at the extraction schema's 4,000-character prompt and answer limits.
     const long = (s: string) => `${s} `.repeat(Math.ceil(4000 / (s.length + 1))).slice(0, 3990);
     const questions: ScriptedQuestion[] = Array.from({ length: 150 }, (_, i) => ({
@@ -2050,12 +2207,16 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
       },
     };
     const before = await recordedSpend();
+    // What the scan RESERVES for its two groups, which is the sum of the stage BUDGETS and not of the
+    // admission caps (HUNT7-B-8): `spending(['extraction'])` then `spending(['grading',
+    // 'verification'])`. The oversized grading request below is refused by the per-request cap, which
+    // is the other number and the point of the case.
     const cap =
       before +
       BigInt(
-        PROPOSED_STAGE_LIMITS.extraction.maxCostMicros +
-          PROPOSED_STAGE_LIMITS.grading.maxCostMicros +
-          PROPOSED_STAGE_LIMITS.verification.maxCostMicros,
+        PROPOSED_STAGE_COST_BUDGET_MICROS.extraction +
+          PROPOSED_STAGE_COST_BUDGET_MICROS.grading +
+          PROPOSED_STAGE_COST_BUDGET_MICROS.verification,
       );
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
@@ -2076,7 +2237,8 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
 
   it('a verification request too large for its stage budget sends the items to a grown-up (LJA-F4)', async () => {
     const scan = await queuedScan({ pages: 1 });
-    // About 40 KB of question text: grading (150,000 micros) fits, verification (100,000) does not.
+    // About 40 KB of question text: grading's admission cap (216,816 micros) fits it, verification's
+    // (100,000) does not (HUNT7-B-8: this line still named grading's pre-HUNT5-C-1 150,000).
     const long = (s: string) => `${s} `.repeat(Math.ceil(1990 / (s.length + 1))).slice(0, 1990);
     const questions: ScriptedQuestion[] = Array.from({ length: 10 }, (_, i) => ({
       page: 1,
@@ -2108,9 +2270,9 @@ describe('final lead review (LJA-F1..F5, F11, F12)', () => {
 
   it('a stage whose usage cannot be recorded keeps its cost counted against the cap (LJA-F5)', async () => {
     const adminId = await seedOwnerAdmin(api.db);
-    const { PROPOSED_STAGE_LIMITS } = await import('@pencillift/ai');
-    // Room for exactly one extraction stage.
-    const cap = (await recordedSpend()) + BigInt(PROPOSED_STAGE_LIMITS.extraction.maxCostMicros);
+    const { PROPOSED_STAGE_COST_BUDGET_MICROS } = await import('@pencillift/ai');
+    // Room for exactly one extraction stage's RESERVATION, which is its cost BUDGET (HUNT7-B-8).
+    const cap = (await recordedSpend()) + BigInt(PROPOSED_STAGE_COST_BUDGET_MICROS.extraction);
     await api.db.sql`
       insert into public.spend_budgets (scope, period_key, budget_micros, created_by)
       values ('global', '2026-09', ${cap.toString()}::bigint, ${adminId})`;

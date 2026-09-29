@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import {
@@ -5,6 +6,8 @@ import {
   computeOperationCostMicros,
   DEFAULT_RATE_TABLE_2026_09_18,
   estimateUpperBoundCostMicros,
+  type AiStage,
+  type ModelRateTable,
 } from '@pencillift/domain/quotas';
 import {
   createMockResponsesClient,
@@ -458,5 +461,198 @@ describe('a cap above the stage budget is refused, not silently narrowed (HUNT6-
     const { client } = recordingClient([okResult]);
     const out = await runStage({ ...common, client });
     expect(out.result.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HUNT7-B-4/B-5/B-6: what each of the two numbers really promises, and against which rate table
+// ---------------------------------------------------------------------------------------------
+
+/** routing.ts's own source, for the claims that have no runtime assertion (a comment). */
+function routingSource(): string {
+  return readFileSync(new URL('./routing.ts', import.meta.url), 'utf8');
+}
+
+/**
+ * A comment block, with its markers stripped and its whitespace collapsed. Unwrapped BEFORE
+ * matching, because a sentence the formatter split over two lines must still be readable to a
+ * regex — otherwise a prose guard passes on the claim it cannot see (HUNT7-B-7, the L-054 shape).
+ */
+function unwrappedBetween(from: string, to: string): string {
+  const source = routingSource();
+  const start = source.indexOf(from);
+  const end = source.indexOf(to, start + from.length);
+  if (start < 0 || end < 0) throw new Error(`routing.ts no longer contains ${from}`);
+  return source
+    .slice(start, end)
+    .replace(/\s*(?:\/\/|\*)\s*/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+/** The output rate, in micro-USD per output token, a stage's model is priced at. */
+function outputMicrosPerToken(stage: AiStage, rates = DEFAULT_RATE_TABLE_2026_09_18): number {
+  const one = estimateUpperBoundCostMicros(rates, {
+    modelId: STAGE_MODELS[stage],
+    inputTokens: 0,
+    maxOutputTokens: 1_000_000,
+  });
+  if (!one.ok) throw new Error(`${stage} has no rate row`);
+  return one.value / 1_000_000;
+}
+
+/**
+ * HUNT7-B-4. "Every `maxCostMicros` here is an ADMISSION bound and nothing else: the largest single
+ * request the stage may send" is enforced on attempt 1 only. The ONE raised retry — the largest
+ * request the stage ever sends — is weighed against the BUDGET, so it can be priced above the cap
+ * wherever `budget − rateOut x maxOutputTokens` exceeds it. This computes that set from the owner's
+ * numbers and pins it: it is `followup` alone today, and routing.ts has to say so.
+ */
+const RETRY_ABOVE_CAP_STAGES = AI_STAGES.filter((stage) => {
+  const limits = PROPOSED_STAGE_LIMITS[stage];
+  if (limits.maxAttempts < 2) return false;
+  const headroom =
+    PROPOSED_STAGE_COST_BUDGET_MICROS[stage] - outputMicrosPerToken(stage) * limits.maxOutputTokens;
+  return headroom > limits.maxCostMicros;
+});
+
+describe('the admission cap bounds the FIRST request, not every request (HUNT7-B-4)', () => {
+  it('is followup alone that may send a raised retry priced above its admission cap', () => {
+    expect(RETRY_ABOVE_CAP_STAGES).toEqual(['followup']);
+    // The worked instance: the cut-off attempt spends at least rateOut x B, so the retry's own
+    // estimate can reach budget − rateOut x B, which is above followup's cap and below every other
+    // retrying stage's.
+    expect(
+      PROPOSED_STAGE_COST_BUDGET_MICROS.followup -
+        outputMicrosPerToken('followup') * PROPOSED_STAGE_LIMITS.followup.maxOutputTokens,
+    ).toBe(180_000);
+    expect(PROPOSED_STAGE_LIMITS.followup.maxCostMicros).toBe(150_000);
+  });
+
+  it('routing.ts says the cap gates the first request and names the stage configured that way', () => {
+    const doc = unwrappedBetween('// Every `maxCostMicros` here', 'semantic_check: {');
+    expect(doc).toMatch(/FIRST request/);
+    for (const stage of RETRY_ABOVE_CAP_STAGES) expect(doc).toContain(stage);
+  });
+});
+
+/**
+ * HUNT7-B-6. `OUTPUT_TRUNCATED_BUDGET_MULTIPLE`'s docstring travelled from run.ts to routing.ts in
+ * the round that separated the admission CAP from the stage BUDGET, and it still said the raise
+ * never goes "past what the stage's cost cap still admits" — the opposite of what the round did,
+ * three lines above the distinction. The raise is weighed against the budget; the cap is never
+ * raised to fit a longer answer.
+ */
+describe('the truncation multiple is bounded by the stage BUDGET (HUNT7-B-6)', () => {
+  it('says budget, not cap, in the docstring of the constant itself', () => {
+    const doc = unwrappedBetween(
+      " * The MOST of a stage's output budget",
+      'export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE',
+    );
+    expect(doc).toMatch(/cost BUDGET/);
+    expect(doc).not.toMatch(/cost cap/i);
+    // The fact that sentence used to deny, which the case above proves for three stages: the raise
+    // IS paid for out of a budget above the cap.
+    expect(PROPOSED_STAGE_COST_BUDGET_MICROS.coaching).toBeGreaterThan(
+      PROPOSED_STAGE_LIMITS.coaching.maxCostMicros,
+    );
+  });
+});
+
+/**
+ * HUNT7-B-5. `fullRaiseCeiling` priced both of its terms against DEFAULT_RATE_TABLE_2026_09_18
+ * literally, while run.ts spends at the rate table its caller hands it. Rates are versioned and
+ * expected to change (rates.ts, spec P12), so the day a second table is wired the startup check
+ * still validates the budgets against the September one and passes, while `raisedOutputBudget`
+ * prices the retry at the new rates and shrinks or loses it — BUG-260/BUG-309 again, with the guard
+ * that exists to prevent it green. The ceiling now takes the table it is judged against, and
+ * runStage re-derives it for any table that is not the one the budgets were validated against.
+ *
+ * Labeled TEST rate tables (not real prices; `version` says so).
+ */
+const COSTLIER_ASTRA: ModelRateTable = Object.freeze({
+  version: 'test-costlier-astra',
+  models: Object.freeze({
+    ...DEFAULT_RATE_TABLE_2026_09_18.models,
+    'gpt-6-astra': Object.freeze({
+      inputPerMillionMicros: 15_000_000,
+      outputPerMillionMicros: 75_000_000,
+      cachedInputPerMillionMicros: null,
+    }),
+  }),
+});
+
+const CHEAPER_ASTRA: ModelRateTable = Object.freeze({
+  version: 'test-cheaper-astra',
+  models: Object.freeze({
+    ...DEFAULT_RATE_TABLE_2026_09_18.models,
+    'gpt-6-astra': Object.freeze({
+      inputPerMillionMicros: 5_000_000,
+      outputPerMillionMicros: 25_000_000,
+      cachedInputPerMillionMicros: null,
+    }),
+  }),
+});
+
+describe('the full-raise ceiling is priced against the rates it is judged against (HUNT7-B-5)', () => {
+  const dailySet = {
+    prompt: PROMPTS.daily_set,
+    input: [dataEnvelope({})],
+    limits: PROPOSED_STAGE_LIMITS.daily_set,
+    gate,
+    metadata: { stage: 'daily_set' },
+    estimatedInputTokens: STAGE_FLOOR_INPUT_TOKENS.daily_set,
+    sleep: () => Promise.resolve(),
+  };
+
+  it('prices the ceiling at the table it is given, not at the September one', () => {
+    const budget = PROPOSED_STAGE_LIMITS.daily_set.maxOutputTokens;
+    // The recorded budget is exactly the September ceiling; that is the invariant above.
+    expect(fullRaiseCeiling('daily_set', budget)).toBe(PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set);
+    expect(fullRaiseCeiling('daily_set', budget, DEFAULT_RATE_TABLE_2026_09_18)).toBe(
+      PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set,
+    );
+    // At half again the astra rates the same raise costs half again as much: 15 x 1,662 + 75 x 3,000
+    // for the cut-off answer, plus 15 x 1,662 + 75 x 6,000 for the retry.
+    expect(fullRaiseCeiling('daily_set', budget, COSTLIER_ASTRA)).toBe(724_860);
+    expect(fullRaiseCeiling('daily_set', budget, COSTLIER_ASTRA)).toBeGreaterThan(
+      PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set,
+    );
+  });
+
+  it('refuses the stage when the caller’s rates put the raise past the budget', async () => {
+    const { client, requests } = recordingClient([okResult]);
+    const out = runStage({ ...dailySet, client, rates: COSTLIER_ASTRA });
+    await expect(out).rejects.toThrow(RangeError);
+    await expect(out).rejects.toThrow(/full-raise ceiling/);
+    // Loud, and before the gate, the provider and any spend — the same shape as the cap/budget
+    // ordering check above.
+    expect(requests).toEqual([]);
+  });
+
+  it('runs a caller whose rates the recorded budget still affords', async () => {
+    const { client, requests } = recordingClient([
+      {
+        kind: 'ok',
+        text: JSON.stringify({ intro: 'Let’s practice!', items: [] }),
+        usage: { inputTokens: 1_662, cachedInputTokens: 0, outputTokens: 120 },
+        modelId: STAGE_MODELS.daily_set,
+        latencyMs: 10,
+      },
+    ]);
+    expect(
+      fullRaiseCeiling('daily_set', PROPOSED_STAGE_LIMITS.daily_set.maxOutputTokens, CHEAPER_ASTRA),
+    ).toBeLessThanOrEqual(PROPOSED_STAGE_COST_BUDGET_MICROS.daily_set);
+    const out = await runStage({ ...dailySet, client, rates: CHEAPER_ASTRA });
+    expect(out.result.ok).toBe(true);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('routing.ts names the rate table among what fails the worker at startup', () => {
+    const doc = unwrappedBetween(
+      ' * Validates the per-stage cost BUDGETS',
+      'function defineStageCostBudgets',
+    );
+    expect(doc).toMatch(/rate table/i);
+    expect(doc).toContain('DEFAULT_RATE_TABLE_2026_09_18');
   });
 });

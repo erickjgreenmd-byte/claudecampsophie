@@ -254,6 +254,90 @@ describe('locking a paired family tablet returns it to the child space (MOB-R4-L
     expect(again.calls).toEqual([]);
   });
 
+  /**
+   * HUNT7-A-2. The debt was a bare boolean that named neither the space it was owed for nor the
+   * device store it was computed against, and nothing cleared it when the device left the child
+   * space: `enterParentMode` writes mode 'parent' and switches protection ON and left the flag
+   * standing. The session layer settles on EVERY 'active' (src/lib/app-session.ts), and on iOS
+   * 'active' follows any 'inactive' blip that never reached 'background' — control centre, the
+   * notification shade, a Face ID or permission dialog, a dismissed call — none of which runs the
+   * lock. So one stale debt switched ADULT screen privacy off with parent screens mounted, and the
+   * next backgrounding then let the OS snapshot the still-painted adult frame for its app-switcher
+   * card: the family name, the children's nicknames and grades, the planner and the billing screen.
+   * That is the state HUNT6-I-4 deferred the change to protect, undone by the deferral.
+   *
+   * Two ways to hold a debt across a return to parent mode: the ordering race in HUNT7-A-1, and the
+   * Lock button's own chain, which settles only after `relockOnServer()` — an authenticated POST with
+   * the client's 20 s default timeout, long enough for a 6-digit PIN and an unlock POST on a slow link.
+   */
+  it('[repro] a debt that outlives the return to parent mode does not strip adult protection', async () => {
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-8-abcdefghijkl');
+    await lockParentAreaOnDevice(storage, effects());
+    expect(childSpaceOwesScreenPrivacy()).toBe(true);
+
+    // The parent PINs back in before the debt is settled: this device is the adult's again, and the
+    // state it needs is the one enterParentMode just applied. Entering the parent's space drops the
+    // debt there and then, so there is nothing left for a later blip to deliver.
+    await enterParentMode(
+      storage,
+      effects(),
+      { unlocked: true, unlockedUntil: SERVER_UNTIL, unlockSeconds: UNLOCK_SECONDS },
+      SERVER_NOW,
+    );
+    expect(await currentMode(storage)).toBe('parent');
+    expect(childSpaceOwesScreenPrivacy()).toBe(false);
+
+    const fx = effects();
+    expect(await settleChildSpaceScreenPrivacy(fx)).toBe(false);
+    expect(fx.calls).not.toContain('privacy:false');
+  });
+
+  it('[repro] a settle re-reads the mode, so a debt is never applied outside the child space', async () => {
+    // The second half of HUNT7-A-2, and the half that does not depend on one caller remembering to
+    // drop the debt: `enterParentMode` clears it above, but the flag alone could not notice ANY other
+    // path that takes the device out of the child space, and there was no such re-read at all. Writing
+    // the mode straight into the store stands in for that class of path — what the settle must not do
+    // is trust a flag about a state it has not looked at.
+    const storage = memoryStorage();
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-9-abcdefghijkl');
+    await lockParentAreaOnDevice(storage, effects());
+    expect(childSpaceOwesScreenPrivacy()).toBe(true);
+    await storage.setItem(STORAGE_KEYS.mode, 'parent');
+
+    const fx = effects();
+    expect(await settleChildSpaceScreenPrivacy(fx)).toBe(false);
+    expect(fx.calls).toEqual([]);
+    expect(childSpaceOwesScreenPrivacy()).toBe(false);
+  });
+
+  it('a keychain that cannot say which space the device is in keeps adult protection on', async () => {
+    // Fail closed: `currentMode` rejecting is not "the child's space", so the change is not applied.
+    const data = new Map<string, string>();
+    let readable = true;
+    const storage: SecureStorage = {
+      getItem: (k) =>
+        readable
+          ? Promise.resolve(data.get(k) ?? null)
+          : Promise.reject(new Error('keychain gone')),
+      setItem: (k, v) => {
+        data.set(k, v);
+        return Promise.resolve();
+      },
+      deleteItem: (k) => {
+        data.delete(k);
+        return Promise.resolve();
+      },
+    };
+    await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-10-abcdefghijk');
+    await lockParentAreaOnDevice(storage, effects());
+    expect(childSpaceOwesScreenPrivacy()).toBe(true);
+    readable = false;
+    const fx = effects();
+    expect(await settleChildSpaceScreenPrivacy(fx)).toBe(false);
+    expect(fx.calls).toEqual([]);
+  });
+
   it('an OS that refuses the change does not leave the debt open for every later foreground', async () => {
     const storage = memoryStorage();
     await storage.setItem(STORAGE_KEYS.childRefreshToken, 'refresh-token-number-7-abcdefghijkl');

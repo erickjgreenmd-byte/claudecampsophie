@@ -71,11 +71,25 @@ export function stepUpApi(): ApiClient | null {
  * Decision: biometric unlock stores the parent's PIN under `requireAuthentication` with
  * WHEN_PASSCODE_SET_THIS_DEVICE_ONLY, so it never leaves this device, is not backed up, and is
  * readable only after the OS biometric prompt. The server still verifies the PIN on every unlock.
+ *
+ * Removing it ANSWERS whether the PIN ITEM went, and is still best effort (HUNT7-K-1): a keychain that
+ * refuses that one delete must not stop the two flag deletes below — those are what withholds the
+ * biometric offer — and must not throw at the callers that only want the enrolment gone (the
+ * biometric-disable path, and `isEnabled`'s 'other_user' cleanup). Discarding the rejection here was
+ * what let `clearDeviceAdultSecrets` report `secretsCleared: true` for a device still holding the
+ * parent's 6-digit PIN: resolving proved the two FLAGS were deleted, which is the fact next to the one
+ * the closure copy claims. BIOMETRIC_PIN_KEY is the only item written with `requireAuthentication` and
+ * WHEN_PASSCODE_SET_THIS_DEVICE_ONLY, and expo-secure-store documents deletes as able to reject, so
+ * the asymmetric failure is the plausible one rather than a theoretical one.
  */
-async function clearBiometricPin(): Promise<void> {
-  await SecureStore.deleteItemAsync(BIOMETRIC_PIN_KEY).catch(() => undefined);
+async function clearBiometricPin(): Promise<boolean> {
+  const pinRemoved = await SecureStore.deleteItemAsync(BIOMETRIC_PIN_KEY).then(
+    () => true,
+    () => false,
+  );
   await secureStorage.deleteItem(BIOMETRIC_ENABLED_KEY);
   await secureStorage.deleteItem(BIOMETRIC_OWNER_KEY);
+  return pinRemoved;
 }
 
 export const biometricPinStore: BiometricPinStore = {
@@ -121,7 +135,15 @@ export const biometricPinStore: BiometricPinStore = {
       keychainAccessible: SecureStore.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
     });
   },
-  clear: clearBiometricPin,
+  /**
+   * The best-effort face of `clearBiometricPin`: the callers that only want the enrolment gone (this
+   * store's own 'other_user' cleanup above, unlock.ts's stale-PIN removal, the unlock screen's "turn
+   * Face ID off") have nothing to do with what it answers. The one caller that must report what the
+   * device kept calls the helper itself (`clearDeviceAdultSecrets`, below).
+   */
+  async clear() {
+    await clearBiometricPin();
+  },
 };
 
 /** Whether this device can offer biometric unlock at all. */
@@ -216,17 +238,25 @@ export async function signOutClosedAccountOnDevice(): Promise<DeviceSignOutOutco
 /**
  * What a signed-out device must not keep whichever way the adult left: the parent's PIN must not stay
  * for the next adult to unlock with (MOB-R2-06), and the store SDK must forget the identity it was
- * bound to. Both are best effort; neither may stop the sign-out — and both are now REPORTED rather
- * than discarded (HUNT6-J-1), so the closure screen can say what happened to this device instead of
+ * bound to. Both are best effort; neither may stop the sign-out — and both are REPORTED rather than
+ * discarded (HUNT6-J-1), so the closure screen can say what happened to this device instead of
  * inferring it from nothing having thrown. Answers whether both succeeded.
+ *
+ * Each half is asked of the operation the flag NAMES, not of its wrapper (HUNT7-K-1). Round 6 turned
+ * the two `.catch(() => undefined)`s here into `.then(() => true, () => false)` while both helpers went
+ * on swallowing the failure that matters one level in — the PIN item's own delete, and
+ * `Purchases.logOut()` — so `pinCleared && storeForgotten` was true whenever two plain keychain flag
+ * deletes resolved: the "nothing threw" predicate HUNT6-J-1 exists to remove, one layer further in.
+ * Both helpers answer now, and both still never throw, so the outer `.then(…, () => false)` is kept as
+ * the belt for a rejection neither is supposed to produce.
  */
 async function clearDeviceAdultSecrets(): Promise<boolean> {
-  const pinCleared = await biometricPinStore.clear().then(
-    () => true,
+  const pinCleared = await clearBiometricPin().then(
+    (removed) => removed,
     () => false,
   );
   const storeForgotten = await forgetStoreIdentity().then(
-    () => true,
+    (forgotten) => forgotten,
     () => false,
   );
   return pinCleared && storeForgotten;

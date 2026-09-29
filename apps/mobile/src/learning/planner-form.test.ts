@@ -142,6 +142,16 @@ describe('mobile planner form (mirrors PUT /v1/children/:id/learning-schedule)',
     expect(formatInZone('2026-07-02T23:00:00.000Z', 'Not/AZone')).toBe('2026-07-02 23:00 UTC');
   });
 
+  it('[repro] a NOT_FOUND offers the retry the planner has, not a gesture it does not (HUNT7-J-2)', () => {
+    // The only importer of `plannerError` is app/(parent)/planner.tsx, which renders inside <Screen>
+    // (src/family/ui.tsx): its ScrollView has no RefreshControl, so "Pull to refresh." named the one
+    // recovery that screen cannot offer. Its ErrorBoxes pass `onRetry`, which renders "Try again".
+    const notFound = plannerError(new ApiRequestError('NOT_FOUND', 'No such child', 404));
+    expect(notFound.needsPin).toBe(false);
+    expect(notFound.message).not.toMatch(/pull to refresh/i);
+    expect(notFound.message).toMatch(/try again/i);
+  });
+
   it('maps errors to parent copy and routes a missing PIN to the unlock screen', () => {
     expect(plannerError(new ApiRequestError('STEP_UP_REQUIRED', 'x', 403))).toEqual({
       message: 'Enter your parent PIN to continue.',

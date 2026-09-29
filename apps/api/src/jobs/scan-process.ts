@@ -67,6 +67,11 @@ import type { Tx } from '../db.ts';
 import type { StorageProvider } from '../providers/index.ts';
 import { hasVerifiedConsent } from '../services/consent.ts';
 import { ImageFormatError, stripImageMetadata } from '../services/image-metadata.ts';
+import {
+  SCAN_AI_WALL_BUDGET_MS,
+  SCAN_FEEDBACK_WORST_CASE_MS,
+  SCAN_RUBRIC_WORST_CASE_MS,
+} from './dispatcher.ts';
 import type { DeadLetterReason, JobDeferral, JobDeps, JobHandler, JobRow } from './dispatcher.ts';
 import {
   acquireSpendHold,
@@ -895,6 +900,12 @@ class ScanRun {
    * screenBeforeGrading for the post-grading backstop, so both decide on the same flags.
    */
   private readonly inputScreens = new Map<string, InputScreen>();
+  /**
+   * When this run started, in epoch ms from the job clock. The ledger claimed this job only because
+   * SCAN_AI_WALL_BUDGET_MS of the invocation was left (dispatcher.ts), so the run's own provider work
+   * is measured from here and stops before it can pass that budget (see `hasWallTimeForFeedback`).
+   */
+  private readonly startedAt: number;
 
   constructor(
     private readonly deps: JobDeps,
@@ -904,7 +915,34 @@ class ScanRun {
     private readonly ctx: AssignmentCtx,
     private readonly mode: 'initial' | 'recheck',
     private readonly reservationId: string | null,
-  ) {}
+  ) {
+    this.startedAt = deps.clock().getTime();
+  }
+
+  /**
+   * Whether the wall time this job was CLAIMED with still holds `worstCaseMs` of provider work
+   * (HUNT7-B-3).
+   *
+   * The ledger's claim filter declares SCAN_AI_WALL_BUDGET_MS for a scan and refuses to claim one
+   * without that much of the invocation left. Nothing used to hold the run to it: the coaching loop
+   * runs once per wrong answer with no cap and no clock, so a worksheet of several wrong answers whose
+   * calls each timed out went past the declaration and could be killed at the wall — spending an
+   * attempt and leaving the row `running` behind a 20-minute lease, with the parent's assignment stuck
+   * in "being checked". The declaration is now a bound this checks.
+   *
+   * The two callers pass DIFFERENT worst cases, because their work is not the same size and the first
+   * version of this fix gated both on the larger one: a coached question may cost the coaching stage
+   * plus one moderation call (SCAN_FEEDBACK_WORST_CASE_MS), while a rubric-labelled question calls no
+   * stage at all and costs one moderation call (SCAN_RUBRIC_WORST_CASE_MS, a tenth as much). A notice
+   * for a flagged question is model-free and is never gated on this.
+   *
+   * What makes it bite is cumulative ELAPSED time, whatever consumed it — a slow database, a slow
+   * storage read or a long safety screen reach it as surely as a timing-out provider does.
+   */
+  private hasWallTimeFor(worstCaseMs: number): boolean {
+    const elapsed = this.deps.clock().getTime() - this.startedAt;
+    return elapsed + worstCaseMs <= SCAN_AI_WALL_BUDGET_MS;
+  }
 
   // ---- state ---------------------------------------------------------------------------------
 
@@ -1820,6 +1858,9 @@ class ScanRun {
       }
     });
 
+    // Set when the wall budget refused a rubric question its labels: that question was not fully
+    // checked, and `needsReview` below carries it to a grown-up rather than reporting `ready`.
+    let rubricLabelsLost = false;
     for (const g of graded) {
       // Moderation before generation: a severe-risk answer or prompt is never sent to the tutor.
       // screenBeforeGrading already kept flagged questions out of grading; this is the backstop, on
@@ -1841,13 +1882,38 @@ class ScanRun {
         hasPrivate: g.private !== null,
         parentOverride: g.question.parent_override,
       });
+      // A safety notice is model-free and is never gated on the clock. The two steps that do call the
+      // provider are gated on their OWN worst case, not on the larger of the two (HUNT7-B-3 and the
+      // checker's finding on its first fix, which gated rubric on coaching's figure and so refused
+      // labels with up to 91,500 ms of usable budget left).
+      //
+      // The two degradations are NOT equivalent, which is why only one of them is silent. A coached
+      // question past its gate gets the reviewed template: less good, still an answer, and exactly
+      // what the owner's spend ceiling already does. A rubric question past its gate gets NO labels
+      // at all, and `rubricFeedback` has no template to fall back on — so that is a LOSS, and a scan
+      // that reported `ready` with labels missing would be telling the parent the work was checked
+      // when part of it was not. Such a scan goes to parent review instead.
       if (step === 'safety') await this.safetyResponse(g.question, input);
-      else if (step === 'coach') await this.coach(g);
-      else if (step === 'rubric') await this.rubricFeedback(g);
+      else if (step === 'coach') {
+        const allowed = this.hasWallTimeFor(SCAN_FEEDBACK_WORST_CASE_MS);
+        if (!allowed) {
+          this.deps.log({ level: 'warn', event: 'scan_feedback_skipped', code: 'WALL_BUDGET' });
+        }
+        await this.coach(g, allowed);
+      } else if (step === 'rubric') {
+        if (this.hasWallTimeFor(SCAN_RUBRIC_WORST_CASE_MS)) await this.rubricFeedback(g);
+        else {
+          this.deps.log({ level: 'warn', event: 'scan_rubric_skipped', code: 'WALL_BUDGET' });
+          rubricLabelsLost = true;
+        }
+      }
     }
 
     const needsReview =
       unsettledElsewhere ||
+      // A written-work question whose labels the wall budget refused was not fully checked, so the
+      // assignment does not claim it was.
+      rubricLabelsLost ||
       graded.some((g) => {
         const shown = g.question.parent_override ?? g.final;
         return shown === 'needs_parent_review' || shown === 'unresolved';
@@ -1920,7 +1986,15 @@ class ScanRun {
     return answers.length > 0 ? { tutorKey: modelKey, answers } : null;
   }
 
-  private async coach(g: Graded): Promise<void> {
+  /**
+   * `tutorAllowed` false: no tutor call is made and the child gets the reviewed template, the same
+   * outcome as a blocked, failed or unguardable packet. The caller passes false when this run has no
+   * wall time left for one (HUNT7-B-3). The template is a WRITTEN answer for this transcription, so
+   * the check above then treats the question as answered and a later run of the same job does not coach
+   * it — exactly as past the owner's spend ceiling. A corrected transcription is coached afresh,
+   * because that check is scoped to `corrected_at`.
+   */
+  private async coach(g: Graded, tutorAllowed = true): Promise<void> {
     const [existing] = await this.deps.db.asService(
       (tx) => tx<{ n: number }[]>`
         select count(*)::int as n from public.child_feedback f
@@ -1933,7 +2007,7 @@ class ScanRun {
     if ((existing?.n ?? 0) > 0) return; // already coached for this transcription (crash replay)
 
     let rows: { kind: string; body: string }[] | null = null;
-    const key = this.coachingKey(g);
+    const key = tutorAllowed ? this.coachingKey(g) : null;
     if (key !== null) {
       try {
         rows = await this.spending(['coaching'], async () => {

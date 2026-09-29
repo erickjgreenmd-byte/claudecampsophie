@@ -113,14 +113,20 @@ export default function ParentPrivacyScreen() {
   const latestLoad = useRef(0);
 
   const load = useCallback(async () => {
+    // The ticket is taken FIRST, before either return below, the way `useLoad` takes its own before
+    // anything can be awaited (HUNT7-J-7). It used to be taken after the `!api` return, so a run that
+    // found no client published 'not_connected' and left the ticket pointing at the PREVIOUS run: a
+    // load still in flight then passed the check below and repainted the family this device can no
+    // longer speak for — its children, exports and safety reports — over that honest state. Every
+    // entry into `load` supersedes what is in flight, including the two that publish nothing.
+    latestLoad.current += 1;
+    const ticket = latestLoad.current;
     // Every reload door at once: the effect below, pull-to-refresh, and the post-action reloads.
     if (closureStarted.current) return;
     if (!api) {
       setState({ status: 'not_connected' });
       return;
     }
-    latestLoad.current += 1;
-    const ticket = latestLoad.current;
     try {
       const data = await loadPrivacyOverview(api);
       // A load superseded while its request was in flight publishes nothing. Two ways to be

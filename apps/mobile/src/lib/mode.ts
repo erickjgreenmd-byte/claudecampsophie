@@ -31,7 +31,14 @@ export interface DeviceSignOutOutcome {
    * could not be read at all. The copy says exactly that (src/privacy/parent-privacy.ts).
    */
   readonly sessionEndConfirmed: boolean;
-  /** The parent's biometric PIN and the store SDK identity were both removed from this device. */
+  /**
+   * The parent's biometric PIN and the store SDK identity were both removed from this device.
+   *
+   * Each half is what the operation itself reported (HUNT7-K-1): the keychain accepted the delete of
+   * the PIN ITEM — not merely of the two flags that withhold the biometric offer — and the store SDK
+   * accepted the logOut, or has since been bound to another family. False is therefore "this device
+   * may still hold one of them", which is what the copy says (src/privacy/parent-privacy.ts).
+   */
   readonly secretsCleared: boolean;
 }
 
@@ -141,28 +148,55 @@ export function parentStateStillCurrent(publishedUnder: number | null): boolean 
  * for its app-switcher card at that transition is still the ADULT one: resetNavigationToChildHome is
  * a JS router.replace (src/family/runtime.ts), which cannot paint while the app is suspended. Turning
  * protection off inside that handler removed it at the one instant it exists for. So the lock records
- * the debt, and the two callers that KNOW the app is in the foreground settle it: the 'active'
- * handler in src/lib/app-session.ts, and the Lock button the parent has just pressed
+ * the debt, and the callers that KNOW the app is in the foreground settle it: the 'active' handler in
+ * src/lib/app-session.ts, the same file's backgrounding handler once the lock has finished and
+ * AppState says the app is back (HUNT7-A-1), and the Lock button the parent has just pressed
  * (src/family/ui.tsx).
+ *
+ * The debt NAMES what it is owed for (HUNT7-A-2): the space, and the device store the lock read the
+ * mode from. It was a bare boolean, so nothing could tell whether it was still due — and nothing
+ * cleared it when the device left the child space, because `enterParentMode` writes mode 'parent',
+ * switches protection ON and left the flag standing. A settle that arrived after that switched ADULT
+ * protection off with parent screens mounted (on iOS every 'inactive' → 'active' blip reaches the
+ * settler: control centre, the notification shade, a Face ID prompt, a dismissed call, none of which
+ * runs the lock). The three functions that apply a privacy state of their own drop the debt now, and
+ * the settle re-reads the mode before it applies anything.
  */
-let childSpaceOwedScreenPrivacyOff = false;
+let screenPrivacyDebt: { readonly space: 'child'; readonly storage: SecureStorage } | null = null;
 
 /** Whether the child's space is still owed its screen-privacy change. */
 export function childSpaceOwesScreenPrivacy(): boolean {
-  return childSpaceOwedScreenPrivacyOff;
+  return screenPrivacyDebt !== null;
+}
+
+/**
+ * Dropped by every path that applies a screen-privacy state of its own (HUNT7-A-2), so no deferred
+ * change can arrive after the state it was computed for has been replaced.
+ */
+function forgetScreenPrivacyDebt(): void {
+  screenPrivacyDebt = null;
 }
 
 /**
  * Settles that debt — and only from a caller that is sure the app is in the foreground, since the
- * whole point is that the adult frame stays protected while the OS snapshots it. Answers whether
- * anything was owed. The debt is cleared before the call, so an OS that refuses is not retried on
- * every foreground: the child's space allowing capture is a comfort, adult protection is not.
+ * whole point is that the adult frame stays protected while the OS snapshots it. Answers whether the
+ * change was APPLIED. The debt is dropped before anything is awaited, so two settles cannot both
+ * apply it and an OS that refuses is not retried on every foreground: the child's space allowing
+ * capture is a comfort, adult protection is not.
+ *
+ * Being owed is not enough (HUNT7-A-2): the device may have left the space the debt was recorded for,
+ * and only the keychain can say so, which is why the debt carries the store it was recorded against
+ * rather than trusting whatever store a later caller happens to hold. A mode that cannot be read is
+ * not the child's space, so protection stays as it is.
  */
 export async function settleChildSpaceScreenPrivacy(
   effects: Pick<ModeEffects, 'setScreenPrivacy'>,
 ): Promise<boolean> {
-  if (!childSpaceOwedScreenPrivacyOff) return false;
-  childSpaceOwedScreenPrivacyOff = false;
+  const debt = screenPrivacyDebt;
+  if (debt === null) return false;
+  screenPrivacyDebt = null;
+  const mode = await currentMode(debt.storage).catch((): AppMode => 'parent');
+  if (mode !== debt.space) return false;
   await effects.setScreenPrivacy(false).catch(() => undefined);
   return true;
 }
@@ -180,11 +214,15 @@ export async function settleChildSpaceScreenPrivacy(
  * back (one route in the stack means no back arrow) and the next cold start showed the parent/child
  * chooser, because entryRoute only sends mode 'child' straight to the child home. The child space
  * needs no PIN; the parent PINs back in from "Grown-ups".
+ *
+ * Answers whether the child's space is still owed its screen-privacy change (HUNT7-A-1). The
+ * backgrounding caller needs that answer: the debt below is recorded after three awaited keychain
+ * round trips, so the 'active' event that was supposed to settle it can have gone by already.
  */
 export async function lockParentAreaOnDevice(
   storage: SecureStorage,
   effects: ModeEffects,
-): Promise<void> {
+): Promise<boolean> {
   // Local state first: an offline relock must not leave the screens open.
   forgetParentUnlock();
   effects.clearAdultCaches();
@@ -202,13 +240,16 @@ export async function lockParentAreaOnDevice(
     // correct it, because the mode written above makes that hook return early. It is RECORDED here
     // and not applied here (HUNT6-I-4): this same function runs from the backgrounding handler, where
     // the adult screen is still the painted frame, so switching protection off here removed it at the
-    // exact moment the OS snapshots the app. `settleChildSpaceScreenPrivacy` applies it.
-    childSpaceOwedScreenPrivacyOff = true;
+    // exact moment the OS snapshots the app. `settleChildSpaceScreenPrivacy` applies it, and the debt
+    // names the space and the store it was read from so no later settle can apply it to another state.
+    screenPrivacyDebt = { space: 'child', storage };
   } else {
     // A parent-only device stays in parent mode on the unlock screen: adult privacy stays on.
     effects.resetNavigationToUnlock();
   }
   await effects.relockOnServer().catch(() => undefined);
+  // Still owed, i.e. no settle overtook this lock while the relock was out.
+  return childSpaceOwesScreenPrivacy();
 }
 
 /**
@@ -253,6 +294,8 @@ export async function whileStorePurchaseOpen<T>(
 /** Adult credentials are never persisted by this module; Supabase keeps its own session store. */
 export async function enterChildMode(storage: SecureStorage, effects: ModeEffects): Promise<void> {
   forgetParentUnlock();
+  // This path applies the child space's screen-privacy state itself, below, so a deferred one is void.
+  forgetScreenPrivacyDebt();
   effects.clearAdultCaches();
   // Relock even if the network call fails: local state must not keep adult data regardless.
   await effects.relockOnServer().catch(() => undefined);
@@ -292,6 +335,9 @@ export async function enterParentMode(
     return 'window_lapsed';
   }
   await storage.setItem(STORAGE_KEYS.mode, 'parent');
+  // The device is the adult's again, so any deferred child-space change is void (HUNT7-A-2): letting
+  // one arrive after this line switched adult protection off with parent screens on screen.
+  forgetScreenPrivacyDebt();
   await effects.setScreenPrivacy(true);
   return 'parent';
 }
@@ -315,6 +361,8 @@ export async function signOutParent(
   effects.clearAdultCaches();
   await effects.relockOnServer().catch(() => undefined);
   forgetParentUnlock();
+  // This path applies its own screen-privacy state at the end, so a deferred one is void.
+  forgetScreenPrivacyDebt();
   // Reported, not swallowed (HUNT6-J-1). Nothing below is skipped whatever this answered — that is
   // the "nothing may stop the sign-out" rule and it is unchanged — but the answer reaches the caller,
   // because `.catch(() => undefined)` here, on top of parentAuth.signOut dropping supabase's own

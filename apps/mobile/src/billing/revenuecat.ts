@@ -78,6 +78,13 @@ export function revenueCatPublicKey(): string | null {
 let sdkConfigured = false;
 /** The family billing ref the SDK currently acts for, or null (signed out / child mode). */
 let identifiedAs: string | null = null;
+/**
+ * A logOut the SDK refused, remembered until a bind replaces the identity it was left holding
+ * (HUNT7-K-1). `identifiedAs` is set to null before the logOut is awaited, so without this the SECOND
+ * `forgetStoreIdentity` of a sign-out — and the closure screen reads the second one — would answer
+ * "nothing to forget" for a device whose SDK is still bound to the closed account's app user id.
+ */
+let storeIdentityMayRemain = false;
 const packages = new Map<string, PurchasesPackage>();
 /** Identity changes run one at a time, so a logOut can never interleave with a later logIn. */
 let identityQueue: Promise<void> = Promise.resolve();
@@ -106,12 +113,15 @@ export function identifyStoreAccount(billingRef: string): Promise<void> {
       });
       sdkConfigured = true;
       identifiedAs = billingRef;
+      // Whatever identity a refused logOut left behind, the SDK now acts for this family.
+      storeIdentityMayRemain = false;
       return;
     }
     if (identifiedAs !== billingRef) {
       packages.clear();
       await Purchases.logIn(billingRef);
       identifiedAs = billingRef;
+      storeIdentityMayRemain = false;
     }
   });
 }
@@ -121,15 +131,26 @@ export function identifyStoreAccount(billingRef: string): Promise<void> {
  * (renewals, Ask to Buy approvals, codes redeemed in the App Store app) are no longer attributed to
  * its billing ref. Runs when the parent signs out or the device switches to child mode (see the
  * adult-cache clearer below). The next identify() binds the SDK again.
+ *
+ * It ANSWERS whether the SDK has forgotten the identity, and still never throws (HUNT7-K-1): the
+ * account-closure screen tells the parent whether this device kept anything of theirs, and
+ * `clearDeviceAdultSecrets` (src/family/runtime.ts) can only report that if the operation the claim
+ * names reports. `Purchases.logOut().catch(() => undefined)` meant a resolved promise proved a
+ * module-local map had been cleared and this mutex had resolved — the fact ADJACENT to "the store SDK
+ * forgot the family". True with nothing bound is honest: there is then no identity to keep.
  */
-export function forgetStoreIdentity(): Promise<void> {
+export function forgetStoreIdentity(): Promise<boolean> {
   packages.clear();
   return serialized(async () => {
     packages.clear();
     if (identifiedAs === null) return;
     identifiedAs = null;
-    await Purchases.logOut().catch(() => undefined);
-  });
+    const loggedOut = await Purchases.logOut().then(
+      () => true,
+      () => false,
+    );
+    if (!loggedOut) storeIdentityMayRemain = true;
+  }).then(() => !storeIdentityMayRemain);
 }
 
 /**

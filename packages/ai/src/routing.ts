@@ -5,6 +5,7 @@ import {
   defineStageLimits,
   estimateUpperBoundCostMicros,
   type AiStage,
+  type ModelRateTable,
 } from '@pencillift/domain/quotas';
 
 /**
@@ -89,9 +90,13 @@ const EXTRACTION_GRADING_COST_MICROS = 216_816;
 
 /**
  * The MOST of a stage's output budget a truncated answer is retried with (JOBS-R2-02): once, at up to
- * this multiple of the configured `maxOutputTokens`, and never past what the stage's cost cap still
- * admits — the owner's ceiling is never exceeded to fit a longer answer. It lives here, next to the
- * caps it is spent against, because `fullRaiseCeiling` below prices it; run.ts re-exports it.
+ * this multiple of the configured `maxOutputTokens`, and never past what the stage's cost BUDGET
+ * (PROPOSED_STAGE_COST_BUDGET_MICROS below) still admits. That budget is sized for exactly this
+ * raise; what is never raised to fit a longer answer is the per-request ADMISSION bound, so no
+ * request bigger than the owner admitted is sent to pay for one (HUNT6-D-CAP). HUNT7-B-6: this
+ * sentence named the admission bound after the split, which is the one of the two numbers the raise
+ * is NOT weighed against. It lives here, next to both tables, because `fullRaiseCeiling` below
+ * prices it; run.ts re-exports it.
  */
 export const OUTPUT_TRUNCATED_BUDGET_MULTIPLE = 2;
 
@@ -131,7 +136,7 @@ export const STAGE_FLOOR_INPUT_TOKENS: Readonly<Record<AiStage, number>> = {
  *
  * It is the exact sum run.ts weighs against the stage BUDGET on that retry (never against the
  * admission bound, which is a per-request number and is not raised to fit a retry — HUNT6-D-CAP),
- * built from the same two
+ * priced at the SAME rate table run.ts is handed, built from the same two
  * production functions rather than re-derived: `computeOperationCostMicros` of the cut-off answer
  * (metered at the stage's floor input and the WHOLE configured output budget, which is what a
  * `max_output_tokens` incomplete reports) plus `estimateUpperBoundCostMicros` of the retry at
@@ -145,17 +150,28 @@ export const STAGE_FLOOR_INPUT_TOKENS: Readonly<Record<AiStage, number>> = {
  * It is a FLOOR guarantee, not a promise at every input size: above the floor the admissible raise
  * shrinks with the input, and a stage can still end OUTPUT_TRUNCATED with a partial raise on a large
  * request (grading past about 85 questions, below).
+ *
+ * `rates` is the table the ceiling is PRICED at, and it is an argument because run.ts spends at the
+ * table its caller hands it, not at this file's default (HUNT7-B-5). It defaults to
+ * DEFAULT_RATE_TABLE_2026_09_18, which is the object `defineStageCostBudgets` validates the recorded
+ * budgets against and the one every production caller passes; run.ts re-derives this ceiling at any
+ * other table it is handed, so a new rate table version cannot shrink a promised retry while the
+ * startup check stays green.
  */
-export function fullRaiseCeiling(stage: AiStage, maxOutputTokens: number): number {
+export function fullRaiseCeiling(
+  stage: AiStage,
+  maxOutputTokens: number,
+  rates: ModelRateTable = DEFAULT_RATE_TABLE_2026_09_18,
+): number {
   const modelId = STAGE_MODELS[stage];
   const inputTokens = STAGE_FLOOR_INPUT_TOKENS[stage];
-  const cutOff = computeOperationCostMicros(DEFAULT_RATE_TABLE_2026_09_18, {
+  const cutOff = computeOperationCostMicros(rates, {
     modelId,
     inputTokens,
     cachedInputTokens: 0,
     outputTokens: maxOutputTokens,
   });
-  const retry = estimateUpperBoundCostMicros(DEFAULT_RATE_TABLE_2026_09_18, {
+  const retry = estimateUpperBoundCostMicros(rates, {
     modelId,
     inputTokens,
     maxOutputTokens: maxOutputTokens * OUTPUT_TRUNCATED_BUDGET_MULTIPLE,
@@ -189,11 +205,19 @@ export const PROPOSED_STAGE_LIMITS = defineStageLimits({
     maxOutputTokens: 2_000,
     maxCostMicros: 100_000,
   },
-  // Every `maxCostMicros` here is an ADMISSION bound and nothing else: the largest single request
-  // the stage may send (see PROPOSED_STAGE_COST_BUDGET_MICROS below, which is what the one raised
-  // retry is weighed against). HUNT6-D-1 raised five of them to their full-raise ceiling and that
-  // widened admission with them, which admitted an oversized personalization request LJA-F4 exists
-  // to prove is refused; they are back at the owner's recorded numbers.
+  // Every `maxCostMicros` here is the ADMISSION bound for the FIRST request of a stage: run.ts
+  // weighs attempt 1 against it and refuses an oversized request with STAGE_LIMIT and ZERO provider
+  // calls, which is the oversize guard LJA-F4 pins. It is NOT a bound on every request the stage
+  // sends. Every attempt after the first — including the ONE raised retry, which is the LARGEST
+  // request a stage ever sends — is weighed against PROPOSED_STAGE_COST_BUDGET_MICROS below, so a
+  // raised retry can be priced ABOVE this cap wherever `budget − rateOut x maxOutputTokens` exceeds
+  // it. As configured that is one stage, followup (240,000 − 50 x 1,200 = 180,000 against a 150,000
+  // cap), which has no prompt and no runStage caller today; every other retrying stage's raise stays
+  // under its own cap, and packages/ai/src/run-truncation.test.ts computes the set from these tables
+  // so a fourth number cannot join it silently (HUNT7-B-4).
+  // HUNT6-D-1 raised five of these caps to their full-raise ceiling and that widened admission with
+  // them, which admitted an oversized personalization request LJA-F4 exists to prove is refused; they
+  // are back at the owner's recorded numbers.
   semantic_check: {
     maxAttempts: 2,
     timeoutMs: 30_000,
@@ -222,7 +246,16 @@ export const PROPOSED_STAGE_LIMITS = defineStageLimits({
  * Validates the per-stage cost BUDGETS against the admission caps they sit beside and the ceiling
  * they exist for, so a new stage, a raised `maxOutputTokens` or a lowered number fails the worker at
  * startup instead of promising a retry it cannot pay for (the same fail-closed rule as
- * `defineStageLimits`). The stages excused from the ceiling are named HERE, in the check itself, so
+ * `defineStageLimits`).
+ *
+ * It prices the ceiling at DEFAULT_RATE_TABLE_2026_09_18 and at nothing else, so what it validates is
+ * the recorded budgets AT THAT rate table. The rate table is versioned and expected to change
+ * (packages/domain/src/quotas/rates.ts; spec P12 "Keep billing rates in a versioned server table"),
+ * and run.ts spends at the table its caller hands it — so a changed rate table is the one input to
+ * this invariant that this check cannot see, and it is the change that most plausibly reopens
+ * BUG-309. run.ts therefore re-derives `fullRaiseCeiling` at any OTHER table it is handed and refuses
+ * the stage loudly rather than promising a retry those prices cannot pay for (HUNT7-B-5). The stages
+ * excused from the ceiling are named HERE, in the check itself, so
  * the invariant this file states holds for every stage the check does not name (HUNT6-D-ESCALATION:
  * the comment it replaces claimed every stage while `escalation` sat 160,000 micros below its own
  * ceiling, silently excused).
@@ -268,8 +301,12 @@ function defineStageCostBudgets(
  * The budget for a STAGE AS A WHOLE, in integer micro-USD: the cumulative metered cost of every
  * attempt it may make, including the ONE raised retry a truncated answer gets (JOBS-R2-02), and the
  * worst case the spend HOLD reserves: apps/api/src/jobs/scan-process.ts's `spending()` sums it over
- * the stages of a group, and apps/api/src/jobs/learning-jobs.ts reserves it for the personalization
- * stage. Both are this table and not the caps below (F-HOLD: the personalization hold still reserved
+ * the stages of a group, and apps/api/src/jobs/learning-jobs.ts reserves it for EITHER personalization
+ * stage — `personalizeItems` takes `stage: 'daily_set' | 'thursday_bundle'` and both arms are live, so
+ * the hold it takes is daily_set's 483,240 or thursday_bundle's 933,600, and the larger of the two is
+ * the largest single hold in the product (HUNT7-B-2: a doc figure was written from the daily_set arm
+ * alone and understated the peak by 93%; apps/api/tests/learning-jobs.test.ts pins both arms).
+ * Both callers use this table and not the caps below (F-HOLD: the personalization hold still reserved
  * `PROPOSED_STAGE_LIMITS[stage].maxCostMicros` after the split, so a stage that took its raised retry
  * could spend past the hold taken for it, and the hold bounded nothing).
  *
@@ -289,9 +326,29 @@ function defineStageCostBudgets(
  * number is below it, and packages/ai/src/run-truncation.test.ts pins the same invariant plus a real
  * run at each stage's floor input.
  *
- * These are HOLDS, not spend: settleSpend replaces each with the actual usage, so a call that
- * succeeds costs no more than before and the exposure is a family near their monthly ceiling waiting
- * a tick longer.
+ * TWO things are weighed against this number, and only one of them settles back (HUNT7-B-1).
+ * (1) The spend HOLD a caller reserves before the stage runs: settleSpend replaces it with the
+ * metered usage, so a stage that SUCCEEDS costs no more than it did before the split and the exposure
+ * is a family near their monthly ceiling waiting a tick longer. (2) The CUMULATIVE metered cost of
+ * every attempt after the first: run.ts weighs `spent` plus the next attempt's estimate against this
+ * number and never against the admission cap, whatever ended the earlier attempt — a truncated
+ * answer, a client-side timeout, a 5xx or a validation rejection alike. That half is real spend, and
+ * for the five stages whose budget is above their cap it is a LARGER bound than the single number
+ * that governed the whole stage before the split.
+ *
+ * Where it moves money. An attempt whose usage the provider never reported is metered at the full
+ * upper bound it was admitted with (JOBS-R1-03), so after one of those `spent` equals its estimate
+ * exactly and the next attempt is weighed as twice it. For the five stages whose budget is above
+ * their cap there is therefore a band of estimated input sizes in which the stage now makes and pays
+ * for a SECOND billed generation where the admission cap alone ended it after one: coaching
+ * 2,501..7,876, followup 1,501..6,000, daily_set 2,501..9,162, thursday_bundle 5,001..16,680,
+ * semantic_check 5,201..5,400 estimated input tokens. A failure whose usage the provider DID report
+ * spends less than its estimate, so its second attempt fits at larger inputs still. That is
+ * deliberate, not a side effect: a transient failure is exactly the case where a second try gets the
+ * child the coached hint or the personalized set instead of a fallback, and the hold above already
+ * reserved the money for it. The bands are COMPUTED from these two tables, never asserted, by
+ * packages/ai/src/run-metering.test.ts > 'the stage budget bounds every attempt after the first'; the
+ * owner's copy of them belongs beside the hold table in docs/Cost_Analysis.md section 3.
  *
  * - extraction, grading: EXTRACTION_GRADING_COST_MICROS, which is ABOVE `fullRaiseCeiling` (155,972
  *   and 153,264) because it is sized for the full raise at the largest scan the product accepts, not

@@ -673,6 +673,15 @@ export async function personalizeItems(
   // the cap left the hold below what the stage may spend — daily_set's cap is 350,000 micros and its
   // two attempts may cost 483,240 — so the hold stopped bounding the spend, which is the only thing
   // a hold is for. scan-process.ts's `spending()` sums the same table.
+  //
+  // `stage` has TWO arms and this line takes a different hold for each (HUNT7-B-2): daily_set
+  // reserves 483,240 micro-USD and thursday_bundle 933,600, the largest single hold the product
+  // takes — thursday_bundle's cap is 700,000 and its two attempts may cost 933,600. The thursday arm
+  // is live production (generateThursdayReview is a registered handler the tick enqueues), so an
+  // owner ceiling sized for the daily figure alone refuses this hold below and the child gets the
+  // un-personalized bank items. Both numbers are pinned by runs in
+  // apps/api/tests/learning-jobs.test.ts, one case per arm, because the owner's cost record was once
+  // written from the daily arm alone and understated the peak by 93%.
   let hold: string | null;
   try {
     hold = await acquireSpendHold(deps, PROPOSED_STAGE_COST_BUDGET_MICROS[stage]);

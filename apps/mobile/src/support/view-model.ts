@@ -7,7 +7,9 @@ import {
   SUPPORT_REFUND_NOTICE,
   SUPPORT_RULES,
   SUPPORT_SUBJECT_MAX_LENGTH,
+  supportBillingPeriodKindNote,
   supportCaseKindSchema,
+  supportDerivedChargeLabel,
   type BillingSettlement,
   type CreateSupportCaseRequest,
   type ReplySupportCaseRequest,
@@ -143,15 +145,42 @@ const SETTLEMENT_LABELS: Readonly<Record<BillingSettlement, string>> = {
   chargeback: 'charged back through the store',
 };
 
-/** "App Store · Sep 1, 2026 to Oct 1, 2026 · $39.99 for 1 child". */
+/**
+ * "App Store · Sep 1, 2026 to Oct 1, 2026 · $39.99 for 1 child" for a subscription charge, and
+ * "Web billing · mid-cycle adjustment billed with the Sep 1, 2026 charge · $10.00" for anything else.
+ *
+ * HUNT7-C-3: one renewal can be recorded as TWO rows, the second a derived '<invoice>:proration' row
+ * spread from the first, so it repeats the subscription period's dates and paid_slots. Reading that row
+ * out as "$10.00 for 1 child" over those dates states two things that are false about it: the money is
+ * a mid-cycle item covering part of the PREVIOUS period, and it is no part of a charge for a number of
+ * children. The wording comes from the contract so the app and the portal say the same thing.
+ */
 export function periodLabel(period: SupportBillingPeriod, timeZone?: string): string {
+  const note = supportBillingPeriodKindNote(period.kind);
+  // Only a row the API says was billed with ANOTHER row reads "billed with the <date> charge"
+  // (HUNT7-C-3): a standalone mid-cycle adjustment, an add-on or a tax-only charge is its own invoice
+  // and keeps its own dates, with the kind as a qualifier.
+  if (note !== null && period.derivedFromProviderPeriodId !== null) {
+    const billedWith = supportDerivedChargeLabel(note, shortDate(period.periodStart, timeZone));
+    return `${channelName(period.channel)} · ${billedWith} · ${formatUsd(period.chargedCents)}`;
+  }
+  if (note !== null) {
+    const span = `${shortDate(period.periodStart, timeZone)} to ${shortDate(period.periodEnd, timeZone)}`;
+    return `${channelName(period.channel)} · ${span} · ${note} · ${formatUsd(period.chargedCents)}`;
+  }
   const slots = `${period.paidSlots} ${period.paidSlots === 1 ? 'child' : 'children'}`;
   return `${channelName(period.channel)} · ${shortDate(period.periodStart, timeZone)} to ${shortDate(period.periodEnd, timeZone)} · ${formatUsd(period.chargedCents)} for ${slots}`;
 }
 
-/** Short enough for a picker chip: "App Store · Sep 1, 2026 · $39.99". */
+/**
+ * Short enough for a picker chip: "App Store · Sep 1, 2026 · $39.99", and, for a row that is not a
+ * subscription charge, the kind after the amount so two entries sharing a date are never the same
+ * sentence (HUNT7-C-3).
+ */
 export function periodChipLabel(period: SupportBillingPeriod, timeZone?: string): string {
-  return `${channelName(period.channel)} · ${shortDate(period.periodStart, timeZone)} · ${formatUsd(period.chargedCents)}`;
+  const note = supportBillingPeriodKindNote(period.kind);
+  const qualifier = note === null ? '' : ` · ${note}`;
+  return `${channelName(period.channel)} · ${shortDate(period.periodStart, timeZone)} · ${formatUsd(period.chargedCents)}${qualifier}`;
 }
 
 /**

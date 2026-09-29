@@ -116,10 +116,22 @@ export const parentAuth = {
    * 'global'. Ending every session is the portal's own "sign out everywhere".
    *
    * It REPORTS what happened (HUNT6-J-1). supabase-js does not throw for a refused or failed
-   * sign-out; it returns the failure in `{ error }`, and when the logout call failed it does not
-   * remove the local session either — so dropping that `error` left a device still holding the
-   * parent's session with nothing in the app able to tell. `ok: false` means this device may still be
-   * signed in. Callers must still not let a failure stop the rest of their sign-out.
+   * sign-out; it returns the failure in `{ error }` — so dropping that `error` left the only wrapper
+   * that decides what this app may claim about a signed-out device unable to say anything at all.
+   *
+   * What it does with the stored session, since this is the file a maintainer reads for it
+   * (HUNT7-K-3): with scope 'local', auth-js 2.116 still removes the local session when the logout
+   * call failed. `_signOut` calls removeCurrentSession() and only THEN returns the `{ error }`, for an
+   * HTTP failure and for a fetch failure alike (AuthRetryableFetchError is not an AuthApiError, so it
+   * is not one of the 404/401/403 cases it passes over). The one path that returns an error WITHOUT
+   * removing is the early `sessionError` return — the stored session could not be read or refreshed —
+   * which is a different fact from "the logout call failed".
+   *
+   * So `ok: false` means this device cannot say the session ended: either the service was never told,
+   * or the session could not be read at all. It is deliberately NOT "this device is still signed in" —
+   * that is the adjacent claim, and the copy may claim neither state (src/lib/mode.ts's
+   * DeviceSignOutOutcome, src/privacy/parent-privacy.ts). Callers must still not let a failure stop
+   * the rest of their sign-out.
    */
   async signOut(): Promise<SignOutResult> {
     // Not configured: there is no session on this device to end, so nothing failed.

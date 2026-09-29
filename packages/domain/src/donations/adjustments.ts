@@ -81,6 +81,17 @@ export function adjustmentKey(accrualId: string, kind: AdjustmentKind): string {
  * permanent refund or a reversible dispute caused it, so the event order alone cannot tell that a
  * won dispute left the period at full price (e.g. partial refund → chargeback → dispute won).
  * docs/Architecture.md §5: reconciliation uses fetched provider state, not event order.
+ *
+ * What this rule does and does NOT establish (HUNT7-C-2). It establishes that THE STATE HANDED IN
+ * says the period is settled with nothing refunded; it cannot establish that the period really is at
+ * full price, because that is a property of the caller's figures, not of this decision. It is exactly
+ * where that distinction was lost: a won dispute wrote refunded_cents 0 and settlement 'settled' onto
+ * a period the family had been partly refunded for, because the reversal subtracted more than the
+ * dispute had added, and this rule then paid the school's $1 back for a refunded month while behaving
+ * precisely as specified. The caller owes this rule a settlement state that is true of the money
+ * (apps/api/src/services/billing-sync.ts keeps the refunded and disputed parts apart for that
+ * reason); a partial refund that survives a won dispute must reach here as 'partially_refunded' with
+ * its cents, and then this rule plans nothing, which is the outcome.
  */
 export function planAdjustment(input: PlanAdjustmentInput): DonationAdjustment | null {
   const { accrual, event, existingAdjustmentKeys: keys } = input;

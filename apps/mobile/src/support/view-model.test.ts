@@ -50,12 +50,43 @@ const PERIOD: SupportBillingPeriod = {
   id: PERIOD_ID,
   channel: 'app_store',
   providerPeriodId: 'txn_synthetic_001',
+  kind: 'subscription_period',
+  derivedFromProviderPeriodId: null,
   periodStart: '2026-09-01T00:00:00.000Z',
   periodEnd: '2026-10-01T00:00:00.000Z',
   paidSlots: 1,
   chargedCents: 3999,
   refundedCents: 0,
   settlement: 'settled',
+};
+
+/**
+ * HUNT7-C-3: the second row a renewal with a deferred mid-cycle item writes. `prorationPeriodFor`
+ * spreads it from the subscription period, so it carries the SAME dates and paid_slots and differs
+ * only in its provider id, its kind and its amount — it is not a charge for those dates and it is not
+ * a charge for a number of children.
+ */
+const PRORATION: SupportBillingPeriod = {
+  ...PERIOD,
+  id: '44444444-4444-4444-8444-444444444444',
+  channel: 'stripe',
+  providerPeriodId: 'in_synthetic_002:proration',
+  kind: 'proration',
+  derivedFromProviderPeriodId: 'in_synthetic_002',
+  chargedCents: 1000,
+};
+
+/**
+ * HUNT7-C-3, the CHECKER's finding on the first fix: a mid-cycle adjustment can also arrive as an
+ * invoice of its OWN, with its own dates and no parent charge. The first fix labelled this one
+ * "billed with the Sep 1, 2026 charge" too, asserting a billing relationship it does not have and
+ * throwing away the dates that ARE true of it.
+ */
+const STANDALONE_PRORATION: SupportBillingPeriod = {
+  ...PRORATION,
+  id: '55555555-5555-4555-8555-555555555555',
+  providerPeriodId: 'in_synthetic_003',
+  derivedFromProviderPeriodId: null,
 };
 
 function aCase(overrides: Partial<SupportCase> = {}): SupportCase {
@@ -130,9 +161,44 @@ describe('billing periods', () => {
       'App Store · Sep 1, 2026 to Oct 1, 2026 · $39.99 for 1 child',
     );
     expect(periodChipLabel(PERIOD, UTC)).toBe('App Store · Sep 1, 2026 · $39.99');
+  });
+
+  it('[HUNT7-C-3] a mid-cycle charge that is its OWN invoice keeps its own dates', () => {
+    // The checker's finding on the first fix: this row has no parent charge, so "billed with the
+    // <date> charge" is false of it, and the dates it does have are the truth about it.
+    expect(periodLabel(STANDALONE_PRORATION, UTC)).toBe(
+      'Web billing · Sep 1, 2026 to Oct 1, 2026 · mid-cycle adjustment · $10.00',
+    );
+    expect(periodLabel(STANDALONE_PRORATION, UTC)).not.toMatch(/billed with/);
+    // It is still not a charge for a number of children.
+    expect(periodLabel(STANDALONE_PRORATION, UTC)).not.toMatch(/for 1 child/);
     expect(
       periodLabel({ ...PERIOD, channel: 'play_store', paidSlots: 3, chargedCents: 5997 }, UTC),
     ).toBe('Google Play · Sep 1, 2026 to Oct 1, 2026 · $59.97 for 3 children');
+  });
+
+  it('[HUNT7-C-3] names a derived mid-cycle row for what it is, not as a period charge for a child', () => {
+    // Before this, the picker offered 'Web billing · Sep 1, 2026 · $10.00' beside the subscription
+    // charge for the same date with nothing to tell them apart, and the case detail then said
+    // 'Web billing · Sep 1, 2026 to Oct 1, 2026 · $10.00 for 1 child' — a sentence that is false
+    // about the row, since that $10 is a mid-cycle item and no part of a charge for those dates.
+    expect(periodLabel(PRORATION, UTC)).toBe(
+      'Web billing · mid-cycle adjustment billed with the Sep 1, 2026 charge · $10.00',
+    );
+    expect(periodLabel(PRORATION, UTC)).not.toMatch(/for 1 child/);
+    expect(periodChipLabel(PRORATION, UTC)).toBe(
+      'Web billing · Sep 1, 2026 · $10.00 · mid-cycle adjustment',
+    );
+    // An ordinary subscription charge reads exactly as it did.
+    expect(periodLabel(PERIOD, UTC)).toBe(
+      'App Store · Sep 1, 2026 to Oct 1, 2026 · $39.99 for 1 child',
+    );
+    expect(periodChipLabel(PERIOD, UTC)).toBe('App Store · Sep 1, 2026 · $39.99');
+    // Both rows are the family's and both stay pickable: a standalone mid-cycle invoice is a real
+    // charge a parent may want refunded, so the fix is the label, never hiding the row.
+    const options = billingPeriodOptions([PERIOD, PRORATION], UTC);
+    expect(options.map((o) => o.value)).toEqual([NO_PERIOD_VALUE, PERIOD.id, PRORATION.id]);
+    expect(options[2]!.label).toBe('Web billing · Sep 1, 2026 · $10.00 · mid-cycle adjustment');
   });
 
   it('names every channel the contract knows and falls back to the raw key for an unknown one', () => {

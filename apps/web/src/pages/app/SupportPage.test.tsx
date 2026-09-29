@@ -19,12 +19,33 @@ const period: SupportBillingPeriod = {
   id: PERIOD,
   channel: 'app_store',
   providerPeriodId: 'txn_synthetic_001',
+  kind: 'subscription_period',
+  derivedFromProviderPeriodId: null,
   periodStart: '2026-09-01T00:00:00.000Z',
   periodEnd: '2026-10-01T00:00:00.000Z',
   paidSlots: 2,
   chargedCents: 4998,
   refundedCents: 0,
   settlement: 'settled',
+};
+
+/**
+ * HUNT7-C-3: the derived second row a renewal with a deferred mid-cycle item writes. It is spread
+ * from the subscription period, so it repeats that period's dates, paid_slots and settlement instant
+ * and differs only in its provider id, its kind and its amount.
+ */
+const PRORATION_PERIOD = '4d5e6f70-6666-4aaa-8bbb-000000000006';
+const prorationPeriod: SupportBillingPeriod = {
+  ...period,
+  id: PRORATION_PERIOD,
+  channel: 'stripe',
+  providerPeriodId: 'in_synthetic_002:proration',
+  kind: 'proration',
+  // This row IS derived — it is the second period a renewal with a deferred mid-cycle item writes —
+  // so it names the charge it was billed with. A standalone mid-cycle invoice has null here and keeps
+  // its own dates instead (HUNT7-C-3, the checker's finding on the first fix).
+  derivedFromProviderPeriodId: 'in_synthetic_002',
+  chargedCents: 1000,
 };
 
 function supportCase(overrides: Partial<SupportCase> = {}): SupportCase {
@@ -142,6 +163,36 @@ describe('SupportPage access and empty state', () => {
 });
 
 describe('Opening a case', () => {
+  it('[HUNT7-C-3] names the derived mid-cycle row in the refund picker instead of offering a second unnamed charge', async () => {
+    const subscription: SupportBillingPeriod = {
+      ...period,
+      channel: 'stripe',
+      providerPeriodId: 'in_synthetic_002',
+    };
+    const { api } = fakeApi({
+      // As the API sends them: one invoice, two rows, the real charge first.
+      'GET /v1/support/billing-periods': { periods: [subscription, prorationPeriod] },
+    });
+    render(api);
+    const form = await screen.findByRole('form', { name: 'Open a case' });
+    await userEvent.selectOptions(
+      within(form).getByLabelText('What is it about?'),
+      'refund_request',
+    );
+    const picker = await within(form).findByLabelText('Which charge? (optional)');
+    const labels = within(picker)
+      .getAllByRole('option')
+      .map((o) => o.textContent);
+    // Before this, the two entries read 'Web billing · Sep 1 – Oct 1 · $49.98' and
+    // '… · $10.00' with nothing to tell them apart, so a parent opening a refund request for their
+    // renewal could pick the derived row and have every figure on their case be the wrong row's.
+    expect(labels[0]).toBe('Choose a billing period');
+    expect(labels[1]).toMatch(/^Web billing · .+ – .+ · \$49\.98$/);
+    expect(labels[2]).toMatch(
+      /^Web billing · mid-cycle adjustment billed with the .+ charge · \$10\.00$/,
+    );
+  });
+
   it('validates, shows the refund notice and billing periods for a refund request, and posts the case', async () => {
     const { api, sent, listCalls } = fakeApi({
       'POST /v1/support/cases': (call: Call) => {

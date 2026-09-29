@@ -355,6 +355,40 @@ export function stoppedScanOutcome(
   };
 }
 
+/** What the child reads between their "Stop sending" tap and the server's answer (HUNT7-K-2). */
+export const CHILD_STOPPING_MESSAGE = 'Stopping…';
+
+/** A step the child's "Stop sending" hands the screen, in the order the screen must take them. */
+export type StoppedScanStep =
+  /** The tap is acknowledged NOW: no progress claim, and no live Stop button, while the cancel runs. */
+  | { readonly kind: 'stopping' }
+  /** The cancel answered; `outcome` is what the child reads and whether the attempt is kept. */
+  | { readonly kind: 'stopped'; readonly outcome: StoppedScanOutcome };
+
+/**
+ * The whole "Stop sending" operation, so its ORDER can be run and asserted rather than read out of
+ * the screen (HUNT7-K-2; the same move HUNT6-J-2 made for the parent's account closure).
+ *
+ * The 'stopping' step comes BEFORE the cancel, which is a POST with the client's 20-second default
+ * timeout and one retry on a single UNAUTHENTICATED answer. `abort()` sets no state of its own, so the
+ * screen used to keep rendering "Sending page N of M…" — false by then, the send is already aborted on
+ * the device — with the same live "Stop sending" and no other control reachable, for that whole window.
+ * A child aged 5-13 on a flaky connection presses it again, and again, because nothing happened.
+ *
+ * The cancel is still awaited and its answer still decides what the child reads and whether the
+ * attempt survives: that answer is what keeps AC_CAPTURE_06's one job, one charge honest
+ * (`stoppedScanOutcome`).
+ */
+export async function runStoppedScan(
+  api: ApiClient,
+  attempt: UploadAttempt,
+  step: (next: StoppedScanStep) => void,
+): Promise<void> {
+  step({ kind: 'stopping' });
+  const outcome = stoppedScanOutcome(await cancelScan(api, attempt));
+  step({ kind: 'stopped', outcome });
+}
+
 const GENERIC_COPY = 'Something went wrong. Let’s try again.';
 
 const CODE_COPY: Partial<Record<ApiRequestError['code'], string>> = {

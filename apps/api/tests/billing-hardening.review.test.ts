@@ -401,7 +401,12 @@ describe('BILL-R1-1: a chargeback is a refund for the revenue view', () => {
       settlement: 'partially_refunded',
       refunded_cents: 1000,
     });
-    // Stripe disputes at most the un-refunded remainder; the chargeback adds to the refund.
+    // Stripe may dispute any part of a charge (webhooks.ts states so), and this case uses the
+    // un-refunded remainder: the chargeback adds it to the refund and the two are exactly the charge,
+    // so the cap does not bite here. HUNT7-C-1: nor does the code depend on the amount being at most
+    // the remainder any more. A larger dispute is bounded by what this row has ROOM for — its charge
+    // less what was already refunded — and the excess is carried to the invoice's ':proration' row if
+    // it has one (this store transaction has no sibling, so a charge is all there is to claw back).
     await refund(fam, pid, 'chargeback', 3998);
     expect(await periodRow(pid)).toMatchObject({ settlement: 'chargeback', refunded_cents: 4998 });
     await refund(fam, pid, 'chargeback_reversed', 3998);
@@ -516,6 +521,11 @@ describe('BILL-R1-1: a won dispute after a partial refund, through the webhook',
     // HUNT6-C-2: the win gives back what the chargeback added, so the genuine partial refund survives
     // whole. Before the fix the dispute was added tax-inclusive (2705) and capped at the charge, then
     // subtracted tax-inclusive, leaving 2293 — 206 cents of the family's refund read as kept revenue.
+    // HUNT7-C-2: one unit is why 2499 + 2499 is exactly the charge here, so the cap never bites and
+    // add-then-subtract happen to agree. That is a property of THIS fixture (its own comment says the
+    // amounts were chosen so rounding cannot bite), not of the arithmetic: where the cap does bite the
+    // two disagreed, and what makes them agree everywhere is that the win gives back the recorded
+    // `chargeback_cents` — what the dispute really added — rather than the converted amount.
     await stripeDispute(invoiceId, 2705, 'won');
     expect(await periodRow(invoiceId)).toMatchObject({
       settlement: 'partially_refunded',

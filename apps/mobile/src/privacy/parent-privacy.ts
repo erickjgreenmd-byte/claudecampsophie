@@ -157,8 +157,15 @@ export async function exportDownloadAction(
   }
 }
 
+/**
+ * What POST /v1/account/close answered, as the flow needs it. The two SUCCESS statuses carry no
+ * message (HUNT7-K-4): what the parent reads about a closed account is decided from the status AND
+ * this device's sign-out outcome, by `accountClosedDeviceMessage` below, so a message here could only
+ * be the unconditional "and this device is signed out" that this round removed from the screen. An
+ * error keeps its message, because the 'refused' step is what shows it.
+ */
 export type CloseAccountResult =
-  | { readonly status: 'closed' | 'pending'; readonly message: string }
+  | { readonly status: 'closed' | 'pending' }
   | { readonly status: 'step_up' }
   | { readonly status: 'error'; readonly message: string };
 
@@ -178,8 +185,11 @@ export type CloseAccountResult =
  * an unconfirmed sign-out does not prove the device is still signed in — and it does not prove it is
  * signed out either, because a session it could not read is a session it leaves alone. So the
  * unconfirmed copy claims neither: it says the app could not confirm, and names the one action that
- * is right in both cases. `secretsCleared` is whether both device clears succeeded. Neither fact is
- * "nothing threw", which is all the previous version could observe.
+ * is right in both cases. `secretsCleared` is what the two device clears THEMSELVES reported — the
+ * keychain accepted the delete of the PIN item, and the store SDK accepted the logOut (HUNT7-K-1,
+ * src/family/runtime.ts). Neither fact is "nothing threw", which is all the earlier versions could
+ * observe: the first swallowed both failures, and the second read the resolution of two wrappers whose
+ * inner calls still swallowed theirs.
  *
  * No password advice on the `closed` branch (HUNT6-J-3): a completed closure soft-deletes the auth
  * user — the email is replaced by a hash and every session ends
@@ -255,10 +265,18 @@ export async function runAccountClosure(
 }
 
 /**
- * Deletes the parent's own sign-in (POST /v1/account/close). Nothing is sent until the parent has
- * ticked the confirmation; the server needs a recent PIN unlock. A family owner is told to delete
- * the family account first (the server's FAMILY_DELETION_REQUIRED rule); `closed` and `pending`
- * both mean the device must sign out now (the API's signOut flag).
+ * Deletes the parent's own sign-in (POST /v1/account/close): nothing is sent until the parent has
+ * ticked the confirmation, and the server needs a recent PIN unlock. It maps the server's
+ * FAMILY_DELETION_REQUIRED rule (a family owner is told to delete the family account first) and its
+ * step-up demand, and reports anything else as an error in adult-readable words.
+ *
+ * It says nothing about what the parent then reads. `closed` and `pending` both mean the device signs
+ * out now, and whether that SUCCEEDED is what the copy turns on, so the sentence is chosen by
+ * `accountClosedDeviceMessage` from the reported device outcome and this function returns the status
+ * alone (HUNT7-K-4). It used to build the unconditional `ACCOUNT_CLOSE_COPY.closed`/`.pending` as well,
+ * which no caller had read since round 6 — a sentence still produced, still documented as what the
+ * status means, and still pinned by a test, on the screen whose whole point is that it may not be said
+ * unconditionally.
  */
 export async function closeAccountAction(
   api: ApiClient,
@@ -272,10 +290,7 @@ export async function closeAccountAction(
       { confirm: true },
       closeAccountResponseSchema,
     );
-    return {
-      status: result.status,
-      message: result.status === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending,
-    };
+    return { status: result.status };
   } catch (error) {
     if (
       error instanceof ApiRequestError &&

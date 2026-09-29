@@ -27,7 +27,12 @@ import {
   DEFAULT_HANDLERS,
   exportBuildHandler,
   JOB_LEASE_MINUTES,
+  JOB_WORST_CASE_MS,
   runJobs,
+  SCAN_AI_WALL_BUDGET_MS,
+  SCAN_FEEDBACK_WORST_CASE_MS,
+  TICK_TRAILING_RESERVE_MS,
+  TICK_WALL_LIMIT_MS,
   type JobDeps,
   type JobHandler,
 } from '../src/jobs/dispatcher.ts';
@@ -401,6 +406,50 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
   });
 
   /**
+   * HUNT7-B-3. The claim filter compares a STATIC per-kind declaration against the wall time left, and
+   * nothing enforced that declaration afterwards: `runOne` awaits the handler with no deadline and the
+   * scan pipeline had no wall-clock check at all, so "no job is claimed that would run past
+   * TICK_WALL_LIMIT_MS − TICK_TRAILING_RESERVE_MS" bounded the ESTIMATE and not the run. The
+   * declaration was 7 minutes while the pipeline's own timeouts and attempt counts already reach
+   * 450,000 ms with ONE coached question (extraction 3 x 45 s, grading 3 x 45 s, verification 2 x 45 s,
+   * coaching 2 x 45 s), and a worksheet with several wrong answers went far past it — a scan claimed at
+   * the filter's limit could still be killed at the wall, spending an attempt and leaving the row
+   * `running` behind a 20-minute lease.
+   *
+   * These derive the pipeline's worst case from PROPOSED_STAGE_LIMITS, so the declaration cannot fall
+   * below the timeouts and attempt counts it is supposed to express, and require that scan-process's
+   * own wall budget is that same declaration — a bound the code enforces rather than a hypothesis.
+   */
+  it('declares a scan worst case its own stage timeouts and attempt counts justify (HUNT7-B-3)', () => {
+    const stageWall = (stage: 'extraction' | 'grading' | 'verification' | 'coaching') =>
+      PROPOSED_STAGE_LIMITS[stage].maxAttempts * PROPOSED_STAGE_LIMITS[stage].timeoutMs;
+    // The scan's own sequence: extract, grade, verify, then coach the wrong answers. Every stage can
+    // use all of its attempts and still continue (two timeouts and a success), so the sum is reachable
+    // — and one coached question is the FLOOR, not the worst case, of the coaching term.
+    const onePipeline =
+      stageWall('extraction') +
+      stageWall('grading') +
+      stageWall('verification') +
+      stageWall('coaching');
+    expect(onePipeline).toBe(450_000);
+    expect(JOB_WORST_CASE_MS.scan_process).toBeGreaterThanOrEqual(onePipeline);
+    // And it still has to fit the window the filter measures against, or no scan is ever claimed.
+    expect(JOB_WORST_CASE_MS.scan_process).toBeLessThanOrEqual(
+      TICK_WALL_LIMIT_MS - TICK_TRAILING_RESERVE_MS,
+    );
+    // The declaration is what the pipeline enforces on itself, not a second, looser number.
+    expect(SCAN_AI_WALL_BUDGET_MS).toBe(JOB_WORST_CASE_MS.scan_process);
+    // With room for at least one more coached question after the three fixed stages have each timed
+    // out in full — otherwise the budget would bound the run by giving coaching nothing.
+    expect(
+      stageWall('extraction') +
+        stageWall('grading') +
+        stageWall('verification') +
+        SCAN_FEEDBACK_WORST_CASE_MS,
+    ).toBeLessThanOrEqual(SCAN_AI_WALL_BUDGET_MS);
+  });
+
+  /**
    * HUNT5-C-5: the reserve bounds the LEDGER only. The twelve steps that run before it in
    * runScheduledTick have no wall-clock budget at all — the same file says so in
    * TICK_WALL_LIMIT_MS's docstring — so a long inactivity sweep can still leave the trailing
@@ -430,18 +479,26 @@ describe('the tick claim budget (JOBS-R2-07)', () => {
    * previous pattern would have missed even in range. That is the L-054 defect the finding was filed
    * about, repeated one line away.
    *
-   * So this searches the WHOLE FILE, case-insensitively, and reports the offending LINES: no window
-   * for the next copy to hide between. The reserve keeps the LEDGER from claiming into the last two
-   * minutes of the invocation; it does not hand the trailing steps two minutes, because `remaining` is
-   * measured from the TICK's start and no step in front of the ledger has a deadline.
+   * So this searches the WHOLE FILE, case-insensitively: no window for the next copy to hide between.
+   * The reserve keeps the LEDGER from claiming into the last two minutes of the invocation; it does not
+   * hand the trailing steps two minutes, because `remaining` is measured from the TICK's start and no
+   * step in front of the ledger has a deadline.
+   *
+   * HUNT7-B-3: it searched the whole file LINE BY LINE, and every pattern here is a multi-word phrase,
+   * so the copy this case was written to catch — one line from `const remaining`, at the repo's print
+   * width — escaped it the moment the formatter split it over two comment lines. That is the L-054
+   * shape the case exists to answer, in the case itself. The file is now normalised ONCE (comment
+   * markers stripped, whitespace collapsed) and the phrases are searched in that single string, with
+   * the surrounding words reported instead of a line number so a failure still says where to look.
    */
   it('nowhere in the dispatcher promises the trailing steps a reserved slice', () => {
     const source = readFileSync(new URL('../src/jobs/dispatcher.ts', import.meta.url), 'utf8');
-    const promises = /reserved slice|enough for the sweep|always gets a slice|leaves to the steps/i;
-    const offenders = source
-      .split('\n')
-      .map((line, index) => `${index + 1}: ${line.trim()}`)
-      .filter((line) => promises.test(line));
+    const promises =
+      /reserved slice|enough for the sweep|always gets a slice|leaves to the steps/gi;
+    const unwrapped = source.replace(/\s*(?:\/\/|\*)\s*/g, ' ').replace(/\s+/g, ' ');
+    const offenders = [...unwrapped.matchAll(promises)].map(
+      (m) => `…${unwrapped.slice(Math.max(0, m.index - 70), m.index + m[0].length + 70)}…`,
+    );
     expect(offenders).toEqual([]);
     // And the two places that DO explain the bound must still say what really bounds the trailing
     // steps: nothing does. Positive checks stay windowed, because a claim has a place it belongs.

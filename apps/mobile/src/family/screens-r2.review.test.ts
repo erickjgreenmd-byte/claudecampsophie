@@ -1,7 +1,51 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { biometricOffer, BIOMETRIC_OWNER_KEY } from './unlock.ts';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { accountClosedDeviceMessage } from '../privacy/parent-privacy.ts';
+import { biometricOffer, BIOMETRIC_OWNER_KEY, BIOMETRIC_PIN_KEY } from './unlock.ts';
+
+/**
+ * Labeled mocks of the native layer, for the HUNT7-K-1 case at the end of this file: it is the only
+ * one here that RUNS src/family/runtime.ts instead of reading it. Nothing below talks to a real
+ * keychain, store SDK, navigator or auth service; the device secrets are synthetic.
+ */
+const native = vi.hoisted(() => ({
+  /** Keys whose delete the OS refuses. expo-secure-store documents deletes as able to reject. */
+  refuseDeleteOf: new Set<string>(),
+  deleted: [] as string[],
+  storeForgotten: true,
+}));
+vi.mock('react-native', () => ({ Platform: { OS: 'ios' } }));
+vi.mock('expo-router', () => ({
+  router: {
+    canDismiss: () => false,
+    dismissAll: () => undefined,
+    replace: () => undefined,
+  },
+}));
+vi.mock('expo-screen-capture', () => ({
+  preventScreenCaptureAsync: () => Promise.resolve(),
+  allowScreenCaptureAsync: () => Promise.resolve(),
+  enableAppSwitcherProtectionAsync: () => Promise.resolve(),
+  disableAppSwitcherProtectionAsync: () => Promise.resolve(),
+}));
+vi.mock('expo-secure-store', () => ({
+  getItemAsync: () => Promise.resolve(null),
+  setItemAsync: () => Promise.resolve(),
+  deleteItemAsync: (key: string) => {
+    native.deleted.push(key);
+    return native.refuseDeleteOf.has(key)
+      ? Promise.reject(new Error('the keychain refused this item'))
+      : Promise.resolve();
+  },
+  canUseBiometricAuthentication: () => false,
+  WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'mock_when_unlocked',
+  WHEN_PASSCODE_SET_THIS_DEVICE_ONLY: 'mock_when_passcode_set',
+}));
+vi.mock('expo-constants', () => ({ default: { expoConfig: { extra: {} } } }));
+vi.mock('../billing/revenuecat.ts', () => ({
+  forgetStoreIdentity: () => Promise.resolve(native.storeForgotten),
+}));
 
 /**
  * Mobile round-2 hardening of the screens (MOB-R2-01/04/05/06/07 and the mobile half of WEB-R2-02).
@@ -115,8 +159,13 @@ describe('the biometric PIN never outlives its owner (MOB-R2-06)', () => {
     expect(runtime).toMatch(
       /export async function signOutParentOnDevice[^]*?clearDeviceAdultSecrets\(\)/,
     );
+    // The helper that ANSWERS whether the PIN item itself went (HUNT7-K-1), not the void-returning
+    // best-effort face of it on `biometricPinStore`: what the closure screen may claim about the device
+    // in the parent's hands is built from this call. The last case in this file runs it, rather than
+    // reading it — this grep was satisfied by every version of that defect.
+    expect(runtime).toMatch(/async function clearDeviceAdultSecrets[^]*?clearBiometricPin\(\)/);
     expect(runtime).toMatch(
-      /async function clearDeviceAdultSecrets[^]*?biometricPinStore\.clear\(\)/,
+      /async function clearBiometricPin\(\)[^]*?deleteItemAsync\(BIOMETRIC_PIN_KEY\)/,
     );
   });
 
@@ -337,9 +386,49 @@ describe('a render error shows a retry screen instead of closing the app (MOB-R2
 });
 
 describe('signing out of the phone leaves other sessions alone (WEB-R2-02, mobile half)', () => {
+  const auth = readFileSync(join(srcDir, 'lib', 'parent-auth.ts'), 'utf8');
+
   it('the mobile parent sign-out is local to this device', () => {
-    const auth = readFileSync(join(srcDir, 'lib', 'parent-auth.ts'), 'utf8');
     expect(auth).toMatch(/signOut\(\{ scope: 'local' \}\)/);
+  });
+
+  /**
+   * HUNT7-K-3. The JSDoc over the one wrapper that decides what this app may claim about a signed-out
+   * device said the opposite of what auth-js 2.116 does, and the opposite of its own suite: with
+   * scope 'local' (this call) `_signOut` calls removeCurrentSession() and only THEN returns the
+   * `{ error }`, for an HTTP failure and for a fetch failure alike — the session is gone from the
+   * keychain in both shapes parent-auth.test.ts exercises, and that suite asserts it
+   * (`expect(await parentAuth.userId()).toBeNull()` after a 500 on /logout). The one path that returns
+   * an error WITHOUT removing is the early `sessionError` return: the stored session could not be read
+   * or refreshed, which is a different fact from "the logout call failed".
+   *
+   * Prose only, and per L-053 the code, the suite and src/lib/mode.ts were the ones that were right.
+   * The harm was to the next reader: the sentence justified `ok: false` as "this device may still be
+   * signed in", which is the overstatement HUNT6-J-1's fix removed from the parent-facing copy
+   * ("We could not sign this device out." → "We could not confirm this device is signed out."), stated
+   * as fact in the file whose own danger is a false claim about the device the parent is holding.
+   */
+  it('[repro] the sign-out doc says what auth-js does with the local session, and claims no more', () => {
+    // One line, so a sentence broken across two comment lines cannot slip past a negative match —
+    // which is how the first version of this case passed over the words it was written to forbid.
+    const oneLine = (text: string) =>
+      text
+        .replace(/^[ \t]*\*/gm, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const doc = oneLine(
+      /\/\*\*((?:(?!\*\/)[\s\S])*)\*\/\s*async signOut\(\)/.exec(auth)?.[1] ?? '',
+    );
+    expect(doc).not.toBe('');
+    expect(doc).toMatch(/does not throw for a refused or failed sign-out/i);
+    expect(doc).not.toMatch(/does not remove the local session either/i);
+    expect(doc).toMatch(/still removes the local session/i);
+    // And `ok: false` is described as what it is: a device that cannot say, not one that is signed in.
+    expect(doc).not.toMatch(/may still be signed in/i);
+    expect(doc).toMatch(/cannot say the session ended/i);
+    // The same distinction mode.ts's DeviceSignOutOutcome already drew, so the two agree.
+    const mode = oneLine(readFileSync(join(srcDir, 'lib', 'mode.ts'), 'utf8'));
+    expect(mode).toMatch(/removes the local session even when the logout call failed/);
   });
 });
 
@@ -369,12 +458,29 @@ describe('every parent screen keys its loads on the client the gate published (H
       .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
 
   /**
-   * Every `useCallback(…)`/`useEffect(…)` in a screen as {body, deps}, found by walking to the
-   * matching close paren of the hook call, so a nested hook or a multi-line body is not mis-split.
+   * Every hook CALL in a screen as {name, assignedTo, body, deps}, found by walking to the matching
+   * close paren, so a nested hook or a multi-line body is not mis-split.
+   *
+   * Any `useSomething(`, not only useCallback/useEffect (HUNT7-J-5). The narrow version could not see
+   * three shapes of the very defect it was written for: a `useMemo` loader (app/(parent)/privacy.tsx
+   * already builds its client in a useMemo, so the shape is in use in this directory), a loader hook
+   * declared OUTSIDE app/(parent)/ and called here (this walker reads only this directory, so the
+   * screen showed it no useCallback/useEffect at all — HUNT6-I-1's planner differing only in where the
+   * helper lived), and a client bound under another name.
    */
-  function hooks(source: string): { body: string; deps: string | null }[] {
-    const found: { body: string; deps: string | null }[] = [];
-    const calls = /\buse(?:Callback|Effect)\(/g;
+  function hooks(source: string): {
+    name: string;
+    assignedTo: string | null;
+    body: string;
+    deps: string | null;
+  }[] {
+    const found: {
+      name: string;
+      assignedTo: string | null;
+      body: string;
+      deps: string | null;
+    }[] = [];
+    const calls = /(?:\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?\b(use[A-Z]\w*)\(/g;
     for (let m = calls.exec(source); m !== null; m = calls.exec(source)) {
       let depth = 1;
       let i = m.index + m[0].length;
@@ -387,42 +493,215 @@ describe('every parent screen keys its loads on the client the gate published (H
       // A trailing comma is prettier's, on a multi-line hook call; a hook whose dependency array
       // cannot be read reads as none, which FAILS the check below rather than excusing the screen.
       const deps = /,\s*(\[[^[\]]*\])\s*,?\s*$/.exec(call.trimEnd())?.[1] ?? null;
-      found.push(
-        deps === null
-          ? { body: call, deps }
-          : { body: call.slice(0, call.lastIndexOf(deps)), deps },
-      );
+      found.push({
+        name: m[2] ?? '',
+        assignedTo: m[1] ?? null,
+        body: deps === null ? call : call.slice(0, call.lastIndexOf(deps)),
+        deps,
+      });
     }
     return found;
   }
 
   const uses = (text: string, name: string) => new RegExp(`(?<![\\w.])${name}(?![\\w])`).test(text);
 
-  it('[repro] no parent screen has a load hook that a new client cannot re-run', () => {
-    const offenders: string[] = [];
-    for (const name of screens) {
-      const source = code(readFileSync(join(parentDir, name), 'utf8'));
-      for (const hook of hooks(source)) {
-        for (const dependency of ['api', 'load']) {
-          if (uses(hook.body, dependency) && !uses(hook.deps ?? '', dependency)) {
-            offenders.push(
-              `${name}: a hook using \`${dependency}\` has deps ${hook.deps ?? '(none)'}`,
-            );
-          }
-        }
+  /**
+   * A hook that STARTS a request: an `ApiClient` call in its body (`.get(`/`.send(` are its only two
+   * methods), a BARE `loadSomething(`/`load(` — the shape of the loader helpers in src/ — or a hook
+   * whose own name is a loader's.
+   *
+   * A loader call on an object (`store.loadProducts()`) is deliberately not one: app/(parent)/plan.tsx
+   * loads the STORE's prices in an effect keyed on the billing ref the client-keyed load produced, so it
+   * does re-run for a new adult, and it never touches the gate's client. That is what this walker
+   * flagged when it first ran widened, and reading the screen is what settled it.
+   */
+  const FETCHES = /\.(?:get|send)\(|(?<![\w.$])(?:load[A-Z]\w*|load)\(/;
+  const LOADER_HOOK = /^use\w*(?:Load|Query|Fetch|Api)\w*$/;
+
+  /**
+   * Every load hook in a screen that a new client cannot re-run, named. The identifiers are DERIVED
+   * from the screen instead of hard-coded as 'api'/'load' (HUNT7-J-5): whatever the gate's client is
+   * bound to here, plus every hook binding whose own body fetches, since that is a loader closed over
+   * the client. Such a hook is keyed either by listing one of them in its dependency array, or by
+   * taking one that is itself recomputed when the client changes — which is how `useLoad(loadFamily)`
+   * is keyed, and why it needs no deps of its own.
+   */
+  function loadHookOffenders(source: string): string[] {
+    const text = code(source);
+    const all = hooks(text);
+    const keyed = new Set<string>(['api', 'load']);
+    for (const m of text.matchAll(
+      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;\n]*\baccess\.api\b/g,
+    )) {
+      if (m[1] !== undefined) keyed.add(m[1]);
+    }
+    for (const hook of all) {
+      if (hook.assignedTo !== null && FETCHES.test(hook.body)) keyed.add(hook.assignedTo);
+    }
+    const recomputedOnClient = new Set<string>();
+    for (const hook of all) {
+      if (hook.assignedTo === null || hook.deps === null) continue;
+      if ([...keyed].some((name) => uses(hook.deps ?? '', name))) {
+        recomputedOnClient.add(hook.assignedTo);
       }
     }
+    const offenders: string[] = [];
+    for (const hook of all) {
+      if (!FETCHES.test(hook.body) && !LOADER_HOOK.test(hook.name)) continue;
+      const used = [...keyed].filter((name) => uses(hook.body, name));
+      if (used.length === 0) {
+        offenders.push(`${hook.name}: a load that goes through no client this screen names`);
+        continue;
+      }
+      for (const name of used) {
+        if (uses(hook.deps ?? '', name)) continue;
+        // The "it is recomputed when the client changes" excuse holds ONLY for a hook with no
+        // dependency array of its own — a custom hook call such as `useLoad(loadFamily)`, which keys
+        // on its argument internally. A hook that DOES declare deps and leaves the keyed name out of
+        // them does not re-run when that name changes, whatever recomputes it: that is exactly
+        // BUG-335 / HUNT6-I-1, so excusing it made this walker WEAKER than the round-6 one it
+        // replaced (found by the round-7 checker on the first version of this fix).
+        if (hook.deps === null && recomputedOnClient.has(name)) continue;
+        offenders.push(`${hook.name}: uses \`${name}\` with deps ${hook.deps ?? '(none)'}`);
+      }
+    }
+    return offenders;
+  }
+
+  it('[repro] no parent screen has a load hook that a new client cannot re-run', () => {
+    const offenders = screens.flatMap((name) =>
+      loadHookOffenders(readFileSync(join(parentDir, name), 'utf8')).map(
+        (problem) => `${name}: ${problem}`,
+      ),
+    );
     expect(offenders).toEqual([]);
   });
 
-  it('the screens really do go through the shared hook, so the check above has something to check', () => {
-    // A guard over an empty set passes (L-054): at least one hook per data screen must be found, and
-    // the shared loader must be the one they use.
-    expect(screens.length).toBeGreaterThan(8);
-    for (const name of ['children.tsx', 'home.tsx', 'planner.tsx', 'devices.tsx']) {
-      expect(hooks(code(readFileSync(join(parentDir, name), 'utf8'))).length).toBeGreaterThan(0);
-      expect(screen('(parent)', name)).toMatch(/useLoad\(/);
+  /**
+   * [repro] HUNT7-J-5. The sentence above says no parent screen can opt out silently, and the walker
+   * that backed it inspected useCallback/useEffect only, in this directory only, for the identifiers
+   * 'api' and 'load' only. Below are SYNTHETIC screens — not files in the tree — each one a way to
+   * satisfy that check while the next adult at the device reads the previous family's rows. The
+   * positive control comes first: a correctly keyed screen must produce nothing, or "not equal []"
+   * would be a check that passes for the wrong reason.
+   */
+  it('[repro] the walker sees the shapes this defect can come back in', () => {
+    const keyedCorrectly = `
+      function Rows({ api }: { api: ApiClient }) {
+        const load = useCallback(() => api.get('/v1/family', familyOverviewResponseSchema), [api]);
+        const rows = useLoad(load);
+        useEffect(() => { void load(); }, [load]);
+        return rows;
+      }`;
+    expect(loadHookOffenders(keyedCorrectly)).toEqual([]);
+
+    // Derived, not hard-coded: a screen that binds the gate's client under another name and KEYS its
+    // hook on it is correct and must not be reported. Without that derivation the third shape below
+    // would still be flagged, but for the wrong reason ("no client this screen names"), and this
+    // correct screen would be flagged with it.
+    const keyedUnderAnotherName = `
+      function Rows() {
+        const access = useParentAccess();
+        const parentClient = access.api;
+        const rows = useMemo(() => parentClient.get('/v1/family', familyResponseSchema), [parentClient]);
+        return rows;
+      }`;
+    expect(loadHookOffenders(keyedUnderAnotherName)).toEqual([]);
+
+    const shapes: Record<string, string> = {
+      // HUNT6-I-1's own shape, differing only in where the helper is declared: this walker reads
+      // app/(parent)/ alone, so the screen shows it no hook body of its own to inspect.
+      'a loader hook declared in src/ and called here': `
+        function Rows({ api }: { api: ApiClient }) {
+          const family = useApiLoad(() => api.get('/v1/family', familyResponseSchema), 'family');
+          return family;
+        }`,
+      // Not in the old regex — and privacy.tsx builds its client in a useMemo, so this is not a
+      // hypothetical hook for this directory.
+      'a useMemo loader': `
+        function Rows({ api }: { api: ApiClient }) {
+          const rows = useMemo(() => api.get('/v1/family', familyResponseSchema), []);
+          return rows;
+        }`,
+      // BUG-335 / HUNT6-I-1's own shape, and the two the FIRST version of this widened walker was
+      // blind to: it excused any hook that used a name something else recomputed, whatever that
+      // hook's own dependency array said, which made it weaker than the round-6 walker it replaced.
+      // `load` is recomputed when the client changes, but an effect that does not LIST it does not
+      // re-run when it changes, so the next adult keeps the previous family's rows.
+      // The client is BOUND to a name here, exactly as the real screens bind it, so the walker keys
+      // `load` on it and these two shapes turn on the dependency-array rule alone — which is what
+      // makes them evidence for it. (Written with `access.api` inline they were flagged for an
+      // unrelated reason and could not tell the two walkers apart.)
+      'an effect that calls a client-keyed loader but keys on something else': `
+        function Rows() {
+          const access = useParentAccess();
+          const api = access.api;
+          const load = useCallback(() => api.get('/v1/family', familyResponseSchema), [api]);
+          useEffect(() => { void load(); }, [path, tick]);
+          return null;
+        }`,
+      'an effect that calls a client-keyed loader with an empty dependency array': `
+        function Rows() {
+          const access = useParentAccess();
+          const api = access.api;
+          const load = useCallback(() => api.get('/v1/family', familyResponseSchema), [api]);
+          useEffect(() => { void load(); }, []);
+          return null;
+        }`,
+      // The client under another name, which neither hard-coded identifier matched.
+      'the gate’s client bound under another name': `
+        function Rows() {
+          const access = useParentAccess();
+          const parentClient = access.api;
+          const rows = useMemo(() => parentClient.get('/v1/family', familyResponseSchema), []);
+          return rows;
+        }`,
+    };
+    for (const [what, source] of Object.entries(shapes)) {
+      expect(loadHookOffenders(source), what).not.toEqual([]);
     }
+  });
+
+  /**
+   * The companion guard, widened with the walker (HUNT7-J-5). It used to name four screens and check
+   * that each used `useLoad(` — i.e. the set it vouched for was the set that already passed, while
+   * privacy.tsx, rewards.tsx and resources.tsx load through their own code and were not mentioned at
+   * all. Now every screen that loads through a hook must either use the shared hook or be here BY NAME
+   * with the assertion that stands in for it, so a screen added later is not silently a fourth
+   * exception — which is how rewards.tsx came to have half of HUNT6-I-2 with nothing pinning either
+   * half (HUNT7-J-4).
+   */
+  it('the screens really do go through the shared hook, or are named exceptions with their own guard', () => {
+    const ownLoader: Record<string, RegExp> = {
+      // Its own run ticket: only the newest load may publish (HUNT6-J-2's residual, HUNT7-J-7).
+      'privacy.tsx': /const ticket = latestLoad\.current;/,
+      // The same ticket, on the screen that was given only half of HUNT6-I-2 (HUNT7-J-4).
+      'rewards.tsx': /const ticket = latestLoad\.current;/,
+      // Not a ticket but each effect's own cancellation: the cleanup disarms a run whose `api` has
+      // changed, so a superseded answer publishes nothing.
+      'resources.tsx': /let active = true;[\s\S]*?if \(!active/,
+    };
+    // A guard over an empty set passes (L-054): the walker must be finding load hooks at all.
+    expect(screens.length).toBeGreaterThan(8);
+    const loading = screens.filter((name) =>
+      hooks(code(readFileSync(join(parentDir, name), 'utf8'))).some(
+        (hook) => FETCHES.test(hook.body) || LOADER_HOOK.test(hook.name),
+      ),
+    );
+    expect(loading.length).toBeGreaterThan(5);
+    const exceptions: string[] = [];
+    for (const name of loading) {
+      const source = readFileSync(join(parentDir, name), 'utf8');
+      if (/useLoad\(/.test(code(source))) continue;
+      exceptions.push(name);
+      const own = ownLoader[name];
+      expect(
+        own,
+        `${name} loads without the shared hook and is not a named exception`,
+      ).toBeDefined();
+      if (own !== undefined) expect(source, name).toMatch(own);
+    }
+    expect([...exceptions].sort()).toEqual(Object.keys(ownLoader).sort());
   });
 });
 
@@ -573,6 +852,60 @@ describe('nothing puts the deleted account’s sections back on the screen (HUNT
   it('the pull-to-refresh gesture is not offered while the closure is the screen', () => {
     expect(privacy).toMatch(
       /api && state\.status !== 'closing' && state\.status !== 'account_closed' \? \(\s*<RefreshControl/,
+    );
+  });
+});
+
+/**
+ * HUNT7-K-1. `secretsCleared` is what the closure copy rests on — with it false the parent is told
+ * "we could not remove everything this app had saved for your account. Removing the app removes the
+ * rest." — and it could not observe the failure it exists for. Round 6 turned the two
+ * `.catch(() => undefined)` wrappers in `clearDeviceAdultSecrets` into `.then(() => true, () => false)`,
+ * but both wrapped helpers swallow the operation the flag NAMES one level in: `clearBiometricPin`
+ * discarded the rejection of `deleteItemAsync(BIOMETRIC_PIN_KEY)` and resolved as long as the two
+ * plain flag deletes worked, and `forgetStoreIdentity` discarded `Purchases.logOut()`. So the
+ * composite meant "no keychain flag write threw" — the same predicate HUNT6-J-1 was filed to remove.
+ * BIOMETRIC_PIN_KEY is the only item written with `requireAuthentication` and
+ * WHEN_PASSCODE_SET_THIS_DEVICE_ONLY, so the asymmetric failure is the plausible one.
+ *
+ * This is the one case in this file that runs runtime.ts rather than reading it (the native modules
+ * above are labeled mocks): the previous check only grepped that `clearDeviceAdultSecrets` mentions
+ * `biometricPinStore.clear()`, which every version of this defect satisfies.
+ */
+describe('a closed account’s device secrets are reported, not assumed (HUNT7-K-1)', () => {
+  beforeEach(() => {
+    native.refuseDeleteOf.clear();
+    native.deleted = [];
+    native.storeForgotten = true;
+  });
+
+  it('[repro] a keychain that refuses the PIN item answers secretsCleared: false', async () => {
+    const { signOutClosedAccountOnDevice } = await import('./runtime.ts');
+    native.refuseDeleteOf.add(BIOMETRIC_PIN_KEY);
+    const outcome = await signOutClosedAccountOnDevice();
+    expect(outcome.secretsCleared).toBe(false);
+    // The two flags are still deleted, so the stale PIN cannot be offered as an unlock: the clear
+    // stays best effort, it just stops lying about what it managed.
+    expect(native.deleted).toContain(BIOMETRIC_OWNER_KEY);
+    // And the parent reads the sentence the round added for exactly this device.
+    expect(accountClosedDeviceMessage('closed', outcome)).toMatch(/could not remove everything/i);
+  });
+
+  it('[repro] a store SDK that refuses to forget the identity answers false too', async () => {
+    const { signOutClosedAccountOnDevice } = await import('./runtime.ts');
+    native.storeForgotten = false;
+    const outcome = await signOutClosedAccountOnDevice();
+    expect(outcome.secretsCleared).toBe(false);
+    expect(accountClosedDeviceMessage('closed', outcome)).toMatch(/could not remove everything/i);
+  });
+
+  it('a device that gave up both secrets says so, and the copy is the clean one', async () => {
+    const { signOutClosedAccountOnDevice } = await import('./runtime.ts');
+    const outcome = await signOutClosedAccountOnDevice();
+    expect(outcome.secretsCleared).toBe(true);
+    expect(native.deleted).toContain(BIOMETRIC_PIN_KEY);
+    expect(accountClosedDeviceMessage('closed', outcome)).not.toMatch(
+      /could not remove everything/i,
     );
   });
 });

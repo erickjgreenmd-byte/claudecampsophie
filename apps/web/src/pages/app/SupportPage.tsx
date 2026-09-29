@@ -9,8 +9,10 @@ import {
   SUPPORT_REFUND_NOTICE,
   SUPPORT_RULES,
   SUPPORT_SUBJECT_MAX_LENGTH,
+  supportBillingPeriodKindNote,
   supportBillingPeriodsResponseSchema,
   supportCaseKindSchema,
+  supportDerivedChargeLabel,
   supportCaseResponseSchema,
   supportCasesResponseSchema,
   type CreateSupportCaseRequest,
@@ -122,9 +124,27 @@ const textareaStyle = {
 
 const mutedSmall = { color: 'var(--muted)', fontSize: '0.9rem' } as const;
 
+/**
+ * HUNT7-C-3: one renewal can be recorded as TWO rows — its subscription charge and a derived
+ * '<invoice>:proration' row holding a mid-cycle change billed with it, which repeats the subscription
+ * period's dates and paid_slots. A row that is not a subscription charge is therefore NOT a charge for
+ * those dates, and is named as what it is: money billed WITH the charge of that date. The wording comes
+ * from the contract so the portal and the app say the same thing about the same row.
+ */
 function periodLabel(p: SupportBillingPeriod): string {
   const refund = p.refundedCents > 0 ? ` (refunded ${formatUsd(p.refundedCents)})` : '';
-  return `${STORE_NAME[p.channel]} · ${formatDate(p.periodStart)} – ${formatDate(p.periodEnd)} · ${formatUsd(p.chargedCents)}${refund}`;
+  const note = supportBillingPeriodKindNote(p.kind);
+  const dates = `${formatDate(p.periodStart)} – ${formatDate(p.periodEnd)}`;
+  // "billed with the <date> charge" is true only of a row the API says was billed with another one
+  // (HUNT7-C-3). A standalone mid-cycle adjustment, an add-on or a tax-only charge is its own invoice,
+  // so it keeps its own dates and takes the kind as a qualifier instead.
+  const what =
+    note === null
+      ? dates
+      : p.derivedFromProviderPeriodId !== null
+        ? supportDerivedChargeLabel(note, formatDate(p.periodStart))
+        : `${dates} · ${note}`;
+  return `${STORE_NAME[p.channel]} · ${what} · ${formatUsd(p.chargedCents)}${refund}`;
 }
 
 function Support() {

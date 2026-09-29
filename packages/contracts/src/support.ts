@@ -29,6 +29,60 @@ export type SupportCaseResolution = z.infer<typeof supportCaseResolutionSchema>;
 export const supportAuthorKindSchema = z.enum(['parent', 'admin']);
 export type SupportAuthorKind = z.infer<typeof supportAuthorKindSchema>;
 
+/**
+ * What a provider billing period's money IS (public.billing_periods.kind). It is not decoration: one
+ * renewal invoice can write TWO rows — its subscription charge, and, when the provider listed a
+ * mid-cycle change on it as pending, a derived '<invoice>:proration' row that holds the money
+ * collected for that item. The derived row is spread from the subscription period, so it repeats that
+ * period's dates and paid_slots and differs only in its provider id, this kind and its amount
+ * (HUNT7-C-3). Without the kind a parent's picker showed two entries for the same dates with nothing
+ * to tell them apart, and picking the wrong one linked their case to the wrong row's figures. The
+ * admin contract has carried this enum since the row existed; the parent's did not.
+ */
+export const billingPeriodKindSchema = z.enum([
+  'subscription_period',
+  'proration',
+  'addon',
+  'tax_only',
+]);
+export type BillingPeriodKind = z.infer<typeof billingPeriodKindSchema>;
+
+/**
+ * What a parent-facing surface calls each kind, lower case so it composes inside a label. ONE wording
+ * for the portal and the app: the round-6 divergence this fixes was a row that reached one surface's
+ * label and not the other's, so both read these from here rather than each spelling their own.
+ */
+export const SUPPORT_BILLING_PERIOD_KIND_LABELS: Readonly<Record<BillingPeriodKind, string>> = {
+  subscription_period: 'subscription charge',
+  proration: 'mid-cycle adjustment',
+  addon: 'add-on charge',
+  tax_only: 'tax-only charge',
+};
+
+/**
+ * The words a parent needs BESIDE the amount when the row is not an ordinary subscription charge, and
+ * null when it is (a subscription charge needs no qualifier; saying so on every row is noise).
+ */
+export function supportBillingPeriodKindNote(kind: BillingPeriodKind): string | null {
+  return kind === 'subscription_period' ? null : SUPPORT_BILLING_PERIOD_KIND_LABELS[kind];
+}
+
+/**
+ * How a surface names money that is NOT a charge for the period's dates: it was billed WITH that
+ * charge. `chargeDate` is already formatted by the surface (the portal and the app format dates
+ * differently, and the app formats in the family's own zone), and `note` comes from
+ * `supportBillingPeriodKindNote`. Saying "Sep 19 – Oct 19 · $10.00" of a DERIVED mid-cycle item states
+ * something false about it — that $10 covers a part of the PREVIOUS period, and it is not a charge for
+ * a number of children either.
+ *
+ * Use it only where `derivedFromProviderPeriodId` is non-null. A row that is its own invoice — a
+ * standalone mid-cycle adjustment, an add-on, a tax-only charge — has its own dates, and this label
+ * would both assert a billing relationship it does not have and throw those dates away.
+ */
+export function supportDerivedChargeLabel(note: string, chargeDate: string): string {
+  return `${note} billed with the ${chargeDate} charge`;
+}
+
 /** Settlement states of a provider billing period (public.billing_periods.settlement). */
 export const billingSettlementSchema = z.enum([
   'pending',
@@ -89,6 +143,17 @@ export const supportBillingPeriodSchema = z.strictObject({
   id: uuidSchema,
   channel: channelSchema,
   providerPeriodId: z.string().min(1).max(200),
+  /** What this row's money is; a derived 'proration' row repeats a subscription period's dates. */
+  kind: billingPeriodKindSchema,
+  /**
+   * Set ONLY when this row's money was billed with ANOTHER row's charge, and then it is that row's
+   * provider id. The API states it because the API created the row; a surface must never infer it from
+   * `kind` or from the shape of `providerPeriodId` (HUNT7-C-3, the checker's finding on the first fix):
+   * a mid-cycle adjustment can equally arrive as an invoice of its OWN, with its own dates, and
+   * "billed with the <date> charge" is false of that one. `addon` and `tax_only` rows are their own
+   * invoices too. Null means this row's own dates are the truth about it.
+   */
+  derivedFromProviderPeriodId: z.string().min(1).max(200).nullable(),
   periodStart: isoDateTimeSchema,
   periodEnd: isoDateTimeSchema,
   paidSlots: z.number().int().min(1).max(12),

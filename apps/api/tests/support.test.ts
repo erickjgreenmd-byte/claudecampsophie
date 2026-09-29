@@ -50,13 +50,24 @@ async function seedPeriod(
   channel: string,
   providerPeriodId: string,
   start: string,
+  /**
+   * A row that is not an ordinary subscription charge: the derived ':proration' row below.
+   *
+   * `id` is settable because the ordering assertion needs it: with two random uuids the old
+   * `order by period_start desc, id desc` came out in the right order about three runs in five, so the
+   * test only failed on the mutation some of the time (the round-7 checker measured it). Giving the
+   * derived row an id that sorts ABOVE the subscription row's makes the old order fail every time.
+   */
+  options: { kind?: string; chargedCents?: number; id?: string } = {},
 ): Promise<string> {
   const end = new Date(new Date(start).getTime() + 30 * 86_400_000).toISOString();
+  const charged = options.chargedCents ?? 4998;
   const [row] = await api.db.sql<{ id: string }[]>`
     insert into public.billing_periods (family_id, channel, provider_period_id, kind, period_start, period_end,
-      paid_slots, regular_amount_cents, charged_amount_cents, settlement, settled_at)
-    values (${fam.familyId}, ${channel}, ${providerPeriodId}, 'subscription_period', ${start}, ${end},
-            2, 4998, 4998, 'settled', ${start})
+      paid_slots, regular_amount_cents, charged_amount_cents, settlement, settled_at, id)
+    values (${fam.familyId}, ${channel}, ${providerPeriodId}, ${options.kind ?? 'subscription_period'},
+            ${start}, ${end}, 2, 4998, ${charged}, 'settled', ${start},
+            ${options.id ?? api.db.sql`gen_random_uuid()`})
     returning id`;
   return row!.id;
 }
@@ -104,6 +115,35 @@ describe('intake', () => {
       refundedCents: 0,
       settlement: 'settled',
     });
+  });
+
+  it('[HUNT7-C-3] says what kind each period is, and never lists a derived proration row above its own charge', async () => {
+    // A renewal that carried a deferred mid-cycle item is recorded as TWO periods: the subscription
+    // charge and a derived '<invoice>:proration' row that `prorationPeriodFor` spreads from it, so it
+    // inherits the same period_start, period_end and paid_slots and differs only in its provider id,
+    // its kind and its amount (apps/api/src/services/billing-sync.ts). Both belong to the family and
+    // both are pickable for a refund request, so the picker has to say which is which: two entries
+    // reading 'Web billing · Sep 19 – Oct 19 · $49.98' and '… · $10.00' with nothing to tell them
+    // apart is a parent guessing which charge is theirs, and the tie between equal period_starts was
+    // broken by a random uuid, so half the time the $10 row came first in a list called newest-first.
+    // Ids chosen so the derived row sorts ABOVE the subscription row under `id desc`: the old
+    // tie-break then puts it first every run, not three runs in five (the checker's measurement).
+    await seedPeriod(famA, 'stripe', 'in_sup_r7', '2026-09-19T00:00:00Z', {
+      id: '11111111-1111-4111-8111-111111111111',
+    });
+    await seedPeriod(famA, 'stripe', 'in_sup_r7:proration', '2026-09-19T00:00:00Z', {
+      kind: 'proration',
+      chargedCents: 1000,
+      id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+    });
+    const body = supportBillingPeriodsResponseSchema.parse(
+      await ok(api.request('/v1/support/billing-periods', { token: tokenA })),
+    );
+    const web = body.periods.filter((p) => p.channel === 'stripe');
+    expect(web.map((p) => [p.providerPeriodId, p.kind, p.chargedCents])).toEqual([
+      ['in_sup_r7', 'subscription_period', 4998],
+      ['in_sup_r7:proration', 'proration', 1000],
+    ]);
   });
 
   it('rejects an over-long subject, unknown keys, a billing period on a non-refund kind and empty text', async () => {
@@ -193,6 +233,9 @@ describe('parent flow', () => {
       id: period!.id,
       channel: 'app_store',
       providerPeriodId: 'sup-a-sep',
+      // HUNT7-C-3: the kind travels with the period on a case too, so the case detail names the same
+      // row the picker named — otherwise 'Charge in question' is the sentence a parent cannot check.
+      kind: 'subscription_period',
       chargedCents: 4998,
       refundedCents: 0,
       settlement: 'settled',

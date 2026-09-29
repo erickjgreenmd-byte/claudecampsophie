@@ -6,6 +6,7 @@ import {
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import { toScanPage, type ScanPage } from './scan-session.ts';
 import {
+  CHILD_STOPPING_MESSAGE,
   PageLimitError,
   ScanCancelledError,
   ScanStoppedError,
@@ -14,9 +15,11 @@ import {
   cancelScan,
   childUploadMessage,
   newAttempt,
+  runStoppedScan,
   stoppedScanOutcome,
   toHex,
   uploadScan,
+  type StoppedScanStep,
   type UploadIo,
   type UploadProgress,
 } from './upload.ts';
@@ -669,5 +672,83 @@ describe('a cancel that never reached the server is not reported as a stop (HUNT
     expect(outcome.keepAttempt).toBe(true);
     expect(outcome.message).not.toMatch(/stopped/i);
     expect(outcome.message).toMatch(/My scans/);
+  });
+});
+
+/**
+ * HUNT7-K-2. The child taps "Stop sending" and the screen went on saying "Sending page 2 of 3…" with
+ * a live "Stop sending" for the whole cancel round trip: `abort()` sets no React state, and the abort
+ * branch left the running state only once `await cancelScan(...)` answered. That POST carries no
+ * per-request timeout, so it runs to the client's 20 s default before answering 'unsure', and the
+ * child API retries once on a single UNAUTHENTICATED answer — up to two full attempts of a screen
+ * whose progress line is false (the send is already aborted locally) and whose only visible control
+ * does nothing. It is HUNT6-J-2's defect on the child surface, left unfixed in the round that named
+ * it: there, "the screen used to clear its busy flag as soon as the API answered and set its outcome
+ * only after the sign-out, so for that whole window it looked idle with every control live".
+ *
+ * The order is run here rather than grepped out of the screen (L-054), the way `runAccountClosure`
+ * did for the parent closure: scan-screen.test.ts can only read the screen as text, and its
+ * `abortBranch` regex asserted the branch's spelling, which both orderings satisfy.
+ */
+describe('stopping a scan tells the child before it asks the server (HUNT7-K-2)', () => {
+  /** An api whose cancel never answers until the test lets it, like a stalled POST. */
+  function stalledCancel() {
+    let answer: (() => void) | null = null;
+    const api: ApiClient = {
+      get: () => Promise.reject(new Error('unexpected GET')),
+      send: (_method, _path, _body, schema) =>
+        new Promise((resolve) => {
+          answer = () => resolve(schema.parse(state('cancelled')));
+        }),
+    };
+    return { api, answered: () => answer !== null, answer: () => answer?.() };
+  }
+
+  it('[repro] the stopping step is emitted before a cancel that has not answered', async () => {
+    const { api, answered, answer } = stalledCancel();
+    const steps: StoppedScanStep[] = [];
+    const attempt = { ...newAttempt(newKey), assignmentId: ASSIGNMENT };
+    const running = runStoppedScan(api, attempt, (step) => steps.push(step));
+    // Let the cancel be issued, and nothing more: the request is out and unanswered.
+    await Promise.resolve();
+    expect(answered()).toBe(true);
+    expect(steps).toEqual([{ kind: 'stopping' }]);
+
+    answer();
+    await running;
+    expect(steps.map((step) => step.kind)).toEqual(['stopping', 'stopped']);
+    const last = steps[1];
+    expect(last?.kind === 'stopped' && last.outcome).toEqual(stoppedScanOutcome('cancelled'));
+  });
+
+  it('hands the caller the same outcome cancelScan earns, for every answer', async () => {
+    for (const [failure, expected] of [
+      [null, 'cancelled'],
+      [new ApiRequestError('BUSINESS_RULE', 'too late', 422, 'INVALID_TRANSITION'), 'too_late'],
+      [new ApiRequestError('NETWORK', 'offline', 0, 'TIMEOUT'), 'unsure'],
+    ] as const) {
+      const { api } = fakeApi({ fail: () => failure });
+      const steps: StoppedScanStep[] = [];
+      await runStoppedScan(api, { ...newAttempt(newKey), assignmentId: ASSIGNMENT }, (step) =>
+        steps.push(step),
+      );
+      const last = steps[1];
+      expect(last?.kind === 'stopped' && last.outcome).toEqual(stoppedScanOutcome(expected));
+    }
+    // And a scan this device never saw created still asks nothing and keeps its keys (HUNT6-J-4).
+    const { api, calls } = fakeApi();
+    const steps: StoppedScanStep[] = [];
+    await runStoppedScan(api, newAttempt(newKey), (step) => steps.push(step));
+    expect(calls).toEqual([]);
+    expect(steps.map((step) => step.kind)).toEqual(['stopping', 'stopped']);
+    const last = steps[1];
+    expect(last?.kind === 'stopped' && last.outcome.keepAttempt).toBe(true);
+  });
+
+  it('the stopping copy is calm, child-sized and never commercial', () => {
+    expect(CHILD_STOPPING_MESSAGE).toBe('Stopping…');
+    expect(CHILD_STOPPING_MESSAGE).not.toMatch(/\$|buy|purchase|upgrade|pay|error|failed/i);
+    // No progress claim: the page count is what the child was told before they tapped Stop.
+    expect(CHILD_STOPPING_MESSAGE).not.toMatch(/page|sending/i);
   });
 });
