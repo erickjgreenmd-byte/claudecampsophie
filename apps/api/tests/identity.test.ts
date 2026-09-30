@@ -243,7 +243,11 @@ describe('what it refuses, and whose fault each refusal says it is', () => {
 });
 
 describe('the cost claim in docs/Cost_Analysis.md is true of this route', () => {
-  it('sends no selfie, so the identity_face_compare stage is never entered', async () => {
+  // Not `async`: this case reads the source synchronously and awaits nothing, which
+  // `@typescript-eslint/require-await` refuses. It shipped as `async` in e5c74d2 because I ran vitest
+  // and prettier over that edit and NOT eslint, then read the wrapper's exit code instead of the
+  // gate's own GATE_EXIT line and pushed a commit the gate had rejected.
+  it('sends no selfie, so the identity_face_compare stage is never entered', () => {
     // docs/Cost_Analysis.md states that one provider call happens per verification and that the
     // 15,000-micro `identity_face_compare` stage is never spent — a 43% reduction in the worst case
     // of establishing an adult. That is a claim about THIS route, so it is asserted here rather than
