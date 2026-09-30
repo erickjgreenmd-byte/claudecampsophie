@@ -8,6 +8,8 @@ Written 2026-09-29 at code `5ba16c3`, after six hardening rounds. This page answ
 
 **The software is ready to be beta tested. The beta cannot start, and the blockers are not software.**
 
+> UPDATED 2026-09-30, and the update includes a correction against this record's own earlier claim. The adult identity check was listed as complete software waiting on a vendor. It was not complete: it had a migration, a contract and a provider adapter, and **no route and no screen** — nothing in the repository imported its contract except itself. A parent could not have done the check at all, whichever vendor was contracted. The route and its tests exist now (`f13eb76`); the two screens are the last piece. Building the route also surfaced a defect nothing could have caught while nothing called it: `statedDateOfBirth` was validated with a schema whose floor is the year 2000, so every parent born before it — anyone 27 or over in 2026, which is most parents — was refused before their licence was read.
+
 Those are two separate claims and they need separating, because conflating them is how a product gets
 put in front of a child before its consent path exists.
 
@@ -26,7 +28,7 @@ system**, and the code enforces that rather than trusting anyone to remember:
 
 | Gate | Owner action | What enforces it |
 |---|---|---|
-| A verifiable-parental-consent provider is selected and contracted | #7 | `consent_provider` in `GET /v1/admin/readiness`; outside development a missing credential selects a provider that REFUSES every call, never a mock |
+| An approved method establishes that a consenting ADULT is present. **CHANGED by the owner's decision of 2026-09-30, and this is the gate that moved** | **#48** (counsel), with #7 only if counsel requires a vendor | Two standards now exist and the code reads both through one predicate, `public.adult_identity_established`. The owner's method — a government photo ID whose own date of birth makes an adult, PLUS the holder's legal declaration that they are the person on it and the child's parent or guardian — is BUILT and reachable: migration 0990, `POST /v1/identity/verification`, and a verified `consent_records` row written in the same transaction, which every existing gate already reads. So this no longer waits on a vendor contract. What it waits on is counsel answering ONE question (#48): whether sending homework to a ZDR-bound processor is a disclosure to a third party. If it is not, the internal-use standard applies and this method very likely clears 16 CFR 312.5(b)(2); if it is, the stronger biometric standard is required and #7 returns. `public.adult_identity_basis` records which standard each adult met, so that reversal would re-verify only the affected adults. The residual is stated in 0990's header and in docs/Threat_Model.md: reading a licence is not the FTC's database check, and anyone holding an adult's licence passes the document half |
 | OpenAI ZDR approval for under-13 data is documented with a reference and a past verification date | #6 | `zdr_evidence`, and `checkChildDataGate` in `packages/ai` blocks child data from reaching any model without it |
 | Legal review of the public pages, the safety wording and the parent-only safety policy is signed off | #15, #24 | `safety_templates`; the web build fails without `VITE_LEGAL_REVIEWED=true`, an effective date and a support mailbox |
 
