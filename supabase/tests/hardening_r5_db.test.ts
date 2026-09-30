@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestDb, type TestDb } from './harness.ts';
 import { grantAdultUnlock, seedChild, seedFamily, type SeededFamily } from './fixtures.ts';
@@ -510,5 +512,72 @@ describe('[HUNT6-B-3] public.request_deletion takes the slot assignment before t
     const [child] = await db.sql<{ status: string }[]>`
       select status from public.child_profiles where id = ${childId}`;
     expect(child!.status).toBe('archived');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// HUNT7-D-2: what the writers of these rows agree on, and what they do not
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * HUNT7-D-2. Migration 0930 defines "the canonical order" for this codebase, and it used to tell its
+ * reader that the archive route, the billing writers and the purges "now agree with this function
+ * statement for statement". They do not, outside the pair {child_slot_assignments, child_profiles}:
+ * `public.request_deletion` revokes sessions and devices BEFORE that pair and the archive route writes
+ * them AFTER it. Nothing is reachable as a deadlock, because every one of these writers serialises on
+ * the family row first — which the interleaving case above proves for the one that is hardest to
+ * believe — but a reader who took the statement-for-statement claim at face value would conclude that
+ * copying this function's sequence is what keeps a new writer safe. It is not; taking the family row
+ * first is.
+ *
+ * 0930's comment now says exactly that, including WHICH writers differ and where. A comment asserting a
+ * disagreement can rot in the other direction — someone makes them agree and the comment becomes false
+ * again — so the disagreement is pinned here, along with the agreement that is claimed. If a later
+ * change reorders either writer, one of these goes red and 0930's comment gets rewritten with it.
+ */
+describe('[HUNT7-D-2] 0930’s claim about the other writers is pinned in both directions', () => {
+  /** The order the tables of interest are first written in, read from the live function body. */
+  function order(body: string, tables: readonly string[]): string[] {
+    return tables
+      .map((t) => ({ t, at: body.indexOf(`public.${t}`) }))
+      .filter((e) => e.at >= 0)
+      .sort((a, b) => a.at - b.at)
+      .map((e) => e.t);
+  }
+
+  it('request_deletion revokes sessions and devices BEFORE the pair, and the pair in order', async () => {
+    const [fn] = await db.sql<{ def: string }[]>`
+      select pg_get_functiondef('public.request_deletion(uuid, uuid)'::regprocedure) as def`;
+    // Everything after the declarations: the `insert into public.deletion_requests` is the first
+    // statement and takes the family row's KEY SHARE through its foreign key.
+    const body = fn!.def.slice(fn!.def.indexOf('insert into public.deletion_requests'));
+    expect(
+      order(body, ['child_sessions', 'child_devices', 'child_slot_assignments', 'child_profiles']),
+    ).toEqual(['child_sessions', 'child_devices', 'child_slot_assignments', 'child_profiles']);
+  });
+
+  it('the archive route writes the pair FIRST and the session rows after — the inversion 0930 names', () => {
+    const route = readFileSync(
+      join(import.meta.dirname, '..', '..', 'apps', 'api', 'src', 'routes', 'family.ts'),
+      'utf8',
+    );
+    const archive = route.slice(route.indexOf("'/children/:childId/archive'"));
+    const upTo = archive.slice(0, archive.indexOf('audit_events'));
+    expect(
+      order(upTo, ['child_slot_assignments', 'child_profiles', 'child_sessions', 'child_devices']),
+    ).toEqual(['child_slot_assignments', 'child_profiles', 'child_sessions', 'child_devices']);
+  });
+
+  it('0930 no longer claims the writers agree statement for statement', () => {
+    const m = readFileSync(
+      join(import.meta.dirname, '..', 'migrations', '0930_deletion_lock_order.sql'),
+      'utf8',
+    );
+    // The corrected text says which writers differ and that the family row is what rules out a cycle.
+    expect(m).toMatch(/Every writer of this pair takes the FAMILY ROW first/);
+    expect(m).toMatch(/HUNT7-D-2 corrects this comment/);
+    // And it does not re-assert the claim, in the one phrasing that was false. The negative is bounded
+    // to the sentence, not the file, because the correction itself quotes the old wording (L-054).
+    expect(m).not.toMatch(/now agree with this function statement for statement/);
   });
 });

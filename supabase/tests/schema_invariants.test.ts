@@ -103,13 +103,35 @@ describe('schema invariants', () => {
       ).filter((r) => !allowlisted.has(r.table_name));
     expect(await childWriteGrants()).toEqual([]);
 
-    // And the invariant can see each of those grants: planted, caught, and revoked again. One plant
-    // per cell of the 2x2 matrix the query covers — {PUBLIC, pl_child} x {table level, column
-    // level} — so no grantee can be dropped from either arm and stay green. Five plants for four
-    // cells: each table-level cell is planted with DELETE, which has no column form and so can only
-    // be reported by the table-level arm, and PUBLIC x table also keeps the INSERT plant it started
-    // with (role_column_grants expands a table-level INSERT to every column, so that plant alone
-    // does not pin the table-level arm).
+    // And the invariant can see each of those grants: planted, caught, and revoked again. The query
+    // has FOUR independent lists — two grantee lists and two privilege lists — and a plant is only
+    // worth having if some single word can be deleted from one of them and only that plant reds.
+    //
+    // Plants 1-5 pin the four grantee cells of {PUBLIC, pl_child} x {table level, column level}: each
+    // table-level cell is planted with DELETE, which has no column form and so can only be reported
+    // by the table-level arm, and PUBLIC x table also keeps the INSERT plant it started with
+    // (role_column_grants expands a table-level INSERT to every column, so that plant alone does not
+    // pin the table-level arm).
+    //
+    // HUNT7-D-3: pinning the grantees is not pinning the PRIVILEGE lists, and round 6's comment said
+    // "no arm can be dropped" as though it were. Both column-level plants were UPDATE, so `'INSERT'`
+    // could be deleted from the column arm's privilege list at :101 and all five plants stayed green —
+    // plant 1 survives because the TABLE arm still names PUBLIC and INSERT. The arm that word protects
+    // is the one this case's own lead example writes out in full (`grant insert (family_id, child_id)
+    // on public.<family table> to pl_child`) and the one CLAUDE.md's "child writes go through
+    // API-owned SECURITY DEFINER functions" rule rests on, so it is the last arm that should be
+    // deletable with CI green. Plant 6 below is that column-level INSERT. It is the same defect as
+    // HUNT6-E-4 with one word moved: there the deletable word was a grantee, here it is a privilege.
+    //
+    // Which privilege words are load-bearing, so the next reader who mutates them knows what a green
+    // run means. 'INSERT' and 'UPDATE' in the TABLE arm at :96 CAN be deleted with every plant still
+    // green, and that is redundancy rather than a hole: role_column_grants expands a table-level
+    // INSERT or UPDATE to every column, so the column arm reports those grants too. Plant 1 is the
+    // demonstration — it is a TABLE-level insert and it survives deleting 'INSERT' from the table arm.
+    // The words only the table arm can report are 'DELETE' and 'TRUNCATE', because neither has a
+    // column form: DELETE is planted here twice (plants 2 and 5, one per grantee) and TRUNCATE is
+    // planted in the '[DB-R2-04]' case for both grantees. So every word in this query is either
+    // pinned by a plant or provably redundant, and nothing is merely unexamined.
     //
     // 1. The grant to PUBLIC that `grantee = 'pl_child'` could not see, table level.
     await db.sql`grant insert on public.audit_events to public`;
@@ -175,6 +197,21 @@ describe('schema invariants', () => {
       ]);
     } finally {
       await db.sql`revoke delete on public.audit_events from pl_child`;
+    }
+    expect(await childWriteGrants()).toEqual([]);
+
+    // 6. A column-level INSERT to pl_child — the grant this case's lead example names, and the one
+    // privilege word no other plant reaches (HUNT7-D-3). The table-level view does not report a
+    // column-level grant at all, so only the column arm's `'INSERT'` can see it: delete that word and
+    // this plant reds while every other plant stays green, which is what makes the word undeletable.
+    // It is the shape a real slip would take, because the migrations write grants column by column.
+    await db.sql`grant insert (metadata) on public.audit_events to pl_child`;
+    try {
+      expect(await childWriteGrants()).toEqual([
+        { table_name: 'audit_events', grantee: 'pl_child', privilege_type: 'INSERT' },
+      ]);
+    } finally {
+      await db.sql`revoke insert (metadata) on public.audit_events from pl_child`;
     }
     expect(await childWriteGrants()).toEqual([]);
   });

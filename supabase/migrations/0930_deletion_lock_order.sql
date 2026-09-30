@@ -73,11 +73,33 @@
 --     to a non-null value and the trigger returns at 0200_billing.sql's
 --     `if new.released_at is not null` before reaching its `perform 1 from public.families ... for
 --     update`.
---   * The archive route, the billing writers and the purges (each: families `for update`, then the
---     assignment, then the profile) now agree with this function statement for statement, and this
---     function's own first lock is the family row, taken by the KEY SHARE that `insert into
---     public.deletion_requests` needs for its foreign key — which their FOR UPDATE conflicts with. So
+--   * Every writer of this pair takes the FAMILY ROW first, and that — not a shared statement order —
+--     is what rules out a cycle. The archive route, the billing writers and the purges take it FOR
+--     UPDATE; this function's own first lock on it is the KEY SHARE that `insert into
+--     public.deletion_requests` needs for its foreign key, which their FOR UPDATE conflicts with. So
 --     no cycle exists among the writers of this pair, by either route.
+--   * Within the pair they do agree: assignment, then profile.
+--
+-- HUNT7-D-2 corrects this comment. It used to say those writers "now agree with this function
+-- statement for statement", and that is FALSE outside the pair, in three places:
+--   (a) the archive route (POST /v1/children/:id/archive in apps/api/src/routes/family.ts) writes, in
+--       this order: child_slot_assignments, child_profiles, child_sessions, child_devices,
+--       audit_events — the session and device rows AFTER the pair. This function writes child_sessions
+--       and child_devices BEFORE the pair (they are its second and third statements, right after the
+--       deletion_requests insert). For {child_profiles, child_sessions} and for
+--       {child_slot_assignments, child_sessions} the two writers are inverted.
+--   (b) app.purge_family_data (0820_support_cases_purge.sql) deletes child_slot_assignments at a
+--       different point in its sequence, so its order does not match statement for statement either.
+--   (c) public.data_exports is written near the end here and is not written by the archive route at all.
+-- (Statements, not line numbers: line numbers in a comment rot at the next edit — this correction's own
+-- first draft cited four of them and three were already stale by the time it was written.)
+-- None of that is reachable as a deadlock today, precisely because of the first bullet: every one of
+-- these writers serialises on the family row before it touches any of these tables, so two of them
+-- never hold one of these row locks concurrently. The claim that mattered is the family-row one; the
+-- statement-for-statement claim was decoration, and decoration that would have told the next author
+-- they could add a writer WITHOUT taking the family row as long as they copied this function's
+-- sequence. They cannot. A new writer of any of these tables takes the family row first, or it has to
+-- re-derive this argument from scratch.
 -- The release also cannot flip the child back to a draft: billing's releaseSlotlessProfiles only
 -- touches `status = 'active'` rows whose latest release_reason is 'expired' or 'downgrade', and this
 -- child is 'archived' with reason 'archived'.
