@@ -52,14 +52,61 @@ export const identityImageSchema = z.strictObject({
 export type IdentityImage = z.infer<typeof identityImageSchema>;
 
 /**
+ * The declaration the adult makes, which is what binds the document to the person holding the phone.
+ *
+ * OWNER DECISION (2026-09-30): the licence establishes that an ADULT exists and consents; this
+ * statement binds that adult to the act. The face comparison used to do the binding and cannot: it is
+ * biometric identification, which no provider PencilLift can reach will perform, so `adult_confirmed`
+ * was unsatisfiable and every adult failed closed (migration 0990's header has the full reasoning).
+ *
+ * WHAT THIS IS NOT. It is not the FTC-approved ID method. 16 CFR 312.5(b)(2)(v) approves checking a
+ * government ID against DATABASES of such information; a vision model reading a licence checks it
+ * against nothing and cannot tell whose hand is holding the phone. Two things narrow that gap and
+ * neither closes it: `statedDateOfBirth` is checked against the document (DOB_MISMATCH), so the
+ * submitter has to know the document holder's birth date; and this declaration carries the legal
+ * consequence of a false statement. docs/Threat_Model.md T41 states the residual, and owner action
+ * #48 carries the one question counsel must answer for the method to be sufficient.
+ *
+ * The version is stamped SERVER-side, never taken from the client, and travels onto the consent row —
+ * so a later wording is a new version and existing rows keep the words their adult actually agreed
+ * to. The client asserts the declaration; it does not get to choose which declaration it made (L-060).
+ */
+export const IDENTITY_ATTESTATION_VERSION = '2026-09-v1';
+
+/**
+ * Counsel approves this wording under owner action #48; until they do it is the draft the product
+ * ships behind the same legal-review gate as the public pages. It says three things on purpose: who
+ * the adult is relative to the document, who they are relative to the child, and that this is a legal
+ * declaration — the third is what gives the first two consequence.
+ */
+export const IDENTITY_ATTESTATION_STATEMENT =
+  'I am the person shown on this document, I am at least 18 years old, and I am this child’s ' +
+  'parent or legal guardian. I understand this is a legal declaration.';
+
+/** What a surface says when the declaration is not made. One wording for the portal and the app. */
+export const IDENTITY_ATTESTATION_REQUIRED_COPY =
+  'Please confirm the statement above before submitting your ID.';
+
+/**
  * POST /v1/identity/verification. The adult's own stated date of birth is required and is CHECKED
  * AGAINST the document rather than trusted: a mismatch is a refusal (DOB_MISMATCH), which is the one
  * cheap signal that the document belongs to someone else. Neither date is stored.
+ *
+ * No selfie, since 0990: nothing compares it to anything, and an image PencilLift cannot use is an
+ * image it should not ask a parent to send — collecting a face photo for no purpose is the worst of
+ * both worlds, carrying the biometric exposure without the verification.
  */
 export const submitIdentityVerificationRequestSchema = z.strictObject({
   statedDateOfBirth: calendarDateSchema,
   document: identityImageSchema,
-  selfie: identityImageSchema,
+  /**
+   * The adult affirms `IDENTITY_ATTESTATION_STATEMENT`. A literal `true` rather than a boolean: the
+   * absence of the field and a `false` are the same refusal, and neither can be mistaken for consent.
+   * The DATABASE is what actually enforces it — `adult_confirmed` is generated and requires the
+   * stamped version — because `authenticated` reaches these tables through the Data API and would
+   * otherwise find the requirement optional (L-060).
+   */
+  holderAttestation: z.literal(true),
 });
 export type SubmitIdentityVerificationRequest = z.infer<
   typeof submitIdentityVerificationRequestSchema
@@ -148,8 +195,21 @@ export type IdentityFaceMatch = z.infer<typeof identityFaceMatchSchema>;
 
 /** GET /v1/identity/verification, and the POST's own answer. */
 export const identityVerificationStatusSchema = z.strictObject({
-  /** True only when a government ID, an adult date of birth and a face match all held. */
+  /**
+   * True only when the document was a government photo ID, its own date of birth put the holder at or
+   * over `ADULT_MIN_AGE_YEARS`, AND the holder made the declaration. Generated in the database, so no
+   * writer can assert it (migration 0990).
+   */
   confirmed: z.boolean(),
+  /**
+   * WHICH standard this adult met, so the weaker basis is never invisible: 'verified' is the
+   * biometric standard (`identity_verifications.adult_confirmed`), 'declared' is the document plus
+   * the holder's legal declaration (`identity_declarations.adult_declared`, migration 0990, the
+   * owner's method), and null is neither. `confirmed` above is true for both — it answers "may this
+   * adult proceed"; this answers "on what evidence", which is the question an audit asks and the one
+   * that says whose adults would need re-verifying if counsel requires the stronger standard.
+   */
+  basis: z.enum(['verified', 'declared']).nullable(),
   /** The most recent attempt, or null when the adult has never submitted one. */
   latest: z
     .strictObject({
@@ -158,7 +218,14 @@ export const identityVerificationStatusSchema = z.strictObject({
       provider: z.string().min(1).max(120),
       documentIsGovernmentId: z.boolean(),
       documentHolderIsAdult: z.boolean(),
+      /**
+       * Recorded, never gating, since 0990: 'not_attempted' is the ordinary value because PencilLift
+       * stopped asking. Kept because it is the evidence that the question WAS asked and refused,
+       * which is the record justifying the owner's method.
+       */
       faceMatch: identityFaceMatchSchema,
+      /** The declaration's version, or null when none was made — which cannot confirm. */
+      holderAttestationVersion: z.string().min(1).max(40).nullable(),
       /** Null on a confirmation. */
       failureCode: z.enum(IDENTITY_FAILURE_CODES).nullable(),
       /** True when a development double ran the check. Never true in production. */
@@ -166,8 +233,20 @@ export const identityVerificationStatusSchema = z.strictObject({
     })
     .nullable(),
   /**
-   * Whether the configured provider can compare faces at all. False makes the flow honest about why
-   * it cannot finish, instead of letting a parent retry a photo that was never the problem.
+   * The declaration version a client must show and affirm. A literal, so a client cannot submit an
+   * affirmation of some other wording: the version it agreed to is the version the server stamps.
+   *
+   * (An earlier draft of this docblock said `faceCheckAvailable` had been REMOVED here. It had not —
+   * I restored it two edits later, and left the claim standing. Recorded rather than quietly
+   * deleted, because a comment asserting something about code that is not true is the exact defect
+   * class this round spent four stages hunting, and I wrote one inside the fix for it.)
+   */
+  attestationVersionRequired: z.literal(IDENTITY_ATTESTATION_VERSION),
+  /**
+   * Whether the stronger biometric standard can be met at all in this deployment. False today, and
+   * stated rather than hidden: it is what makes `basis: 'declared'` an honest answer instead of a
+   * silent downgrade. When a vendor is contracted (owner action #47) this turns true and new adults
+   * meet the stronger standard without any client change.
    */
   faceCheckAvailable: z.boolean(),
 });
@@ -182,8 +261,15 @@ export const IDENTITY_RULES = {
 } as const;
 
 /**
- * The sentence the product uses wherever the ordering is enforced, so the portal, the app and the API
- * all say the same thing about the same rule (L-037).
+ * The sentence for the ordering rule.
+ *
+ * ITS DOCBLOCK USED TO CLAIM “the portal, the app and the API all say the same thing about the same
+ * rule (L-037)”. That was FALSE and it was mine: nothing imported this constant — not the portal, not
+ * the app, not the API. The round-7 parity audit found it among six such claims, and it is exactly the
+ * species of claim that produced the round's largest finding, written by the person who had just spent
+ * a stage hunting it. What is true is stated instead: this is the ONE definition, and it is shared the
+ * moment a surface imports it. A test that asserts an importer set is the only thing that could make
+ * the stronger claim, and there is not one.
  */
 export const IDENTITY_REQUIRED_COPY =
-  'Verify your ID first. We check a government photo ID and a selfie once, to confirm an adult is setting this up, and the photos are deleted straight after the check.';
+  'Verify your ID first. We check a government photo ID once, to confirm an adult is setting this up, and the photo is deleted straight after the check.';
