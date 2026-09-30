@@ -155,6 +155,42 @@ hypothetical path: `personalizeItems` takes its hold as
 job handler, is enqueued by the scheduled tick, and calls `personalizeItems` with `'thursday_bundle'`.
 `PROPOSED_STAGE_COST_BUDGET_MICROS.thursday_bundle` is 933,600 in `packages/ai/src/routing.ts`.
 
+A hold is a reservation and settles back. The stage BUDGET is not only that, and the owner's copy of what
+it also bounds belongs here (HUNT7-B-1). `run.ts` weighs attempt 1 against the per-request ADMISSION cap
+and every attempt AFTER the first against the cumulative budget — whatever ended the earlier attempt: a
+truncated answer, a client-side timeout, a 5xx or a validation rejection alike. So for the five stages whose
+budget sits above their cap, the split that HUNT6-D-1 made bought a band of estimated input sizes in which
+the stage now makes and PAYS FOR a second billed generation where the single old number ended it after one.
+That is real spend, not a reservation.
+
+| Stage | Second billed attempt from | …to | Estimated input tokens |
+|---|---:|---:|---|
+| coaching | 2,501 | 7,876 | per coached question |
+| followup | 1,501 | 6,000 | per follow-up turn |
+| daily_set | 2,501 | 9,162 | per daily personalization |
+| thursday_bundle | 5,001 | 16,680 | per Thursday review |
+| semantic_check | 5,201 | 5,400 | per checked answer |
+
+Read the band as: below `from`, the admission cap alone already allowed two attempts, so the split changed
+nothing; above `to`, the budget has no room either and the stage still stops after one. Inside it, a failure
+the provider never reported usage for is metered at the full upper bound it was admitted with (JOBS-R1-03),
+so `spent` equals that estimate exactly and the loop weighs twice it — over the cap, inside the budget. A
+failure whose usage the provider DID report costs less than its estimate, so its second attempt fits at
+larger inputs still; these figures are the conservative edge.
+
+This is deliberate and the money is already reserved: the hold above is taken at the budget, and a transient
+failure is exactly the case where a second try gets the child the coached hint or the personalized set
+instead of a fallback. What the owner is being told is the SIZE of it, which routing.ts previously described
+as "not money".
+
+Neither the figures nor the stage list is maintained by hand. `packages/ai/src/run-metering.test.ts` >
+'the stage budget bounds every attempt after the first' COMPUTES both edges with the production estimator
+from `PROPOSED_STAGE_LIMITS`, `PROPOSED_STAGE_COST_BUDGET_MICROS` and the rate table, asserts the stage list
+is exactly the stages whose budget exceeds their cap, and really runs a coaching stage to two billed attempts
+at the band's top and to one attempt a single token past it. `packages/ai/src/cost-doc.test.ts` then asserts
+this table against the same figures in routing.ts's own docstring. Each link is asserted rather than assumed,
+so the chain is an invariant and not three places that happen to agree (L-066).
+
 Reserving the admission cap instead — which the personalization hold still did after the split, until
 `F-HOLD` caught it — left that hold 133,240 micros short of what the daily stage may spend, so the hold
 stopped bounding the spend, which is the only thing a hold is for. `runStage` now throws a `RangeError` if it

@@ -135,3 +135,86 @@ describe('[HUNT7-B-2] Cost_Analysis.md names the largest hold, and names it corr
     }
   });
 });
+
+/**
+ * HUNT7-B-1, the document half. routing.ts's own docstring was corrected to say that the stage budget
+ * is also the CUMULATIVE bound on every attempt after the first, and to name, per stage, the band of
+ * estimated input sizes in which that bought a second BILLED generation. The owner's cost record said
+ * none of it — it described the budget column as a reservation only — so the one number the owner reads
+ * to decide what PencilLift may spend understated the spend by a whole extra generation per stage in
+ * that band.
+ *
+ * WHAT THIS CASE PINS, and what it deliberately does not. It does NOT re-derive the bands: a third copy
+ * of that computation would drift exactly as the markdown did. `run-metering.test.ts` owns the
+ * derivation — it computes both edges with the production estimator, asserts the stage list is exactly
+ * the stages whose budget exceeds their cap, and runs a real coaching stage to two billed attempts
+ * inside the band and to one attempt a single token past it — and it asserts routing.ts's docstring
+ * carries those figures. This case closes the last link: the DOCUMENT carries the same figures as the
+ * docstring. Each link is asserted, not assumed, which is what makes the chain an invariant rather than
+ * three places that happen to agree today (L-066).
+ */
+const BAND_TABLE = [
+  'Stage',
+  'Second billed attempt from',
+  '…to',
+  'Estimated input tokens',
+] as const;
+
+/**
+ * The band figures routing.ts states, as `{stage, from, to}`. Read from the docstring of
+ * PROPOSED_STAGE_COST_BUDGET_MICROS with the comment markers stripped and whitespace collapsed FIRST,
+ * because the formatter splits that sentence across lines and a regex that cannot see a wrapped
+ * sentence passes on the claim it is guarding (HUNT7-B-7, the L-054 shape).
+ */
+function bandsStatedInRouting(): { stage: string; from: string; to: string }[] {
+  const source = readFileSync(join(import.meta.dirname, 'routing.ts'), 'utf8');
+  const from = source.indexOf(' * The budget for a STAGE AS A WHOLE');
+  const to = source.indexOf('export const PROPOSED_STAGE_COST_BUDGET_MICROS');
+  if (from < 0 || to < from) throw new Error('routing.ts no longer documents the budget table');
+  const text = source
+    .slice(from, to)
+    .replace(/\s*\*\s*/g, ' ')
+    .replace(/\s+/g, ' ');
+  const out: { stage: string; from: string; to: string }[] = [];
+  // Each number must END in a digit: `[\d,]*` alone swallowed the comma separating one band
+  // from the next stage's name, so 7,876 read as '7,876,'.
+  const re = /([a-z_]+) (\d(?:[\d,]*\d)?)\.\.(\d(?:[\d,]*\d)?)/g;
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    out.push({ stage: m[1]!, from: m[2]!, to: m[3]! });
+  }
+  return out;
+}
+
+describe('the cost record carries the second-billed-attempt bands (HUNT7-B-1)', () => {
+  it('states every band routing.ts states, with the same two edges', () => {
+    const stated = bandsStatedInRouting();
+    // Anti-vacuity: if the docstring stops naming bands, this case must fail rather than pass on an
+    // empty list. Five stages have a budget above their cap; that count is asserted from the
+    // constants, not written down, so it moves with the owner's numbers.
+    const expected = AI_STAGES.filter(
+      (stage) =>
+        PROPOSED_STAGE_LIMITS[stage].maxAttempts >= 2 &&
+        PROPOSED_STAGE_COST_BUDGET_MICROS[stage] > PROPOSED_STAGE_LIMITS[stage].maxCostMicros,
+    );
+    expect(stated.map((b) => b.stage).sort()).toEqual([...expected].sort());
+
+    const rows = tableRows(BAND_TABLE);
+    expect(rows.length).toBe(stated.length);
+    for (const band of stated) {
+      const found = rows.find((cells) => cells[0] === band.stage);
+      expect(found, `${band.stage} is missing from the cost record's band table`).toBeDefined();
+      expect(found![1], band.stage).toBe(band.from);
+      expect(found![2], band.stage).toBe(band.to);
+    }
+  });
+
+  it('says the budget is cumulative spend and not only a reservation', () => {
+    // The paragraph, not the table: a reader who sees only figures does not learn that the second
+    // attempt is BILLED. These are the three claims the document has to make.
+    expect(doc).toMatch(/every attempt AFTER the first/i);
+    expect(doc).toMatch(/second billed generation/i);
+    expect(doc).toMatch(/real spend, not a reservation/i);
+    // And the derivation is named, so a reader can check it rather than trust the table.
+    expect(doc).toContain('packages/ai/src/run-metering.test.ts');
+  });
+});
