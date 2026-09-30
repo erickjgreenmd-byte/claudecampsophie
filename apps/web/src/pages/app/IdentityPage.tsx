@@ -259,7 +259,15 @@ function IdentityCheck() {
           id={documentId}
           type="file"
           accept={IDENTITY_IMAGE_MIME_TYPES.join(',')}
-          capture="environment"
+          /*
+           * NO `capture` attribute, deliberately. `capture="environment"` was here, and on a phone
+           * browser it opens the camera with no library option, so a parent who has ALREADY
+           * photographed their licence cannot choose that photo — the commonest case, since people
+           * photograph documents before they need them. It is not a security control either: the
+           * browser may ignore it, every desktop does, and it is bypassed by picking a file at all.
+           * Nothing was gained and one legitimate parent per flow was blocked. `accept` stays,
+           * because that one is a real narrowing the shared gate then re-checks.
+           */
           aria-describedby={describedBy(documentId, documentProblem)}
           onChange={(e) => void chooseFile(e.target.files?.[0])}
         />
