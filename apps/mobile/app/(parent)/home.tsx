@@ -6,6 +6,7 @@ import {
   consentStatusResponseSchema,
   familyOverviewResponseSchema,
   guardiansResponseSchema,
+  IDENTITY_SCREEN_COPY,
   type ConsentStatus,
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
@@ -81,6 +82,15 @@ function FamilyHome({ api }: { api: ApiClient }) {
       </Card>
 
       <ConsentCard api={api} status={consent} onChanged={() => void reload()} />
+
+      {/* The adult ID check gates children, payment and pairing codes, so its way in sits above
+          them rather than among the family tools. The label is the screen's own shared title, so
+          the portal's heading and this entry cannot come to read differently. */}
+      <Button
+        label={IDENTITY_SCREEN_COPY.title}
+        secondary
+        onPress={() => router.push('/(parent)/identity')}
+      />
 
       <Heading>Children</Heading>
       {family.children.length === 0 ? (

@@ -35,6 +35,10 @@ export const routes: RouteObject[] = [
   { path: '/app/learning', lazy: page(() => import('./pages/app/LearningPlannerPage.tsx')) },
   { path: '/app/school', lazy: page(() => import('./pages/app/SchoolAndPromotionsPage.tsx')) },
   { path: '/app/resources', lazy: page(() => import('./pages/app/ResourcesPage.tsx')) },
+  // The adult ID check gates children, payment and pairing codes, so it comes before them here
+  // as well. Registered by the lead: a screen with no route entry is unreachable, which is the
+  // whole of L-074 and is exactly how the identity capability sat unusable for a round.
+  { path: '/app/identity', lazy: page(() => import('./pages/app/IdentityPage.tsx')) },
   { path: '/app/subscription', lazy: page(() => import('./pages/app/SubscriptionPage.tsx')) },
   { path: '/admin', lazy: page(() => import('./pages/admin/AdminHomePage.tsx')) },
   { path: '/admin/mfa', lazy: page(() => import('./pages/admin/MfaPage.tsx')) },

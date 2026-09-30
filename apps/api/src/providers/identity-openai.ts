@@ -156,15 +156,25 @@ export function createOpenAiIdentityProvider(options: {
       // (15,000 micro-USD of budget) is never spent. 'not_attempted' is the honest answer to a
       // question nobody asked — distinct from 'refused', which is what this adapter answers when the
       // comparison IS requested and the provider's policy declines it.
-      const faceMatch =
-        input.selfie === undefined ? ('not_attempted' as const) : await compareFaces(input);
+      const comparisonWasAsked = input.selfie !== undefined;
+      const faceMatch = comparisonWasAsked ? await compareFaces(input) : ('not_attempted' as const);
       return {
         documentIsGovernmentId: true,
         documentHolderIsAdult: true,
         faceMatch,
-        // 'matched' is unreachable through this adapter; the branch exists so that the day a provider
-        // here CAN answer it, the result is already correct rather than needing a second edit.
-        failureCode: faceMatch === 'matched' ? null : faceCode(faceMatch),
+        // A COMPARISON NOBODY ASKED FOR CANNOT FAIL, and getting this wrong was worse than a refusal.
+        // When I made the selfie optional I left this line as `faceMatch === 'matched' ? null : ...`,
+        // so a valid government ID of a genuine adult came back carrying a face failure code. The
+        // route then wrote a row with `adult_declared` true (document + declaration both held) AND a
+        // non-null `failure_code`, which violates 0990's
+        // `identity_declarations_established_names_no_failure` — so every adult submission in
+        // production would have raised, not merely been refused. Nothing caught it because no test
+        // exercised this adapter at all: the suites run the labeled mock, whose own `check` returns
+        // `failureCode: null`. That is L-074 in the code that the lesson was written about.
+        //
+        // 'matched' stays the only non-failing answer WHEN a comparison was requested, so the day a
+        // provider here can answer it the result is already right.
+        failureCode: !comparisonWasAsked || faceMatch === 'matched' ? null : faceCode(faceMatch),
         providerReference: reference,
       };
 

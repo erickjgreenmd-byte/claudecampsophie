@@ -1,3 +1,4 @@
+import { IDENTITY_SCREEN_COPY } from '@pencillift/contracts';
 import { useEffect, useRef } from 'react';
 import {
   createBrowserRouter,
@@ -21,6 +22,10 @@ import { createSupabaseAuth } from './lib/supabase-auth.ts';
 
 const PARENT_LINKS: readonly (readonly [string, string])[] = [
   ['/app', 'Family'],
+  // Before Children, because the ID check gates children, payment and pairing codes. The label is
+  // the screen's own shared title, so this entry and the page heading cannot come to read
+  // differently — and the phone's entry point on app/(parent)/home.tsx uses the same constant.
+  ['/app/identity', IDENTITY_SCREEN_COPY.title],
   ['/app/children', 'Children'],
   ['/app/homework', 'Homework'],
   ['/app/learning', 'Learning'],
@@ -95,6 +100,9 @@ function BrandBar() {
  */
 export const PORTAL_PAGE_TITLES: readonly [string, string][] = [
   ['/app', 'Your family'],
+  // Same constant as the nav entry and the page heading, so the three cannot drift. The navigation
+  // suite asserts every registered route has a title, which is what caught this one missing.
+  ['/app/identity', IDENTITY_SCREEN_COPY.title],
   ['/app/children', 'Children'],
   ['/app/homework', 'Homework'],
   ['/app/learning', 'Learning planner'],

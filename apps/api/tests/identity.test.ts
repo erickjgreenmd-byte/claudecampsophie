@@ -88,7 +88,13 @@ describe('the adult identity check is reachable at all (the route that did not e
     // Said rather than hidden: the stronger standard is unreachable here, which is what makes a
     // 'declared' basis an honest answer instead of a silent downgrade.
     expect(body.attestationVersionRequired).toBe(IDENTITY_ATTESTATION_VERSION);
-    expect(typeof body.faceCheckAvailable).toBe('boolean');
+    // FALSE, not merely a boolean. `typeof … === 'boolean'` is what this asserted, and it passed
+    // while the development double declared `canCompareFaces: true` — a claim NO deployment can
+    // make, since the only real adapter reports false (biometric identification, which its
+    // provider's policies forbid). So every developer and every test read "this account can also
+    // run a face check", the sentence no parent will ever see, and the sentence they all see was
+    // exercised by nothing. A test that accepts either answer is not asserting the answer.
+    expect(body.faceCheckAvailable).toBe(false);
   });
 
   it('refuses an unauthenticated caller', async () => {

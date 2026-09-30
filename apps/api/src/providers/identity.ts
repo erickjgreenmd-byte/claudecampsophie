@@ -102,35 +102,42 @@ export function isAdultOn(dateOfBirth: string, now: Date): boolean {
  * is exercisable end to end in development and in tests without sending anyone's licence anywhere.
  * The one thing it will not do is confirm an under-age stated date of birth, because a mock that
  * ignores its input teaches the tests nothing.
+ *
+ * `canCompareFaces` IS FALSE, and that is not a limitation of the double — it is the double telling
+ * the truth about the product. It said `true` until this was read back, and `true` is a claim no
+ * deployment can make: the only real adapter (`identity-openai.ts`) reports `false` because the
+ * comparison is biometric identification its provider's policies forbid. The status response builds
+ * `faceCheckAvailable` straight off this flag, so the mock's `true` put every developer and every
+ * test on the "this account can also run a face check" sentence that NO parent will ever read, and
+ * left the sentence they all read exercised by nothing. A mock that claims a capability the product
+ * does not have is the same defect as a capability with no caller (L-074), pointed the other way.
  */
 export function createDevelopmentIdentityMock(): IdentityProvider {
   return {
     name: 'development_mock',
     isMock: true,
-    canCompareFaces: true,
-    check: (input) => {
-      // With no selfie there is nothing to compare, and the mock says so rather than inventing a
-      // match: a mock that answers a question it was not asked teaches the tests a falsehood.
-      const faceMatch =
-        input.selfie === undefined ? ('not_attempted' as const) : ('matched' as const);
-      return Promise.resolve(
+    canCompareFaces: false,
+    check: (input) =>
+      // 'not_attempted' unconditionally, because a provider that cannot compare faces is never sent
+      // a selfie to compare. Inventing 'matched' from an input that cannot arrive would teach the
+      // tests a falsehood about the one field migration 0980's stronger standard turns on.
+      Promise.resolve(
         isAdultOn(input.statedDateOfBirth, input.now)
           ? {
               documentIsGovernmentId: true,
               documentHolderIsAdult: true,
-              faceMatch,
+              faceMatch: 'not_attempted' as const,
               failureCode: null,
               providerReference: 'mock-identity',
             }
           : {
               documentIsGovernmentId: true,
               documentHolderIsAdult: false,
-              faceMatch,
+              faceMatch: 'not_attempted' as const,
               failureCode: 'NOT_AN_ADULT' as const,
               providerReference: 'mock-identity',
             },
-      );
-    },
+      ),
   };
 }
 
