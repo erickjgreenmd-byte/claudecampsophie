@@ -6,7 +6,9 @@
  */
 import {
   ACCOUNT_CLOSE_COPY,
+  ACCOUNT_CLOSE_OUTCOME_COPY,
   ACCOUNT_CLOSE_RULES,
+  accountCloseOutcome,
   adultUnlockResponseSchema,
   closeAccountResponseSchema,
   dataExportResponseSchema,
@@ -20,6 +22,8 @@ import {
   privacyFamilyViewSchema,
   safetyReportResponseSchema,
   safetyReportsResponseSchema,
+  type AccountCloseOutcome,
+  type ClosePendingReason,
   type CreateDeletionRequest,
   type DataExport,
   type DeletionRequest,
@@ -165,7 +169,9 @@ export async function exportDownloadAction(
  * error keeps its message, because the 'refused' step is what shows it.
  */
 export type CloseAccountResult =
-  | { readonly status: 'closed' | 'pending' }
+  | { readonly status: 'closed' }
+  /** HUNT7-E-1: which event the parent is waiting for, as the route named it — never re-derived here. */
+  | { readonly status: 'pending'; readonly reason: ClosePendingReason }
   | { readonly status: 'step_up' }
   | { readonly status: 'error'; readonly message: string };
 
@@ -194,26 +200,22 @@ export type CloseAccountResult =
  * No password advice on the `closed` branch (HUNT6-J-3): a completed closure soft-deletes the auth
  * user — the email is replaced by a hash and every session ends
  * (apps/api/src/providers/auth-admin.ts) — so there is no sign-in left to change a password for, and
- * ACCOUNT_CLOSE_COPY.intro says exactly that. `pending` keeps it, because ACCOUNT_CLOSE_COPY.ownerRule
- * says the parent can still sign in until the family deletion finishes.
+ * ACCOUNT_CLOSE_COPY.intro says exactly that. Both pending outcomes keep it, because on both the
+ * sign-in is still there: the owner's until the family deletion finishes (ACCOUNT_CLOSE_COPY.ownerRule)
+ * and a retried closure's until the queued job gets through.
  */
 export function accountClosedDeviceMessage(
-  status: 'closed' | 'pending',
+  outcome: AccountCloseOutcome,
   device: DeviceSignOutOutcome,
 ): string {
-  if (device.sessionEndConfirmed && device.secretsCleared) {
-    return status === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending;
-  }
-  const closure =
-    status === 'closed'
-      ? 'Your PencilLift account is closed.'
-      : 'Your request is recorded, and your sign-in closes automatically once your family account\u2019s deletion has finished.';
+  const copy = ACCOUNT_CLOSE_OUTCOME_COPY[outcome];
+  if (device.sessionEndConfirmed && device.secretsCleared) return copy.full;
   const thisDevice = device.sessionEndConfirmed
     ? 'This device is signed out, but we could not remove everything this app had saved for your account. Removing the app removes the rest.'
     : 'We could not confirm this device is signed out. Sign out from the parent menu before you put it down.';
   const worry =
-    status === 'pending' ? ' If you are worried, change your password from another device.' : '';
-  return `${closure} ${thisDevice}${worry}`;
+    outcome === 'closed' ? '' : ' If you are worried, change your password from another device.';
+  return `${copy.serverOnly} ${thisDevice}${worry}`;
 }
 
 /** A step the "Delete my account" flow hands the screen, in the order the screen must take them. */
@@ -261,7 +263,10 @@ export async function runAccountClosure(
     sessionEndConfirmed: false,
     secretsCleared: false,
   }));
-  step({ kind: 'closed', message: accountClosedDeviceMessage(result.status, device) });
+  step({
+    kind: 'closed',
+    message: accountClosedDeviceMessage(accountCloseOutcome(result), device),
+  });
 }
 
 /**
@@ -272,11 +277,11 @@ export async function runAccountClosure(
  *
  * It says nothing about what the parent then reads. `closed` and `pending` both mean the device signs
  * out now, and whether that SUCCEEDED is what the copy turns on, so the sentence is chosen by
- * `accountClosedDeviceMessage` from the reported device outcome and this function returns the status
- * alone (HUNT7-K-4). It used to build the unconditional `ACCOUNT_CLOSE_COPY.closed`/`.pending` as well,
- * which no caller had read since round 6 — a sentence still produced, still documented as what the
- * status means, and still pinned by a test, on the screen whose whole point is that it may not be said
- * unconditionally.
+ * `accountClosedDeviceMessage` from the reported device outcome and this function returns what the
+ * server settled — the status, plus the `reason` a pending answer carries (HUNT7-K-4, HUNT7-E-1). It
+ * used to build the unconditional `ACCOUNT_CLOSE_COPY.closed`/`.pending` as well, which no caller had
+ * read since round 6 — a sentence still produced, still documented as what the status means, and still
+ * pinned by a test, on the screen whose whole point is that it may not be said unconditionally.
  */
 export async function closeAccountAction(
   api: ApiClient,
@@ -290,7 +295,11 @@ export async function closeAccountAction(
       { confirm: true },
       closeAccountResponseSchema,
     );
-    return { status: result.status };
+    // The reason travels with a pending answer: nothing here or downstream can tell the two pending
+    // events apart, and they do not promise the parent the same thing (HUNT7-E-1).
+    return result.status === 'closed'
+      ? { status: 'closed' }
+      : { status: 'pending', reason: result.reason };
   } catch (error) {
     if (
       error instanceof ApiRequestError &&

@@ -2,7 +2,9 @@ import { useEffect, useId, useState, type FormEvent, type ReactNode } from 'reac
 import { Link, useNavigate } from 'react-router';
 import {
   ACCOUNT_CLOSE_COPY,
+  ACCOUNT_CLOSE_OUTCOME_COPY,
   ACCOUNT_CLOSE_RULES,
+  accountCloseOutcome,
   closeAccountResponseSchema,
   exportDownloadResponseSchema,
   dataExportResponseSchema,
@@ -18,6 +20,7 @@ import {
   safetyReportResponseSchema,
   safetyReportsResponseSchema,
   STANDARD_EXPORT_KINDS,
+  type AccountCloseOutcome,
   type DataExport,
   type DeletionRequest,
   type ExportKind,
@@ -36,6 +39,9 @@ import { StepUpPrompt as SharedStepUpPrompt } from '../../components/StepUpPromp
 import { STORE_THAT_BILLS_YOU } from '../../components/stores.ts';
 import { stillSignedIn } from '../../lib/auth.ts';
 import { RequireParent, useApiQuery, useSession, type QueryState } from '../../lib/session.tsx';
+// The closure's handover to /account-deletion: that page reads the router state, so it owns the value
+// written into it (CLOSURE_ROUTER_STATE) and this screen writes nothing of its own invention.
+import { CLOSURE_ROUTER_STATE } from '../public/AccountDeletionPage.tsx';
 
 /**
  * Parent privacy controls (spec P4, P8, P10, P14 "export/delete and help"; AC_ACCESS_10,
@@ -715,18 +721,19 @@ function ExportDownload({ exportId }: { exportId: string }) {
  */
 /**
  * HUNT5-N6: what the parent reads when the closure went through but this browser's session survived
- * the sign-out. Neither ACCOUNT_CLOSE_COPY line can be shown on this path — both end "this device is
+ * the sign-out. No `full` outcome line can be shown on this path — they all end "this device is
  * signed out", the one thing that did not happen — and /account-deletion's refusal notice opens
  * "This computer is signed out", so the flow must not travel there either. The session sentence is
  * SignOutControl's, word for word, because it reports the same fact on its own path; the closure is
  * restated here because this is the only line the parent gets.
+ *
+ * HUNT7-E-1: restated from the shared `serverOnly` line for the outcome the route named, not from a
+ * clause written out here. This screen used to inline the owner's "once your family account’s deletion
+ * has finished" for every pending closure — the same sentence the app inlined for itself — which is
+ * how one parent's cause came to be told to another's.
  */
-function stillSignedInCopy(status: 'closed' | 'pending'): string {
-  const closure =
-    status === 'closed'
-      ? 'Your PencilLift account is closed.'
-      : 'Your request is recorded, and your sign-in closes automatically once your family account’s deletion has finished.';
-  return `${closure} We could not end your session — you are still signed in on this computer. Use “Sign out” at the top of this page before you leave it.`;
+function stillSignedInCopy(outcome: AccountCloseOutcome): string {
+  return `${ACCOUNT_CLOSE_OUTCOME_COPY[outcome].serverOnly} We could not end your session — you are still signed in on this computer. Use “Sign out” at the top of this page before you leave it.`;
 }
 
 function AccountCloseSection() {
@@ -746,7 +753,9 @@ function AccountCloseSection() {
     }
     setConfirmError(null);
     setSessionStillOpen(null);
-    let status: 'closed' | 'pending' | null = null;
+    // The outcome, not the status: a `pending` answer says which event the parent is waiting for and
+    // every sentence below is chosen from that (HUNT7-E-1).
+    let outcome: AccountCloseOutcome | null = null;
     const ok = await action.run(async () => {
       const result = await api.send(
         'POST',
@@ -754,10 +763,10 @@ function AccountCloseSection() {
         { confirm: true },
         closeAccountResponseSchema,
       );
-      status = result.status;
-      return result.status === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending;
+      outcome = accountCloseOutcome(result);
+      return ACCOUNT_CLOSE_OUTCOME_COPY[outcome].full;
     });
-    if (!ok || status === null) return;
+    if (!ok || outcome === null) return;
     // The API's signOut flag: clear this device's session through the normal sign-out path, then
     // explain on the public page (this page needs a signed-in parent to render). The account is
     // already closed by this point, so the navigation must not depend on the sign-out — otherwise the
@@ -832,7 +841,7 @@ function AccountCloseSection() {
       // The closure line belongs to this message now: the outcome's own copy ends "this device is
       // signed out", which is the half that failed.
       action.setOutcome(null);
-      setSessionStillOpen(stillSignedInCopy(status));
+      setSessionStillOpen(stillSignedInCopy(outcome));
       return;
     }
     // Replaced, not pushed: the closed account's own page is not left one Back away (HUNT6-G-1).
@@ -850,7 +859,7 @@ function AccountCloseSection() {
     // too, so replacing this one entry could never have been the protection.
     void navigate('/account-deletion', {
       replace: true,
-      state: { accountClosed: status, signOutRefused },
+      state: { accountClosed: CLOSURE_ROUTER_STATE[outcome], signOutRefused },
     });
   };
 

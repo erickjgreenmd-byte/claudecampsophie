@@ -1,4 +1,4 @@
-import { ACCOUNT_CLOSE_RULES } from '@pencillift/contracts';
+import { ACCOUNT_CLOSE_RULES, closeAccountResponseSchema } from '@pencillift/contracts';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { cryptoRandom } from '@pencillift/domain';
@@ -145,7 +145,11 @@ describe('POST /v1/account/close (APL-07 / PLAY-10)', () => {
 
     const res = await close(token);
     expect(res.status).toBe(202);
-    expect(await json(res)).toEqual({ status: 'pending', signOut: true });
+    expect(await json(res)).toEqual({
+      status: 'pending',
+      reason: 'after_family_purge',
+      signOut: true,
+    });
     const [job] = await closeJobs(fam.ownerId);
     expect(job).toMatchObject({
       kind: 'account_close',
@@ -251,7 +255,7 @@ describe('POST /v1/account/close (APL-07 / PLAY-10)', () => {
     try {
       const res = await close(token);
       expect(res.status).toBe(202);
-      expect(await json(res)).toEqual({ status: 'pending', signOut: true });
+      expect(await json(res)).toEqual({ status: 'pending', reason: 'retrying', signOut: true });
       expect(await isClosed(guardianId)).toBe(false);
       const [membership] = await api.db.sql<{ status: string }[]>`
         select status from public.family_memberships where user_id = ${guardianId}`;
@@ -273,6 +277,49 @@ describe('POST /v1/account/close (APL-07 / PLAY-10)', () => {
     }
     expect(await isClosed(guardianId)).toBe(true);
     expect((await closeJobs(guardianId))[0]!.status).toBe('succeeded');
+  });
+
+  /**
+   * HUNT7-E-1: `pending` is answered for two different events and only one of them is a family purge,
+   * so the answer says WHICH — every surface picks the parent's sentence from it
+   * (ACCOUNT_CLOSE_OUTCOME_COPY). The reason is set where the branch is taken, so the wire value is
+   * evidence of the branch and not an inference from the status. Both wire values are written out as
+   * literals, and the body is parsed with the contract schema so the route and the contract cannot
+   * agree only in this file.
+   */
+  it('[HUNT7-E-1] a pending closure names its cause: the family purge, or a refused close it retries', async () => {
+    const owned = await seedFamily(api.db, { childCount: 1 });
+    const ownerToken = await unlockedToken(owned.ownerId);
+    await requestFamilyDeletion(owned, ownerToken);
+    const afterPurge = await close(ownerToken);
+    expect(afterPurge.status).toBe(202);
+    expect(closeAccountResponseSchema.parse(await json(afterPurge))).toEqual({
+      status: 'pending',
+      reason: 'after_family_purge',
+      signOut: true,
+    });
+
+    // The guardian's own closure, refused by the auth service: nothing of theirs is being purged —
+    // `removeGuardian` revokes their membership and the family stays live with its owner — so the
+    // cause is the queued retry, and the parent must not be told to wait for a deletion.
+    const fam = await seedFamily(api.db);
+    const guardianId = await addGuardian(fam);
+    const guardianToken = await unlockedToken(guardianId);
+    useAuthAdmin(createRefusingAuthAdmin());
+    try {
+      const retrying = await close(guardianToken);
+      expect(retrying.status).toBe(202);
+      expect(closeAccountResponseSchema.parse(await json(retrying))).toEqual({
+        status: 'pending',
+        reason: 'retrying',
+        signOut: true,
+      });
+    } finally {
+      useAuthAdmin(localDouble);
+    }
+    const [family] = await api.db.sql<{ deleted_at: Date | null }[]>`
+      select deleted_at from public.families where id = ${fam.familyId}`;
+    expect(family!.deleted_at).toBeNull();
   });
 
   it('a dead-lettered closure is not resurrected: a fresh request queues a versioned successor', async () => {

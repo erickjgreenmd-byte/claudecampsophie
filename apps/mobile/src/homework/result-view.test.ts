@@ -118,6 +118,39 @@ describe('verdict copy for children (spec P6)', () => {
     expect(view.showResults).toBe(false);
     expect(view.inProgress).toBe(false);
   });
+
+  /**
+   * HUNT7-E-3: the SAME repair, for the other body that sends the child back to the camera. The
+   * round that rewrote `failed_final` (the case above) did it because the old line "sent the child to
+   * do the one thing that cannot help"; `needs_rescan` kept telling the child to scan again and named
+   * nobody else, although the re-send it asks for can be refused outright. `childUploadMessage`'s
+   * `RULE_COPY` answers three such refusals with a grown-up and no money
+   * (apps/mobile/src/homework/upload.ts: QUOTA_EXCEEDED, CONSENT_REQUIRED, CHILD_NOT_ACTIVE), so the
+   * refusal is real and already child-facing; the advice printed BEFORE it was the gap.
+   *
+   * L-067: the literal line is asserted once, then the rule is derived over every status, so neither
+   * case can be satisfied by the other.
+   */
+  it('every line that sends the child back to the camera also names a grown-up', () => {
+    expect(statusView('needs_rescan').body).toBe(
+      'Some pages were hard to read. Try scanning them again in good light, flat on a table — or ask a grown-up for help.',
+    );
+    // The filter used to name only two phrasings and so MISSED the 'draft'/'uploading' body,
+    // which said 'Open Scan to send it again' with no grown-up — and that is the state a refused
+    // finalize leaves the scan in, so it was the loop the property exists to forbid. A property
+    // is only as good as the set it quantifies over (L-054/L-064): match anything that sends the
+    // child back to the camera, however it is worded.
+    const backToCamera = ASSIGNMENT_STATUSES.filter((s) =>
+      /scan(ning)? (them |it )?again|a new scan|Open Scan|try again/i.test(statusView(s).body),
+    );
+    // Not vacuous, and the SET is pinned so a new such body has to come past this case.
+    expect(backToCamera).toEqual(['draft', 'uploading', 'needs_rescan', 'failed_final']);
+    for (const s of backToCamera) {
+      expect(statusView(s).body).toMatch(/grown-up/);
+      // Child privacy and tone: the child is never told what the family has or has not paid.
+      expect(statusView(s).body).not.toMatch(/paid|slot|plan|subscription|\$/i);
+    }
+  });
 });
 
 describe('result view (AC_GRADING_06)', () => {

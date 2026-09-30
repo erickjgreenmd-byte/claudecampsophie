@@ -11,6 +11,7 @@ import type {
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
   ACCOUNT_CLOSE_COPY,
+  ACCOUNT_CLOSE_OUTCOME_COPY,
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
   SIGN_OUT_NOT_TOLD_COPY,
@@ -1121,7 +1122,7 @@ describe('PrivacyControlsPage', () => {
     const { api } = fakeApi({
       send: (call) =>
         call.path === '/v1/account/close'
-          ? { status: 'pending', signOut: true }
+          ? { status: 'pending', reason: 'after_family_purge', signOut: true }
           : new Error('nope'),
     });
     const router = renderWithDeletionRoute(api, auth);
@@ -1138,9 +1139,10 @@ describe('PrivacyControlsPage', () => {
     expect(router.state.location.pathname).toBe('/app/privacy');
     expect(screen.queryByText(/deletion page:/)).toBeNull();
     expect(document.body.textContent).not.toMatch(/this computer is signed out/i);
-    // And the success outcome is gone: both of its lines end "this device is signed out".
-    expect(document.body.textContent).not.toContain(ACCOUNT_CLOSE_COPY.closed);
-    expect(document.body.textContent).not.toContain(ACCOUNT_CLOSE_COPY.pending);
+    // And the success outcome is gone: every one of its lines ends "this device is signed out".
+    for (const line of Object.values(ACCOUNT_CLOSE_OUTCOME_COPY)) {
+      expect(document.body.textContent).not.toContain(line.full);
+    }
   });
 
   it('[HUNT6-G-1] carries the refusal report to the public page when the reported refusal did clear this browser', async () => {
@@ -1148,7 +1150,7 @@ describe('PrivacyControlsPage', () => {
     const { api } = fakeApi({
       send: (call) =>
         call.path === '/v1/account/close'
-          ? { status: 'pending', signOut: true }
+          ? { status: 'pending', reason: 'after_family_purge', signOut: true }
           : new Error('nope'),
     });
     renderWithDeletionRoute(api, auth);
@@ -1174,7 +1176,7 @@ describe('PrivacyControlsPage', () => {
     const { api } = fakeApi({
       send: (call) =>
         call.path === '/v1/account/close'
-          ? { status: 'pending', signOut: true }
+          ? { status: 'pending', reason: 'after_family_purge', signOut: true }
           : new Error('nope'),
     });
     const router = renderWithDeletionRoute(api, auth);
@@ -1212,7 +1214,7 @@ describe('PrivacyControlsPage', () => {
     const { api } = fakeApi({
       send: (call) =>
         call.path === '/v1/account/close'
-          ? { status: 'pending', signOut: true }
+          ? { status: 'pending', reason: 'after_family_purge', signOut: true }
           : new Error('nope'),
     });
     const router = renderWithDeletionRoute(api, auth, ['/app', '/app/privacy']);
@@ -1283,8 +1285,9 @@ describe('PrivacyControlsPage', () => {
     // case here green. Asserted against the contract string itself so it cannot drift, and NOT over
     // the whole body loosely: the section's intro legitimately describes what closing will do, in
     // nearly the same words, before the parent does it.
-    expect(document.body.textContent).not.toContain(ACCOUNT_CLOSE_COPY.closed);
-    expect(document.body.textContent).not.toContain(ACCOUNT_CLOSE_COPY.pending);
+    for (const line of Object.values(ACCOUNT_CLOSE_OUTCOME_COPY)) {
+      expect(document.body.textContent).not.toContain(line.full);
+    }
   });
 
   it('[HUNT5-N6] still reports the refusal when the thrown sign-out did clear this browser', async () => {
@@ -1382,7 +1385,7 @@ describe('PrivacyControlsPage', () => {
       deletion: { requests: [deletion('family')] },
       send: (call) =>
         call.path === '/v1/account/close'
-          ? { status: 'pending', signOut: true }
+          ? { status: 'pending', reason: 'after_family_purge', signOut: true }
           : new Error('nope'),
     });
     renderWithDeletionRoute(api, auth);
@@ -1438,7 +1441,7 @@ describe('PrivacyControlsPage', () => {
     const { api } = fakeApi({
       send: (call) =>
         call.path === '/v1/account/close'
-          ? { status: 'pending', signOut: true }
+          ? { status: 'pending', reason: 'after_family_purge', signOut: true }
           : new Error('nope'),
     });
     renderWithRealDeletionPage(api, auth);
@@ -1449,8 +1452,9 @@ describe('PrivacyControlsPage', () => {
     // same closure sentence in its own role="status" line, so a bare findByRole would read that one.
     await screen.findByRole('heading', { level: 1, name: /delete your PencilLift account/i });
     const notice = screen.getByRole('status');
-    // The closure itself is still reported, in its own words.
-    expect(notice.textContent).toMatch(/your request is recorded/i);
+    // The closure itself is still reported, in its own words — and in the sentence for the cause the
+    // route gave, not in whichever one comes first (HUNT7-E-1).
+    expect(notice.textContent).toContain(ACCOUNT_CLOSE_OUTCOME_COPY.after_family_purge.full);
     // And the session fact, in the exact shared string rather than a paraphrase of it (L-054).
     expect(notice.textContent).toContain(SIGN_OUT_NOT_TOLD_COPY.signInOpen);
     // HUNT6-F-1: the one remedy that cannot work is not offered, here or anywhere on the page.
@@ -1474,6 +1478,87 @@ describe('PrivacyControlsPage', () => {
     // The account is gone, so neither remedy exists: no password to change, no sign-in to end.
     expect(notice.textContent).not.toMatch(/change your password/i);
     expect(document.body.textContent).not.toMatch(/on your phone/i);
+  });
+
+  /**
+   * HUNT7-E-1. PREMISE: `pending` is answered for two different events, and only one of them is a family
+   * purge. POST /v1/account/close answers `pending` for a guardian (or an adult with no family)
+   * whenever `closeNow` could not close the sign-in — the route's own header says so and
+   * apps/api/tests/account-close.test.ts covers it under 'guardian path when the auth service refuses'.
+   * That parent has no family deletion to wait for: leaving the family revokes their membership and the
+   * family stays live with its owner. Told that their sign-in "closes automatically once your family
+   * account's deletion has finished", the only reading available to them is that nothing will close it,
+   * and the thing that actually will (the queued `account_close` job retrying) was never named. The
+   * route now says which cause it is, and each surface prints that cause's sentence.
+   */
+  it('[repro] [HUNT7-E-1] the public page says why a retried closure is pending, not that a deletion must finish', async () => {
+    const { auth } = signOutCounter();
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', reason: 'retrying', signOut: true }
+          : new Error('nope'),
+    });
+    renderWithRealDeletionPage(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    await screen.findByRole('heading', { level: 1, name: /delete your PencilLift account/i });
+    const notice = screen.getByRole('status');
+    expect(notice.textContent).toContain(ACCOUNT_CLOSE_OUTCOME_COPY.retrying.full);
+    expect(notice.textContent).toMatch(/could not finish closing your sign-in/i);
+    expect(notice.textContent).not.toMatch(/family account/i);
+  });
+
+  it('[repro] [HUNT7-E-1] the portal says it too, in the window before the device sign-out answers', async () => {
+    // The parent reads this screen's own notice for as long as the device sign-out takes (three
+    // network calls at the adapter's timeout), so the cause has to be right here as well as on the
+    // page the flow lands on — and the handover value is the one /account-deletion reads for THIS
+    // cause, not the owner's.
+    let release = () => undefined as void;
+    const signedOut = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    const auth: AuthAdapter = {
+      configured: true,
+      currentSession: () =>
+        Promise.resolve({ accessToken: 'test-token', email: 'parent@example.test' }),
+      signOut: () => signedOut,
+    };
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', reason: 'retrying', signOut: true }
+          : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(await within(card).findByText(ACCOUNT_CLOSE_OUTCOME_COPY.retrying.full)).toBeTruthy();
+    release();
+    expect(await screen.findByText('deletion page: pending_retry')).toBeTruthy();
+  });
+
+  it('[repro] [HUNT7-E-1] and says it here too when the session survived the sign-out', async () => {
+    // The path that stays on the portal restates the closure in its own words (`stillSignedInCopy`),
+    // so it is a second place the cause can be got wrong.
+    const { auth } = reportedRefusal({ cleared: false });
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', reason: 'retrying', signOut: true }
+          : new Error('nope'),
+    });
+    renderWithDeletionRoute(api, auth);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    const alert = text(await within(card).findByRole('alert'));
+    expect(alert).toMatch(/you are still signed in on this computer/i);
+    expect(alert).toContain(ACCOUNT_CLOSE_OUTCOME_COPY.retrying.serverOnly);
+    expect(alert).not.toMatch(/family account/i);
+    expect(screen.queryByText(/deletion page:/)).toBeNull();
   });
 
   it('[HUNT5-F-8] says nothing about the session when the sign-out was carried out', async () => {

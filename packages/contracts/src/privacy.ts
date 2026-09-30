@@ -272,9 +272,19 @@ export const PARENT_SAFETY_FLAG_COPY = {
  * Please start a new scan with clear photos." — is untrue of this scan twice over (it was stopped
  * once, by the family's own withdrawal, and the photos were fine) and the advice cannot work: a new
  * upload re-checks consent and is refused 422 CONSENT_REQUIRED
- * (HOMEWORK_BUSINESS_RULES). So this outcome gets its own line, here rather than in a page, so the
- * portal and the app say the same thing. It also states the one good fact the settlement delivers,
- * that the pages were given back.
+ * (HOMEWORK_BUSINESS_RULES). So this outcome gets its own line. It also states the one good fact the
+ * settlement delivers, that the pages were given back.
+ *
+ * AUDIENCE (HUNT7-E-3, correcting the reason this docblock used to give — that the wording lived here
+ * rather than in a page so the app would print it too): this is PORTAL copy for a PARENT, and
+ * apps/web/src/pages/app/HomeworkPage.tsx is its only importer in the repo. It lives in this package
+ * beside the other outcome lines the page chooses among, not because a second surface prints it — none
+ * does. The app has no parent homework surface at all: apps/mobile/src/homework/ holds the CHILD's scan
+ * and results screens, and a child is never told about paid slots or money. The child's side of this
+ * same scan is `statusView`'s `failed_final` line in apps/mobile/src/homework/result-view.ts, with
+ * `childUploadMessage` (apps/mobile/src/homework/upload.ts) at the refusal itself.
+ * apps/web/src/pages/app/ArchivedChildCopy.test.tsx pins both halves: the importer set, and that no
+ * docblock here claims a surface that does not print it.
  */
 export const CONSENT_WITHDRAWN_SCAN_COPY =
   'Checking stopped because parental consent for this child’s learning data was withdrawn, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Give consent again on your family dashboard before scanning this worksheet once more.';
@@ -295,8 +305,21 @@ export const CONSENT_WITHDRAWN_SCAN_COPY =
  *
  * Both name the Children page, which is where a slot is assigned and an archived profile activated
  * again, and neither promises capacity this portal cannot sell (WEB-R1-04): with no unused slot that
- * page says where a slot comes from. Here rather than in a page so the portal and the app say the
- * same thing.
+ * page says where a slot comes from.
+ *
+ * AUDIENCE (HUNT7-E-3, correcting the reason this docblock used to give — that the wording lived here
+ * rather than in a page so the app would print it too): this is PORTAL copy for a PARENT, and
+ * apps/web/src/pages/app/HomeworkPage.tsx is its only importer in the repo. It lives in this package
+ * beside the other outcome lines the page chooses among, not because a second surface prints it — none
+ * does. The app has no parent homework surface at all: apps/mobile/src/homework/ holds the CHILD's scan
+ * and results screens, and a child is never told about paid slots or money. The child's side of this
+ * same scan is `statusView`'s `failed_final` line in apps/mobile/src/homework/result-view.ts, with
+ * `childUploadMessage` (apps/mobile/src/homework/upload.ts) at the refusal itself.
+ * apps/web/src/pages/app/ArchivedChildCopy.test.tsx pins both halves: the importer set, and that no
+ * docblock here claims a surface that does not print it. An ARCHIVED child, further, reaches no app screen to be
+ * told anything on: `app.current_child_id()` (supabase/migrations/0001_core_identity.sql) requires
+ * `c.status = 'active'`, so that child's paired device reads nothing and the app answers "Ask a
+ * grown-up to connect this device again" (`childLoadMessage`).
  */
 export const ARCHIVED_CHILD_SCAN_COPY =
   'Checking stopped because this child’s profile was archived, and this scan’s pages were given back to your monthly allowance. Nothing was wrong with the photos. Earlier scans and their results stay readable. Activate the profile again on the Children page, while a paid slot is free, to scan this worksheet once more.';
@@ -333,8 +356,28 @@ export const INACTIVE_CHILD_SCAN_COPY =
  * page's own "new scans are not taken" notice while telling the parent to go and get one.
  *
  * Both name the Children page, where a slot is assigned and an archived profile activated again, and
- * neither promises capacity this portal cannot sell (WEB-R1-04). Here rather than in a page so the
- * portal and the app say the same thing, beside the two lines they replace the advice of.
+ * neither promises capacity this portal cannot sell (WEB-R1-04). They sit beside the two lines they
+ * replace the advice of.
+ *
+ * AUDIENCE (HUNT7-E-3, and this docblock is where the over-claim was: the reason it used to give was
+ * that the wording lived here rather than in a page so the app would print it too). Both of these are
+ * PORTAL copy for a
+ * PARENT, printed by `NO_NEW_SCAN_COPY` in apps/web/src/pages/app/HomeworkPage.tsx, which is their
+ * only importer in the repo. Nothing under apps/mobile imports either, and nothing there should: the
+ * app has no parent-facing assignment list, apps/mobile/src/homework/ holds the CHILD's screens
+ * (child-api.ts, scan-session.ts, upload.ts, result-view.ts), and a child must never be told what
+ * their family has or has not paid for. The app's own line for a scan that cannot be re-sent is
+ * `statusView` in apps/mobile/src/homework/result-view.ts, which hedges its clear-photo advice with a
+ * grown-up and names no money, and `childUploadMessage` (apps/mobile/src/homework/upload.ts) at the
+ * refusal, whose `RULE_COPY` answers QUOTA_EXCEEDED, CONSENT_REQUIRED and CHILD_NOT_ACTIVE the same
+ * way. The child's screen is not reachable for either of THESE two states in any case:
+ * `app.current_child_id()` (supabase/migrations/0001_core_identity.sql) requires `c.status = 'active'`,
+ * so an archived or demoted child's paired device reads nothing at all.
+ *
+ * Checkable, not asserted: apps/web/src/pages/app/ArchivedChildCopy.test.tsx pins the importer set of
+ * each constant and forbids any docblock here from claiming a surface that does not print it, so
+ * giving the app a parent homework surface later fails that case instead of quietly vindicating a
+ * sentence nobody re-read.
  *
  * HUNT7-I-1 / HUNT7-E-2: and both STOP at that step. They used to end "and these pages can go through
  * then", which asserts that the profile is the only thing left in the way. For three of the five
@@ -375,6 +418,15 @@ export const ARCHIVED_CHILD_NO_NEW_SCAN_COPY =
  * the Children page actually offers a draft ("Assign one of your family's unused paid slots"), which
  * is true of both populations and still promises no capacity this portal cannot sell (WEB-R1-04):
  * that page says where a slot comes from when none is free.
+ *
+ * AUDIENCE (HUNT7-E-3): as for the archived line above, this is PORTAL copy for a PARENT and
+ * `NO_NEW_SCAN_COPY` in apps/web/src/pages/app/HomeworkPage.tsx is its only importer in the repo. No app
+ * file prints it: there is no parent homework surface on the phone, and a child is never told what their
+ * family has or has not paid for. The app's own line for a scan that cannot be re-sent is `statusView`
+ * in apps/mobile/src/homework/result-view.ts, hedged with a grown-up and naming no money, and
+ * `childUploadMessage` (apps/mobile/src/homework/upload.ts) at the refusal. A demoted child reaches
+ * neither: `app.current_child_id()` (supabase/migrations/0001_core_identity.sql) requires
+ * `c.status = 'active'`, so their paired device reads nothing while the profile is a draft.
  */
 export const INACTIVE_CHILD_NO_NEW_SCAN_COPY =
   'A new scan can’t help while this child has no paid slot: PencilLift takes no new scans for them. Assign one of your family’s unused paid slots to this profile on the Children page, while one is free.';

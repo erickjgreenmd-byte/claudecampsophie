@@ -155,18 +155,31 @@ describe('a deletion-pending child on the Children screen (ACC-FAM-03)', () => {
  * only word on the matter.
  */
 describe('neither parent screen can print “history only” for a deletion-pending child (HUNT7-G-3)', () => {
-  it('[repro] the phone helper reads the flag in the same statement as the portal helper', () => {
-    // L-037: one wording per state across the surfaces. The portal's `childStatusLabel` answers
-    // 'Data deletion under way' before its status switch; the phone's `childStatusText` must decide
-    // it the same way, in the helper both screens print from. family-view.test.ts asserts the
-    // resulting sentence behaviourally; this is the pin that the DECISION is the portal's, not a
-    // second one that can drift again.
-    expect(portal).toMatch(
-      /if \(child\.deletionPending === true\) return 'Data deletion under way';/,
-    );
-    expect(view).toMatch(
-      /if \(child\.deletionPending === true\) return 'Data deletion under way';/,
-    );
+  /**
+   * This case used to assert that the SAME STATEMENT appeared in both surfaces' source — a source pin
+   * over two copies. A stage-4 checker and the repo-wide parity audit both refused it: identical
+   * bodies in two files are a coincidence with good odds, not an invariant, and a pin on the words
+   * cannot see a predicate widened on one side. It broke the moment the real fix landed, which is the
+   * clearest evidence it was guarding the wrong thing.
+   *
+   * The decision now lives once, in `childStatusCopy` (packages/contracts/src/family.ts), which BOTH
+   * surfaces import. So what is asserted here is the property the old pin only approximated: neither
+   * surface holds its own copy of the decision. Mutating the shared sentence reds cases on the portal
+   * AND the phone — three each — which no pair of coincidentally-equal helpers could do.
+   */
+  it('neither surface decides the sentence for itself: there is one definition and both import it', () => {
+    for (const [name, src] of [
+      ['the phone helper', view],
+      ['the portal helper', portal],
+    ] as const) {
+      // No local re-derivation of the deciding flag, and no local status sentence.
+      expect(src, name).not.toMatch(/deletionPending === true\) return '/);
+      expect(src, name).not.toMatch(/return 'Archived: history only'/);
+      expect(src, name).not.toMatch(/return 'Draft: not active yet, no charge'/);
+      // And the one definition is what they call.
+      expect(src, name).toMatch(/childStatusCopy\(child\)/);
+      expect(src, name).toMatch(/childStatusCopy,?\n/);
+    }
   });
 
   it('both screens print that one helper’s sentence and hold no status copy of their own', () => {
@@ -200,7 +213,7 @@ describe('the phone child form sends only what the parent edited (HUNT7-G-4)', (
 
   it('marks each of the three fields touched from its own handler', () => {
     for (const field of ['nickname', 'gradeLevel', 'ageBand']) {
-      expect(children).toContain(`...t, ${field}: true`);
+      expect(children).toContain(`markEdited(t, '${field}')`);
     }
   });
 
@@ -226,11 +239,16 @@ describe('the phone child form sends only what the parent edited (HUNT7-G-4)', (
   it('is the rule the portal form already had, so the two surfaces decide alike', () => {
     // apps/web/src/pages/app/ChildrenPage.tsx EditChildForm: `touched` decides the body and
     // `nothingEdited` the button. The phone now hangs on the same two names.
-    expect(portal).toMatch(
-      /const \[touched, setTouched\] = useState\(\{ nickname: false, gradeLevel: false, ageBand: false \}\);/,
-    );
-    expect(children).toMatch(
-      /const \[touched, setTouched\] = useState\(\{ nickname: false, gradeLevel: false, ageBand: false \}\);/,
-    );
+    // BOTH forms now hold the SAME branded value from packages/contracts/src/family.ts, and neither
+    // builds its own: NOTHING_EDITED and markEdited are its only constructors, so an all-true literal
+    // is a compile error rather than a silent revert of the other guardian's edit.
+    for (const [name, src] of [
+      ['the portal form', portal],
+      ['the phone form', children],
+    ] as const) {
+      expect(src, name).toMatch(/useState\(NOTHING_EDITED\)/);
+      expect(src, name).toMatch(/childEditBody\(/);
+      expect(src, name).not.toMatch(/touched\.nickname \?/);
+    }
   });
 });

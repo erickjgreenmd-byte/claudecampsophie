@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
+  type AccountCloseOutcome,
   type DeletionRequest,
   type PrivacyFamilyView,
   type SafetyReport,
@@ -311,9 +312,16 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
   const SIGNED_OUT = { sessionEndConfirmed: true, secretsCleared: true } as const;
   /** The copy ASSERTING that the device is signed out, as opposed to hedging about it. */
   const ASSERTS_SIGNED_OUT = /(?:^|[.!]\s+|\band\s+)this device is signed out/i;
+  /** Every settled closure, and what the SERVER's half of it says when the device's half failed. */
+  const OUTCOMES = ['closed', 'after_family_purge', 'retrying'] as const;
+  const SERVER_HALF: Record<AccountCloseOutcome, RegExp> = {
+    closed: /account is closed/i,
+    after_family_purge: /closes automatically once your family account/i,
+    retrying: /could not finish closing your sign-in/i,
+  };
 
   it('[HUNT5-N6] says the device is signed out only when the sign-out reported that it was', () => {
-    for (const status of ['closed', 'pending'] as const) {
+    for (const status of OUTCOMES) {
       expect(ASSERTS_SIGNED_OUT.test(accountClosedDeviceMessage(status, SIGNED_OUT))).toBe(true);
 
       // [repro] HUNT6-J-1: the sign-out did not confirm the session ended. The account is closed
@@ -322,7 +330,7 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
         sessionEndConfirmed: false,
         secretsCleared: true,
       });
-      expect(failed).toMatch(status === 'closed' ? /account is closed/i : /closes automatically/i);
+      expect(failed).toMatch(SERVER_HALF[status]);
       expect(ASSERTS_SIGNED_OUT.test(failed)).toBe(false);
       // And it claims neither state: supabase-js removes the local session even when the logout call
       // failed, so "we could not sign this device out" would be an overstatement in the other
@@ -355,7 +363,42 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
       { sessionEndConfirmed: true, secretsCleared: false },
     ] as const) {
       expect(accountClosedDeviceMessage('closed', device)).not.toMatch(/change your password/i);
-      expect(accountClosedDeviceMessage('pending', device)).toMatch(/change your password/i);
+      // Both pending causes leave the sign-in in place — the owner's until the purge finishes, the
+      // refused one until the queued job closes it — so the remedy is real on both.
+      expect(accountClosedDeviceMessage('after_family_purge', device)).toMatch(
+        /change your password/i,
+      );
+      expect(accountClosedDeviceMessage('retrying', device)).toMatch(/change your password/i);
+    }
+  });
+
+  /**
+   * HUNT7-E-1. PREMISE: a `pending` answer has two causes, and only one of them is a family purge —
+   * POST /v1/account/close answers `pending` for a guardian (or an adult with no family) whenever
+   * `closeNow` could not close the sign-in, a path apps/api/tests/account-close.test.ts covers under
+   * 'guardian path when the auth service refuses' and the route's own header states. Their family is
+   * not being deleted at all: `removeGuardian` revokes their membership and the family stays live with
+   * its owner. The app printed the owner's sentence for both, so that parent read that their sign-in
+   * closes "once your family account's deletion has finished" — an event that will never happen, which
+   * reads as "nothing will close it", while the real mechanism (the queued `account_close` job
+   * retrying) was never mentioned. The reason now comes from the route, so each cause gets its own
+   * sentence; the app must print the one it was told.
+   */
+  it('[repro] a retried closure does not blame a family deletion for it (HUNT7-E-1)', () => {
+    const FAMILY_PURGE = /family account’s deletion has finished/i;
+    // The owner's cause is the purge, and keeps saying so.
+    expect(accountClosedDeviceMessage('after_family_purge', SIGNED_OUT)).toMatch(FAMILY_PURGE);
+    for (const device of [
+      SIGNED_OUT,
+      { sessionEndConfirmed: false, secretsCleared: true },
+      { sessionEndConfirmed: true, secretsCleared: false },
+    ] as const) {
+      const retrying = accountClosedDeviceMessage('retrying', device);
+      expect(retrying).not.toMatch(FAMILY_PURGE);
+      expect(retrying).not.toMatch(/family/i);
+      // And it says what IS happening: the close is being retried until it goes through.
+      expect(retrying).toMatch(/could not finish closing your sign-in/i);
+      expect(retrying).toMatch(/keeps trying/i);
     }
   });
 
@@ -484,8 +527,22 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
       { method: 'POST', path: '/v1/account/close', body: { confirm: true } },
     ]);
 
-    const pending = fakeApi({ send: () => ({ status: 'pending', signOut: true }) });
-    expect(await closeAccountAction(pending.api, true)).toEqual({ status: 'pending' });
+    // HUNT7-E-1: `pending` alone does not say what the parent should read, so the reason the route
+    // gave travels with it instead of being guessed at the screen.
+    const pending = fakeApi({
+      send: () => ({ status: 'pending', reason: 'retrying', signOut: true }),
+    });
+    expect(await closeAccountAction(pending.api, true)).toEqual({
+      status: 'pending',
+      reason: 'retrying',
+    });
+    const afterPurge = fakeApi({
+      send: () => ({ status: 'pending', reason: 'after_family_purge', signOut: true }),
+    });
+    expect(await closeAccountAction(afterPurge.api, true)).toEqual({
+      status: 'pending',
+      reason: 'after_family_purge',
+    });
 
     // And the copy is not reachable by field access from here either: an error keeps its message,
     // because the 'refused' step is what shows it.

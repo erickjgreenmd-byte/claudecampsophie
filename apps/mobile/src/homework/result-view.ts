@@ -106,7 +106,14 @@ export function statusView(status: AssignmentStatus): StatusView {
     case 'uploading':
       return {
         title: 'Not sent yet',
-        body: 'This scan hasn’t finished sending. Open Scan to send it again.',
+        // 'draft'/'uploading' is EXACTLY the state a refused finalize leaves a scan in: POST
+        // /v1/assignments/:id/finalize runs assertCanCollect and assertWithinAllowance and throws
+        // QUOTA_EXCEEDED, CONSENT_REQUIRED or CHILD_NOT_ACTIVE with the status still 'uploading'
+        // (apps/api/src/routes/homework.ts). So 'send it again' on its own is a loop the child
+        // cannot get out of, for three of the reasons they can land here — and the child cannot
+        // tell which. The grown-up belongs in the line for the same reason as the rescan advice
+        // beside it; naming no money and no plan keeps it the child's business (child privacy).
+        body: 'This scan hasn’t finished sending. Open Scan to try again — or ask a grown-up for help.',
         showResults: false,
         inProgress: false,
       };
@@ -130,9 +137,19 @@ export function statusView(status: AssignmentStatus): StatusView {
     case 'ready':
       return { title: 'Your results are ready', body: '', showResults: true, inProgress: false };
     case 'needs_rescan':
+      // HUNT7-E-3: the clear-photo advice stays — it is what helps in the common case — but it hedges,
+      // because the re-send it asks for can be refused outright and the child is the one who wastes the
+      // effort. POST /v1/assignments goes through `assertCanCollect` (apps/api/src/routes/homework.ts),
+      // which refuses CONSENT_REQUIRED or CHILD_NOT_ACTIVE, and the page allowance refuses
+      // QUOTA_EXCEEDED; `childUploadMessage`'s `RULE_COPY` (./upload.ts) already answers all three with
+      // a grown-up and no money, so the grown-up belongs in the advice printed BEFORE the child
+      // re-photographs the worksheet as well. Money and slots are forbidden here whatever the cause:
+      // the PARENT's version of this sentence is the portal's (ARCHIVED_CHILD_NO_NEW_SCAN_COPY and
+      // INACTIVE_CHILD_NO_NEW_SCAN_COPY in packages/contracts/src/privacy.ts), which no child screen
+      // prints. The sibling `failed_final` line below was hedged the same way and for the same reason.
       return {
         title: 'Let’s get a clearer picture',
-        body: 'Some pages were hard to read. Try scanning them again in good light, flat on a table.',
+        body: 'Some pages were hard to read. Try scanning them again in good light, flat on a table — or ask a grown-up for help.',
         showResults: false,
         inProgress: false,
       };

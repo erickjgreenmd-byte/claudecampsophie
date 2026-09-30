@@ -1754,9 +1754,18 @@ describe('[G-DRAFT] the draft child’s notice says what is true of a draft', ()
             : undefined,
     });
     renderPage(<HomeworkPage />, { api });
-    // The contradicting fact, from the page itself: this profile has never had a slot.
+    // This case used to assert the picker said “no paid slot YET”, under a comment claiming “this
+    // profile has never had a slot”. That claim is false for the population it matters to:
+    // `releaseSlotlessProfiles` (apps/api/src/services/billing-sync.ts) returns a previously ACTIVE
+    // child to 'draft' when the plan expires or the store confirms a downgrade, so a family that
+    // HAD been paying reads it. BUG-406 removed the word from the Children card and a second copy
+    // survived here — in this picker, printed on this page and the planner — pinned by this
+    // assertion. The suffix now comes from `childPickerSuffixCopy` in packages/contracts, shared
+    // with the phone, and says no such thing.
     const picker = await screen.findByLabelText('Child');
-    expect(within(picker).getByRole('option').textContent).toMatch(/no paid slot yet/i);
+    const option = within(picker).getByRole('option').textContent ?? '';
+    expect(option).toMatch(/no paid slot/i);
+    expect(option).not.toMatch(/\byet\b/i);
 
     const scans = await screen.findByRole('region', { name: 'Scans' });
     expect(within(scans).queryAllByText(/paid slot again/i)).toEqual([]);

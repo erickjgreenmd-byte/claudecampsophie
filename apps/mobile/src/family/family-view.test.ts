@@ -17,6 +17,8 @@ import {
   parentActionError,
   slotSummary,
   unusedPaidSlots,
+  markEdited,
+  NOTHING_EDITED,
 } from './family-view.ts';
 
 const RILEY = '6f1c2f0e-1f4b-4c8e-9b3a-2d3e4f5a6b7c';
@@ -387,16 +389,22 @@ describe('the no-slot note does not tell a lapsed family they never paid (HUNT7-
  */
 describe('a phone child edit sends only the fields the parent edited (HUNT7-G-4)', () => {
   const fields = { nickname: 'Riley R.', gradeLevel: 3, ageBand: '8-10' } as const;
-  const nothing = { nickname: false, gradeLevel: false, ageBand: false } as const;
+  // NOTHING_EDITED and markEdited are the ONLY builders of a ChildEditTouched: it carries a
+  // module-private brand precisely so the screen cannot pass an all-true literal (HUNT7-G-4's
+  // checker blocker — that literal restored the whole defect with everything green). These cases
+  // therefore exercise the real construction path rather than a shape that mimics it.
+  const nothing = NOTHING_EDITED;
+  const edited = (...fs: ('nickname' | 'gradeLevel' | 'ageBand')[]) =>
+    fs.reduce(markEdited, NOTHING_EDITED);
 
   it('[repro] a nickname-only edit carries the nickname alone, so the other guardian’s grade survives', () => {
-    expect(childEditBody(fields, { ...nothing, nickname: true })).toEqual({ nickname: 'Riley R.' });
+    expect(childEditBody(fields, edited('nickname'))).toEqual({ nickname: 'Riley R.' });
   });
 
   it('carries each field on its own, and all three together', () => {
-    expect(childEditBody(fields, { ...nothing, gradeLevel: true })).toEqual({ gradeLevel: 3 });
-    expect(childEditBody(fields, { ...nothing, ageBand: true })).toEqual({ ageBand: '8-10' });
-    expect(childEditBody(fields, { nickname: true, gradeLevel: true, ageBand: true })).toEqual({
+    expect(childEditBody(fields, edited('gradeLevel'))).toEqual({ gradeLevel: 3 });
+    expect(childEditBody(fields, edited('ageBand'))).toEqual({ ageBand: '8-10' });
+    expect(childEditBody(fields, edited('nickname', 'gradeLevel', 'ageBand'))).toEqual({
       nickname: 'Riley R.',
       gradeLevel: 3,
       ageBand: '8-10',
@@ -415,7 +423,7 @@ describe('a phone child edit sends only the fields the parent edited (HUNT7-G-4)
     // BUG-330: "edited" is not "differs from the seed". A parent who retypes the value the form
     // opened on is putting it back deliberately — most sharply when the other guardian's value
     // landed under the open form — and that save must reach the server.
-    expect(childEditBody({ ...fields, gradeLevel: 3 }, { ...nothing, gradeLevel: true })).toEqual({
+    expect(childEditBody({ ...fields, gradeLevel: 3 }, edited('gradeLevel'))).toEqual({
       gradeLevel: 3,
     });
   });

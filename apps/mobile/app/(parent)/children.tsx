@@ -22,6 +22,8 @@ import {
   activationMessage,
   childArchiveLabel,
   childEditBody,
+  markEdited,
+  NOTHING_EDITED,
   childEditDriftNote,
   childRows,
   gradeText,
@@ -410,7 +412,10 @@ function EditChild({
    * already chosen: a press is an explicit act on that field, and re-asserting the value on screen is
    * exactly the dead end BUG-330 was filed for. It cannot revert anything the parent has not touched.
    */
-  const [touched, setTouched] = useState({ nickname: false, gradeLevel: false, ageBand: false });
+  // NOTHING_EDITED and markEdited are the only builders of a ChildEditTouched (it carries a
+  // module-private brand), so this state cannot be replaced by an all-true literal without a
+  // compile error — which is the point: that literal WAS the restorable defect (HUNT7-G-4).
+  const [touched, setTouched] = useState(NOTHING_EDITED);
 
   /** Only the fields the parent edited here (WEBR4-03, HUNT5-F-1, HUNT6-G-8, HUNT7-G-4). */
   const changes = (name: string) =>
@@ -446,7 +451,7 @@ function EditChild({
         autoCorrect={false}
         onChangeText={(text) => {
           setNickname(text);
-          setTouched((t) => ({ ...t, nickname: true }));
+          setTouched((t) => markEdited(t, 'nickname'));
           setFieldError(null);
         }}
         placeholderTextColor={colors.muted}
@@ -457,7 +462,7 @@ function EditChild({
         value={grade}
         onChange={(value) => {
           setGrade(value);
-          setTouched((t) => ({ ...t, gradeLevel: true }));
+          setTouched((t) => markEdited(t, 'gradeLevel'));
         }}
       />
       <Choice
@@ -466,7 +471,7 @@ function EditChild({
         value={ageBand}
         onChange={(value) => {
           setAgeBand(value);
-          setTouched((t) => ({ ...t, ageBand: true }));
+          setTouched((t) => markEdited(t, 'ageBand'));
         }}
       />
       <Body muted>

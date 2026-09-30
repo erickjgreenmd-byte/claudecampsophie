@@ -1,5 +1,9 @@
 import { Link, useLocation } from 'react-router';
-import { ACCOUNT_CLOSE_COPY, SIGN_OUT_NOT_TOLD_COPY } from '@pencillift/contracts';
+import {
+  ACCOUNT_CLOSE_OUTCOME_COPY,
+  SIGN_OUT_NOT_TOLD_COPY,
+  type AccountCloseOutcome,
+} from '@pencillift/contracts';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
 import { DraftOnly, draftPrefix, lead, PageTitle, Section, SupportEmail } from './common.tsx';
 
@@ -19,12 +23,36 @@ import { DraftOnly, draftPrefix, lead, PageTitle, Section, SupportEmail } from '
  * export_build job and can be downloaded before deleting (RV-public-site-2 resolved).
  */
 
-/** Set by the parent area after an in-app closure (router state, never a URL parameter). */
-type ClosedState = 'closed' | 'pending';
+/**
+ * What the parent area puts in the router state (never a URL parameter) for each closure OUTCOME, and
+ * the only vocabulary this page reads. One value per outcome, because each outcome has its own sentence
+ * and a `pending` closure that waits for the family purge is not the same event as one the closing
+ * service refused and the queued job is retrying (HUNT7-E-1). The writer imports this map
+ * (PrivacyControlsPage's AccountCloseSection), so the two halves of the handover cannot drift; the
+ * parse below is derived from it rather than written out again, and a value it does not hold shows no
+ * notice at all — this page is public, and a stranger's plain GET must raise nothing.
+ *
+ * `pending` is the value the parent area sent before this change, when the owner's sentence was the only
+ * pending sentence it had, so it maps to that outcome; the retried closure — the one that was being
+ * told the owner's story — is what the new value is for. Renaming rather than adding would have gained
+ * nothing here and would have invalidated the public page's own review case for the owner's notice.
+ */
+export const CLOSURE_ROUTER_STATE = {
+  closed: 'closed',
+  after_family_purge: 'pending',
+  retrying: 'pending_retry',
+} as const satisfies Record<AccountCloseOutcome, string>;
 
-function closedFromState(state: unknown): ClosedState | null {
+const OUTCOME_BY_ROUTER_STATE = new Map<string, AccountCloseOutcome>(
+  Object.entries(CLOSURE_ROUTER_STATE).map(([outcome, value]) => [
+    value,
+    outcome as AccountCloseOutcome,
+  ]),
+);
+
+function closedFromState(state: unknown): AccountCloseOutcome | null {
   const value = (state as { accountClosed?: unknown } | null)?.accountClosed;
-  return value === 'closed' || value === 'pending' ? value : null;
+  return typeof value === 'string' ? (OUTCOME_BY_ROUTER_STATE.get(value) ?? null) : null;
 }
 
 /**
@@ -45,16 +73,19 @@ function signOutRefusedFromState(state: unknown): boolean {
  * keeping the parent on the portal page otherwise (HUNT6-G-1). What failed is telling the auth
  * service.
  *
- * HUNT6-G-6: which remedy follows depends on the outcome, so there are two strings, not one. On
- * `pending` the sign-in is deliberately still usable until the family purge finishes, so a password
- * change is something the parent can carry out — that string is the one SignOutControl says on its
- * own path, shared through the contracts constant. On `closed` the sign-in is gone: naming a password
- * change or a sign-out elsewhere would ask the parent, on the screen confirming their account is
- * deleted, to do two things the deletion has just made impossible. The earlier copy said the same
- * sentence for both and its comment justified that with "a session elsewhere may still work", which
- * is a property only the `pending` path has.
+ * HUNT6-G-6: which remedy follows depends on the outcome, so there are two strings, not one. While the
+ * closure is pending the sign-in is still there, so a password change is something the parent can
+ * carry out — that string is the one SignOutControl says on its own path, shared through the contracts
+ * constant. On `closed` the sign-in is gone: naming a password change or a sign-out elsewhere would ask
+ * the parent, on the screen confirming their account is deleted, to do two things the deletion has just
+ * made impossible. The earlier copy said the same sentence for both and its comment justified that with
+ * "a session elsewhere may still work", which is a property only a pending closure has.
+ *
+ * HUNT7-E-1: both pending causes keep the sign-in, for different reasons — the owner's until the purge
+ * finishes, the retried one until the queued job gets through — so this branches on `closed` alone and
+ * the closure sentence above says which cause it was.
  */
-function serverNotTold(closed: ClosedState): string {
+function serverNotTold(closed: AccountCloseOutcome): string {
   return closed === 'closed'
     ? SIGN_OUT_NOT_TOLD_COPY.signInClosed
     : SIGN_OUT_NOT_TOLD_COPY.signInOpen;
@@ -74,9 +105,7 @@ export default function AccountDeletionPage() {
       {closed ? (
         <div className="notice" role="status" style={{ marginBottom: 16 }}>
           <p style={{ margin: 0 }}>
-            <strong>
-              {closed === 'closed' ? ACCOUNT_CLOSE_COPY.closed : ACCOUNT_CLOSE_COPY.pending}
-            </strong>
+            <strong>{ACCOUNT_CLOSE_OUTCOME_COPY[closed].full}</strong>
           </p>
           {signOutRefused ? <p style={{ margin: '8px 0 0' }}>{serverNotTold(closed)}</p> : null}
         </div>
@@ -152,7 +181,8 @@ export default function AccountDeletionPage() {
           <li>The deleted family or child data can no longer be opened from any device.</li>
           <li>
             When you delete your own account, your sign-in stops working everywhere as soon as it is
-            closed (at once for a guardian; after the family deletion for the family owner).
+            closed (at once for a guardian, or shortly after if we can’t reach the sign-in service
+            right then; after the family deletion for the family owner).
           </li>
         </ul>
         <h3>Within 30 days</h3>

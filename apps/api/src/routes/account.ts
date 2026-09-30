@@ -1,5 +1,9 @@
 import { Hono } from 'hono';
-import { ACCOUNT_CLOSE_RULES, closeAccountRequestSchema } from '@pencillift/contracts';
+import {
+  ACCOUNT_CLOSE_RULES,
+  closeAccountRequestSchema,
+  type CloseAccountResponse,
+} from '@pencillift/contracts';
 import { readJson } from '../app.ts';
 import type { Tx } from '../db.ts';
 import { ApiError } from '../errors.ts';
@@ -21,6 +25,10 @@ import type { AuthAdminProvider } from '../providers/index.ts';
  *   when the auth service could not be reached (the queued job retries; the token stops working
  *   the moment the user is closed).
  * - An adult without a family closes their sign-in at once.
+ * The two `pending` answers are not the same event, so each carries the `reason` of the branch that
+ * produced it — `after_family_purge` above, `retrying` here — and the parent reads the sentence that
+ * follows from it (HUNT7-E-1; ACCOUNT_CLOSE_OUTCOME_COPY). Only this handler knows which branch it
+ * took, so the value is set here and never inferred from the status downstream.
  * Every answer says `signOut: true`; the device clears its parent session through its normal
  * sign-out path. Audit rows carry ids only; the log carries the outcome only.
  */
@@ -100,7 +108,12 @@ export function accountRoutes(): Hono<AppEnv> {
 
     if (owned) {
       deps.log({ level: 'info', event: 'account_close_requested', code: 'AFTER_PURGE' });
-      return c.json({ status: 'pending', signOut: true }, 202);
+      const afterPurge: CloseAccountResponse = {
+        status: 'pending',
+        reason: 'after_family_purge',
+        signOut: true,
+      };
+      return c.json(afterPurge, 202);
     }
     const closed = await closeNow(authAdmin, deps, userId);
     deps.log({
@@ -108,7 +121,12 @@ export function accountRoutes(): Hono<AppEnv> {
       event: 'account_close_requested',
       code: closed ? 'CLOSED' : 'QUEUED',
     });
-    return c.json({ status: closed ? 'closed' : 'pending', signOut: true }, closed ? 200 : 202);
+    // `retrying` because that is what this branch did: `closeNow` answered false, so nothing is being
+    // purged for this caller and the queued job is the only thing that will close the sign-in.
+    const answer: CloseAccountResponse = closed
+      ? { status: 'closed', signOut: true }
+      : { status: 'pending', reason: 'retrying', signOut: true };
+    return c.json(answer, closed ? 200 : 202);
   });
 
   return r;

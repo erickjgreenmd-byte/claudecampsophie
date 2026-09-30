@@ -16,6 +16,12 @@ import {
   type FamilyChild,
   type FamilyOverview,
   type UpdateChildProfileRequest,
+  childEditBody,
+  childPickerSuffixCopy,
+  childStatusCopy,
+  markEdited,
+  NOTHING_EDITED,
+  type ChildCopySubject,
 } from '@pencillift/contracts';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
@@ -63,21 +69,13 @@ const AGE_BAND_OPTIONS: readonly AgeBand[] = ageBandSchema.options;
  * WEB-R2-03 makes 'archived' reachable in one click, and a requested deletion archives a child too:
  * for those two there is no slot waiting to be bought, so the sentence was false and unactionable.
  */
-export function childPickerSuffix(child: {
-  status: string;
-  // `| undefined` explicitly: with exactOptionalPropertyTypes a caller's parsed
-  // `deletionPending?: boolean | undefined` is not assignable to a bare optional (HUNT5-F-2).
-  deletionPending?: boolean | undefined;
-}): string {
-  if (child.deletionPending === true) return ' (data deletion under way)';
-  switch (child.status) {
-    case 'active':
-      return '';
-    case 'archived':
-      return ' (archived — history only)';
-    default:
-      return ' (no paid slot yet)';
-  }
+export function childPickerSuffix(child: ChildCopySubject): string {
+  // Delegates to the ONE definition in packages/contracts/src/family.ts. This used to hold its own
+  // switch, whose `default:` arm returned ' (no paid slot yet)' — the "yet" BUG-406 removed from the
+  // same claim on the Children card, still live here and printed by HomeworkPage and
+  // LearningPlannerPage, because that repair's grep was for the other wording (L-057's third copy, in
+  // the file the repair itself edited). Its archived arm also disagreed with the phone's.
+  return childPickerSuffixCopy(child);
 }
 
 /**
@@ -91,21 +89,12 @@ export function childPickerSuffix(child: {
  * sentence from the dashboard row by wrapping the CALL there; the sibling call on this page kept it,
  * so the branch lives in the one helper both surfaces print from (L-037).
  */
-export function childStatusLabel(child: {
-  status: FamilyChild['status'];
-  // `| undefined` explicitly: with exactOptionalPropertyTypes a caller's parsed
-  // `deletionPending?: boolean | undefined` is not assignable to a bare optional.
-  deletionPending?: boolean | undefined;
-}): string {
-  if (child.deletionPending === true) return 'Data deletion under way';
-  switch (child.status) {
-    case 'draft':
-      return 'Draft: not active yet, no charge';
-    case 'active':
-      return 'Active: uses a paid slot';
-    case 'archived':
-      return 'Archived: history only';
-  }
+export function childStatusLabel(child: ChildCopySubject): string {
+  // Delegates to the ONE definition in packages/contracts/src/family.ts, which the app imports too.
+  // The docblock above this used to claim "the branch lives in the one helper both surfaces print
+  // from (L-037)" while the phone held a byte-identical copy of the same switch — the exact false
+  // claim round 7's largest finding is named after, in the file that defined the helper.
+  return childStatusCopy(child);
 }
 
 function Children() {
@@ -715,18 +704,23 @@ function EditChildForm({
    * diff decides any of that any more: `seed` only seeds the fields, and `drifted` below is the one
    * comparison left in this form — of the live prop against the seed, to say what changed under it.
    */
-  const [touched, setTouched] = useState({ nickname: false, gradeLevel: false, ageBand: false });
+  // The SAME branded value the phone form uses (packages/contracts/src/family.ts): NOTHING_EDITED
+  // and markEdited are its only builders, so neither form can pass an all-true literal and send a
+  // field the parent never edited. That literal is the defect, and on the phone it typechecked.
+  const [touched, setTouched] = useState(NOTHING_EDITED);
   const nicknameId = useId();
   const gradeId = useId();
   const bandId = useId();
   const errorId = useId();
 
-  /** Only the fields the parent edited in this form (WEBR4-03, HUNT5-F-1, HUNT6-G-8). */
-  const changes = (name: string): UpdateChildProfileRequest => ({
-    ...(touched.nickname ? { nickname: name } : {}),
-    ...(touched.gradeLevel ? { gradeLevel: Number(grade) } : {}),
-    ...(touched.ageBand ? { ageBand } : {}),
-  });
+  /**
+   * Only the fields the parent edited in this form (WEBR4-03, HUNT5-F-1, HUNT6-G-8) — now by the ONE
+   * shared rule rather than a second copy of it. The phone held a byte-identical re-derivation for
+   * three rounds while this one was pinned, which is why it silently reverted the other guardian's
+   * grade; a checker proved mutating one could not red a single test on the other.
+   */
+  const changes = (name: string): UpdateChildProfileRequest =>
+    childEditBody({ nickname: name, gradeLevel: Number(grade), ageBand }, touched);
   const nothingEdited = Object.keys(changes(nickname.trim())).length === 0;
 
   /**
@@ -779,7 +773,7 @@ function EditChildForm({
         aria-describedby={fieldError ? errorId : undefined}
         onChange={(e) => {
           setNickname(e.target.value);
-          setTouched((t) => ({ ...t, nickname: true }));
+          setTouched((t) => markEdited(t, 'nickname'));
           setFieldError(null);
         }}
       />
@@ -794,7 +788,7 @@ function EditChildForm({
         value={grade}
         onChange={(e) => {
           setGrade(e.target.value);
-          setTouched((t) => ({ ...t, gradeLevel: true }));
+          setTouched((t) => markEdited(t, 'gradeLevel'));
         }}
       >
         {GRADES.map((g) => (
@@ -809,7 +803,7 @@ function EditChildForm({
         value={ageBand}
         onChange={(e) => {
           setAgeBand(e.target.value as AgeBand);
-          setTouched((t) => ({ ...t, ageBand: true }));
+          setTouched((t) => markEdited(t, 'ageBand'));
         }}
       >
         {AGE_BAND_OPTIONS.map((band) => (

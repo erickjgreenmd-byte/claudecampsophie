@@ -17,6 +17,191 @@ export const childProfileStatusSchema = z.enum(CHILD_PROFILE_STATUSES);
 export type ChildProfileStatus = z.infer<typeof childProfileStatusSchema>;
 
 /**
+ * PARENT-FACING COPY ABOUT A CHILD'S STATUS — ONE DEFINITION, BOTH SURFACES.
+ *
+ * This exists because the claim "one helper decides the sentence for every surface" was written five
+ * times inside `apps/web` alone (HUNT6-G-2, HUNT6-H-4, WEBR4-03, HUNT5-F-1, HUNT6-G-8) and was false
+ * every time: the phone kept printing the older sentence, and seven of round 7's sixty findings are
+ * that one shape. Round 7's first repair made the two helpers BYTE-IDENTICAL in two files and tied
+ * them together with tests that read each other's source. A stage-4 checker and the repo-wide parity
+ * audit both refused that: a source pin catches a reworded sentence but NOT a widened predicate, so it
+ * guards the words and not the meaning — two identical switch bodies are a coincidence with good odds,
+ * not an invariant (L-066, L-070).
+ *
+ * So the decision lives here, where `apps/web` and `apps/mobile` can both import it and neither can
+ * hold its own copy. `packages/contracts/src/family.ts` is already `export *`-ed from the index, so
+ * this needs no new registration point.
+ *
+ * The API is a FUNCTION over the child rather than a lookup table on the status, because the deciding
+ * fact is not the status: `public.request_deletion` archives a child-scope target in the same
+ * transaction that enqueues the purge, so EVERY deletion-pending child is `archived`, and a table
+ * keyed on status alone would answer "Archived: history only" — that the history is KEPT — for exactly
+ * the children whose history is being deleted. The flag is therefore tested FIRST, and a caller cannot
+ * skip that by reading a different key.
+ */
+export interface ChildCopySubject {
+  readonly status: string;
+  /**
+   * `| undefined` explicitly: with `exactOptionalPropertyTypes` a caller's parsed
+   * `deletionPending?: boolean | undefined` is not assignable to a bare optional (HUNT5-F-2).
+   */
+  readonly deletionPending?: boolean | undefined;
+}
+
+/** What the parent reads when the purge is running. Precedes every status word. */
+export const CHILD_DELETION_PENDING_STATUS = 'Data deletion under way';
+
+/**
+ * The status sentence, for a child whose data is NOT being deleted. Exported so a test can assert the
+ * set is exactly `CHILD_PROFILE_STATUSES` — a fourth status must not fall through to a sentence
+ * written for a third (L-057).
+ */
+export const CHILD_STATUS_COPY: Readonly<Record<ChildProfileStatus, string>> = {
+  draft: 'Draft: not active yet, no charge',
+  active: 'Active: uses a paid slot',
+  archived: 'Archived: history only',
+};
+
+/** The one status sentence both the portal and the app print. */
+export function childStatusCopy(child: ChildCopySubject): string {
+  if (child.deletionPending === true) return CHILD_DELETION_PENDING_STATUS;
+  return Object.hasOwn(CHILD_STATUS_COPY, child.status)
+    ? CHILD_STATUS_COPY[child.status as ChildProfileStatus]
+    : // A status neither surface has heard of: say what is certain and claim nothing else. Answering
+      // with a third status's sentence is how "no paid child slots yet" reached a family whose plan
+      // had lapsed (BUG-406).
+      'Status unavailable';
+}
+
+/**
+ * The suffix on a child's name in a picker. Two of its three arms had DIVERGED between the surfaces
+ * (the audit's finding): the portal said ' (archived — history only)' where the phone said
+ * ' (archived — plan is read-only)', and the portal's `default:` arm said ' (no paid slot YET)' where
+ * the phone said ' (no paid slot)'. "Yet" is the word BUG-406 removed from the same claim elsewhere,
+ * and it is false for a family whose plan lapsed: `releaseSlotlessProfiles` returns a previously
+ * ACTIVE child to 'draft' on an expiry or a store-confirmed downgrade. The portal kept it here, on two
+ * further pages, because the repair's grep was for the other wording.
+ */
+export const CHILD_PICKER_SUFFIX_COPY = {
+  deletionPending: ' (data deletion under way)',
+  draft: ' (no paid slot)',
+  active: '',
+  archived: ' (archived — history only)',
+} as const;
+
+/** The one picker suffix both surfaces print. */
+export function childPickerSuffixCopy(child: ChildCopySubject): string {
+  if (child.deletionPending === true) return CHILD_PICKER_SUFFIX_COPY.deletionPending;
+  return Object.hasOwn(CHILD_PICKER_SUFFIX_COPY, child.status)
+    ? CHILD_PICKER_SUFFIX_COPY[child.status as ChildProfileStatus]
+    : // Claim nothing for a status we do not know rather than assert the draft arm (L-057).
+      '';
+}
+
+/**
+ * Whether PencilLift prepares practice for this child. The single definition of the question that four
+ * separate screen regions were each deciding for themselves (BUG-402, L-068), now shared by the portal
+ * and the app rather than mirrored in each.
+ *
+ * The four statements that decide it: `app.current_child_id()` requires `c.status = 'active'`
+ * (migration 0001), so no request from the child's device can open a set for any other status;
+ * `loadChildContext` prepares nothing for a non-active profile (apps/api/src/jobs/learning-jobs.ts);
+ * activation is what assigns a paid slot; and archiving releases it.
+ *
+ * It is NOT the same question as "is this plan read-only" — `ownedChild(c, 'write')` keeps a DRAFT
+ * child's plan writable on purpose, so the two agree for 'archived' and disagree for every draft. A
+ * region that needs the other question must ask the other question.
+ */
+export function receivesPractice(childStatus: string | undefined): boolean {
+  return childStatus === 'active';
+}
+
+/** The three editable fields of a child profile, as a form holds them. */
+export interface ChildEditFields {
+  readonly nickname: string;
+  readonly gradeLevel: number;
+  readonly ageBand: AgeBand;
+}
+
+/**
+ * Which of them the parent has edited in THIS form.
+ *
+ * BRANDED ON PURPOSE (HUNT7-G-4, the checker's blocker). The first version of this fix put the rule in
+ * `childEditBody` and tested it as a pure function — and left the CALL SITE unpinned, so passing
+ * `{ nickname: true, gradeLevel: true, ageBand: true }` instead of the real `touched` state restored
+ * the whole defect (the phone sends a field the parent never edited, reverting the other guardian's
+ * change) with the full mobile suite, `tsc` and `eslint` all green. A source-text pin would only guard
+ * the spelling of that argument.
+ *
+ * So the type makes the wrong argument impossible instead: `editedBrand` is a module-private
+ * `unique symbol`, so no object literal written outside this file can satisfy this interface. The only
+ * values that exist are `NOTHING_EDITED` and what `markEdited` returns, both of which carry the real
+ * per-field flags. Restoring the defect is now a COMPILE error, which the gate already runs — a
+ * guarantee rather than an assertion about source text (L-070).
+ */
+declare const editedBrand: unique symbol;
+export interface ChildEditTouched {
+  readonly nickname: boolean;
+  readonly gradeLevel: boolean;
+  readonly ageBand: boolean;
+  /** Module-private brand; see above. Never read, and unwritable from outside this file. */
+  readonly [editedBrand]: true;
+}
+
+/** The starting point: the parent has edited nothing, so an immediate Save sends nothing. */
+export const NOTHING_EDITED = {
+  nickname: false,
+  gradeLevel: false,
+  ageBand: false,
+  // The cast is the brand's ONE constructor and is confined to this module. `editedBrand` is declared
+  // in type space only (`declare const`), so it does not exist at runtime and must never appear in a
+  // value: writing `[editedBrand]: true` here threw `ReferenceError: editedBrand is not defined` when
+  // the module loaded, which took two whole test FILES to zero — 54 cases that reported as "passing"
+  // by being absent. The raised floor in scripts/test-minimums.json is what would have caught it.
+} as unknown as ChildEditTouched;
+
+/** Record that the parent edited one field. The only way to build a `ChildEditTouched` that sends. */
+export function markEdited(
+  touched: ChildEditTouched,
+  field: 'nickname' | 'gradeLevel' | 'ageBand',
+): ChildEditTouched {
+  return { ...touched, [field]: true };
+}
+
+/**
+ * What PATCH /v1/children/:childId carries from the phone's child form: the fields the parent EDITED
+ * there, and nothing else (HUNT7-G-4).
+ *
+ * The form used to seed all three fields from the live prop once and then send all three,
+ * unconditionally, from that seed. The card is keyed on `row.id` (app/(parent)/children.tsx), so a
+ * reload never remounts it and the seed is as old as the open form: guardian B moved the child up a
+ * grade on the portal while parent A had the phone form open on the old grade, A corrected a typo in
+ * the nickname, and the PATCH put the grade back — the route writes exactly the fields present and
+ * the contract's refine only rejects an empty body (packages/contracts/src/family.ts). That is
+ * BUG-222/WEBR4-03 verbatim, which the portal fixed in round 4 (WEBR4-03), again in round 5
+ * (HUNT5-F-1) and again in round 6 (HUNT6-G-8), each time inside apps/web only.
+ *
+ * "Edited" and not "differs from the seed": those two are the same until a concurrent change lands,
+ * and after it the field the parent can SEE becomes unsavable, which is BUG-330. Reseeding the fields
+ * from the live prop is not the fix either — that is the loss HUNT5-F-1 was filed for — so the form
+ * carries `childEditDriftNote` below instead.
+ *
+ * The rule is a value-in/value-out helper because this suite cannot render react-native (see
+ * apps/mobile/vitest.config.ts): a rule that only exists inside a screen cannot be tested at all,
+ * which is why the phone kept the defect for three rounds while the portal's was pinned.
+ */
+export function childEditBody(
+  fields: ChildEditFields,
+  touched: ChildEditTouched,
+): UpdateChildProfileRequest {
+  return {
+    ...(touched.nickname ? { nickname: fields.nickname } : {}),
+    ...(touched.gradeLevel ? { gradeLevel: fields.gradeLevel } : {}),
+    ...(touched.ageBand ? { ageBand: fields.ageBand } : {}),
+  };
+}
+
+/**
  * Launch scope is K-8, children under 13 (API-AUTH-R1-05, docs/Threat_Model.md T38): no band for
  * 14-18 is offered, so a profile can never be declared outside the under-13 consent and
  * child-mode flows. Widening it is a product decision (the database check already allows more).

@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { cleanup, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
@@ -552,12 +552,11 @@ function functionStarts(text: string): { name: string; at: number }[] {
   }));
 }
 
-/** The innermost named function a position sits in — the LAST one declared before it. */
-function enclosingFunction(text: string, at: number): string {
-  let name = '';
-  for (const start of functionStarts(text)) if (start.at < at) name = start.name;
-  return name;
-}
+// `enclosingFunction` used to live here, to allow ONE named function to carry the "you asked for a
+// deletion" sentence. HUNT7-E-1 moved that sentence into the shared contract, so the portal now needs
+// no allowance at all and the guard is strictly stronger: not "at most one, and only there" but "none
+// here, and the one that exists is in the contract". The helper went with the allowance rather than
+// being left unused. `functionStarts` stays — `componentAround` below still uses it.
 
 /**
  * The COMPONENT a match sits in: from the function declaration that encloses it to the next one, or
@@ -644,20 +643,49 @@ describe('[G-THIRD-NOTICE] no deletion notice in the portal claims the reader as
      * (apps/api/src/routes/family.ts). Named here rather than excluded by a narrower pattern, so a
      * FOURTH copy still has to come past this case; asserted below, so it cannot quietly stop existing.
      */
-    const allowedInside = 'stillSignedInCopy';
+    // WHERE THE ALLOWED SENTENCE LIVES MOVED, and this case had to move with it. HUNT7-E-1 took the
+    // closure outcome out of `stillSignedInCopy` and into the shared contract, because a `pending`
+    // closure has TWO causes (a family purge, or a refused close the queue is retrying) and the portal
+    // was printing the purge sentence for both. That left this guard with zero allowed occurrences and
+    // the web suite red — two agents in one stage with DISJOINT FILE LISTS and a shared INVARIANT,
+    // which file-level ownership cannot separate.
+    //
+    // Both halves of the guard are kept. No portal source may carry the sentence at all now; and the
+    // one legitimate copy must still exist where it moved to, so it cannot quietly stop existing.
     const offenders: string[] = [];
-    const allowed: string[] = [];
     for (const { path, text } of portalCopy()) {
       for (const match of text.matchAll(READER_ASKED)) {
         const at = match.index;
         const around = text.slice(Math.max(0, at - 600), at + 600);
         if (!/delet/i.test(around)) continue;
-        const enclosing = enclosingFunction(text, at);
-        (enclosing === allowedInside ? allowed : offenders).push(`${path}:${at} ${match[0]}`);
+        offenders.push(`${path}:${at} ${match[0]}`);
       }
     }
     expect(offenders).toEqual([]);
-    expect(allowed).toHaveLength(1);
+
+    // Anti-vacuity, in the contract that now owns it: the pending-after-purge outcome still says it,
+    // and it is the ONLY pending outcome that mentions a deletion — the `retrying` arm must not, which
+    // is the whole of HUNT7-E-1.
+    const contract = readFileSync(
+      join(
+        import.meta.dirname,
+        '..',
+        '..',
+        '..',
+        '..',
+        '..',
+        'packages',
+        'contracts',
+        'src',
+        'account.ts',
+      ),
+      'utf8',
+    );
+    const deletionClaims = [...contract.matchAll(READER_ASKED)].filter((m) =>
+      /delet/i.test(contract.slice(Math.max(0, m.index - 300), m.index + 300)),
+    );
+    expect(deletionClaims.length).toBeGreaterThan(0);
+    expect(contract).toMatch(/after_family_purge/);
   });
 
   it('and no portal copy attributes a change to an adult the response cannot name', () => {
@@ -682,5 +710,124 @@ describe('[G-THIRD-NOTICE] no deletion notice in the portal claims the reader as
     // Not vacuous: the portal's one legitimate actor phrase is still there and still being read, so a
     // sweep that stopped matching anything at all would fail here.
     expect(scanned).toEqual(['pages/app/GuardiansPage.tsx:InviteForm']);
+  });
+});
+
+/**
+ * HUNT7-E-3: `ARCHIVED_CHILD_NO_NEW_SCAN_COPY` and `INACTIVE_CHILD_NO_NEW_SCAN_COPY` were put in
+ * packages/contracts/src/privacy.ts with the reason "here rather than in a page so the portal and the
+ * app say the same thing". Nothing under apps/mobile has ever imported either: the app has no
+ * parent-facing assignment list, and apps/mobile/src/homework/ holds the CHILD's screens. A reason that
+ * is not true is worse than no reason, because the next reader stops looking for the app's own copy —
+ * the same over-claim HUNT6-F-SHARED-COPY corrected in packages/contracts/src/account.ts. Two sibling
+ * docblocks in that file gave the identical reason, so it was house style rather than one slip, and it
+ * is decided here for all of them at once.
+ *
+ * The rule is a BICONDITIONAL, so this is not a ban on a phrase: a docblock may say another surface
+ * prints its string exactly when some file under apps/mobile imports it. `PARENT_SAFETY_FLAG_ACTIONS`
+ * is that case and is checked as the positive row — apps/mobile/src/privacy/parent-privacy.ts does
+ * import it — which also proves the detector fires on a real claim rather than on nothing. Give the app
+ * a parent homework surface later and the negative rows fail, which is when the claim needs deciding
+ * again.
+ */
+const REPO = resolve(import.meta.dirname, '../../../../..');
+
+/** Where the copy is defined; excluded from the importer sweep, since defining is not printing. */
+const CONTRACT_FILE = 'packages/contracts/src/privacy.ts';
+
+/** `app: true` means some app file is expected to print this string too. */
+const AUDIENCE_ROWS = [
+  { name: 'CONSENT_WITHDRAWN_SCAN_COPY', app: false },
+  { name: 'ARCHIVED_CHILD_SCAN_COPY', app: false },
+  { name: 'ARCHIVED_CHILD_NO_NEW_SCAN_COPY', app: false },
+  { name: 'INACTIVE_CHILD_NO_NEW_SCAN_COPY', app: false },
+  { name: 'PARENT_SAFETY_FLAG_ACTIONS', app: true },
+] as const;
+
+/**
+ * Every source root in the repo, so "only the portal prints it" is a claim about the product and not
+ * about one app. Roots rather than a walk from the repo root: node_modules, build output and the native
+ * projects hold neither imports of ours nor any copy.
+ */
+function sourceRoots(): string[] {
+  const roots = ['apps/api/src', 'apps/web/src', 'apps/mobile/src', 'apps/mobile/app'];
+  for (const pkg of readdirSync(join(REPO, 'packages'))) roots.push(`packages/${pkg}/src`);
+  return roots;
+}
+
+/** Repo-relative paths of every non-test source file, as forward-slash paths. */
+function sourceFiles(): string[] {
+  return sourceRoots().flatMap((root) =>
+    readdirSync(join(REPO, root), { recursive: true, encoding: 'utf8' })
+      .filter((rel) => /\.tsx?$/.test(rel) && !/\.test\.tsx?$/.test(rel))
+      .map((rel) => `${root}/${rel.split(sep).join('/')}`),
+  );
+}
+
+/**
+ * Files that PRINT the string, not files that mention the name. Comments are stripped first (the same
+ * way `portalCopy` above strips them), because the corrected docblock in
+ * apps/mobile/src/homework/result-view.ts names both constants in order to say the app does NOT print
+ * them — a sweep that counted that as an import would report the very claim it exists to refute.
+ */
+function importersOf(name: string): string[] {
+  return sourceFiles().filter(
+    (path) =>
+      path !== CONTRACT_FILE &&
+      readFileSync(join(REPO, path), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/^[ \t]*\/\/.*$/gm, ' ')
+        .includes(name),
+  );
+}
+
+/** The doc comment immediately above `export const NAME =`. */
+function docblockAbove(text: string, name: string): string {
+  const at = text.indexOf(`export const ${name} =`);
+  expect(at).toBeGreaterThan(0);
+  const end = text.lastIndexOf('*/', at);
+  const start = text.lastIndexOf('/**', end);
+  expect(start).toBeGreaterThan(0);
+  return text.slice(start, end + 2);
+}
+
+/**
+ * Ways of saying that another surface prints this same string. Deliberately wider than the one sentence
+ * removed, because the defect is the CLAIM and not its wording; a docblock that describes what the app
+ * says INSTEAD ("the app's own line is `statusView` …") asserts nothing of the kind and must not match.
+ */
+const SAMENESS_CLAIM =
+  /say the same|says the same|same (?:sentence|wording|words|copy|line)|shared with the (?:app|phone)|both (?:surfaces|clients)|every surface/i;
+
+describe('[HUNT7-E-3] a shared-copy reason is given only where the app really prints the copy', () => {
+  const contract = readFileSync(join(REPO, CONTRACT_FILE), 'utf8');
+
+  it('the portal-only lines are imported by the portal page alone, and no app file', () => {
+    const importers = Object.fromEntries(
+      AUDIENCE_ROWS.filter((row) => !row.app).map((row) => [row.name, importersOf(row.name)]),
+    );
+    expect(importers).toEqual({
+      CONSENT_WITHDRAWN_SCAN_COPY: ['apps/web/src/pages/app/HomeworkPage.tsx'],
+      ARCHIVED_CHILD_SCAN_COPY: ['apps/web/src/pages/app/HomeworkPage.tsx'],
+      ARCHIVED_CHILD_NO_NEW_SCAN_COPY: ['apps/web/src/pages/app/HomeworkPage.tsx'],
+      INACTIVE_CHILD_NO_NEW_SCAN_COPY: ['apps/web/src/pages/app/HomeworkPage.tsx'],
+    });
+  });
+
+  it('so each of their docblocks names that page, and claims no surface that does not print it', () => {
+    for (const { name } of AUDIENCE_ROWS.filter((row) => !row.app)) {
+      const doc = docblockAbove(contract, name);
+      expect(doc).toContain('apps/web/src/pages/app/HomeworkPage.tsx');
+      expect(doc).not.toMatch(SAMENESS_CLAIM);
+      // Hedged, not deleted: the reader is still sent to the app's own child-facing line.
+      expect(doc).toContain('apps/mobile/src/homework/result-view.ts');
+    }
+  });
+
+  it('while copy the app does print may still say so — and one does', () => {
+    for (const { name } of AUDIENCE_ROWS.filter((row) => row.app)) {
+      expect(importersOf(name).filter((path) => path.startsWith('apps/mobile/'))).not.toEqual([]);
+      expect(docblockAbove(contract, name)).toMatch(SAMENESS_CLAIM);
+    }
   });
 });

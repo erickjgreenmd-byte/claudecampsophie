@@ -286,7 +286,7 @@ describe('the planner says nothing false about a child being deleted (HUNT7-J-2)
     );
     // The flag is tested first: request_deletion archives a child-scope target (migration 0890), so
     // such a child reads as archived too, and "archived" is the more comforting of the two words.
-    expect(childPickerSuffix({ status: 'archived' })).toBe(' (archived — plan is read-only)');
+    expect(childPickerSuffix({ status: 'archived' })).toBe(' (archived — history only)');
     expect(childPickerSuffix({ status: 'draft' })).toBe(' (no paid slot)');
     expect(childPickerSuffix({ status: 'active' })).toBe('');
     expect(childPickerSuffix({ status: 'active', deletionPending: true })).toBe(

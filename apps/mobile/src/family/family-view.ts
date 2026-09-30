@@ -1,11 +1,12 @@
 import {
   CHILD_ACTIVATION_RULES,
-  type AgeBand,
   type ChildActivationResponse,
   type ChildDevice,
   type FamilyChild,
   type FamilyOverview,
-  type UpdateChildProfileRequest,
+  childPickerSuffixCopy,
+  childStatusCopy,
+  type ChildCopySubject,
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 
@@ -69,18 +70,12 @@ export function gradeText(grade: number): string {
  * all, so it was the only thing the screen said about it. HUNT6-G-2 fixed the portal and claimed one
  * helper decides the sentence for every surface (L-037); the phone is the other surface.
  */
-export function childStatusText(
-  child: Pick<FamilyChild, 'status'> & { readonly deletionPending?: boolean | undefined },
-): string {
-  if (child.deletionPending === true) return 'Data deletion under way';
-  switch (child.status) {
-    case 'draft':
-      return 'Draft: not active yet, no charge';
-    case 'active':
-      return 'Active: uses a paid slot';
-    case 'archived':
-      return 'Archived: history only';
-  }
+export function childStatusText(child: ChildCopySubject): string {
+  // ONE definition, in packages/contracts/src/family.ts, which the portal imports too. This function
+  // and the portal's `childStatusLabel` were byte-identical switch bodies in two files, cross-guarded
+  // only by a test that read the other file's source — which catches a reworded sentence but not a
+  // widened predicate, so it guarded the words and not the meaning (the stage-4 checker's finding).
+  return childStatusCopy(child);
 }
 
 /**
@@ -109,13 +104,13 @@ export function childPlanEditable(status: FamilyChild['status']): boolean {
  * (migration 0890), so such a child reads as archived here too, and "archived" is the more comforting
  * of the two words.
  */
-export function childPickerSuffix(
-  child: Pick<FamilyChild, 'status'> & { readonly deletionPending?: boolean | undefined },
-): string {
-  if (child.deletionPending === true) return ' (data deletion under way)';
-  if (child.status === 'archived') return ' (archived — plan is read-only)';
-  if (child.status === 'draft') return ' (no paid slot)';
-  return '';
+export function childPickerSuffix(child: ChildCopySubject): string {
+  // ONE definition (packages/contracts/src/family.ts). The archived arm here used to say
+  // ' (archived — plan is read-only)' where the portal said ' (archived — history only)': two
+  // sentences for one state, one audience, in helpers of the same name. The shared arm is the
+  // portal's, because "history only" is what the status line says and is true wherever the picker is
+  // printed, while "plan is read-only" is only true of the planner.
+  return childPickerSuffixCopy(child);
 }
 
 export interface ChildRow {
@@ -220,51 +215,16 @@ export function childArchiveLabel(status: FamilyChild['status']): string {
 }
 
 /** The three fields the child edit form holds, as the form holds them. */
-export interface ChildEditFields {
-  readonly nickname: string;
-  readonly gradeLevel: number;
-  readonly ageBand: AgeBand;
-}
-
-/** Which of them the parent has edited in THIS form. */
-export interface ChildEditTouched {
-  readonly nickname: boolean;
-  readonly gradeLevel: boolean;
-  readonly ageBand: boolean;
-}
-
-/**
- * What PATCH /v1/children/:childId carries from the phone's child form: the fields the parent EDITED
- * there, and nothing else (HUNT7-G-4).
- *
- * The form used to seed all three fields from the live prop once and then send all three,
- * unconditionally, from that seed. The card is keyed on `row.id` (app/(parent)/children.tsx), so a
- * reload never remounts it and the seed is as old as the open form: guardian B moved the child up a
- * grade on the portal while parent A had the phone form open on the old grade, A corrected a typo in
- * the nickname, and the PATCH put the grade back — the route writes exactly the fields present and
- * the contract's refine only rejects an empty body (packages/contracts/src/family.ts). That is
- * BUG-222/WEBR4-03 verbatim, which the portal fixed in round 4 (WEBR4-03), again in round 5
- * (HUNT5-F-1) and again in round 6 (HUNT6-G-8), each time inside apps/web only.
- *
- * "Edited" and not "differs from the seed": those two are the same until a concurrent change lands,
- * and after it the field the parent can SEE becomes unsavable, which is BUG-330. Reseeding the fields
- * from the live prop is not the fix either — that is the loss HUNT5-F-1 was filed for — so the form
- * carries `childEditDriftNote` below instead.
- *
- * The rule is a value-in/value-out helper because this suite cannot render react-native (see
- * apps/mobile/vitest.config.ts): a rule that only exists inside a screen cannot be tested at all,
- * which is why the phone kept the defect for three rounds while the portal's was pinned.
- */
-export function childEditBody(
-  fields: ChildEditFields,
-  touched: ChildEditTouched,
-): UpdateChildProfileRequest {
-  return {
-    ...(touched.nickname ? { nickname: fields.nickname } : {}),
-    ...(touched.gradeLevel ? { gradeLevel: fields.gradeLevel } : {}),
-    ...(touched.ageBand ? { ageBand: fields.ageBand } : {}),
-  };
-}
+// HUNT7-G-4's rule now lives in packages/contracts/src/family.ts so the PORTAL form and the PHONE
+// form share one branded definition instead of two that agree. Re-exported here so this module stays
+// the phone's family-view surface; it is one definition, not a second one.
+export {
+  childEditBody,
+  markEdited,
+  NOTHING_EDITED,
+  type ChildEditFields,
+  type ChildEditTouched,
+} from '@pencillift/contracts';
 
 /**
  * What changed under the open child form since it was seeded, or null while nothing has (HUNT7-G-4,
