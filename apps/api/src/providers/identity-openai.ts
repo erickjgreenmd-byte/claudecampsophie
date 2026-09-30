@@ -149,8 +149,15 @@ export function createOpenAiIdentityProvider(options: {
         };
       }
 
-      // ---- 2. the face comparison, asked and recorded ----
-      const faceMatch = await compareFaces(input);
+      // ---- 2. the face comparison, asked and recorded ONLY when a selfie was sent ----
+      // Since migration 0990 the product's standard is the document plus the holder's legal
+      // declaration, so no selfie is collected and this second call does not happen: one provider
+      // round trip per verification instead of two, and the measured `identity_face_compare` stage
+      // (15,000 micro-USD of budget) is never spent. 'not_attempted' is the honest answer to a
+      // question nobody asked — distinct from 'refused', which is what this adapter answers when the
+      // comparison IS requested and the provider's policy declines it.
+      const faceMatch =
+        input.selfie === undefined ? ('not_attempted' as const) : await compareFaces(input);
       return {
         documentIsGovernmentId: true,
         documentHolderIsAdult: true,
@@ -167,7 +174,12 @@ export function createOpenAiIdentityProvider(options: {
         const faceInput: InputPart[] = [
           dataEnvelope({ purpose: 'adult_age_check_with_consent' }),
           imagePart(args.document.mimeType, args.document.base64, 'high'),
-          imagePart(args.selfie.mimeType, args.selfie.base64, 'high'),
+          // Only reached with a selfie present: the caller above checks, and this narrows it for the
+          // compiler rather than asserting with `!` — an assertion would still compile the day someone
+          // calls this directly.
+          ...(args.selfie === undefined
+            ? []
+            : [imagePart(args.selfie.mimeType, args.selfie.base64, 'high')]),
         ];
         const out = await runStage({
           prompt: PROMPTS.identity_face_compare,

@@ -44,8 +44,14 @@ export interface IdentityProvider {
 export interface IdentityCheckInput {
   /** A government photo ID, as captured. Released when the call returns. */
   readonly document: IdentityImage;
-  /** A selfie, as captured. Released when the call returns. */
-  readonly selfie: IdentityImage;
+  /**
+   * A selfie, as captured, released when the call returns. OPTIONAL since migration 0990: the owner's
+   * standard is the document plus a legal declaration, so no selfie is collected and there is nothing
+   * to compare. Absent means "do not attempt a comparison", which a provider answers as
+   * 'not_attempted' rather than as a failure — the two are different claims and only one of them is
+   * about the parent.
+   */
+  readonly selfie?: IdentityImage | undefined;
   /** The date the adult typed, `YYYY-MM-DD`, for cross-checking against the document. */
   readonly statedDateOfBirth: string;
   /** The application's clock. Expiry and age are judged against this, never against a wall clock. */
@@ -102,31 +108,40 @@ export function createDevelopmentIdentityMock(): IdentityProvider {
     name: 'development_mock',
     isMock: true,
     canCompareFaces: true,
-    check: (input) =>
-      Promise.resolve(
+    check: (input) => {
+      // With no selfie there is nothing to compare, and the mock says so rather than inventing a
+      // match: a mock that answers a question it was not asked teaches the tests a falsehood.
+      const faceMatch =
+        input.selfie === undefined ? ('not_attempted' as const) : ('matched' as const);
+      return Promise.resolve(
         isAdultOn(input.statedDateOfBirth, input.now)
           ? {
               documentIsGovernmentId: true,
               documentHolderIsAdult: true,
-              faceMatch: 'matched' as const,
+              faceMatch,
               failureCode: null,
               providerReference: 'mock-identity',
             }
           : {
               documentIsGovernmentId: true,
               documentHolderIsAdult: false,
-              faceMatch: 'matched' as const,
+              faceMatch,
               failureCode: 'NOT_AN_ADULT' as const,
               providerReference: 'mock-identity',
             },
-      ),
+      );
+    },
   };
 }
 
 /**
  * The provider used when nothing is configured. It is NOT a mock and it does not pretend: it refuses
- * every check with `FACE_CHECK_UNAVAILABLE`, so a deployment that forgot to configure a provider fails
+ * every check with `PROVIDER_UNAVAILABLE`, so a deployment that forgot to configure a provider fails
  * closed and says which side the problem is on. A missing credential is a blocker, never a pass.
+ *
+ * The code is not `FACE_CHECK_UNAVAILABLE` any more: since 0990 the document read is the thing that
+ * needs a provider and the comparison is not asked for, so blaming the face check would name the
+ * wrong missing piece — and this is the copy a parent reads.
  */
 export function createUnconfiguredIdentityProvider(): IdentityProvider {
   return {
@@ -138,7 +153,7 @@ export function createUnconfiguredIdentityProvider(): IdentityProvider {
         documentIsGovernmentId: false,
         documentHolderIsAdult: false,
         faceMatch: 'not_attempted' as const,
-        failureCode: 'FACE_CHECK_UNAVAILABLE' as const,
+        failureCode: 'PROVIDER_UNAVAILABLE' as const,
         providerReference: null,
       }),
   };

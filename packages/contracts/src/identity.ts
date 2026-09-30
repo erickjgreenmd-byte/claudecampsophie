@@ -9,7 +9,7 @@
 // Requests are strict, so no client can smuggle in the outcome it wants: `confirmed`, the provider
 // name and the instant are all the server's (routes/identity.ts, app.record_identity_verification).
 import { z } from 'zod';
-import { calendarDateSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
+import { birthDateSchema, isoDateTimeSchema, uuidSchema } from './common.ts';
 
 /**
  * The largest image the check accepts, per image, DECODED. A phone photo of a licence is well under
@@ -97,7 +97,9 @@ export const IDENTITY_ATTESTATION_REQUIRED_COPY =
  * both worlds, carrying the biometric exposure without the verification.
  */
 export const submitIdentityVerificationRequestSchema = z.strictObject({
-  statedDateOfBirth: calendarDateSchema,
+  // `birthDateSchema`, NOT `calendarDateSchema`: the latter's floor is the year 2000, which
+  // refused every parent born before it — most of them. See that schema's docstring.
+  statedDateOfBirth: birthDateSchema,
   document: identityImageSchema,
   /**
    * The adult affirms `IDENTITY_ATTESTATION_STATEMENT`. A literal `true` rather than a boolean: the
@@ -114,8 +116,9 @@ export type SubmitIdentityVerificationRequest = z.infer<
 
 /**
  * Why a check did not confirm. These are the codes the SERVER may return; the copy for each is below.
- * `PROVIDER_ERROR` and `FACE_CHECK_UNAVAILABLE` are ours, not the parent's fault, and their copy says
- * so — the project has filed blame-the-parent copy three times (HUNT7-I-3 and its predecessors).
+ * `PROVIDER_ERROR`, `PROVIDER_UNAVAILABLE` and `FACE_CHECK_UNAVAILABLE` are OURS, not the parent's
+ * fault, and their copy says so — the project has filed blame-the-parent copy three times (HUNT7-I-3
+ * and its predecessors).
  */
 export const IDENTITY_FAILURE_CODES = [
   'NOT_A_GOVERNMENT_ID',
@@ -124,7 +127,16 @@ export const IDENTITY_FAILURE_CODES = [
   'NOT_AN_ADULT',
   'DOB_MISMATCH',
   'FACE_NOT_CONFIRMED',
+  // Reachable only where the stronger biometric standard is configured (owner action #47). Kept
+  // rather than removed: `identity_verifications` still exists and can still refuse this way.
   'FACE_CHECK_UNAVAILABLE',
+  // The adult did not affirm the declaration. Since 0990 this is the refusal that matters most,
+  // because the declaration is the gate.
+  'ATTESTATION_REQUIRED',
+  // No identity provider is configured at all, so the DOCUMENT could not be read. Distinct from
+  // FACE_CHECK_UNAVAILABLE, which names the comparison: they are different missing pieces and a
+  // parent reading the wrong one is told to wait for something that was never the problem.
+  'PROVIDER_UNAVAILABLE',
   'PROVIDER_ERROR',
 ] as const;
 export type IdentityFailureCode = (typeof IDENTITY_FAILURE_CODES)[number];
@@ -149,6 +161,10 @@ const IDENTITY_FAILURE_COPY: Readonly<Record<IdentityFailureCode, string>> = {
     'We couldn’t confirm the selfie shows the person on the ID. Take the selfie in good light, facing the camera, with nothing covering your face.',
   FACE_CHECK_UNAVAILABLE:
     'We can’t run the face check on your account yet, so we can’t finish setting it up. This is on us, not you — support can complete the check for you.',
+  ATTESTATION_REQUIRED:
+    'Please confirm the statement that you are the person on the ID and this child’s parent or legal guardian. We can’t set the account up without it.',
+  PROVIDER_UNAVAILABLE:
+    'We can’t check IDs on your account yet, so we can’t finish setting it up. This is on us, not you — nothing was saved, and support can complete the check for you.',
   PROVIDER_ERROR:
     'Something went wrong on our side while checking your ID. Nothing was saved. Please try again.',
 };
@@ -169,8 +185,11 @@ export function identityFailureCopy(code: string | null | undefined): string {
 
 /** Whether a refusal is the parent's to act on, or ours. Drives whether a retry is offered at all. */
 export function identityFailureIsOurs(code: string | null | undefined): boolean {
+  // ATTESTATION_REQUIRED is deliberately NOT here: it is the one refusal the parent can always fix,
+  // by reading the statement and confirming it. Calling it ours would hide the only action there is.
   return (
     code === 'FACE_CHECK_UNAVAILABLE' ||
+    code === 'PROVIDER_UNAVAILABLE' ||
     code === 'PROVIDER_ERROR' ||
     code === null ||
     code === undefined ||

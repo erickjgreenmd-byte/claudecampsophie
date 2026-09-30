@@ -24,6 +24,28 @@ export const calendarMonthSchema = z
   .regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'Expected YYYY-MM')
   .refine(calendarYearInRange, CALENDAR_YEAR_MESSAGE);
 export const calendarDateSchema = z.iso.date().refine(calendarYearInRange, CALENDAR_YEAR_MESSAGE);
+
+/**
+ * A HUMAN DATE OF BIRTH, which `calendarDateSchema` above must not be used for.
+ *
+ * That schema's window is years 2000..2100, and its own docstring says why: "school calendars, promo
+ * campaign months and test dates never fall outside this window; a value outside it is a typo." A
+ * date of birth is not one of those. `submitIdentityVerificationRequestSchema` used it anyway, so in
+ * 2026 every parent aged 27 or over — anyone born before 2000, which is most parents — was refused
+ * with "Use a year between 2000 and 2100" before their licence was ever read. The adult ID check was
+ * unusable by the population it exists for, and the route test that submitted a 1990 birth date is
+ * what found it.
+ *
+ * The window here is a plausibility check on a LIVING ADULT's birth year, nothing more: 1900 is below
+ * any living parent and comfortably above Postgres's own limits, and the upper bound is open because
+ * whether a date makes an ADULT is a question about the clock, not about the schema — `isAdultOn`
+ * answers it against the application's stated instant, and a future date simply is not an adult.
+ */
+export const BIRTH_YEAR_MIN = 1900;
+export const BIRTH_YEAR_MESSAGE = `Use a year from ${BIRTH_YEAR_MIN} onwards`;
+export const birthDateSchema = z.iso
+  .date()
+  .refine((text) => Number(text.slice(0, 4)) >= BIRTH_YEAR_MIN, BIRTH_YEAR_MESSAGE);
 /** Client-generated idempotency key (UUID or similar high-entropy token). */
 export const idempotencyKeySchema = z
   .string()

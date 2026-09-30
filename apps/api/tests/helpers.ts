@@ -15,6 +15,7 @@ import {
   createOutboxEmailMock,
   createLocalAuthAdminDouble,
 } from '../src/providers/index.ts';
+import { createDevelopmentIdentityMock } from '../src/providers/identity.ts';
 
 export const TEST_JWT_SECRET = 'test-supabase-jwt-secret-with-at-least-32-chars!!';
 export const TEST_ISSUER = 'https://test-project.supabase.co/auth/v1';
@@ -69,6 +70,11 @@ export async function createTestApi(overrides: Record<string, string> = {}): Pro
     stripe: createStripeClientMock(),
     // Labeled local double of the Supabase Auth Admin soft delete (migration 0830); never outside test.
     authAdmin: createLocalAuthAdminDouble(() => apiDb),
+    // LABELED MOCK. Every row it produces carries is_test_provider = true and productionReadiness
+    // blocks while it is configured, so it can never stand in for a real check in front of a real
+    // family. It is wired here so the whole ordering — verify the adult, add children with their
+    // attestations, pay, issue codes — is exercisable without sending anyone's licence anywhere.
+    identity: createDevelopmentIdentityMock(),
   };
   const app = createApp({
     config,

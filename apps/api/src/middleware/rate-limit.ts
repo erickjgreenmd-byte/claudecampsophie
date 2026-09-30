@@ -105,6 +105,9 @@ export const RATE_RULES = {
    * checks), so refused calls cannot use up the parent's own budget.
    */
   pinSetPerUser: { limit: 10, windowSeconds: 3600 },
+  // Per ADULT, not per family: each attempt costs a provider call, and an adult invited to a
+  // second family must not receive a second budget of attempts.
+  identityCheckPerUser: { limit: 6, windowSeconds: 3600 },
   /** Per client network: an IPv4 address or an IPv6 /64 (one subscriber's allocation). */
   pairingRedeemPerNetwork: { limit: 20, windowSeconds: 15 * 60 },
   /**

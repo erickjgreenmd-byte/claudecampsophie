@@ -6,6 +6,7 @@ import { withLiveSessionCheck } from './auth/parent.ts';
 import type { AppDeps, AppEnv } from './middleware/context.ts';
 import { toBase64Url, randomBytes } from './security/crypto.ts';
 import { healthRoutes } from './routes/health.ts';
+import { identityRoutes } from './routes/identity.ts';
 import { adultRoutes } from './routes/adult.ts';
 import { childAuthRoutes } from './routes/child-auth.ts';
 import { familyRoutes } from './routes/family.ts';
@@ -146,6 +147,7 @@ export function createApp(appDeps: AppDeps): Hono<AppEnv> {
 
   app.route('/', healthRoutes());
   app.route('/v1/adult', adultRoutes());
+  app.route('/v1/identity', identityRoutes()); // /v1/identity/verification
   app.route('/v1/child', childAuthRoutes());
   app.route('/v1', familyRoutes());
   // Feature verticals. Each module owns its paths under the prefix shown.
