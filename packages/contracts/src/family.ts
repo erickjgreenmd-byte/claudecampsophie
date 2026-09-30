@@ -92,11 +92,21 @@ export const familyOverviewResponseSchema = z.strictObject({
 });
 export type FamilyOverview = z.infer<typeof familyOverviewResponseSchema>;
 
-/** POST /v1/children (parent + step-up). Always creates an uncharged draft. */
+/**
+ * POST /v1/children (parent + step-up). Always creates an uncharged draft.
+ *
+ * `parentalAttestation` is the ticked statement, and it arrives WITH the child's details in one
+ * submission rather than as a later step: that way a child row never exists without an attestation
+ * covering it, not even momentarily. It must be literally `true` — an absent or false value is a 422,
+ * because an untickable checkbox and an unticked one are the same thing to a parent and neither is
+ * consent. The server records `CONSENT_ATTESTATION_VERSION` and its own clock, never a
+ * client-supplied version or instant.
+ */
 export const createChildProfileRequestSchema = z.strictObject({
   nickname: freeTextSchema({ max: 40 }),
   gradeLevel: gradeLevelSchema,
   ageBand: ageBandSchema,
+  parentalAttestation: z.literal(true),
 });
 export type CreateChildProfileRequest = z.infer<typeof createChildProfileRequestSchema>;
 
@@ -306,6 +316,37 @@ export function maskEmail(email: string): string {
 /** Version of the consent notice the parent agrees to; bump when the notice text changes. */
 export const CONSENT_POLICY_VERSION = '2026-09-v1';
 export const CONSENT_PURPOSE = 'child_learning_data';
+
+/**
+ * The parental/guardian ATTESTATION, made once per child (migration 0970,
+ * docs/design/Consent_Design.md).
+ *
+ * Verifiable parental consent is two claims. That the consenting person is an ADULT is established by
+ * the consent provider and recorded on `public.consent_records`. That this adult is THIS CHILD'S parent
+ * or legal guardian is established by nothing an identity check can produce — no COPPA-enumerated
+ * method verifies a family relationship, because there is no database of who is whose parent — so the
+ * regulation contemplates the adult's own assertion, and the assertion therefore does real legal work.
+ *
+ * The statement lives here rather than in a page so the portal and the app present the SAME words, and
+ * it is VERSIONED so the record of what a parent agreed to survives a later rewording: the child row
+ * stores the version and the instant, and this repository stores the wording that version names.
+ * Bump the version whenever a character of the statement changes, and never edit a released version's
+ * text in place.
+ *
+ * Counsel approves this wording as part of owner action #15; until they do it is the draft the product
+ * ships behind the same legal-review gate as the public pages.
+ */
+export const CONSENT_ATTESTATION_VERSION = '2026-09-v1';
+/**
+ * What a surface says when the box is not ticked. HERE rather than in either client, because a
+ * one-surface copy change is the divergence seven findings of round 7 were made of: the portal and the
+ * app must refuse in the same words for the same reason.
+ */
+export const ATTESTATION_REQUIRED_COPY =
+  'Please confirm you are this child\u2019s parent or legal guardian before adding them.';
+export const CONSENT_ATTESTATION_STATEMENT =
+  'I am the parent or legal guardian of this child, and I agree to PencilLift collecting and ' +
+  'processing their homework and practice work as described in the Privacy Policy.';
 
 export const CONSENT_STATES = ['none', 'pending', 'verified', 'failed', 'withdrawn'] as const;
 export const consentStateSchema = z.enum(CONSENT_STATES);

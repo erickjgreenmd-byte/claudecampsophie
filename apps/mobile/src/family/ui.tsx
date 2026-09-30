@@ -219,6 +219,51 @@ export function Choice<T extends string>({
   );
 }
 
+/**
+ * A single required tick box, for a statement the parent must affirm before an action (the parental
+ * attestation on adding a child, migration 0970). It is a `checkbox` to assistive technology rather
+ * than a `switch`, because it records an affirmation rather than turning a setting on and off, and
+ * the state is announced through `accessibilityState.checked` — never by colour alone. The whole
+ * row is the target so it clears the minimum touch size even when the statement wraps to several
+ * lines, and `error` renders beside the box it is about rather than at the top of the form.
+ */
+export function Checkbox({
+  label,
+  checked,
+  onChange,
+  error,
+  disabled,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  error?: string | null | undefined;
+  disabled?: boolean | undefined;
+}) {
+  return (
+    <View>
+      <Pressable
+        accessibilityRole="checkbox"
+        accessibilityLabel={label}
+        accessibilityState={{ checked, disabled: disabled === true }}
+        disabled={disabled === true}
+        onPress={() => onChange(!checked)}
+        style={[styles.checkRow, disabled === true ? styles.disabled : null]}
+      >
+        <View style={[styles.checkBox, checked ? styles.checkBoxOn : null]}>
+          <Text style={styles.checkMark}>{checked ? '\u2713' : ' '}</Text>
+        </View>
+        <Text style={styles.checkLabel}>{label}</Text>
+      </Pressable>
+      {error !== null && error !== undefined && error !== '' ? (
+        <Text accessibilityRole="alert" style={styles.checkError}>
+          {error}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
 export function Loading({ label }: { label: string }) {
   return (
     <ActivityIndicator color={colors.teal} accessibilityLabel={label} style={styles.loading} />
@@ -851,6 +896,33 @@ export const styles = StyleSheet.create({
   chipSelected: { backgroundColor: colors.tealText },
   chipText: { color: colors.tealText, fontWeight: '800', fontSize: typography.scale.md },
   chipTextSelected: { color: colors.white },
+  checkRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+    minHeight: minTouchTarget,
+    paddingVertical: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  checkBox: {
+    width: 28,
+    height: 28,
+    borderRadius: radii.sm,
+    borderWidth: 2,
+    borderColor: colors.teal,
+    backgroundColor: colors.white,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkBoxOn: { backgroundColor: colors.tealText, borderColor: colors.tealText },
+  checkMark: { color: colors.white, fontSize: typography.scale.md, fontWeight: '800' },
+  checkLabel: {
+    flex: 1,
+    fontSize: typography.scale.md,
+    color: colors.navy,
+    lineHeight: typography.scale.md * 1.4,
+  },
+  checkError: { color: colors.danger, fontSize: typography.scale.md, marginTop: spacing.xs },
   code: {
     fontSize: typography.scale.xxl,
     fontWeight: '800',

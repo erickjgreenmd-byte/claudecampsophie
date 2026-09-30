@@ -41,7 +41,7 @@ const addChild = (token: string) =>
   api.request('/v1/children', {
     method: 'POST',
     token,
-    body: { nickname: 'Sam', gradeLevel: 2, ageBand: '5-7' },
+    body: { nickname: 'Sam', gradeLevel: 2, ageBand: '5-7', parentalAttestation: true },
   });
 
 describe('PIN attempts (RV-lead-identity-access-1)', () => {

@@ -1659,5 +1659,54 @@ describe('[HR4-0860-02] a Data-API delete of a test date obeys the archived-chil
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// HUNT7-E-5: the reporter kinds the database permits and the kinds the contract permits are one set
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * HUNT7-E-5. apps/api/src/routes/privacy.ts built a per-reporter-kind window pair for 'system' and
+ * for 'child' and then a CATCH-ALL pair for `reporter_kind not in ('system', 'child')`, justified in
+ * the code as future-proofing — "so a reporter kind added later is listed rather than silently
+ * dropped from the family's list". It would not be listed. `safetyReportReporterKindSchema` is a
+ * closed `z.enum(['child','parent','system'])` (packages/contracts/src/privacy.ts) and both clients
+ * parse the response through `safetyReportsResponseSchema`, so a row carrying a fourth kind does not
+ * appear in the list — it throws, and the family's whole safety list fails to render. The catch-all
+ * pair would also hold the oldest and newest of the SET, not of each kind in it, so the bound's
+ * "for every kind, with no exception" would stop being true of the new kind.
+ *
+ * Nothing today can produce such a row: the check constraint is what forbids it. So this is the
+ * honest test — the two sets are pinned as ONE set, and a migration that widens the constraint
+ * without widening the contract enum and giving the new kind its own window pair reds here.
+ */
+describe('[HUNT7-E-5] safety_reports_reporter_kind_check permits exactly the kinds the contract lists', () => {
+  /**
+   * The kinds `safetyReportReporterKindSchema` lists (packages/contracts/src/privacy.ts). Written
+   * out rather than imported: @pencillift/db has no dependency on @pencillift/contracts, and adding
+   * one to reach a three-element enum is not worth a package edge. The API-side twin of this
+   * assertion lives beside the query it constrains.
+   */
+  const CONTRACT_REPORTER_KINDS = ['child', 'parent', 'system'] as const;
+
+  it('the constraint names those kinds and no others', async () => {
+    const [row] = await db.sql<{ def: string }[]>`
+      select pg_get_constraintdef(c.oid) as def from pg_constraint c
+       where c.conrelid = 'public.safety_reports'::regclass
+         and c.conname = 'safety_reports_reporter_kind_check'`;
+    expect(row?.def).toBeDefined();
+    const permitted = [...row!.def.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!).sort();
+    expect(permitted).toEqual([...CONTRACT_REPORTER_KINDS].sort());
+  });
+
+  it('a row carrying a kind the contract does not list is refused', async () => {
+    const fam = await seedFamily(db, { childCount: 1 });
+    const message = await pgMessage(
+      db.sql`
+        insert into public.safety_reports (family_id, reporter_kind, category, status)
+        values (${fam.familyId}, 'reviewer', 'other', 'open')`,
+    );
+    expect(message).toMatch(/safety_reports_reporter_kind_check/);
+  });
+});
+
 // A stable id so a failure message names the finding, not a random uuid.
 export const HARDENING_R2_DB_MARKER = `hardening-r2-db:${randomUUID().slice(0, 8)}`;

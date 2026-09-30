@@ -7,6 +7,7 @@ import {
   type ResponsesRequest,
   type ResponsesResult,
 } from '@pencillift/ai';
+import { CONSENT_ATTESTATION_VERSION } from '@pencillift/contracts';
 import { cryptoRandom } from '@pencillift/domain';
 import {
   grantAdultUnlock,
@@ -515,9 +516,16 @@ describe('deletion purge and raw-file retention (spec P4, E4 Deletion)', () => {
     );
     await runJobs(e.deps);
     // The parent adds a new profile on the freed slot (no new purchase needed) ...
+    // The attestation columns are set because migration 0970 refuses an ACTIVE child without one
+    // (`child_profiles_active_requires_attestation`): every active child carries the adult's
+    // parent/guardian affirmation. This fixture inserts directly rather than through POST
+    // /v1/children because the point of the case is the page allowance, not the add path.
     const [second] = await e.api.db.sql<{ id: string }[]>`
-      insert into public.child_profiles (family_id, nickname, grade_level, age_band, status)
-      values (${fam.familyId}, 'Sam', 3, '8-10', 'active') returning id`;
+      insert into public.child_profiles
+        (family_id, nickname, grade_level, age_band, status,
+         attestation_version, attested_at, attested_by)
+      values (${fam.familyId}, 'Sam', 3, '8-10', 'active',
+              ${CONSENT_ATTESTATION_VERSION}, now(), ${fam.ownerId}) returning id`;
     const res = await e.api.request('/v1/assignments', {
       method: 'POST',
       token,

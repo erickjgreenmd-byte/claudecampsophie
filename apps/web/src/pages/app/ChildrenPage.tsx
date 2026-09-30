@@ -6,6 +6,8 @@ import {
   ageBandSchema,
   childActivationResponseSchema,
   childArchiveResponseSchema,
+  ATTESTATION_REQUIRED_COPY,
+  CONSENT_ATTESTATION_STATEMENT,
   createChildProfileResponseSchema,
   createPairingCodeResponseSchema,
   familyOverviewResponseSchema,
@@ -785,28 +787,38 @@ function AddChildForm({ onAdded }: { onAdded: () => void }) {
   const [nickname, setNickname] = useState('');
   const [grade, setGrade] = useState('3');
   const [ageBand, setAgeBand] = useState<AgeBand>('8-10');
-  const [fieldError, setFieldError] = useState<string | null>(null);
-  const errorId = useId();
+  const [nicknameError, setNicknameError] = useState<string | null>(null);
+  // The parental/guardian attestation for THIS child (migration 0970). It travels with the child's
+  // details in one submission, so a child never exists without an attestation covering it.
+  const [attested, setAttested] = useState(false);
+  const [attestError, setAttestError] = useState<string | null>(null);
+  const nicknameErrorId = useId();
+  const attestErrorId = useId();
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const name = nickname.trim();
-    if (name.length < 1 || name.length > 40) {
-      setFieldError('Enter a nickname of 1 to 40 characters.');
-      return;
-    }
-    setFieldError(null);
+    const badNickname = name.length < 1 || name.length > 40;
+    setNicknameError(badNickname ? 'Enter a nickname of 1 to 40 characters.' : null);
+    setAttestError(attested ? null : ATTESTATION_REQUIRED_COPY);
+    // Both are reported in one pass: a parent who left the nickname blank AND skipped the box sees
+    // both reasons, rather than fixing one and being refused again for the other.
+    if (badNickname || !attested) return;
     const ok = await run('add', async () => {
       await api.send(
         'POST',
         '/v1/children',
-        { nickname: name, gradeLevel: Number(grade), ageBand },
+        { nickname: name, gradeLevel: Number(grade), ageBand, parentalAttestation: true },
         createChildProfileResponseSchema,
       );
       return `${name} was added as a draft profile.`;
     });
     if (ok) {
       setNickname('');
+      // The next child needs its own attestation: the statement is about one child, so a ticked box
+      // must never carry over to a sibling.
+      setAttested(false);
+      setAttestError(null);
       onAdded();
     }
   };
@@ -825,15 +837,19 @@ function AddChildForm({ onAdded }: { onAdded: () => void }) {
           value={nickname}
           maxLength={40}
           autoComplete="off"
-          aria-describedby={fieldError ? errorId : undefined}
+          aria-describedby={nicknameError ? nicknameErrorId : undefined}
           onChange={(e) => {
             setNickname(e.target.value);
-            setFieldError(null);
+            setNicknameError(null);
           }}
         />
-        {fieldError ? (
-          <p id={errorId} role="alert" style={{ color: 'var(--danger)', margin: '4px 0 0' }}>
-            {fieldError}
+        {nicknameError ? (
+          <p
+            id={nicknameErrorId}
+            role="alert"
+            style={{ color: 'var(--danger)', margin: '4px 0 0' }}
+          >
+            {nicknameError}
           </p>
         ) : null}
         <label htmlFor="child-grade">Grade</label>
@@ -856,6 +872,34 @@ function AddChildForm({ onAdded }: { onAdded: () => void }) {
             </option>
           ))}
         </select>
+        <div style={{ margin: '16px 0 0' }}>
+          <label
+            htmlFor="child-attestation"
+            style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontWeight: 400 }}
+          >
+            <input
+              id="child-attestation"
+              type="checkbox"
+              checked={attested}
+              aria-describedby={attestError ? attestErrorId : undefined}
+              onChange={(e) => {
+                setAttested(e.target.checked);
+                setAttestError(null);
+              }}
+              style={{ marginTop: 4, width: 20, height: 20 }}
+            />
+            <span>{CONSENT_ATTESTATION_STATEMENT}</span>
+          </label>
+          {attestError ? (
+            <p
+              id={attestErrorId}
+              role="alert"
+              style={{ color: 'var(--danger)', margin: '4px 0 0' }}
+            >
+              {attestError}
+            </p>
+          ) : null}
+        </div>
         <div style={buttonRow}>
           <button type="submit" className="btn" disabled={busy !== null}>
             {busy === 'add' ? 'Adding…' : 'Add draft child'}

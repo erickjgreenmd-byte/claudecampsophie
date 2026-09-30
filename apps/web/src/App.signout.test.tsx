@@ -8,9 +8,16 @@ import { ApiRequestError } from '@pencillift/contracts/client';
 import { SIGN_OUT_NOT_TOLD_COPY } from '@pencillift/contracts';
 import { appRoutes } from './App.tsx';
 import { routes } from './routes.tsx';
-import type { AccountAuth, AuthAdapter, AuthOutcome, SignOutScope } from './lib/auth.ts';
+import {
+  stillSignedIn,
+  type AccountAuth,
+  type AuthAdapter,
+  type AuthOutcome,
+  type SessionRead,
+  type SignOutScope,
+} from './lib/auth.ts';
 import { SessionProvider } from './lib/session.tsx';
-import { createSupabaseAuth } from './lib/supabase-auth.ts';
+import { createSupabaseAuth, type SessionStore } from './lib/supabase-auth.ts';
 import { createClient } from '@supabase/supabase-js';
 import PrivacyControlsPage from './pages/app/PrivacyControlsPage.tsx';
 import SignInPage from './pages/auth/SignInPage.tsx';
@@ -51,10 +58,20 @@ interface Fakes {
  * adapter that fails by rejecting instead; `silent` is the same refusal with nothing reported.
  * `cleared` is a reported refusal whose stored session the adapter did remove, so this browser has no
  * session left but the server was never told.
+ *
+ * HUNT7-F-1: `unreadable` is the third answer the session question has — the read did not come back
+ * with "there is no session", it came back unable to say. The Supabase adapter answers that whenever
+ * `getSession()` resolves with an error (a refresh that keeps failing) over a session it could not
+ * remove, and a caller that spends it as "signed out" prints "This computer is signed out" over a
+ * session that comes back with the network. `currentSession()` still answers `null` there, exactly as
+ * the real adapter does, so only `readSession()` tells the two apart.
  */
 function fakes(
   session: { accessToken: string; email: string } | null,
-  options: { readonly refuse?: 'reported' | 'thrown' | 'silent' | 'cleared' } = {},
+  options: {
+    readonly refuse?: 'reported' | 'thrown' | 'silent' | 'cleared';
+    readonly unreadable?: boolean;
+  } = {},
 ): Fakes & {
   auth: AuthAdapter;
   api: ApiClient;
@@ -85,6 +102,14 @@ function fakes(
       verifiedTotpFactorId: () => Promise.resolve(null),
     } satisfies AccountAuth,
     currentSession: () => Promise.resolve(current),
+    readSession: () =>
+      Promise.resolve<SessionRead>(
+        current
+          ? { state: 'signed_in', session: current }
+          : options.unreadable
+            ? { state: 'unreadable' }
+            : { state: 'signed_out' },
+      ),
     signOut: async (scope) => {
       if (!options.refuse || options.refuse === 'cleared') current = null;
       await signOut(scope);
@@ -277,6 +302,30 @@ describe('WEB-R4-AUTH-2 a refused sign-out is never reported as success', () => 
     expect(screen.getByLabelText('Email')).toBeTruthy();
   });
 
+  /**
+   * HUNT7-F-1: a session that could not be READ is not a session that is gone, and this is the one
+   * shape where the difference is user-visible. A refusal whose storage removal did not get through
+   * leaves the session where auth-js keeps it, and `getSession()` — hitting the same refresh failure
+   * that caused the refusal — answers `session: null` WITH an error. Spending that as "signed out"
+   * prints "This computer is signed out" on the sign-in page over a session that is refreshed back
+   * into life as soon as the network returns, on the shared computer this control exists for. The
+   * control must stay where the parent can try again instead.
+   */
+  it('[HUNT7-F-1] stays on the portal page when the session could not be read, not just when it answered', async () => {
+    const parts = fakes(
+      { accessToken: 'synthetic-token', email: 'pat.parent@example.test' },
+      { refuse: 'cleared', unreadable: true },
+    );
+    const router = renderShell('/app/children', parts, { '/sign-in': <SignInPage /> });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Sign out' }));
+    await waitFor(() => expect(parts.signOut).toHaveBeenCalledWith('local'));
+    expect((await screen.findByRole('alert')).textContent).toMatch(/still signed in/i);
+    expect(router.state.location.pathname).toBe('/app/children');
+    // And nothing anywhere claims this computer is signed out.
+    expect(document.body.textContent).not.toContain(SIGN_OUT_NOT_TOLD_COPY.signInOpen);
+  });
+
   it('treats an adapter that rejects the same way, rather than moving on', async () => {
     const parts = fakes(
       { accessToken: 'synthetic-token', email: 'pat.parent@example.test' },
@@ -333,6 +382,25 @@ const STORED = 'sb-example-auth-token';
  * it are pinning the decision rule (a refusal over a readable session must not be presented as a
  * finished sign-out), not production's library behaviour.
  */
+/**
+ * An error in the shape auth-js resolves one in. `__isAuthError` plus the class `name` is how auth-js
+ * itself tells its errors apart (lib/errors.js: `isAuthError`, `isAuthApiError`,
+ * `isAuthRetryableFetchError`), so an error built here is classified exactly as a real one is.
+ * `AuthApiError` is only ever constructed from an answer the auth service gave (lib/fetch.js
+ * `handleError`); `AuthRetryableFetchError` is a request that got no answer at all — a rejected fetch
+ * (status 0) or a 5xx/gateway failure.
+ */
+function authError(
+  name: 'AuthApiError' | 'AuthRetryableFetchError' | 'AuthSessionMissingError',
+  message: string,
+  status: number,
+  code?: string,
+): { message: string } {
+  return { __isAuthError: true, name, message, status, ...(code ? { code } : {}) } as unknown as {
+    message: string;
+  };
+}
+
 function adapterWith(
   result: { error: { message: string } | null },
   options: { readonly keepsSessionOnSignOut?: boolean } = {},
@@ -370,11 +438,12 @@ function adapterWith(
   return { adapter, signOut };
 }
 
-/** Narrowed to the two methods the cases below call on the real client (see realAdapter). */
+/** Narrowed to the methods the cases below call on the real client (see realAdapter). */
 interface PinnedClient {
   readonly auth: {
     signOut(options: { scope: 'local' }): Promise<{ error: unknown }>;
     getSession(): Promise<{ data: { session: unknown } }>;
+    onAuthStateChange(listener: (event: string) => void): unknown;
   };
 }
 
@@ -569,6 +638,84 @@ describe('[HUNT6-F-PREMISE] what @supabase/auth-js 2.116.0 does on a refused sig
     expect(localStorage.getItem(STORED)).toBeNull();
     expect(await adapter.currentSession()).toBeNull();
   });
+
+  /**
+   * HUNT7-F-3: a removal the adapter makes by hand is invisible to every other tab. `_removeSession()`
+   * is the only place a removal raises SIGNED_OUT (GoTrueClient.js:4416-4433), and the single
+   * `_notifyAllSubscribers('SIGNED_OUT', null)` it ends with is both the in-tab notification and the
+   * post on the per-storageKey BroadcastChannel every `persistSession` client in every tab listens on
+   * (:4345-4354, :270-291). auth-js registers no `window` 'storage' listener, so there is no other
+   * way a second tab learns. That made the two refusal paths asymmetric: a sign-out auth-js CARRIED
+   * OUT dropped the other tab to the sign-in prompt, a sign-out it REFUSED left that tab showing the
+   * family's children, scans, verdicts and guardian emails, and "Signed in as …", after this tab had
+   * told the parent the computer was signed out.
+   *
+   * Asserted on the event, because the event is the thing that was missing: the subscriber here
+   * stands in for the other tab's `useParentSession`, which re-reads the session only from
+   * `auth.onChange` (lib/session.tsx:81-92).
+   */
+  it('[HUNT7-F-3] raises SIGNED_OUT after a refusal, so another tab stops showing the family', async () => {
+    const { adapter, client } = realAdapter(nowS() - 60);
+    const events: string[] = [];
+    client().auth.onAuthStateChange((event) => {
+      events.push(event);
+    });
+    expect(await whileOffline(() => adapter.signOut('local'))).toEqual({ serverNotTold: true });
+    expect(localStorage.getItem(STORED)).toBeNull();
+    expect(events).toContain('SIGNED_OUT');
+  });
+
+  /**
+   * HUNT7-F-5: the second path on which a refusal leaves a stored session — and the one the
+   * `forgetStoredSession` docstring said could not exist. `__loadSession`'s proactive-preserve branch
+   * hands the stored session back only while the access token is still valid AND the stored slot still
+   * holds the SAME refresh token (GoTrueClient.js:2578-2588). That guard fails in two ways, not one:
+   * storage was cleared, and storage was REPLACED — another tab's refresh rotated the slot
+   * (`_saveSession` after a successful `_callRefreshToken`, :4265-4272; the library's own debug line
+   * distinguishes `nowHolds: 'replaced'` from `'cleared'`, :4250). On the replaced half the refusal
+   * comes back over a session that is newer and perfectly valid, and `forgetStoredSession` removes it.
+   *
+   * INVERTED: the assertion below was first written as the docstring's own prediction — "the stored
+   * session is already gone and this has nothing to remove", i.e. `expect(...).not.toBeNull()` — and
+   * it was red, because there was a live session and the adapter took it out. The removal is the
+   * intended outcome (the parent pressed Sign out); what was wrong was the enumeration, which is what
+   * a next author reads to decide which paths need a removal at all.
+   */
+  it('[HUNT7-F-5] removes the session another writer stored while the pre-flight refresh was failing', async () => {
+    const { adapter, fetchCalls } = realAdapter(nowS() + 85);
+    const report = await whileOffline(async () => {
+      // The other tab rotates the slot while this tab's pre-flight refresh is still failing.
+      const rotated = setTimeout(
+        () =>
+          localStorage.setItem(
+            STORED,
+            JSON.stringify({
+              access_token: 'synthetic.rotated.jwt',
+              refresh_token: 'synthetic-refresh-rotated',
+              expires_at: nowS() + 3600,
+              token_type: 'bearer',
+              user: {
+                id: '4c1d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f',
+                email: 'pat.parent@example.test',
+              },
+            }),
+          ),
+        1_000,
+      );
+      try {
+        return await adapter.signOut('local');
+      } finally {
+        clearTimeout(rotated);
+      }
+    });
+    expect(report).toEqual({ serverNotTold: true });
+    // The refusal came from the refresh, so nothing was ever said to the server — which is what
+    // separates this from [HUNT6-F-MARGIN], where the very same token DID reach /logout: the
+    // replacement is what makes the preserve-guard fail.
+    expect(fetchCalls.some((url) => url.includes('grant_type=refresh_token'))).toBe(true);
+    expect(fetchCalls.some((url) => url.includes('/logout'))).toBe(false);
+    expect(localStorage.getItem(STORED)).toBeNull();
+  });
 });
 
 /**
@@ -602,8 +749,15 @@ describe('WEB-R4-AUTH-2 the Supabase adapter surfaces a refused sign-out', () =>
    * computer is signed out" has to read it (which is what PrivacyControlsPage now does, below).
    *
    * Driven with storage made hostile, the sharpest form of it: a browser with site data blocked throws
-   * on merely touching `globalThis.localStorage`, so the removal cannot run at all — and the adapter
-   * still REPORTS rather than throwing, which is the fact this case pins.
+   * on merely touching `globalThis.localStorage` — and the adapter still REPORTS rather than throwing,
+   * which is the fact this case pins.
+   *
+   * HUNT7-F-1: what the removal does there has changed, and this docstring said the old thing. It used
+   * to be `globalThis.localStorage?.removeItem(...)`, which in this browser threw and removed nothing
+   * at all; the adapter now owns the store it gave the client, so with localStorage unusable the
+   * removal runs against that store instead and reaches the session auth-js is really holding (the
+   * [HUNT7-F-1] block below). What this case pins is unchanged: a refusal is reported, never thrown,
+   * whatever storage does.
    *
    * HUNT6-F-PREMISE: it used to pin a second "fact" as well — that the session stays readable through
    * a refusal, on the strength of an in-memory session auth-js 2.116.0 does not have. That assertion
@@ -629,6 +783,104 @@ describe('WEB-R4-AUTH-2 the Supabase adapter surfaces a refused sign-out', () =>
     }
   });
 
+  /**
+   * HUNT7-F-2: `serverNotTold` said "every error auth-js resolved with", and one class of those
+   * errors proves the opposite of what the sentence tells the parent. `_signOut` returns a
+   * `sessionError` from `__loadSession` (GoTrueClient.js:3427-3429), which is produced whenever a
+   * refresh of an expired session fails — including a refresh the auth server ANSWERED by rejecting
+   * this session's own refresh token (a password changed elsewhere, an admin revocation, the
+   * `pending` closure's purge). auth-js removes the session itself on that path
+   * (`_callRefreshToken`'s non-retryable branch, :4306-4312), so the session provably no longer
+   * exists anywhere — and the parent was being told, in a role="alert" above the sign-in form, to
+   * change their password over it.
+   *
+   * The report is derived from whether the auth service was reached, not from "an error came back".
+   */
+  it('[HUNT7-F-2] reports nothing to the parent when the auth service had already ended the session', async () => {
+    localStorage.setItem(STORED, JSON.stringify({ refresh_token: 'synthetic-refresh' }));
+    const { adapter, signOut } = adapterWith({
+      error: authError(
+        'AuthApiError',
+        'Invalid Refresh Token: Refresh Token Not Found',
+        400,
+        'refresh_token_not_found',
+      ),
+    });
+    // The sign-out was carried out by the service before we asked, which is the opposite of a
+    // sign-out the service was never told about.
+    expect(await adapter.signOut('local')).toBeUndefined();
+    expect(signOut).toHaveBeenCalledWith({ scope: 'local' });
+    // The local session still goes, whatever is reported.
+    expect(localStorage.getItem(STORED)).toBeNull();
+  });
+
+  it('[HUNT7-F-2] still warns when the auth service could not be reached at all', async () => {
+    localStorage.setItem(STORED, JSON.stringify({ refresh_token: 'synthetic-refresh' }));
+    const { adapter } = adapterWith({
+      error: authError('AuthRetryableFetchError', 'Failed to fetch', 0),
+    });
+    expect(await adapter.signOut('local')).toEqual({ serverNotTold: true });
+  });
+
+  /**
+   * HUNT7-F-2, the other edge: the service answered, and what it answered does NOT say this session
+   * is over. A rate-limited or rejected /logout leaves the session alive server-side, so the warning
+   * is exactly right there — only an answer naming this session's own credential as gone may silence
+   * it.
+   */
+  it('[HUNT7-F-2] warns when the service answered but did not end the session', async () => {
+    localStorage.setItem(STORED, JSON.stringify({ refresh_token: 'synthetic-refresh' }));
+    const { adapter } = adapterWith({
+      error: authError('AuthApiError', 'Too many requests', 429, 'over_request_rate_limit'),
+    });
+    expect(await adapter.signOut('local')).toEqual({ serverNotTold: true });
+  });
+
+  /**
+   * HUNT7-F-1, the mapping itself. auth-js does not reject a read it could not make: `getSession()`
+   * resolves `{ data: { session: null }, error }` whenever the session it holds needs a refresh and the
+   * refresh fails, which is the same failure that caused the refusal a moment earlier, cached for 60s
+   * (constants.js:21). Dropping that `error` — which the adapter did — makes an unreadable session
+   * indistinguishable from an absent one, and only the absent one may be told to a parent as "This
+   * computer is signed out".
+   */
+  function adapterReading(read: { session: unknown; error?: { message: string } }) {
+    return createSupabaseAuth(
+      supabaseConfig,
+      () =>
+        ({
+          auth: {
+            getSession: () =>
+              Promise.resolve({
+                data: { session: read.session },
+                ...(read.error ? { error: read.error } : {}),
+              }),
+            onAuthStateChange: () => ({
+              data: { subscription: { unsubscribe: () => undefined } },
+            }),
+          },
+        }) as never,
+    );
+  }
+
+  it('[HUNT7-F-1] answers “unreadable”, not “signed out”, when the session could not be read', async () => {
+    const adapter = adapterReading({
+      session: null,
+      error: authError('AuthRetryableFetchError', 'Failed to fetch', 0),
+    });
+    expect(await adapter.readSession?.()).toEqual({ state: 'unreadable' });
+    // `currentSession()` cannot carry the difference, which is why it is not what the surfaces ask.
+    expect(await adapter.currentSession()).toBeNull();
+    expect(await stillSignedIn(adapter)).toBe(true);
+  });
+
+  it('[HUNT7-F-1] answers “signed out” for a read that came back empty and clean', async () => {
+    const adapter = adapterReading({ session: null });
+    expect(await adapter.readSession?.()).toEqual({ state: 'signed_out' });
+    expect(await adapter.currentSession()).toBeNull();
+    expect(await stillSignedIn(adapter)).toBe(false);
+  });
+
   it('resolves with nothing to report, and touches nothing else, when the sign-out was carried out', async () => {
     localStorage.setItem(STORED, JSON.stringify({ refresh_token: 'synthetic-refresh' }));
     const { adapter, signOut } = adapterWith({ error: null });
@@ -636,6 +888,183 @@ describe('WEB-R4-AUTH-2 the Supabase adapter surfaces a refused sign-out', () =>
     expect(signOut).toHaveBeenCalledWith({ scope: 'local' });
     // supabase-js clears its own storage on a successful sign-out; the adapter does not guess.
     expect(localStorage.getItem(STORED)).not.toBeNull();
+  });
+});
+
+/**
+ * HUNT7-F-1: the browser BUG-322's own recorded impact names — a shared family, school or library
+ * computer with site data blocked — is the one where a refused sign-out could not reach the session at
+ * all, and the surfaces said "This computer is signed out" over it anyway.
+ *
+ * Merely touching `globalThis.localStorage` throws there, so auth-js's `supportsLocalStorage()` is
+ * false (lib/helpers.js:61-72, which returns false on the throw BEFORE consulting its
+ * `localStorageWriteTests` cache) and, with no `storage` option passed, it holds this origin's session
+ * in its own `memoryLocalStorageAdapter` (GoTrueClient.js:249-269) — where a `localStorage.removeItem`
+ * cannot reach it. The session is not persisted, which is why round 6 concluded it "cannot outlive the
+ * tab"; but it does not have to. The refusal path that leaves it is the pre-flight refresh
+ * (retryable failure → `_callRefreshToken` removes nothing, :4290-4313), the auto-refresh ticker
+ * refreshes it straight out of that same memory store as soon as the fetch succeeds, and the parent is
+ * on the sign-in page one "Parent portal" link away from the family, having been told the computer was
+ * signed out.
+ *
+ * So the adapter owns the store: it hands `createClient` a session store of its own — this origin's
+ * localStorage when that is readable AND writable, its own map otherwise — and a refused sign-out
+ * clears whatever auth-js actually used, and can say whether it did.
+ *
+ * Labeled fake auth server below; no network, and every token is synthetic.
+ */
+describe('[HUNT7-F-1] a refused sign-out in a browser that cannot use localStorage', () => {
+  const PARENT = {
+    id: '4c1d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f',
+    email: 'pat.parent@example.test',
+  };
+
+  /** A browser with site data blocked: reading the property throws, as Chrome and Safari do. */
+  function blockSiteData(): () => void {
+    const real = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', {
+      get() {
+        throw new DOMException('site data blocked', 'SecurityError');
+      },
+      configurable: true,
+    });
+    return () => {
+      if (real) Object.defineProperty(globalThis, 'localStorage', real);
+    };
+  }
+
+  /**
+   * A labeled fake auth service. It answers a password sign-in with a session that expires in two
+   * minutes — outside auth-js's 90s EXPIRY_MARGIN_MS, so reading the session does not set off a
+   * proactive refresh — and a refresh with an hour-long one. `offline` makes every request reject,
+   * which is what a captive portal, an auth outage and a dropped connection all reach auth-js as.
+   */
+  function authService() {
+    const state = { offline: false };
+    const calls: string[] = [];
+    const answer = (accessToken: string, refreshToken: string, expiresIn: number) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            token_type: 'bearer',
+            expires_in: expiresIn,
+            user: PARENT,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      );
+    const fetch = ((input: unknown) => {
+      const url = String(input);
+      calls.push(url);
+      if (state.offline) return Promise.reject(new TypeError('Failed to fetch'));
+      if (url.includes('grant_type=password'))
+        return answer('synthetic.access.1', 'synthetic-r1', 120);
+      if (url.includes('grant_type=refresh_token')) {
+        return answer('synthetic.access.2', 'synthetic-r2', 3600);
+      }
+      return Promise.reject(new Error(`unexpected request ${url}`));
+    }) as typeof globalThis.fetch;
+    return { state, calls, fetch };
+  }
+
+  function lockedDownAdapter(service: ReturnType<typeof authService>) {
+    return createSupabaseAuth(
+      supabaseConfig,
+      (url, key, options) =>
+        createClient(url, key, {
+          auth: { ...options.auth, autoRefreshToken: false, detectSessionInUrl: false },
+          global: { fetch: service.fetch },
+        }) as never,
+    );
+  }
+
+  it('leaves no session for the network to bring back', async () => {
+    const restore = blockSiteData();
+    vi.useFakeTimers();
+    try {
+      const service = authService();
+      const adapter = lockedDownAdapter(service);
+      const account = adapter.account;
+      expect(account).toBeDefined();
+      // The parent signs in on this locked-down browser, so auth-js is holding a session.
+      expect(
+        await account!.signInWithPassword('pat.parent@example.test', 'synthetic-current-pass'),
+      ).toEqual({ ok: true, next: 'signed_in' });
+      expect(await adapter.currentSession()).not.toBeNull();
+
+      // They go offline; the access token expires while they are; then they press Sign out. An
+      // access token that has REALLY expired is the precondition for the refusal that leaves the
+      // session behind: inside the 90s margin auth-js preserves it and reaches /logout instead,
+      // which clears it ([HUNT6-F-MARGIN]).
+      service.state.offline = true;
+      await vi.advanceTimersByTimeAsync(121_000);
+      const pending = adapter.signOut('local');
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(await pending).toEqual({ serverNotTold: true });
+      // The pre-flight refresh failed, so the sign-out never got as far as the server.
+      expect(service.calls.some((url) => url.includes('/logout'))).toBe(false);
+      // This is the read both surfaces make before they print "This computer is signed out".
+      expect(await adapter.currentSession()).toBeNull();
+
+      // The network returns, and the refresh-failure cooldown (60s) lapses.
+      service.state.offline = false;
+      await vi.advanceTimersByTimeAsync(61_000);
+      // The sentence the parent was given has to still be true a minute later.
+      expect(await adapter.currentSession()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      restore();
+    }
+  });
+
+  it('hands auth-js a store this adapter can clear when localStorage cannot be touched', () => {
+    const restore = blockSiteData();
+    try {
+      let store: SessionStore | undefined;
+      createSupabaseAuth(supabaseConfig, (_url, _key, options) => {
+        store = options.auth.storage;
+        return {
+          auth: {
+            onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => undefined } } }),
+          },
+        } as never;
+      });
+      expect(store).toBeDefined();
+      // A store the adapter holds: it reads, writes and — the whole point — removes.
+      store!.setItem('sb-example-auth-token', 'synthetic');
+      expect(store!.getItem('sb-example-auth-token')).toBe('synthetic');
+      store!.removeItem('sb-example-auth-token');
+      expect(store!.getItem('sb-example-auth-token')).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  /**
+   * And the ordinary browser is unchanged: the store IS this origin's localStorage, so a signed-in
+   * parent survives a reload. Moving every session into memory would sign every parent out on every
+   * page load, which is the regression this case exists to catch.
+   */
+  it('keeps using this origin’s localStorage when it works', () => {
+    let store: SessionStore | undefined;
+    createSupabaseAuth(supabaseConfig, (_url, _key, options) => {
+      store = options.auth.storage;
+      return {
+        auth: {
+          onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => undefined } } }),
+        },
+      } as never;
+    });
+    expect(store).toBeDefined();
+    try {
+      store!.setItem(STORED, 'synthetic');
+      expect(localStorage.getItem(STORED)).toBe('synthetic');
+      expect(store!.getItem(STORED)).toBe('synthetic');
+    } finally {
+      localStorage.removeItem(STORED);
+    }
   });
 });
 
@@ -739,11 +1168,17 @@ describe('ACC-WEB-AUTH-A a refused sign-out still explains a closed account', ()
   });
 
   /**
-   * HUNT6-F-3, page half, and the sharpest case there is: a browser with site data blocked. Touching
-   * `globalThis.localStorage` throws, so `forgetStoredSession` removes nothing at all — yet the adapter
-   * still reports `serverNotTold`, because that report is about the SERVER. The closure flow used to
-   * spend that report as "the adapter's own guarantee" that this computer is signed out and hand the
-   * parent the public page's sentence saying so. It reads the session instead.
+   * HUNT6-F-3, page half: site data is blocked from under the adapter, so `globalThis.localStorage`
+   * throws while the sign-out is running — yet the adapter still reports `serverNotTold`, because that
+   * report is about the SERVER. The closure flow used to spend that report as "the adapter's own
+   * guarantee" that this computer is signed out and hand the parent the public page's sentence saying
+   * so. It reads the session instead.
+   *
+   * HUNT7-F-1: the blocking here lands AFTER the adapter was built, so the store it owns still holds the
+   * `Storage` object it captured while that was allowed — which is deliberate, not incidental: a session
+   * store read through a captured object survives a property that starts throwing mid-session. What the
+   * case pins is the page's decision, which does not depend on either: a report plus a session that can
+   * still be read is never presented as a finished sign-out.
    *
    * HUNT6-F-PREMISE: the client here is `keepsSessionOnSignOut` for the same reason as the case above —
    * a refusal that leaves the session readable is what the read is for, not what 2.116.0 produces.

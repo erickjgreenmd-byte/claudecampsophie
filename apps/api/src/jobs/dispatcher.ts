@@ -362,23 +362,27 @@ async function runDeletionPurge(deps: JobDeps, job: JobRow): Promise<void> {
          and (${childId}::uuid is null or child_id = ${childId}::uuid or child_id is null)
     `,
   }));
-  // An export still being built may upload its file after the purge: its path is deterministic.
-  const pendingExportPaths = exports
-    .filter((e) => e.status === 'queued')
-    .flatMap((e) => EXPORT_EXTENSIONS.map((ext) => exportPath(familyId, e.id, ext)));
   // JOBS-R2-01: a row that is not `ready` may still have its file in storage — an attempt whose
   // answer was lost stored the bytes without ever recording `storage_path`, and the row then became
   // `failed`. Nothing else ever removes such an object (the 7-day sweep only reads `ready` rows), so
   // a family deletion would otherwise leave a whole-family JSON, or an answer key, behind for ever.
-  const unreadyExportPaths = exports
+  //
+  // The same list is what the SECOND pass needs (HUNT7-D-1). It used to be built from
+  // `status === 'queued'` alone, on the reading that only a still-building row can have a worker that
+  // uploads after the purge. Migration 0960 broke that reading: a deletion now settles its in-scope
+  // 'queued' rows to 'failed' in the request's own transaction, so the row whose builder is mid-upload
+  // right now is exactly a 'failed' one — and it would have lost its private.storage_removals entry,
+  // leaving the file behind for ever. A row that has been 'failed' or 'expired' for a long time cannot
+  // be written again, and scheduling its deterministic paths a second time costs one idempotent
+  // storage remove; not scheduling the one that can be written costs the file.
+  const unbuiltExportPaths = exports
     .filter((e) => e.status !== 'ready')
     .flatMap((e) => EXPORT_EXTENSIONS.map((ext) => exportPath(familyId, e.id, ext)));
   const paths = [
     ...new Set([
       ...pages.map((p) => p.storage_path),
       ...exports.flatMap((e) => (e.storage_path ? [e.storage_path] : [])),
-      ...unreadyExportPaths,
-      ...pendingExportPaths,
+      ...unbuiltExportPaths,
     ]),
   ];
   if (paths.length > 0) {
@@ -388,12 +392,12 @@ async function runDeletionPurge(deps: JobDeps, job: JobRow): Promise<void> {
       throw new JobFailure('STORAGE_REMOVE_FAILED');
     }
   }
-  // Pages a still-valid signed URL can write, and pending exports, are removed again after the
-  // upload window closes (RV-lead-jobs-ai-20).
+  // Pages a still-valid signed URL can write, and exports that have no published file, are removed
+  // again after the upload window closes (RV-lead-jobs-ai-20; HUNT7-D-1 for the export arm).
   const late = [
     ...new Set([
       ...pages.filter((p) => p.upload_window_open).map((p) => p.storage_path),
-      ...pendingExportPaths,
+      ...unbuiltExportPaths,
     ]),
   ];
   const removeAfter = new Date(now.getTime() + LATE_UPLOAD_WINDOW_MS);

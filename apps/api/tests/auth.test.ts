@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { CONSENT_ATTESTATION_VERSION } from '@pencillift/contracts';
 import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import { RATE_RULES } from '../src/middleware/rate-limit.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
@@ -76,7 +77,7 @@ describe('adult step-up (spec P3, AC_ACCESS_08)', () => {
       api.request('/v1/children', {
         method: 'POST',
         token: t,
-        body: { nickname: 'Sam', gradeLevel: 2, ageBand: '5-7' },
+        body: { nickname: 'Sam', gradeLevel: 2, ageBand: '5-7', parentalAttestation: true },
       });
     expect((await add(token)).status).toBe(403);
     expect((await unlock()).status).toBe(200);
@@ -91,13 +92,61 @@ describe('adult step-up (spec P3, AC_ACCESS_08)', () => {
     expect((await json<{ status: string }>(created)).status).toBe('draft');
   });
 
+  it('refuses a child whose parental attestation is missing, false, or client-dated (0970)', async () => {
+    await unlock();
+    const post = (body: unknown) =>
+      api.request('/v1/children', { method: 'POST', token, body: body as never });
+
+    // An unticked box and an absent one are the same thing to a parent, and neither is consent.
+    for (const body of [
+      { nickname: 'Riley', gradeLevel: 2, ageBand: '5-7' },
+      { nickname: 'Riley', gradeLevel: 2, ageBand: '5-7', parentalAttestation: false },
+    ]) {
+      const res = await post(body);
+      // A contract violation is 400 (VALIDATION); 422 is for a business rule that the body satisfies.
+      expect(res.status).toBe(400);
+      expect((await json<{ error: { code: string } }>(res)).error.code).toBe('VALIDATION_FAILED');
+    }
+
+    // The client cannot choose the wording version or the instant: the request carries only the tick,
+    // and a strictObject refuses anything else, so a caller cannot backdate an attestation or claim
+    // agreement to a version that was never shown.
+    const extra = await post({
+      nickname: 'Riley',
+      gradeLevel: 2,
+      ageBand: '5-7',
+      parentalAttestation: true,
+      attestationVersion: '1999-01-v1',
+      attestedAt: '1999-01-01T00:00:00.000Z',
+    });
+    expect(extra.status).toBe(400);
+
+    // The ticked box succeeds, and the SERVER's version and clock are what got stored.
+    const ok = await post({
+      nickname: 'Riley',
+      gradeLevel: 2,
+      ageBand: '5-7',
+      parentalAttestation: true,
+    });
+    expect(ok.status).toBe(201);
+    const { childId } = await json<{ childId: string }>(ok);
+    const [row] = await api.db.sql<
+      { attestation_version: string; attested_by: string; attested_at: Date }[]
+    >`
+      select attestation_version, attested_by, attested_at
+        from public.child_profiles where id = ${childId}`;
+    expect(row!.attestation_version).toBe(CONSENT_ATTESTATION_VERSION);
+    expect(row!.attested_by).toBe(fam.ownerId);
+    expect(row!.attested_at.getFullYear()).toBeGreaterThan(2000);
+  });
+
   it('relocking on switch to child mode removes the step-up', async () => {
     await unlock();
     expect((await api.request('/v1/adult/lock', { method: 'POST', token })).status).toBe(200);
     const res = await api.request('/v1/children', {
       method: 'POST',
       token,
-      body: { nickname: 'Avery', gradeLevel: 1, ageBand: '5-7' },
+      body: { nickname: 'Avery', gradeLevel: 1, ageBand: '5-7', parentalAttestation: true },
     });
     expect(res.status).toBe(403);
   });

@@ -6,6 +6,8 @@ import {
   type AuthAdapter,
   type AuthOutcome,
   type ParentSession,
+  type SessionRead,
+  type SignOutReport,
 } from './auth.ts';
 import type { WebConfig } from './config.ts';
 
@@ -101,6 +103,28 @@ export function recoverySessionAuth(account: AccountAuth | undefined): RecoveryS
     : null;
 }
 
+/**
+ * HUNT7-F-1: the store the portal's session lives in, owned by this adapter instead of guessed at.
+ *
+ * Without a `storage` option auth-js picks its own: `globalThis.localStorage` when
+ * `supportsLocalStorage()` is true, and otherwise its internal `memoryLocalStorageAdapter`
+ * (GoTrueClient.js:249-269). That second case is a browser with site data blocked — a locked-down
+ * school, library or family computer — and there a `localStorage.removeItem` cannot reach the session
+ * auth-js is actually using: the removal either throws or succeeds as a no-op on a key nobody wrote.
+ * The session stays in that memory store with its refresh token, the auto-refresh ticker brings it back
+ * as soon as the network returns, and the parent has already been told this computer is signed out.
+ *
+ * Passing a store settles it: the adapter clears whatever auth-js used, and can say whether it did
+ * (`forgetStoredSession`). The shape is exactly auth-js's `SupportedStorage` minus the parts it does not
+ * need — three methods, no key enumeration (`removeAllPKCEVerifiers` asks only for named keys,
+ * lib/helpers.js:395-402).
+ */
+export interface SessionStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
 /** Options handed to `createClient`, so a test factory can assert what a second client persists. */
 export interface ClientAuthOptions {
   readonly auth: {
@@ -109,6 +133,7 @@ export interface ClientAuthOptions {
     readonly detectSessionInUrl: boolean;
     readonly autoRefreshToken: boolean;
     readonly storageKey?: string;
+    readonly storage?: SessionStore;
   };
 }
 
@@ -128,71 +153,186 @@ function sessionStorageKey(supabaseUrl: string): string | null {
   }
 }
 
-function portalClient(storageKey: string | null): ClientAuthOptions {
+function portalClient(storageKey: string | null, storage: SessionStore): ClientAuthOptions {
   return {
     auth: {
       flowType: 'pkce',
       persistSession: true,
       detectSessionInUrl: true,
       autoRefreshToken: true,
+      storage,
       ...(storageKey ? { storageKey } : {}),
     },
   };
 }
 
 /**
- * WEB-R4-AUTH-2: removes this origin's stored session. Used only when supabase-js has refused a
- * sign-out *without* clearing it, which in the pinned @supabase/auth-js 2.116.0 is exactly one path:
- * the stored access token has ALREADY EXPIRED (`expires_at` is in the past), so the refresh token is
- * the only credential left and `__loadSession` must refresh before `_signOut` can have a token at all;
- * that refresh fails at the fetch level (offline, captive portal, auth outage), which is the one
- * refresh failure `_callRefreshToken` does NOT clear storage for; and `_useSession` hands `_signOut`
- * the refresh error as a `sessionError`, which it returns before it reaches `removeCurrentSession()`.
- * A still-usable refresh token is left in localStorage, and on a shared family, school or library
- * computer the next person signs straight back in with it as soon as the network returns.
- *
- * HUNT6-F-MARGIN: "the stored access token is inside EXPIRY_MARGIN_MS" was the precondition this
- * comment stated, and a token merely inside that margin takes the OTHER path. Being inside the 90s
- * margin is only what makes `__loadSession` refresh at all; when that refresh fails, auth-js compares
- * the access token against its REAL expiry, and while the token is still valid it keeps the stored
- * session and returns it with `error: null` (its proactive-preserve branch, mirrored in
- * `_callRefreshToken`). `_signOut` therefore still has an access token, calls /logout, and lands on the
- * other refusal path described next — the one that removes the session before returning. Expiry, not
- * the margin, is what leaves a refresh token behind. (auth-js also drops the fallback when storage
- * changed under the refresh, but then the stored session is already gone and this has nothing to
- * remove.) Run against the real library in App.signout.test.tsx's [HUNT6-F-MARGIN] case, beside the
- * expired-token case it is contrasted with.
- *
- * HUNT6-F-PREMISE: on auth-js's OTHER refusal path — the /logout request itself failing with anything
- * but 404/401/403/session-missing — the order is the reverse. `removeCurrentSession()` runs inside
- * that error branch and only then is the error returned, so there is nothing left for this to remove
- * and it is a no-op. The mechanism this comment used to cite, "it returns the error before
- * removeCurrentSession(), so its in-memory session survives the removal", is in neither path: 2.116.0
- * holds no in-memory session at all. `getSession()` goes through `__loadSession`, which re-reads
- * `this.storage` on every call, and `this.storage` is `globalThis.localStorage` whenever
- * `supportsLocalStorage()` is true — so removing that key removes what `getSession()` reads. Both
- * paths are run against the real library in App.signout.test.tsx's [HUNT6-F-PREMISE] cases.
- *
- * Still best-effort, and callers are promised no more than that (the SignOutRefused doc in
- * lib/auth.ts): this cannot report a failure, and with site data blocked it removes nothing.
+ * This origin's localStorage when it is both readable and writable, or null. The write probe is not
+ * belt and braces: "block site data" in Chrome and Safari leaves a `localStorage` object in place whose
+ * every write throws, and delegating to it would break sign-in itself. auth-js applies the same two
+ * tests before choosing its own store (lib/helpers.js:61-90), so the store chosen here is the store
+ * auth-js would have chosen — the difference is only that this adapter holds it.
  */
-function forgetStoredSession(storageKey: string | null): void {
-  if (!storageKey) return;
+function usableLocalStorage(): Storage | null {
   try {
-    globalThis.localStorage?.removeItem(storageKey);
+    const storage = globalThis.localStorage;
+    if (!storage) return null;
+    const probe = `pl-storage-probe-${Math.random()}`;
+    storage.setItem(probe, probe);
+    storage.removeItem(probe);
+    return storage;
   } catch {
-    // Storage blocked (site data blocked, a locked-down browser): merely touching localStorage
-    // throws, so auth-js's supportsLocalStorage() is false and this origin's session is held in its
-    // memoryLocalStorageAdapter instead — where a localStorage removal cannot reach it. Nothing is
-    // removed here, and nothing was persisted either, so that session cannot outlive the tab; what
-    // this function can establish is unchanged, which is why the report stays about the server alone
-    // and the callers read the session for themselves (HUNT6-F-3, HUNT6-F-PREMISE).
+    // Site data blocked, or a locked-down browser: reading the property or writing to it throws.
+    return null;
   }
 }
 
 /**
+ * HUNT7-F-1: the session store this adapter hands the portal's client. localStorage when it works, so a
+ * signed-in parent still survives a reload and other tabs still share the slot; this page's own map
+ * otherwise, which is what auth-js would have used anyway — except that this one can be cleared.
+ *
+ * Reads and writes are deliberately NOT swallowed for the localStorage case. A read that throws must
+ * reach `getSession()` and come back as "unreadable" (see `readSession`); swallowing it would turn a
+ * session that could not be read into a session that is gone, which is the defect this exists to close.
+ */
+export function createSessionStore(): SessionStore {
+  const local = usableLocalStorage();
+  if (local) {
+    return {
+      getItem: (key) => local.getItem(key),
+      setItem: (key, value) => local.setItem(key, value),
+      removeItem: (key) => local.removeItem(key),
+    };
+  }
+  const held = new Map<string, string>();
+  return {
+    getItem: (key) => held.get(key) ?? null,
+    setItem: (key, value) => {
+      held.set(key, value);
+    },
+    removeItem: (key) => {
+      held.delete(key);
+    },
+  };
+}
+
+/**
+ * What the removal below achieved. HUNT7-F-1: it is an answer now, not a silence — the store belongs to
+ * this adapter, so "the session is gone from where auth-js reads it" is a fact it can check rather than
+ * hope for, and `signOut` uses it to decide whether auth-js still has a teardown to do (HUNT7-F-3).
+ */
+type SessionRemoval = 'removed' | 'absent' | 'kept';
+
+/**
+ * WEB-R4-AUTH-2: removes the session from the store this adapter handed the client. Used only when
+ * supabase-js has refused a sign-out *without* clearing it, so a still-usable refresh token is left
+ * behind — and on a shared family, school or library computer the next person is signed straight back
+ * in with it as soon as the network returns.
+ *
+ * HUNT7-F-5: a refusal leaves a stored session whenever `__loadSession` returns a `sessionError`
+ * (GoTrueClient.js:3427-3429), and in the pinned @supabase/auth-js 2.116.0 there are TWO ways to get
+ * one, not one:
+ *  (i) the stored access token has ALREADY EXPIRED, so the refresh token is the only credential left,
+ *      `__loadSession` must refresh before `_signOut` can have a token at all, and that refresh fails
+ *      at the fetch level (offline, captive portal, auth outage) — the one refresh failure
+ *      `_callRefreshToken` does not clear storage for (:4290-4313);
+ *  (ii) the access token is still valid and the refresh failed, but another writer REPLACED the stored
+ *      slot while it was failing — another tab's refresh rotating the session (`_saveSession`,
+ *      :4265-4272). The proactive-preserve branch hands the stored session back only while the slot
+ *      still holds the SAME refresh token (:2578-2588), so a replacement makes it return
+ *      `{ session: null, error }` although storage holds a newer, perfectly valid session.
+ * On (ii) the session removed here is that valid replacement. Removing it is the intended outcome — the
+ * parent pressed Sign out — but it is also a removal the OTHER tab is affected by, which is the reason
+ * the teardown in `signOut` matters. The earlier wording said (ii) could not happen because "the stored
+ * session is already gone and this has nothing to remove"; that is true only of the cleared half of
+ * that guard, and the library's own debug line distinguishes the two (`nowHolds: 'replaced'` vs
+ * `'cleared'`, :4250). App.signout.test.tsx's [HUNT7-F-5] case runs (ii) against the real library.
+ *
+ * HUNT6-F-MARGIN: being inside EXPIRY_MARGIN_MS is NOT what leaves a session behind. Inside the 90s
+ * margin is only what makes `__loadSession` refresh at all; when that refresh fails auth-js compares the
+ * access token against its REAL expiry and, while it is still valid, keeps the stored session and returns
+ * it with `error: null`. `_signOut` therefore still has an access token, calls /logout, and lands on the
+ * refusal path described next. Expiry — or a replaced slot — is what leaves a refresh token behind.
+ *
+ * HUNT6-F-PREMISE: on auth-js's OTHER refusal path — the /logout request itself failing with anything
+ * but 404/401/403/session-missing — the order is the reverse. `removeCurrentSession()` runs inside that
+ * error branch and only then is the error returned, so there is nothing left for this to remove and it
+ * answers `absent`. The mechanism this comment used to cite, "it returns the error before
+ * removeCurrentSession(), so its in-memory session survives the removal", is in neither path: 2.116.0
+ * holds no in-memory session at all. `getSession()` goes through `__loadSession`, which re-reads its
+ * storage on every call — and that storage is the store passed here, so removing this key removes what
+ * `getSession()` reads. Both paths are run against the real library in App.signout.test.tsx's
+ * [HUNT6-F-PREMISE] cases.
+ */
+function forgetStoredSession(store: SessionStore, storageKey: string | null): SessionRemoval {
+  // Only reachable with a project URL `new URL()` cannot parse, which `createClient` itself rejects
+  // first (supabase-js validateSupabaseUrl) — so this cannot happen while the adapter lives. If it ever
+  // does, the key auth-js chose for itself is not known here, and a removal that cannot name its key
+  // must not claim to have made one.
+  if (!storageKey) return 'kept';
+  try {
+    if (store.getItem(storageKey) === null) return 'absent';
+    store.removeItem(storageKey);
+    return store.getItem(storageKey) === null ? 'removed' : 'kept';
+  } catch {
+    // A store that throws on a read or a write says nothing about what it holds, so neither does this.
+    // The session may still be there, and `readSession` answers `unreadable` over it rather than
+    // letting a surface print "This computer is signed out" (HUNT7-F-1).
+    return 'kept';
+  }
+}
+
+/**
+ * HUNT7-F-2: GoTrue error codes that say this session is not (or is no longer) on the auth service.
+ * `session_not_found` is auth-js's own reading of it — "the `session_id` inside the JWT does not
+ * correspond to a row in the `sessions` table … the user has signed out, has been deleted, or their
+ * session has somehow been terminated" (lib/fetch.js:82-86, which raises AuthSessionMissingError for it);
+ * `session_expired` and `refresh_token_not_found` are the same fact about this session's two credentials.
+ *
+ * `refresh_token_already_used` is deliberately NOT here. It can mean the same thing, but it is also what
+ * a token another tab has just rotated answers, and whether the service revoked the rest of the session
+ * with it is not something this file can establish — so the parent keeps the warning, which is the
+ * cautious direction.
+ */
+const SESSION_ALREADY_ENDED_CODES: readonly string[] = [
+  'session_not_found',
+  'session_expired',
+  'refresh_token_not_found',
+];
+
+/**
+ * HUNT7-F-2: whether the error auth-js resolved a sign-out with proves the auth service had ALREADY
+ * ended this session — the opposite of "the server was never told", and the one case where warning the
+ * parent to change their password would be a false statement about their account.
+ *
+ * Both halves are read off the error, and both are facts auth-js constructs: `name` is how auth-js tells
+ * its own error classes apart (lib/errors.js `isAuthApiError`, `isAuthSessionMissingError`), and an
+ * `AuthApiError` is only ever built from an answer the service gave (lib/fetch.js `handleError`) — a
+ * request that got no answer at all, a rejected fetch or a 5xx/gateway failure, is an
+ * `AuthRetryableFetchError` instead. So: the service answered, and what it answered names this session's
+ * own credential as gone. Anything else — offline, a 5xx, a rate limit, a refusal that does not say the
+ * session ended — leaves the session possibly alive and keeps the report.
+ */
+function serviceEndedTheSession(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { name?: unknown; code?: unknown };
+  // `_signOut` swallows this one itself today (GoTrueClient.js:3428), so it is not reachable through
+  // this adapter — but it is the plainest statement of the fact, and it must never be read as a refusal.
+  if (candidate.name === 'AuthSessionMissingError') return true;
+  return (
+    candidate.name === 'AuthApiError' &&
+    typeof candidate.code === 'string' &&
+    SESSION_ALREADY_ENDED_CODES.includes(candidate.code)
+  );
+}
+
+/**
  * The password-proof client: nothing persisted, nothing refreshed and no URL handling, so it can
- * never take over the portal's stored session or race its token refresh.
+ * never take over the portal's stored session or race its token refresh. It is handed no `storage`
+ * either: with `persistSession: false` auth-js ignores the option and uses a memory store of its own
+ * (GoTrueClient.js:249-269), and a second writer on the portal's session slot is exactly what
+ * WEB-R2-04 exists to prevent.
  */
 const PROOF_CLIENT: ClientAuthOptions = {
   auth: {
@@ -220,7 +360,8 @@ export function createSupabaseAuth(
   const url = config.supabaseUrl;
   const key = config.supabasePublishableKey;
   const storageKey = sessionStorageKey(url);
-  const client = factory(url, key, portalClient(storageKey));
+  const store = createSessionStore();
+  const client = factory(url, key, portalClient(storageKey, store));
   const auth = client.auth;
   // Opened by the auth server's own PASSWORD_RECOVERY event (a PKCE reset link exchanged by
   // detectSessionInUrl) and by acceptRecoveryLink (a link started in the mobile app). Never opened
@@ -380,15 +521,40 @@ export function createSupabaseAuth(
     },
   };
 
+  /**
+   * HUNT7-F-1: the read that keeps auth-js's `error`, because dropping it spent "the session could not
+   * be read" as "there is no session".
+   *
+   * `getSession()` resolves `{ data: { session: null }, error }` — it does not reject — whenever the
+   * session it holds needs a refresh and that refresh fails, and `_callRefreshToken` caches that failure
+   * for REFRESH_FAILURE_COOLDOWN_MS (60s, constants.js:21), so the read right after a refused sign-out
+   * hits the very same failure that caused the refusal. On the one path that leaves a session behind,
+   * the session is still there with a usable refresh token while this read comes back empty. That is
+   * `unreadable`, not `signed_out`, and `stillSignedIn` in lib/auth.ts keeps the parent signed in over it.
+   *
+   * A session object that is present but carries no access token or no email is `unreadable` too: it
+   * exists, so this browser is not signed out, and it cannot be used, so it is not a session either.
+   */
+  const readSession = async (): Promise<SessionRead> => {
+    const { data, error } = await auth.getSession();
+    const session = data.session;
+    if (!session?.access_token || !session.user?.email) {
+      return error || session ? { state: 'unreadable' } : { state: 'signed_out' };
+    }
+    return {
+      state: 'signed_in',
+      session: { accessToken: session.access_token, email: session.user.email },
+    };
+  };
+
   return {
     configured: true,
     account,
     async currentSession(): Promise<ParentSession | null> {
-      const { data } = await auth.getSession();
-      const session = data.session;
-      if (!session?.access_token || !session.user.email) return null;
-      return { accessToken: session.access_token, email: session.user.email };
+      const read = await readSession();
+      return read.state === 'signed_in' ? read.session : null;
     },
+    readSession,
     /**
      * WEB-R2-01: scoped. supabase-js defaults to scope 'global', which would end the parent's
      * phone session as well; the portal's sign-out is local unless a caller asks otherwise.
@@ -414,9 +580,9 @@ export function createSupabaseAuth(
       // parent about it — but it is no longer observable through either page, so it is asserted on
       // this adapter directly (App.signout.test.tsx, ACC-WEB-AUTH-A).
       //
-      // HUNT6-F-3: the report says the SERVER was not told, and only that. The clearing below is
-      // best-effort (forgetStoredSession) and cannot report what it achieved, so both callers re-read
-      // currentSession() before showing a signed-out screen; this return value is never a statement
+      // HUNT6-F-3: the report says the SERVER was not told, and only that. The clearing below reports
+      // what it achieved to this function, not to the caller, so both callers read the session
+      // (`stillSignedIn`) before showing a signed-out screen; this return value is never a statement
       // that this origin's session is gone.
       //
       // HUNT6-F-PREMISE: with this pinned auth-js that read is expected to find nothing. Every path on
@@ -424,13 +590,40 @@ export function createSupabaseAuth(
       // removes the session itself before returning a /logout failure, and a pre-flight refresh that
       // failed is the same failure `getSession()` goes on to hit. The read is kept all the same,
       // because that is a fact about one pinned version's internals while "This computer is signed
-      // out" is a sentence said to a parent, and the read is the only thing that establishes it. It is
-      // not dead either: it fires for an adapter that throws, a currentSession() that throws, a
-      // storage adapter other than the two auth-js picks for itself, and the next auth-js.
+      // out" is a sentence said to a parent, and the read is the only thing that establishes it.
+      //
+      // HUNT7-F-1: and "answering `session: null`" is not the same fact as "the session is gone", which
+      // is why that read now keeps the error (readSession above). The session store is this adapter's
+      // own (createSessionStore), so the removal below reaches whatever auth-js is using — including
+      // the memory store it falls back to when site data is blocked, where a localStorage removal
+      // reached nothing and the session came back with the network.
       const { error } = await auth.signOut({ scope });
       if (!error) return;
-      forgetStoredSession(storageKey);
-      return { serverNotTold: true };
+      // HUNT7-F-2: decided before the removal and the teardown, and from the error alone: an answer
+      // proving the service had already ended this session is the opposite of a service that was never
+      // told, and must not put "change your password if you are worried" in front of a parent.
+      const report: SignOutReport = serviceEndedTheSession(error)
+        ? undefined
+        : { serverNotTold: true };
+      // HUNT7-F-3: a removal made here raises no SIGNED_OUT and posts nothing on the per-storageKey
+      // BroadcastChannel, because `_removeSession()` is the only place auth-js does either
+      // (GoTrueClient.js:4416-4433, :4345-4354) and it registers no 'storage' listener. So a second
+      // portal tab kept the family's children, scans, verdicts and guardian emails on screen, and its
+      // "Signed in as …" line, after this tab told the parent the computer was signed out — while a
+      // sign-out auth-js CARRIED OUT dropped that tab to the sign-in prompt. With the session now out
+      // of the store, a second signOut takes the token-less path (:3423-3448: no sessionError, no
+      // access token, so no request) straight to `removeCurrentSession()`, which raises the event and
+      // broadcasts it. Teardown only: the report above is already decided and is not recomputed, and
+      // this runs only where auth-js has not torn down already ('absent') and where the session really
+      // did leave the store ('kept' means it may still be there).
+      if (forgetStoredSession(store, storageKey) === 'removed') {
+        try {
+          await auth.signOut({ scope });
+        } catch {
+          // Teardown, not the outcome: the parent is told what the first call established either way.
+        }
+      }
+      return report;
     },
     onChange(listener) {
       const { data } = auth.onAuthStateChange(() => listener());

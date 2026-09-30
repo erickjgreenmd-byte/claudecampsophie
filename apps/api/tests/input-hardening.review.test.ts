@@ -247,7 +247,7 @@ describe('[API-AUTH-R1-04] per-family caps and rate rules on parent create route
       const res = await api.request('/v1/children', {
         method: 'POST',
         token,
-        body: { nickname: `Draft ${i}`, gradeLevel: 3, ageBand: '8-10' },
+        body: { nickname: `Draft ${i}`, gradeLevel: 3, ageBand: '8-10', parentalAttestation: true },
       });
       statuses.push(res.status);
     }
@@ -255,7 +255,7 @@ describe('[API-AUTH-R1-04] per-family caps and rate rules on parent create route
     const thirteenth = await call('/v1/children', {
       method: 'POST',
       token,
-      body: { nickname: 'One too many', gradeLevel: 3, ageBand: '8-10' },
+      body: { nickname: 'One too many', gradeLevel: 3, ageBand: '8-10', parentalAttestation: true },
     });
     expect(thirteenth.status).toBe(422);
     expect(thirteenth.body.error.code).toBe('BUSINESS_RULE');
@@ -275,7 +275,7 @@ describe('[API-AUTH-R1-04] per-family caps and rate rules on parent create route
     const again = await api.request('/v1/children', {
       method: 'POST',
       token,
-      body: { nickname: 'Jordan', gradeLevel: 2, ageBand: '5-7' },
+      body: { nickname: 'Jordan', gradeLevel: 2, ageBand: '5-7', parentalAttestation: true },
     });
     expect(again.status).toBe(201);
   });
@@ -292,7 +292,7 @@ describe('[API-AUTH-R1-04] per-family caps and rate rules on parent create route
       const res = await api.request('/v1/children', {
         method: 'POST',
         token,
-        body: { nickname: `Sam ${i}`, gradeLevel: 1, ageBand: '5-7' },
+        body: { nickname: `Sam ${i}`, gradeLevel: 1, ageBand: '5-7', parentalAttestation: true },
       });
       if (res.status === 429) {
         limited += 1;
@@ -416,16 +416,16 @@ describe('[API-AUTH-R1-05] child profiles are K-8 and under 13 at the API bounda
 
   it('POST /v1/children refuses grade 9-12 and the 14-18 band', async () => {
     for (const body of [
-      { nickname: 'Teen', gradeLevel: 12, ageBand: '14-18' },
-      { nickname: 'Teen', gradeLevel: 9, ageBand: '11-13' },
-      { nickname: 'Teen', gradeLevel: 8, ageBand: '14-18' },
+      { nickname: 'Teen', gradeLevel: 12, ageBand: '14-18', parentalAttestation: true },
+      { nickname: 'Teen', gradeLevel: 9, ageBand: '11-13', parentalAttestation: true },
+      { nickname: 'Teen', gradeLevel: 8, ageBand: '14-18', parentalAttestation: true },
     ]) {
       expectValidationFailed(await call('/v1/children', { method: 'POST', token: owner, body }));
     }
     const eighth = await api.request('/v1/children', {
       method: 'POST',
       token: owner,
-      body: { nickname: 'Jordan', gradeLevel: 8, ageBand: '11-13' },
+      body: { nickname: 'Jordan', gradeLevel: 8, ageBand: '11-13', parentalAttestation: true },
     });
     expect(eighth.status).toBe(201);
   });

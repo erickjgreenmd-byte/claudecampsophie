@@ -157,14 +157,22 @@ describe('WEB-R2-04 Supabase adapter verifyPassword (labeled fake client, no net
     supabasePublishableKey: 'sb_publishable_test',
   };
 
+  /**
+   * HUNT7-F-1: the portal's client is now handed a session store the adapter owns, so a refused
+   * sign-out can clear whatever auth-js used even where localStorage cannot be touched. The proof
+   * client must not be given it. It persists nothing (`persistSession: false`, which is also the only
+   * condition under which auth-js consults the `storage` option at all — GoTrueClient.js:249-269), and
+   * handing it the portal's store would put a second writer on the slot that holds the parent's real
+   * session, which is the exact thing WEB-R2-04 exists to prevent.
+   */
   it('proves the password on a second, non-persisting client and signs that one out', async () => {
-    const created: { persistSession: unknown; storageKey?: unknown }[] = [];
+    const created: { persistSession: unknown; storageKey?: unknown; storage?: unknown }[] = [];
     const proofSignOut = vi.fn(() => Promise.resolve({ error: null }));
     const proofSignIn = vi.fn(() => Promise.resolve({ error: null }));
     const mainSignIn = vi.fn(() => Promise.resolve({ error: null }));
     let call = 0;
     const factory = (_url: string, _key: string, options?: { auth?: Record<string, unknown> }) => {
-      created.push((options?.auth ?? {}) as { persistSession: unknown });
+      created.push((options?.auth ?? {}) as { persistSession: unknown; storage?: unknown });
       call += 1;
       return (
         call === 1
@@ -191,6 +199,10 @@ describe('WEB-R2-04 Supabase adapter verifyPassword (labeled fake client, no net
     // The portal's own client never re-signs in, so its session (and an owner's aal2) survives.
     expect(mainSignIn).not.toHaveBeenCalled();
     expect(created[1]?.persistSession).toBe(false);
+    // The portal's client owns a session store; the throwaway proof client is handed none, so it
+    // cannot write to the slot the parent's real session lives in.
+    expect(created[0]?.storage).toBeDefined();
+    expect(created[1]?.storage).toBeUndefined();
     expect(proofSignOut).toHaveBeenCalledWith({ scope: 'local' });
   });
 });

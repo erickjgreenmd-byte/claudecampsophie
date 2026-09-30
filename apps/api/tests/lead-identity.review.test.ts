@@ -303,7 +303,7 @@ describe('RV-lead-identity-access-8: step-up and child-session expiry use one cl
       const add = await api.request('/v1/children', {
         method: 'POST',
         token,
-        body: { nickname: 'Avery', gradeLevel: 2, ageBand: '5-7' },
+        body: { nickname: 'Avery', gradeLevel: 2, ageBand: '5-7', parentalAttestation: true },
       });
       expect(add.status).toBe(201);
     } finally {

@@ -152,17 +152,54 @@ A hybrid gets both on the Stripe path only: authorise the card, verify, then cap
 verified. IAP cannot authorise without capturing, so this is web-signup only and does not help an in-app
 signup.
 
-## The gap in the schema — needs a forward migration
+## The gap in the schema — CLOSED by migration 0970 (2026-09-30)
+
+**Status: implemented.** On the owner's directive ("put that into the system that will cover us for
+Parental consent — no more debates on this"), the attestation is now recorded per CHILD rather than
+beside the family's consent record, which is the stronger placement: the claim is about one named child,
+so it belongs on that child's row.
+
+`supabase/migrations/0970_parental_attestation.sql` adds three columns to `public.child_profiles` —
+`attestation_version`, `attested_at`, `attested_by` (FK `auth.users`) — under two constraints:
+
+- `child_profiles_attestation_complete` — all three or none, so a half-written record is impossible.
+- `child_profiles_active_requires_attestation` — `status <> 'active' or attested_at is not null`, so no
+  child can be ACTIVE (the only status that can be paired with a device and receive AI work) without one.
+  Draft and archived rows are deliberately left free: a draft holds no paid slot and does no processing,
+  and archiving must never be blocked by a missing record.
+
+The constraint is on the table, not only in the Hono handler, because `authenticated` reaches
+`public.child_profiles` through the Supabase Data API with the parent's own token and never passes the
+API (L-037, the BUG-240 class). The wording lives in `packages/contracts/src/family.ts` as
+`CONSENT_ATTESTATION_STATEMENT` at `CONSENT_ATTESTATION_VERSION`, rendered by both the portal and the
+phone from that constant so the two can never drift; the version, the instant and which adult are all
+stamped server-side in `apps/api/src/routes/family.ts`, and the request schema is a `strictObject`, so a
+client cannot supply any of the three. Evidence: `docs/Test_Evidence.md`, and BUG-346/BUG-347 in
+`docs/Bug_Ledger.md`.
+
+**What this does and does not claim.** It records an ATTESTATION by a self-asserted adult. It is not
+verified adulthood and it is not verified parenthood — no method verifies parenthood at all. Adult
+verification (government ID plus a live selfie matched to it, the FTC-approved 2023 method) remains an
+owner action; until it is in place, `attested_by` names an adult whose adulthood the product has not
+checked. Counsel still has to approve the statement's wording, and a reworded statement gets a new
+`CONSENT_ATTESTATION_VERSION` so the two are distinguishable in the record.
+
+### The original gap, for the record
+
+### Why it was a gap
+
 
 `public.consent_records` (migration 0001) stores `provider`, `provider_reference`, `method`, `purpose`,
 `policy_version`, `scope`, `status`, `verified_at`, `withdrawn_at`, `adult_user_id`. So *how* adulthood was
 proved is recorded, and *what* was consented to is recorded — but **the parental-guardian attestation has
 no field**, and it is doing real legal work.
 
-**Lead decision:** add it as a forward migration — the attestation's text version and its instant beside
-the existing columns — capture it at the consent step on both surfaces, and have counsel approve the
-wording as part of #15. Not done on 2026-09-29 because two fix stages were in flight and the migration
-number is the lead's to assign when the tree is quiet.
+**Lead decision (2026-09-29), carried out on 2026-09-30 as 0970:** add it as a forward migration, capture
+it on both surfaces, and have counsel approve the wording as part of #15. One thing changed in the doing:
+the columns went on `public.child_profiles` rather than beside `consent_records`' existing ones, because
+the claim is about one named child and belongs on that child's row — and that placement is what lets a
+CHECK constraint make an un-attested active child impossible. Counsel's approval of the wording is still
+outstanding.
 
 The cases where the attestation is doing all the work, and which no ID check touches:
 

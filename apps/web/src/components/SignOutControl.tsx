@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { familyOkResponseSchema, SIGN_OUT_NOT_TOLD_COPY } from '@pencillift/contracts';
-import { maskEmail } from '../lib/auth.ts';
+import { maskEmail, stillSignedIn } from '../lib/auth.ts';
 import { useParentSession, useSession } from '../lib/session.tsx';
 
 const STILL_OPEN =
@@ -52,11 +52,20 @@ const SERVER_NOT_TOLD = SIGN_OUT_NOT_TOLD_COPY.signInOpen;
  * the portal looked signed out while the next person at the keyboard could type /app and read the
  * family's data. The control now waits for the session to be gone before it moves on.
  *
- * WEBR5-E-2: "otherwise say so and stay" is right only while the session really is still here. On the
- * refusal path the adapter clears this origin's storage itself, and staying then kept the family's
- * page and a "Signed in as …" line up over no session at all. Those two cases are now told apart: a
- * session still open keeps the parent here to try again, a cleared one leaves for /sign-in with a
- * notice that says what helps instead of asking for a retry that cannot reach the server.
+ * WEBR5-E-2: "otherwise say so and stay" is right only while the session really is still here. Staying
+ * over a session that had in fact gone kept the family's page and a "Signed in as …" line up over no
+ * session at all. Those two cases are now told apart: a session still open keeps the parent here to try
+ * again, one that is really gone leaves for /sign-in with a notice that says what helps instead of
+ * asking for a retry that cannot reach the server.
+ *
+ * HUNT7-F-4: which of the two happened is settled by the read at `open` below, and by nothing else. The
+ * sentence here used to be "on the refusal path the adapter clears this origin's storage itself", the
+ * same claim BUG-322 had already had deleted from lib/auth.ts as false — on auth-js's /logout-failure
+ * path it is the library that clears the session, not the adapter, and on its pre-flight-refresh path
+ * the adapter's removal can fail and say so only to itself (lib/supabase-auth.ts's forgetStoredSession
+ * and signOut). A refusal report therefore licenses nothing about this browser; a next author reading
+ * that sentence would have deleted the read as redundant, which is exactly what round 6 found the
+ * account-closure flow doing.
  */
 export function SignOutControl() {
   const { api, auth } = useSession();
@@ -65,16 +74,6 @@ export function SignOutControl() {
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   if (state.status !== 'signed_in') return null;
-
-  /** Whether this browser is still holding a session, however the sign-out ended. */
-  const stillSignedIn = async () => {
-    try {
-      return (await auth.currentSession()) !== null;
-    } catch {
-      // The session cannot be read, so it cannot be shown as ended either.
-      return true;
-    }
-  };
 
   const signOut = async () => {
     setBusy(true);
@@ -93,18 +92,20 @@ export function SignOutControl() {
     } catch {
       refused = true;
     }
-    const open = await stillSignedIn();
+    // HUNT7-F-1: the shared read, which treats a session it could not read as still signed in — that
+    // is the only answer that can be given about a session the adapter may not have reached.
+    const open = await stillSignedIn(auth);
     setBusy(false);
     if (open) {
       setProblem(STILL_OPEN);
       return;
     }
     if (refused) {
-      // WEBR5-E-2: the adapter cleared this browser, but the server was never told. Staying put kept
-      // the family's page — children, scans, verdicts, guardian emails — and a "Signed in as …" line
-      // on screen although this browser holds no session at all: the bare storage removal raises no
-      // SIGNED_OUT, so the shell's session state is stale and nothing else moves. This browser IS
-      // signed out, so the portal leaves, and the notice travels with it.
+      // WEBR5-E-2: this browser has no readable session, and the server was never told. Staying put
+      // kept the family's page — children, scans, verdicts, guardian emails — and a "Signed in as …"
+      // line on screen although this browser holds no session at all: the shell's session state can
+      // be stale, so nothing else moves on its own. The read above is what establishes the first
+      // half; the report is what establishes the second (HUNT7-F-4 — neither establishes the other).
       void navigate('/sign-in', { replace: true, state: { signedOutNotice: SERVER_NOT_TOLD } });
       return;
     }

@@ -315,6 +315,9 @@ describe('[HUNT5-F-1] the edit form diffs against the props it was SEEDED with',
     // A sibling action reloads the family while the edit form stays open and seeded on grade 3.
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    // Adding a child needs its own parental attestation (migration 0970), so the sibling action
+    // these cases use as a reload lever has to tick the box like a real parent would.
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
     // HUNT6-G-4: this used to wait on `card('Riley').textContent` matching /Grade 4/, which cannot
     // fail — the open EditChildForm renders one <option> per grade, so "Grade 4" is inside the card
@@ -393,6 +396,9 @@ describe('[HUNT5-F-3] a successful archive closes the edit form it leaves behind
 
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    // Adding a child needs its own parental attestation (migration 0970), so the sibling action
+    // these cases use as a reload lever has to tick the box like a real parent would.
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
 
     const reloaded = await card('Riley');
@@ -442,6 +448,9 @@ describe('[HUNT6-G-5] a status change closes the archive confirmation, not just 
     // condition can close the confirmation.
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    // Adding a child needs its own parental attestation (migration 0970), so the sibling action
+    // these cases use as a reload lever has to tick the box like a real parent would.
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
 
     const reloaded = await card('Riley');
@@ -475,6 +484,9 @@ describe('[HUNT6-G-5] a status change closes the archive confirmation, not just 
     await user.click(within(riley).getByRole('button', { name: /archive Riley/i }));
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    // Adding a child needs its own parental attestation (migration 0970), so the sibling action
+    // these cases use as a reload lever has to tick the box like a real parent would.
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
 
     const reloaded = await card('Riley');
@@ -509,6 +521,9 @@ describe('[HUNT6-G-8] the grade the form is showing can still be saved after a c
 
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), 'Sam');
+    // Adding a child needs its own parental attestation (migration 0970), so the sibling action
+    // these cases use as a reload lever has to tick the box like a real parent would.
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
     const reloaded = await card('Riley');
     await waitFor(async () =>
@@ -594,6 +609,9 @@ describe('[G-PROSE] one status change closes every open panel, and clears it', (
   async function addAChild(user: ReturnType<typeof userEvent.setup>, nickname: string) {
     const add = screen.getByRole('region', { name: 'Add a child' });
     await user.type(within(add).getByLabelText(/nickname/i), nickname);
+    // Adding a child needs its own parental attestation (migration 0970), so the sibling action
+    // these cases use as a reload lever has to tick the box like a real parent would.
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(within(add).getByRole('button', { name: /add draft child/i }));
   }
 

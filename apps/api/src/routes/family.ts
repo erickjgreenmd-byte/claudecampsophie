@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { isValidIanaZone } from '@pencillift/domain';
 import {
   CHILD_PROFILE_RULES,
+  CONSENT_ATTESTATION_VERSION,
   createChildProfileRequestSchema,
   createFamilyRequestSchema,
   updateChildProfileRequestSchema,
@@ -288,7 +289,7 @@ export function familyRoutes(): Hono<AppEnv> {
 
   // Adding a child creates an uncharged draft; activation requires a verified paid slot (spec P11).
   r.post('/children', async (c) => {
-    const { deps } = c.var;
+    const { deps, parent } = c.var;
     const familyId = await currentFamilyId(c);
     await assertRecentUnlock(c);
     await enforceRateLimit(
@@ -312,9 +313,17 @@ export function familyRoutes(): Hono<AppEnv> {
         );
       }
       // Service role: the family id comes from the caller's verified membership (spec E4).
+      //
+      // The parental/guardian attestation is stored WITH the child, in the same statement, so a child
+      // row never exists without one (migration 0970). The version and the instant come from the
+      // server — `CONSENT_ATTESTATION_VERSION` and this request's clock — never from the body,
+      // which carries only the ticked box. `attested_by` is the adult who ticked it, because several
+      // guardians can share a family and which one made the claim is part of the record.
       const [inserted] = await tx<{ id: string }[]>`
-        insert into public.child_profiles (family_id, nickname, grade_level, age_band)
-        values (${familyId}, ${body.nickname}, ${body.gradeLevel}, ${body.ageBand}) returning id
+        insert into public.child_profiles
+          (family_id, nickname, grade_level, age_band, attestation_version, attested_at, attested_by)
+        values (${familyId}, ${body.nickname}, ${body.gradeLevel}, ${body.ageBand},
+                ${CONSENT_ATTESTATION_VERSION}, ${deps.clock()}, ${parent.userId}) returning id
       `;
       return inserted!;
     });

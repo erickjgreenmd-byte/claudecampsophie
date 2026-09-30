@@ -2,6 +2,8 @@ import { useCallback, useState } from 'react';
 import { Text, TextInput } from 'react-native';
 import { router } from 'expo-router';
 import {
+  ATTESTATION_REQUIRED_COPY,
+  CONSENT_ATTESTATION_STATEMENT,
   GRADE_LEVEL_MAX,
   ageBandSchema,
   childActivationResponseSchema,
@@ -28,6 +30,7 @@ import {
   Body,
   Button,
   Card,
+  Checkbox,
   Choice,
   ErrorBox,
   Heading,
@@ -416,6 +419,10 @@ function AddChild({ api, onAdded }: { api: ApiClient; onAdded: () => void }) {
   const [nickname, setNickname] = useState('');
   const [grade, setGrade] = useState('3');
   const [ageBand, setAgeBand] = useState<AgeBand>('8-10');
+  // The parental/guardian attestation for THIS child (migration 0970), worded identically to the
+  // portal's box so the two surfaces ask for the same thing (L-037).
+  const [attested, setAttested] = useState(false);
+  const [attestError, setAttestError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; needsPin: boolean; text: string } | null>(
     null,
@@ -423,8 +430,15 @@ function AddChild({ api, onAdded }: { api: ApiClient; onAdded: () => void }) {
 
   const submit = async () => {
     const name = nickname.trim();
-    if (name.length < 1 || name.length > 40) {
+    const badNickname = name.length < 1 || name.length > 40;
+    // Both reasons are reported in one pass, so fixing one does not earn a second refusal.
+    setAttestError(attested ? null : ATTESTATION_REQUIRED_COPY);
+    if (badNickname) {
       setResult({ ok: false, needsPin: false, text: 'Enter a nickname of 1 to 40 characters.' });
+      return;
+    }
+    if (!attested) {
+      setResult(null);
       return;
     }
     setBusy(true);
@@ -433,10 +447,13 @@ function AddChild({ api, onAdded }: { api: ApiClient; onAdded: () => void }) {
       await api.send(
         'POST',
         '/v1/children',
-        { nickname: name, gradeLevel: Number(grade), ageBand },
+        { nickname: name, gradeLevel: Number(grade), ageBand, parentalAttestation: true },
         createChildProfileResponseSchema,
       );
       setNickname('');
+      // The statement covers one child, so the tick must not carry over to a sibling.
+      setAttested(false);
+      setAttestError(null);
       setResult({ ok: true, needsPin: false, text: `${name} was added as a draft profile.` });
       onAdded();
     } catch (error) {
@@ -471,6 +488,15 @@ function AddChild({ api, onAdded }: { api: ApiClient; onAdded: () => void }) {
         onChange={setGrade}
       />
       <Choice label="Age band" options={AGE_OPTIONS} value={ageBand} onChange={setAgeBand} />
+      <Checkbox
+        label={CONSENT_ATTESTATION_STATEMENT}
+        checked={attested}
+        error={attestError}
+        onChange={(next) => {
+          setAttested(next);
+          setAttestError(null);
+        }}
+      />
       <Button
         label={busy ? 'Adding…' : 'Add draft child'}
         busy={busy}

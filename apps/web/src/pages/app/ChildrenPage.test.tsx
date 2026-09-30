@@ -222,18 +222,57 @@ describe('ChildrenPage', () => {
     await user.type(await screen.findByLabelText('Nickname'), '  Jordan ');
     await user.selectOptions(screen.getByLabelText('Grade'), '4');
     await user.selectOptions(screen.getByLabelText('Age band'), '8-10');
+    await user.click(screen.getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(screen.getByRole('button', { name: 'Add draft child' }));
     expect(await screen.findByText('Jordan was added as a draft profile.')).toBeTruthy();
     expect(sends).toEqual([
       {
         method: 'POST',
         path: '/v1/children',
-        body: { nickname: 'Jordan', gradeLevel: 4, ageBand: '8-10' },
+        body: {
+          nickname: 'Jordan',
+          gradeLevel: 4,
+          ageBand: '8-10',
+          parentalAttestation: true,
+        },
       },
     ]);
     await waitFor(() => expect(gets.length).toBe(2));
     // The refresh keeps the list mounted, so the confirmation stays visible.
     expect(screen.getByText('Jordan was added as a draft profile.')).toBeTruthy();
+    // The statement is about ONE child, so the tick must not carry over to a sibling (0970).
+    expect(screen.getByRole('checkbox', { name: /parent or legal guardian/ })).toHaveProperty(
+      'checked',
+      false,
+    );
+  });
+
+  it('refuses to add a child until the parental attestation is ticked (0970)', async () => {
+    const user = userEvent.setup();
+    const { api, sends } = fakeApi({ send: () => ({ childId: SAM, status: 'draft' }) });
+    renderPage(<ChildrenPage />, { api });
+    await user.type(await screen.findByLabelText('Nickname'), 'Avery');
+    // The button stays enabled so the refusal comes with a reason rather than a dead control.
+    expect(screen.getByRole('button', { name: 'Add draft child' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    await user.click(screen.getByRole('button', { name: 'Add draft child' }));
+    expect(
+      screen.getByText(
+        'Please confirm you are this child\u2019s parent or legal guardian before adding them.',
+      ),
+    ).toBeTruthy();
+    expect(sends).toHaveLength(0);
+    // The message is wired to the box it is about, not to an id nothing renders.
+    const box = screen.getByRole('checkbox', { name: /parent or legal guardian/ });
+    const describedBy = box.getAttribute('aria-describedby') ?? '';
+    expect(describedBy).not.toBe('');
+    expect(document.getElementById(describedBy)?.textContent).toContain('parent or legal guardian');
+    await user.click(box);
+    await user.click(screen.getByRole('button', { name: 'Add draft child' }));
+    expect(await screen.findByText('Avery was added as a draft profile.')).toBeTruthy();
+    expect(sends[0]?.body).toMatchObject({ parentalAttestation: true });
   });
 
   it('validates the nickname and explains step-up for adding a child', async () => {
@@ -244,8 +283,11 @@ describe('ChildrenPage', () => {
     renderPage(<ChildrenPage />, { api });
     await user.click(await screen.findByRole('button', { name: 'Add draft child' }));
     expect(screen.getByText('Enter a nickname of 1 to 40 characters.')).toBeTruthy();
+    // Both reasons are reported in one pass, so fixing one does not earn a second refusal.
+    expect(screen.getByText(/parent or legal guardian before adding them/)).toBeTruthy();
     expect(sends).toHaveLength(0);
     await user.type(screen.getByLabelText('Nickname'), 'Avery');
+    await user.click(screen.getByRole('checkbox', { name: /parent or legal guardian/ }));
     await user.click(screen.getByRole('button', { name: 'Add draft child' }));
     expect(await screen.findByText(/Adding a child needs a recent PIN unlock/)).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Unlock on the Security page' })).toBeTruthy();

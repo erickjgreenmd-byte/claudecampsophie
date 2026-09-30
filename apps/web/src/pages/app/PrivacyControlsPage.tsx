@@ -34,6 +34,7 @@ import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState, Loading, Notice } from '../../components/states.tsx';
 import { StepUpPrompt as SharedStepUpPrompt } from '../../components/StepUpPrompt.tsx';
 import { STORE_THAT_BILLS_YOU } from '../../components/stores.ts';
+import { stillSignedIn } from '../../lib/auth.ts';
 import { RequireParent, useApiQuery, useSession, type QueryState } from '../../lib/session.tsx';
 
 /**
@@ -737,18 +738,6 @@ function AccountCloseSection() {
   const [sessionStillOpen, setSessionStillOpen] = useState<string | null>(null);
   const confirmId = useId();
 
-  /**
-   * Whether this browser is still holding a session, however the sign-out ended — SignOutControl's
-   * check, for the same reason: a session that cannot even be read cannot be shown as ended.
-   */
-  const stillSignedIn = async () => {
-    try {
-      return (await auth.currentSession()) !== null;
-    } catch {
-      return true;
-    }
-  };
-
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!confirmed) {
@@ -783,10 +772,19 @@ function AccountCloseSection() {
     // means this browser's stored session was cleared, so "this computer IS signed out" comes free —
     // is the over-claim HUNT6-G-1 below takes back.
     //
-    // The report now travels in the router state and /account-deletion says that sentence beside the
-    // closure notice (AccountDeletionPage's SERVER_NOT_TOLD, word for word SignOutControl's, which
-    // reports the same fact on its own path). The catch stays for an adapter that fails some other
-    // way; what such a throw can honestly be reported as is the paragraph below.
+    // The report now travels in the router state and /account-deletion says a sentence about the
+    // session beside the closure notice — its `serverNotTold(closed)`, which is
+    // SIGN_OUT_NOT_TOLD_COPY.signInOpen on the `pending` path, the one sentence SignOutControl also
+    // says, and SIGN_OUT_NOT_TOLD_COPY.signInClosed on `closed`, where the sign-in is gone and neither
+    // remedy exists any more (HUNT6-G-6). The catch stays for an adapter that fails some other way;
+    // what such a throw can honestly be reported as is the paragraph below.
+    //
+    // HUNT7-I-4: this used to cite "AccountDeletionPage's SERVER_NOT_TOLD, word for word
+    // SignOutControl's". That constant no longer exists in that file — the same commit replaced it with
+    // the two-string function above — and the second half was made false by that very change, on
+    // purpose: the two surfaces are meant to differ on `closed`, and PrivacyControlsPage.test.tsx's
+    // [HUNT6-G-6] cases assert the divergence. A reader told they cannot differ would not look for the
+    // `closed` branch.
     //
     // HUNT5-N6: "reported the same way" held for the SERVER's session — an adapter that threw did not
     // end that either — but the sentence the public page then says is about THIS COMPUTER, and
@@ -808,13 +806,20 @@ function AccountCloseSection() {
     // `getSession()` re-reads storage on every call — and its two refusal paths leave different things
     // behind: a /logout failure is returned AFTER auth-js's own removeCurrentSession(), while a failed
     // pre-flight refresh is returned before any removal, leaving the stored token for the adapter's
-    // best-effort forgetStoredSession to take out. With this library the read therefore finds nothing
-    // on either path, which is a STRONGER guarantee than the sentence it replaces claimed — but it is a
-    // guarantee about one pinned version's internals, and what is said here is said to a parent, so the
-    // read is what establishes it. Nothing has been narrowed to suit that: the branch still fires for
-    // an adapter that throws (below), a `currentSession()` that throws (stillSignedIn returns true),
-    // a storage adapter other than the two auth-js picks for itself, and the next auth-js. Both paths
-    // are run against the real library in App.signout.test.tsx's [HUNT6-F-PREMISE] cases.
+    // forgetStoredSession to take out. Where the session store can be read and written, the read
+    // therefore finds nothing on either path — but that is a statement about one pinned version's
+    // internals and one kind of browser, and what is said here is said to a parent, so the read is what
+    // establishes it. Nothing has been narrowed to suit that: the branch still fires for an adapter that
+    // throws (below), a session read that throws or cannot answer (stillSignedIn returns true), a
+    // storage adapter other than the ones the adapter picks, and the next auth-js. Both paths are run
+    // against the real library in App.signout.test.tsx's [HUNT6-F-PREMISE] cases.
+    //
+    // HUNT7-F-1: and the read is `stillSignedIn`, shared with SignOutControl so the two surfaces cannot
+    // drift (lib/auth.ts). It answers true for a session that could NOT be read as well as for one that
+    // answered — `currentSession() === null` is both "there is no session" and "the read failed", and
+    // the adapter's read failing is exactly what a refusal caused by a failing refresh produces. On
+    // this screen the difference is the whole sentence: the public page opens "This computer is signed
+    // out", which must not be said over a session that comes back with the network.
     let signOutRefused: boolean;
     try {
       signOutRefused = (await auth.signOut())?.serverNotTold === true;
@@ -823,17 +828,26 @@ function AccountCloseSection() {
       // browser's session is gone.
       signOutRefused = true;
     }
-    if (signOutRefused && (await stillSignedIn())) {
+    if (signOutRefused && (await stillSignedIn(auth))) {
       // The closure line belongs to this message now: the outcome's own copy ends "this device is
       // signed out", which is the half that failed.
       action.setOutcome(null);
       setSessionStillOpen(stillSignedInCopy(status));
       return;
     }
-    // Replaced, not pushed: this page needs a signed-in parent and re-reads the session to render
-    // (RequireParent), and on the `pending` path that session is deliberately still valid until the
-    // family purge finishes — so one Back used to put the next person at a shared computer back inside
-    // the parent portal, on the account that was just closed (HUNT6-G-1).
+    // Replaced, not pushed: the closed account's own page is not left one Back away (HUNT6-G-1).
+    //
+    // HUNT7-I-5: and what keeps the portal shut is not that missing entry. This branch is reached only
+    // when this browser's session is gone — either the adapter reported nothing, which it does only
+    // after auth-js removed the session, or it reported a refusal and the read above found nothing —
+    // and every portal page renders behind its own `RequireParent`, which re-reads THIS browser's
+    // session on each mount (lib/session.tsx:72-93, :117-130). A Back remounts, so the read runs again
+    // and the sign-in prompt is what renders. The reason stated here used to be "one Back used to put
+    // the next person at a shared computer back inside the parent portal, because on the `pending` path
+    // that session is deliberately still valid": that conflates the server-side sign-in `pending` keeps
+    // alive with the stored session RequireParent actually reads — the same conflation HUNT6-G-1
+    // corrected thirty lines above — and a real browser history holds /app and the other portal entries
+    // too, so replacing this one entry could never have been the protection.
     void navigate('/account-deletion', {
       replace: true,
       state: { accountClosed: status, signOutRefused },

@@ -1312,3 +1312,83 @@ describe('HUNT6-B-2 a deletion filed through the Data API withdraws the finished
     expect(row!.storage_path).not.toBeNull();
   });
 });
+
+/**
+ * HUNT7-E-4. The per-kind bound the handler promises is TWO pages of that kind
+ * (UNRESOLVED_REPORTS_PAGE_SIZE, and the claim stated above r.get('/safety-reports')), and every
+ * assertion that claimed to keep it was satisfied without reaching it: the four cases above hold 206,
+ * 202, 203 and 201 open rows of a kind against a bound of 400, so `limit
+ * ${UNRESOLVED_REPORTS_PAGE_SIZE}` could be deleted from `newest_flags` or from `newest_child` and the
+ * whole suite stayed green. Only the PARENT kind was ever pinned at the bound (the 405-row cases with
+ * an exact `toHaveLength(400)`). These two cases put the two kinds that matter most — the safety
+ * screen's flags, and a child's own reports — over the bound with an exact count, so the bound bites
+ * where the flag email points a parent.
+ */
+describe('HUNT7-E-4 the two-page bound bites on the system and child kinds too', () => {
+  it('returns exactly two pages of system flags with 400+ open, both ends included', async () => {
+    const { fam, reportId, questionId } = await flaggedFamily([FALSE_MATCH, MATH], FALSE_MATCH);
+    // Two pages and five OLDER system flags, the HUNT5-B-5 shape (child, question, no note,
+    // 'escalated', the screen columns) and distinct on safety_reports_system_once's
+    // (question_id, transcription_at). Every instant derives from the flag's own row (L-027).
+    const filler = 2 * UNRESOLVED_REPORTS_PAGE_SIZE + 5;
+    const older = await api.db.sql<{ id: string; created_at: Date }[]>`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, question_id,
+                                         status, created_at, transcription_at, screen_version, screen_categories)
+      select ${fam.familyId}, ${fam.children[0]!.id}, 'system', 'severe_risk', ${questionId},
+             'escalated', flag.created_at - (n * interval '1 minute'),
+             flag.transcription_at - (n * interval '1 minute'), flag.screen_version, flag.screen_categories
+        from generate_series(1, ${filler}) as n,
+             (select created_at, transcription_at, screen_version, screen_categories
+                from public.safety_reports where id = ${reportId}) as flag
+      returning id, created_at`;
+    expect(older).toHaveLength(filler);
+    // 406 open flags in all: the real one is the newest, and `n = filler` is the oldest.
+    const oldest = older.reduce((a, b) => (a.created_at <= b.created_at ? a : b));
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    const pendingFlags = reports.filter(
+      (r) => r.reporterKind === 'system' && r.status !== 'resolved',
+    );
+    // EXACTLY the bound, against 406 open rows of the kind. Remove the `limit` from `newest_flags`
+    // and this is 406.
+    expect(pendingFlags).toHaveLength(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
+    // And what the bound promises about WHICH rows: never the oldest of the kind, never its newest.
+    const listed = pendingFlags.map((r) => r.id);
+    expect(listed).toContain(oldest.id);
+    expect(listed).toContain(reportId);
+  });
+
+  it('returns exactly two pages of a child’s own reports with 400+ open, both ends included', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const childId = fam.children[0]!.id;
+    // Two pages and six open child reports, oldest first. Every instant derives from the pinned
+    // request clock (L-027).
+    const total = 2 * UNRESOLVED_REPORTS_PAGE_SIZE + 6;
+    const filed = await api.db.sql<{ id: string }[]>`
+      insert into public.safety_reports (family_id, child_id, reporter_kind, category, status, created_at)
+      select ${fam.familyId}, ${childId}, 'child', 'upsetting', 'open',
+             ${api.now.value}::timestamptz - ((${total} - n) * interval '1 minute')
+        from generate_series(1, ${total}) as n
+      returning id`;
+    expect(filed).toHaveLength(total);
+    const oldest = filed[0]!.id;
+    const newest = filed[filed.length - 1]!.id;
+
+    const parent = await unlockedParent(fam.ownerId);
+    const res = await api.request('/v1/safety-reports', { token: parent });
+    expect(res.status).toBe(200);
+    const { reports } = safetyReportsResponseSchema.parse(await res.json());
+    const pendingChild = reports.filter(
+      (r) => r.reporterKind === 'child' && r.status !== 'resolved',
+    );
+    // EXACTLY the bound, against 406 open rows of the kind. Remove the `limit` from `newest_child`
+    // and this is 406.
+    expect(pendingChild).toHaveLength(2 * UNRESOLVED_REPORTS_PAGE_SIZE);
+    const listed = pendingChild.map((r) => r.id);
+    expect(listed).toContain(oldest);
+    expect(listed).toContain(newest);
+  });
+});

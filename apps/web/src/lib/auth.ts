@@ -9,6 +9,23 @@ export interface ParentSession {
   readonly email: string;
 }
 
+/**
+ * HUNT7-F-1: the answer to "does this browser hold a parent session?", with the third answer the
+ * question really has. `currentSession()` returns `null` both for "there is no session" and for "the
+ * session could not be read", and those are not the same fact: a read that failed leaves the session
+ * wherever the auth SDK keeps it, with its refresh token, so it can come back as soon as the network
+ * does. Spending an unreadable session as an absent one is how the portal came to print "This computer
+ * is signed out" over a live session on a shared computer (BUG-322's own recorded impact).
+ *
+ * Only a definite `signed_out` licenses that sentence. `unreadable` is treated as still signed in by
+ * `stillSignedIn` below — the honest answer, and the one both surfaces' comments already said they
+ * intended.
+ */
+export type SessionRead =
+  | { readonly state: 'signed_in'; readonly session: ParentSession }
+  | { readonly state: 'signed_out' }
+  | { readonly state: 'unreadable' };
+
 /** Result of an account action. Messages are safe to show and never reveal whether an email exists. */
 export type AuthOutcome =
   | { readonly ok: true; readonly next: 'signed_in' | 'check_email' | 'done' }
@@ -71,25 +88,33 @@ export interface AccountAuth {
 export type SignOutScope = 'local' | 'global';
 
 /**
- * WEB-R4-AUTH-2: a sign-out the auth service did not carry out. The server was never told, so the
- * session may still be usable, and the parent has to be told rather than shown a signed-out screen.
+ * WEB-R4-AUTH-2: a sign-out the auth service was not told to carry out. The session may still be
+ * usable, and the parent has to be told rather than shown a signed-out screen.
  *
- * HUNT6-F-3: this report is about the SERVER and nothing else. The adapter also makes a best-effort
- * removal of this origin's stored session, but this value cannot carry what that removal achieved: it
- * removes one localStorage key, swallows any throw, and in a browser with site data blocked there is
- * no stored key to remove in the first place. So a caller that would tell the parent this computer is
- * signed out must READ the session (`currentSession()`) rather than infer it from this value — the
- * earlier wording ("this browser's stored session has been removed") was read as that guarantee by
- * the account-closure flow and spent as user-facing copy.
+ * HUNT6-F-3: this report is about the SERVER and nothing else. The adapter also removes this origin's
+ * stored session, but this value does not carry what that removal achieved. So a caller that would
+ * tell the parent this computer is signed out must READ the session rather than infer it from this
+ * value — the earlier wording ("this browser's stored session has been removed") was read as that
+ * guarantee by the account-closure flow and spent as user-facing copy.
  *
  * HUNT6-F-PREMISE: the reason given for that rule was itself wrong, and the wrong reason is how the
  * next author argues the read away. It said supabase-js returns its error before dropping its own
  * in-memory copy. The pinned @supabase/auth-js 2.116.0 has no in-memory copy — `getSession()` re-reads
- * storage on every call — and on the /logout-failure path it removes the stored session BEFORE
+ * its storage on every call — and on the /logout-failure path it removes the stored session BEFORE
  * returning the error; only a failed pre-flight refresh is returned with the stored token still there.
  * What stands is the narrow reading above: this value is about the server, whatever the library did
  * with storage. App.signout.test.tsx's [HUNT6-F-PREMISE] cases run both paths against the real
  * library, so the rule rests on the library's behaviour rather than on a sentence about it.
+ *
+ * HUNT7-F-2: "was not told" is derived from the auth service not being reached, and NOT from "an error
+ * came back". One class of error auth-js resolves a sign-out with proves the opposite of what this
+ * report makes the two surfaces say: the service ANSWERED, rejecting this session's own refresh
+ * credential as unknown or expired, which means it had already ended the session. Warning a parent to
+ * change their password over a session that provably no longer exists is not caution, it is a false
+ * statement about their account. The adapter's `signOut` says which answers count as that proof.
+ *
+ * HUNT7-F-1: and the read a caller makes is `stillSignedIn` below, not a bare `currentSession()`: a
+ * session that could not be read is not a session that is gone.
  */
 export interface SignOutRefused {
   readonly serverNotTold: true;
@@ -110,13 +135,20 @@ export interface AuthAdapter {
   readonly configured: boolean;
   currentSession(): Promise<ParentSession | null>;
   /**
+   * HUNT7-F-1: the same read, with "could not be read" as an answer of its own. Optional, so the small
+   * test adapters above and below stay valid; `stillSignedIn` falls back to `currentSession()` when it
+   * is absent. A caller deciding whether to tell a parent this computer is signed out must go through
+   * `stillSignedIn`, never through `currentSession() === null`.
+   */
+  readSession?(): Promise<SessionRead>;
+  /**
    * Defaults to `local`: a sign-out here never reaches the parent's other devices.
    *
-   * WEB-R4-AUTH-2: resolves with a `SignOutRefused` report when the auth service did not end the
-   * session, and with nothing when it did. A caller that would otherwise present a signed-out screen
-   * must read the report: the stored refresh token may still be usable server-side. It must also
-   * re-read `currentSession()` before saying this browser is signed out — no report here establishes
-   * that (HUNT6-F-3). See the Supabase adapter's signOut.
+   * WEB-R4-AUTH-2: resolves with a `SignOutRefused` report when the auth service was not told to end
+   * the session, and with nothing when it was. A caller that would otherwise present a signed-out
+   * screen must read the report: the session may still be usable server-side. It must also read the
+   * session with `stillSignedIn` before saying this browser is signed out — no report here establishes
+   * that (HUNT6-F-3, HUNT7-F-1). See the Supabase adapter's signOut.
    */
   signOut(scope?: SignOutScope): Promise<SignOutReport>;
   /** Present when real sign-in is available. */
@@ -125,9 +157,32 @@ export interface AuthAdapter {
   onChange?(listener: () => void): () => void;
 }
 
+/**
+ * HUNT7-F-1: whether this browser may still be holding a parent session, however the sign-out ended —
+ * the one question both surfaces ask before they say "This computer is signed out", so they ask it in
+ * one place and cannot drift apart (L-037). A read that could not be made answers true, because a
+ * session that cannot be read cannot be shown as ended: it is still wherever the auth SDK keeps it,
+ * with a refresh token that revives it when the network returns.
+ *
+ * Exactly what that rests on, adapter by adapter: with `readSession` only a definite `signed_out`
+ * answers false, and `unreadable` and a thrown read both answer true. WITHOUT it — the small test
+ * adapters here and in test/render.tsx — the only signal is `currentSession()`, which cannot carry the
+ * difference, so `null` answers false and only a thrown read answers true. The Supabase adapter, the
+ * one a parent's session actually goes through, implements `readSession`.
+ */
+export async function stillSignedIn(auth: AuthAdapter): Promise<boolean> {
+  try {
+    if (auth.readSession) return (await auth.readSession()).state !== 'signed_out';
+    return (await auth.currentSession()) !== null;
+  } catch {
+    return true;
+  }
+}
+
 export const unconfiguredAuth: AuthAdapter = {
   configured: false,
   currentSession: () => Promise.resolve(null),
+  readSession: () => Promise.resolve({ state: 'signed_out' }),
   signOut: () => Promise.resolve(),
 };
 

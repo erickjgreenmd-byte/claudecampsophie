@@ -166,3 +166,49 @@ because one review test exceeded the default 5 s timeout under load (BUG-062: me
   in index mode): the new check was shown to fail with the fix removed and pass with it restored.
 - Acceptance coverage per criterion, with the test names and counts each assessor ran and a skeptic re-ran:
   `docs/Requirement_Coverage.md` (generated from `docs/coverage_status.json`).
+
+## Parental consent attestation (migration 0970) — 2026-09-30
+
+Every child profile carries a per-child affirmation by a named adult that they are that child's parent
+or legal guardian. Four independent places had to agree, and each is tested where it lives:
+
+- **Database** — `supabase/tests/consent_attestation.test.ts`, 9 cases against real Postgres 16.
+  `child_profiles_active_requires_attestation` refuses an active child with no attestation on INSERT
+  and on UPDATE; `child_profiles_attestation_complete` refuses any partial set of the three columns;
+  draft and archived rows are left free; an archived child keeps the attestation it was activated with.
+  The constraint is on the TABLE rather than in the handler because `authenticated` reaches
+  `public.child_profiles` through the Supabase Data API without passing the API (L-037, BUG-240 class).
+- **API** — `apps/api/tests/auth.test.ts`: a missing or `false` `parentalAttestation` is 400
+  `VALIDATION_FAILED`; a client-supplied `attestationVersion` or `attestedAt` is refused as an unknown
+  key by the request's `strictObject`; a ticked box succeeds and the row's version is the SERVER's
+  constant with `attested_by` = the requesting adult.
+- **Portal and phone as one behaviour** — `apps/mobile/src/family/consent-attestation.test.ts`, 9 cases
+  reading both surfaces' source plus the route and the migration: the statement is rendered from the
+  contract on both and retyped on neither, both send `parentalAttestation` in the same object as the
+  child's details, both clear the tick after a success, both offer a real checkbox to assistive
+  technology, and both refuse with a reason rather than a disabled control.
+- **Portal rendering** — `apps/web/src/pages/app/ChildrenPage.test.tsx`: the refusal shows the
+  contract's copy, sends nothing, leaves the submit button enabled, and the id in the checkbox's
+  `aria-describedby` resolves to an element carrying that copy.
+
+Mutation testing, six mutations, each shown red and each file restored with `sha256sum -c`: drop
+`parentalAttestation` from the phone's request; drop the tick-clearing; restore the portal's disabled
+button; date the attestation from the request body; reorder the insert's columns; retype the statement
+instead of importing it. The fourth passed on the first attempt — the assertion only checked that
+`family.ts` mentions `deps.clock()` somewhere, and other handlers in that file call it (L-054). It was
+re-anchored to the child insert's own values list, after which both it and a column-reordering mutation
+went red.
+
+Suite totals at this slice, all green, floors in `scripts/test-minimums.json` raised to match:
+domain 3656, api 1174, web 849, mobile 823, db 449, ai 91, contracts 20, ui-tokens 4 — **7066 tests**.
+
+**One load-sensitive failure, recorded rather than dismissed.** The first `scripts/verify.sh` run of
+this slice reported `ChildrenPage.archive.test.tsx > takes away a pairing code the child can no longer
+redeem` failing on its final `sends.filter(… '/pairing-code')` count. It did not reproduce: that file
+passes 18/18 in isolation, the full web suite passed 849/849 on three consecutive runs, and a second
+full `verify.sh` passed with exit 0. The plausible cause is load — `verify.sh` runs every package's
+suite, and the attestation added a third `userEvent` interaction to `addAChild`, the helper six of that
+file's cases use as a reload lever, so each case does more work between its `waitFor` deadlines. No
+timeout was widened and no assertion relaxed; this is noted so a recurrence is read as the second
+sighting of a known timing sensitivity rather than as a fresh mystery.
+

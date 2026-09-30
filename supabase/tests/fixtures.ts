@@ -40,15 +40,31 @@ export async function seedFamily(
   return { familyId, ownerId, children };
 }
 
+/** The adult who created the family, used as the default attester for seeded children. */
+async function familyOwner(db: TestDb, familyId: string): Promise<string> {
+  const [row] = await db.sql<{ created_by: string }[]>`
+    select created_by from public.families where id = ${familyId}`;
+  if (!row) throw new Error(`seedChild: no family ${familyId}`);
+  return row.created_by;
+}
+
 export async function seedChild(
   db: TestDb,
   familyId: string,
   nickname = 'Riley',
   status: 'draft' | 'active' | 'archived' = 'active',
+  options: { attestedBy?: string } = {},
 ): Promise<SeededChild> {
+  // An ACTIVE child must carry the parental/guardian attestation (migration 0970), so the fixture
+  // produces a lawful row rather than one the constraint would refuse. `attestedBy` defaults to the
+  // family's owner: a test that cares which adult attested passes it explicitly.
+  const attestedBy = options.attestedBy ?? (await familyOwner(db, familyId));
   const [child] = await db.sql<{ id: string }[]>`
-    insert into public.child_profiles (family_id, nickname, grade_level, age_band, status)
-    values (${familyId}, ${nickname}, 3, '8-10', ${status})
+    insert into public.child_profiles
+      (family_id, nickname, grade_level, age_band, status,
+       attestation_version, attested_at, attested_by)
+    values (${familyId}, ${nickname}, 3, '8-10', ${status},
+            ${'2026-09-v1'}, now(), ${attestedBy})
     returning id
   `;
   const [device] = await db.sql<{ id: string }[]>`

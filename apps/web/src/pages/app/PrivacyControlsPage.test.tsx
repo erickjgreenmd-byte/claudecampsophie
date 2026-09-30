@@ -17,8 +17,8 @@ import {
   type SafetyReport,
 } from '@pencillift/contracts';
 import { createMemoryRouter, RouterProvider, useLocation } from 'react-router';
-import type { AuthAdapter } from '../../lib/auth.ts';
-import { SessionProvider } from '../../lib/session.tsx';
+import type { AuthAdapter, SessionRead } from '../../lib/auth.ts';
+import { RequireParent, SessionProvider } from '../../lib/session.tsx';
 import { renderPage } from '../../test/render.tsx';
 import AccountDeletionPage from '../public/AccountDeletionPage.tsx';
 import PrivacyControlsPage from './PrivacyControlsPage.tsx';
@@ -36,14 +36,35 @@ function DeletionPageStub() {
   );
 }
 
-/** Renders the privacy page with a route for the public deletion page (account closure lands there). */
-function renderWithDeletionRoute(api: Partial<ApiClient>, auth: AuthAdapter) {
+/**
+ * Renders the privacy page with a route for the public deletion page (account closure lands there).
+ *
+ * HUNT7-I-5: the portal route is real, and gated the way every portal page is gated — its own
+ * `RequireParent` (PrivacyControlsPage.tsx:52, HomeworkPage.tsx:64, RewardsPage.tsx:42). With
+ * `initialEntries` the caller can put a portal entry BEHIND /app/privacy, which is what a browser
+ * history holds, so a Back can be asked what it actually renders instead of being clamped by a
+ * one-entry history.
+ */
+function renderWithDeletionRoute(
+  api: Partial<ApiClient>,
+  auth: AuthAdapter,
+  initialEntries: readonly string[] = ['/app/privacy'],
+) {
   const router = createMemoryRouter(
     [
+      {
+        path: '/app',
+        element: (
+          <RequireParent>
+            <h1>Your family</h1>
+            <p>Riley</p>
+          </RequireParent>
+        ),
+      },
       { path: '/app/privacy', element: <PrivacyControlsPage /> },
       { path: '/account-deletion', element: <DeletionPageStub /> },
     ],
-    { initialEntries: ['/app/privacy'] },
+    { initialEntries: [...initialEntries] },
   );
   const client: ApiClient = {
     get: () => Promise.reject(new Error('unexpected GET')),
@@ -118,19 +139,33 @@ function renderWithRealDeletionPage(api: Partial<ApiClient>, auth: AuthAdapter) 
  * never be presented as a finished sign-out. It is reachable by an adapter that throws, a
  * `currentSession()` that throws, a storage adapter other than the two auth-js picks for itself,
  * another tab writing a session back, and the next auth-js.
+ *
+ * HUNT7-F-1: `unreadable` is the third answer, and the one this flow got wrong. `currentSession()`
+ * answers `null` both when there is no session and when the session could not be read — which is what
+ * the Supabase adapter's `getSession()` resolves while a refresh keeps failing over a session the
+ * removal did not reach. Only `readSession()` separates them, and "could not be read" may never be
+ * spent as "this computer is signed out".
  */
-function reportedRefusal(options: { readonly cleared: boolean }): {
+function reportedRefusal(options: { readonly cleared: boolean; readonly unreadable?: boolean }): {
   auth: AuthAdapter;
   attempts: () => number;
 } {
   let attempted = 0;
   let gone = false;
+  const session = { accessToken: 'test-token', email: 'parent@example.test' };
   return {
     attempts: () => attempted,
     auth: {
       configured: true,
-      currentSession: () =>
-        Promise.resolve(gone ? null : { accessToken: 'test-token', email: 'parent@example.test' }),
+      currentSession: () => Promise.resolve(gone ? null : session),
+      readSession: () =>
+        Promise.resolve<SessionRead>(
+          gone
+            ? options.unreadable
+              ? { state: 'unreadable' }
+              : { state: 'signed_out' }
+            : { state: 'signed_in', session },
+        ),
       signOut: () => {
         attempted += 1;
         if (options.cleared) gone = true;
@@ -1126,13 +1161,16 @@ describe('PrivacyControlsPage', () => {
   });
 
   /**
-   * HUNT6-G-1: the navigation REPLACES the portal entry. It used to push, so one Back returned to
-   * /app/privacy, where RequireParent re-reads the session — and on the `pending` path that session
-   * is deliberately still valid — so the next person at a shared computer was inside the parent
-   * portal again, on the account the parent had just closed.
+   * HUNT7-F-1: a session the adapter could not READ is not a session that is gone, and this is the
+   * screen where spending one as the other is worst. The public page's refusal notice opens "This
+   * computer is signed out"; a refusal whose storage removal did not get through leaves the session
+   * where auth-js keeps it, and `getSession()` — hitting the same refresh failure that caused the
+   * refusal — answers `session: null` with an error. The parent closes their account on a shared
+   * computer, reads that it is signed out, and walks away from a session the network brings back.
+   * A read that could not tell keeps them here, where the portal's own Sign out is.
    */
-  it('[HUNT6-G-1] leaves no history entry to go back into the portal with', async () => {
-    const { auth } = reportedRefusal({ cleared: true });
+  it('[HUNT7-F-1] keeps the parent here when the session could not be read, not only when it answered', async () => {
+    const { auth, attempts } = reportedRefusal({ cleared: true, unreadable: true });
     const { api } = fakeApi({
       send: (call) =>
         call.path === '/v1/account/close'
@@ -1143,9 +1181,53 @@ describe('PrivacyControlsPage', () => {
     const card = await screen.findByRole('region', { name: /delete my account/i });
     await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
     await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
+    expect(text(await within(card).findByRole('alert'))).toMatch(
+      /you are still signed in on this computer/i,
+    );
+    expect(card.textContent).toMatch(/your request is recorded/i);
+    expect(attempts()).toBe(1);
+    expect(router.state.location.pathname).toBe('/app/privacy');
+    expect(screen.queryByText(/deletion page:/)).toBeNull();
+    expect(document.body.textContent).not.toMatch(/this computer is signed out/i);
+  });
+
+  /**
+   * HUNT6-G-1: the navigation REPLACES the portal entry, so the closed account's own page is not one
+   * Back away.
+   *
+   * HUNT7-I-5: what makes a Back safe is not the missing entry. This branch is reached only when the
+   * session is gone from this browser (`signOutRefused === false`, which the adapter returns only
+   * after auth-js removed the session, or a reported refusal whose re-read found nothing), and every
+   * portal page renders behind its own `RequireParent`, which re-reads THIS browser's session on
+   * every mount (lib/session.tsx:72-93, :117-130) — a Back remounts, so the read runs again. The
+   * comment used to justify the replace by "one Back used to put the next person back inside the
+   * parent portal", conflating the server-side sign-in that `pending` keeps alive with the stored
+   * session RequireParent actually reads; and this case measured history DEPTH in a router built with
+   * a single entry, where `navigate(-1)` is clamped, so it could not have seen the difference. The
+   * history now holds a portal entry behind the closure, as a real browser's does, and the assertion
+   * is the property: going back renders no portal content.
+   */
+  it('[HUNT6-G-1 / HUNT7-I-5] a Back after the closure reaches no portal content', async () => {
+    const { auth } = reportedRefusal({ cleared: true });
+    const { api } = fakeApi({
+      send: (call) =>
+        call.path === '/v1/account/close'
+          ? { status: 'pending', signOut: true }
+          : new Error('nope'),
+    });
+    const router = renderWithDeletionRoute(api, auth, ['/app', '/app/privacy']);
+    const card = await screen.findByRole('region', { name: /delete my account/i });
+    await userEvent.click(within(card).getByRole('checkbox', { name: /i understand my sign-in/i }));
+    await userEvent.click(within(card).getByRole('button', { name: /delete my account/i }));
     expect(await screen.findByText('deletion page: pending')).toBeTruthy();
+    // The privacy entry was replaced, so one Back lands on the portal page behind it — and that page
+    // shows the sign-in prompt, because the session this browser held is gone.
     await router.navigate(-1);
-    await waitFor(() => expect(router.state.location.pathname).toBe('/account-deletion'));
+    await waitFor(() => expect(router.state.location.pathname).toBe('/app'));
+    // The gate re-reads the session on this mount, so the prompt is what settles (never the family).
+    await waitFor(() => expect(document.body.textContent).toMatch(/please sign in/i));
+    expect(screen.queryByRole('heading', { name: 'Your family' })).toBeNull();
+    expect(screen.queryByText('Riley')).toBeNull();
     expect(screen.queryByRole('region', { name: /delete my account/i })).toBeNull();
   });
 
