@@ -8,15 +8,21 @@ Written 2026-09-29 at code `5ba16c3`, after six hardening rounds. This page answ
 
 **The software is ready to be beta tested. The beta cannot start, and the blockers are not software.**
 
-> UPDATED 2026-09-30, and the update includes a correction against this record's own earlier claim. The adult identity check was listed as complete software waiting on a vendor. It was not complete: it had a migration, a contract and a provider adapter, and **no route and no screen** — nothing in the repository imported its contract except itself. A parent could not have done the check at all, whichever vendor was contracted. The route and its tests exist now (`f13eb76`); the two screens are the last piece. Building the route also surfaced a defect nothing could have caught while nothing called it: `statedDateOfBirth` was validated with a schema whose floor is the year 2000, so every parent born before it — anyone 27 or over in 2026, which is most parents — was refused before their licence was read.
+> UPDATED 2026-09-30, and the update includes a correction against this record's own earlier claim. The adult identity check was listed as complete software waiting on a vendor. It was not complete: it had a migration, a contract and a provider adapter, and **no route and no screen** — nothing in the repository imported its contract except itself. A parent could not have done the check at all, whichever vendor was contracted. The route and its tests landed in `f13eb76`; **both screens landed in `aa0fcbc`, so the consent path is now walkable end to end** — `/app/identity` in the portal and `(parent)/identity` on the phone, 31 and 32 cases. Building the route surfaced a defect nothing could have caught while nothing called it: `statedDateOfBirth` was validated with a schema whose floor is the year 2000, so every parent born before it — anyone 27 or over in 2026, which is most parents — was refused before their licence was read.
+>
+> WIRING THE SCREENS THEN FOUND FIVE MORE, and the worst was in code this record had already called complete. The real OpenAI adapter still derived a failure code from a face comparison the shipped method never asks for, so a genuine adult's row would have carried `adult_declared` true **and** a non-null `failure_code` — a combination migration 0990's own CHECK constraint forbids, which means the insert would have RAISED. **Every adult submission in production would have returned a 500 on the only path to a paid account.** Every suite was green, because every suite runs the labeled development mock and no test had ever constructed the real adapter (BUG-415, and L-074 is the lesson, written about this very capability a round earlier). The other four are in the ledger as BUG-416..419.
+>
+> What this says about the verdict, plainly: "ready to be beta tested" was true of the tests and not of the product, twice in two days, on the same capability. The difference now is that the capability has a caller on both surfaces and the caller is exercised — which is the only thing that would have found any of the five.
 
 Those are two separate claims and they need separating, because conflating them is how a product gets
 put in front of a child before its consent path exists.
 
 - **As software**, the product is in the best state it has been in: 6,966 tests pass with zero skipped,
-  every package typechecks, six adversarial hunt-and-fix rounds have worked 344 recorded
-  defects (`docs/Bug_Ledger.md`), all closed but the three carried deliberately below, and the last three rounds found 9, 3 and 2 high-severity defects — a curve
-  that says the remaining density is low, not zero.
+  every package typechecks, seven adversarial hunt-and-fix rounds have worked 349 recorded
+  defects (`docs/Bug_Ledger.md`), all closed but the three carried deliberately below plus BUG-411's
+  open divergences, and the last four rounds found 9, 3, 2 and (round 7) 3 high-severity defects — a
+  curve that says the remaining density is low, not zero. At `aa0fcbc` the asserted floors are api
+  1,203, mobile 894, web 961, contracts 42, db 484, domain 3,665, ai 96, ui-tokens 4.
 - **As a running service**, nothing exists. No Supabase project is connected, no Worker is deployed, no
   native build has ever been produced, and no line of this code has run on a phone or a tablet
   (`docs/Connections.md` — every provider row is a named blocker).
