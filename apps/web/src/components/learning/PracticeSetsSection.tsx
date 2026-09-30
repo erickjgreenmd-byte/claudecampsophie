@@ -2,8 +2,12 @@ import { useId, useState } from 'react';
 import { Link } from 'react-router';
 import {
   answerKeyResponseSchema,
+  formatCalendarDate,
+  formatInZone,
   practiceSetsResponseSchema,
+  receivesPractice,
   reviewPdfExportResponseSchema,
+  subjectName,
   type AnswerKeyResponse,
   type ChildSubject,
   type ParentPracticeSet,
@@ -27,11 +31,8 @@ import {
   SET_KIND_LABEL,
   SET_STATUS_LABEL,
   choiceLetter,
-  formatCalendarDate,
-  formatInZone,
   mixSummary,
   questionsLabel,
-  subjectName,
 } from './format.ts';
 
 type KindFilter = 'all' | ParentPracticeSet['kind'];
@@ -76,24 +77,30 @@ const FILTERS: readonly { value: KindFilter; label: string }[] = [
  * listed on the Privacy page when ready.
  *
  * HUNT5-F-10: `childStatus` is the profile's status as GET /v1/family reports it ('active', 'draft'
- * or 'archived'; the planner types it as a plain string, so a value this page does not recognise is
- * treated as NOT active and gets the conditional — fail-closed — while omitting the prop altogether
- * keeps the live promise, see the last sentence of this comment). It
- * is read for exactly one sentence, the per-set release line, and the test is "is this profile
- * ACTIVE?", not "is it archived?" — a draft cannot open a set either. An archived profile's sets stay listed
- * — that history is what BUG-070 made readable — and their release instants stay printed, because the
- * planner's archived notice frames every time below it as what the schedule would produce if the
- * profile were active again. What cannot stay is the PROMISE: `app.current_child_id()` requires
- * `c.status = 'active'` (migration 0001), so no request from the child's device can open a set at
- * all, whatever its release instant, and the API refuses every write with CHILD_ARCHIVED. So the
- * instant is kept and re-worded as the notice's conditional. Omitting the prop keeps the live
- * behaviour, so a caller that has no status shows what it always showed.
+ * or 'archived'; the planner types it as a plain string). It is read for exactly one sentence, the
+ * per-set release line, through `receivesPractice` (packages/contracts/src/family.ts) — the planner's
+ * and the app's one definition of "does this profile receive practice", so the test is "is this profile
+ * ACTIVE?", not "is it archived?": a draft cannot open a set either. An archived profile's sets stay
+ * listed — that history is what BUG-070 made readable — and their release instants stay printed,
+ * because the planner's archived notice frames every time below it as what the schedule would produce
+ * if the profile were active again. What cannot stay is the PROMISE: `app.current_child_id()` requires
+ * `c.status = 'active'` (migration 0001), so no request from the child's device can open a set at all,
+ * whatever its release instant, and the API refuses every write with CHILD_ARCHIVED. So the instant is
+ * kept and re-worded as the notice's conditional.
  *
- * HUNT6-H-3: those two sentences used to read "an unknown value is treated as live", which is the
- * opposite of what the condition does — a status string other than 'active' takes the conditional
- * branch, and only `undefined` takes the promise. The code's behaviour is the one worth keeping
- * (a promise to a child must not be made on a guess), so the prose says it (L-053), and
- * ArchivedChildSections.test.tsx pins the unrecognised-status case so it cannot drift again.
+ * HUNT6-H-3, then BUG-411: an unrecognised status takes the conditional, and so now does a MISSING one.
+ *
+ * `childStatus` is REQUIRED and its type INCLUDES undefined, which is deliberate and is not the same
+ * as optional. Under `exactOptionalPropertyTypes` a caller cannot omit it, so every call site has to
+ * say what it knows — including saying `childStatus={undefined}` when it genuinely does not know. That
+ * is the compile-time half L-071 asks for: the forgetful caller is an error rather than a behaviour a
+ * test has to notice. Making it plainly optional was the older shape, and the two inner components
+ * below already took `string | undefined`, so the outer one being optional was the inconsistency.
+ *
+ * It is NOT required-and-non-optional, because "I have not loaded the status yet" is a real state and
+ * the honest branch is its default: `receivesPractice(undefined)` is false, matching `buildUpcomingView`
+ * and the Coming up card, so nothing here decides a promise on a guess (L-057).
+ * ArchivedChildSections.test.tsx pins the unrecognised-status and the explicit-undefined cases.
  */
 export function PracticeSetsSection({
   childId,
@@ -106,7 +113,7 @@ export function PracticeSetsSection({
   childName: string;
   subjects: readonly ChildSubject[];
   zone: string;
-  childStatus?: string;
+  childStatus: string | undefined;
 }) {
   const { api } = useSession();
   const [filter, setFilter] = useState<KindFilter>('all');
@@ -368,11 +375,20 @@ function SetCard({
           for its paid slot — the first shipped fix tested only 'archived' and left the draft promising.
           The set stays listed and the instant stays printed, under the same conditional framing the
           planner's notice gives everything below it; only the promise becomes a hypothetical. A
-          hypothetical time under that heading is honest, a promise to the child is not. A status this
-          page does not recognise is treated as NOT active and gets the conditional too (HUNT6-H-3);
-          it is a caller that passes NO status that keeps the promise, so an unwired caller loses
-          nothing. */}
-      {set.releaseAt === null ? null : childStatus !== undefined && childStatus !== 'active' ? (
+          hypothetical time under that heading is honest, a promise to the child is not.
+
+          BUG-411/BUG-407's residual: this was the last region on the screen deciding the question with
+          its own inline comparison of the status against the active value, while the planner claimed
+          ONE definition of it. It now asks `receivesPractice`
+          (packages/contracts/src/family.ts), the definition the rest of the planner and the phone use,
+          so widening what "receives practice" means reaches this sentence too.
+
+          That also closed the one status this region answered differently from every other: a caller
+          that passed NO status used to keep the live promise. `receivesPractice(undefined)` is false,
+          so an unwired caller now gets the hypothetical — fail closed, as `buildUpcomingView` and the
+          Coming up card already do. A promise to a child must not be made on a guess (L-057: the
+          outcome nobody enumerated lands on the honest branch by default). */}
+      {set.releaseAt === null ? null : !receivesPractice(childStatus) ? (
         <p style={hintStyle}>
           Would open for {childName} from {formatInZone(set.releaseAt, zone)} once the profile is
           active{childStatus === 'archived' ? ' again' : ''}.

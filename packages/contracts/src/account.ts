@@ -17,6 +17,10 @@
 // which already revokes them.
 import { z } from 'zod';
 import { isoDateTimeSchema } from './common.ts';
+// The store-subscription sentence belongs to the deletion copy (privacy.ts) and is said here too;
+// this file imports it rather than restating it, so the closure card and the deletion screens cannot
+// drift apart again (BUG-411).
+import { storeSubscriptionNotice } from './privacy.ts';
 
 /** Stable `rule` codes returned with 409 by POST /v1/account/close. */
 export const ACCOUNT_CLOSE_RULES = {
@@ -75,8 +79,8 @@ export function accountCloseOutcome(
 
 /**
  * Honest copy shared by the portal and the app (spec P14: what the product does, nothing more).
- * The store subscription line matches the deletion screens: PencilLift never cancels a store
- * subscription.
+ * The store subscription line IS the deletion screens' line, imported from privacy.ts rather than
+ * written out again: PencilLift never cancels a store subscription.
  */
 export const ACCOUNT_CLOSE_COPY = {
   title: 'Delete my account',
@@ -87,8 +91,13 @@ export const ACCOUNT_CLOSE_COPY = {
   guardianRule:
     'If you joined a family by invitation, you are removed from that family at once. The family and its children’s data stay with the family owner.',
   keep: 'Billing records, consent records and the security log keep only a pseudonymous id, never your email address.',
-  storeNotice:
-    'Deleting your account does not cancel an App Store, Google Play or Amazon Appstore subscription. Cancel it in the store first if you no longer want to be charged.',
+  /**
+   * `sign_in`, not `family`: "Delete my account" closes THIS parent's sign-in and deletes no
+   * family data, so the family-wide sentence would name the wrong thing (privacy.ts's
+   * `storeSubscriptionNotice`). `null` because the portal is sold through no store and the app
+   * passes its build's channel where it has one.
+   */
+  storeNotice: storeSubscriptionNotice('sign_in', null),
   confirmLabel: 'I understand my sign-in will be closed and this can’t be undone',
   action: 'Delete my account',
   closed: 'Your PencilLift account is closed and this device is signed out.',

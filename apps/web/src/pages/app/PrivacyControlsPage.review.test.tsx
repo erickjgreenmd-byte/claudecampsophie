@@ -2,8 +2,15 @@
 // "[RV-privacy-<n>]" tests reproduce defects; "probe:" tests pin risky behaviour that held up.
 // Synthetic data only (Riley, Sam).
 import { cleanup, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
+import {
+  deletionConfirmationCopy,
+  deletionRequestedMessage,
+  privacyRetentionLines,
+  storeSubscriptionNotice,
+} from '@pencillift/contracts';
 import type {
   DataExports,
   DeletionRequests,
@@ -27,7 +34,17 @@ const FAMILY: PrivacyFamilyView = {
   ],
 };
 
-function fakeApi(deletions: DeletionRequests = { requests: [] }): Partial<ApiClient> {
+/** The completion instant every accepted deletion in this file answers with. */
+const COMPLETE_BY = '2026-10-24T15:00:00.000Z';
+
+/** The page's own date format, so the expected sentence is the contract's, whole. */
+const portalDate = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+
+function fakeApi(
+  deletions: DeletionRequests = { requests: [] },
+  send?: (path: string) => unknown,
+): Partial<ApiClient> {
   const settle = <S extends z.ZodType>(value: unknown, schema: S) =>
     Promise.resolve(schema.parse(value));
   return {
@@ -40,7 +57,8 @@ function fakeApi(deletions: DeletionRequests = { requests: [] }): Partial<ApiCli
       }
       return Promise.reject(new Error(`unexpected GET ${path}`));
     },
-    send: () => Promise.reject(new Error('unexpected send')),
+    send: <S extends z.ZodType>(_method: string, path: string, _body: unknown, schema: S) =>
+      send ? settle(send(path), schema) : Promise.reject(new Error('unexpected send')),
   };
 }
 
@@ -85,5 +103,104 @@ describe('PrivacyControlsPage review', () => {
     expect(options(/child to delete/i, deleteCard)).toEqual(['Choose a child', 'Sam']);
     const list = screen.getByRole('list', { name: /deletion requests/i });
     expect(list.textContent).toMatch(/riley’s data/i);
+  });
+});
+
+/**
+ * BUG-411 / L-070 / L-071: the portal prints the contracts' deletion and retention sentences, for
+ * the scope the parent actually chose. These are CALL-SITE tests: the sentences themselves are
+ * asserted in packages/contracts/src/privacy.test.ts, and what is asserted here is the output this
+ * screen hands the parent — a shared definition proves nothing if the screen picks the wrong
+ * argument or keeps a sentence of its own beside it.
+ */
+describe('PrivacyControlsPage prints the shared deletion copy for the chosen scope', () => {
+  const portalCopy = (target: Parameters<typeof deletionConfirmationCopy>[0]) =>
+    deletionConfirmationCopy(target, null);
+
+  it('[repro] a single child’s confirmation says what stays, and never the account-wide sentence', async () => {
+    renderPage(<PrivacyControlsPage />, { api: fakeApi() });
+    const card = await screen.findByRole('group', { name: /delete a child’s data/i });
+    await userEvent.selectOptions(within(card).getByLabelText(/child to delete/i), SAM);
+    const copy = portalCopy({ scope: 'child', childId: SAM, nickname: 'Sam' });
+    const text = card.textContent ?? '';
+    expect(text).toContain(copy.effect);
+    expect(text).toContain(copy.storeNotice);
+    expect(within(card).getByLabelText(copy.typePrompt)).toBeTruthy();
+    // The family's sentences are the ones this card must never carry.
+    const family = portalCopy({ scope: 'family' });
+    expect(text).not.toContain(family.effect);
+    expect(text).not.toContain(family.storeNotice);
+    expect(text).not.toMatch(/Deleting your PencilLift (family )?account does not cancel/);
+  });
+
+  it('the whole-family confirmation says what it removes, with the family’s store sentence', async () => {
+    renderPage(<PrivacyControlsPage />, { api: fakeApi() });
+    const card = await screen.findByRole('group', { name: /delete your whole family account/i });
+    const copy = portalCopy({ scope: 'family' });
+    expect(card.textContent).toContain(copy.effect);
+    expect(card.textContent).toContain(copy.storeNotice);
+    expect(within(card).getByLabelText(copy.typePrompt)).toBeTruthy();
+    expect(card.textContent).not.toContain(
+      portalCopy({ scope: 'child', childId: SAM, nickname: 'Sam' }).effect,
+    );
+  });
+
+  it('prints the shared retention lines, all six, and writes none of its own', async () => {
+    renderPage(<PrivacyControlsPage />, { api: fakeApi() });
+    const retention = await screen.findByRole('region', {
+      name: /how long we keep information/i,
+    });
+    const items = within(retention)
+      .getAllByRole('listitem')
+      .map((li) => li.textContent);
+    // The portal is sold through no store, so it can name none as the reader's own.
+    expect(items).toEqual([...privacyRetentionLines(null)]);
+    expect(retention.textContent).toContain(storeSubscriptionNotice('any', null));
+  });
+});
+
+/**
+ * The answer a parent reads AFTER the server accepts the request, on the portal. BUG-411's
+ * highest-severity half was that the app's answer did not branch on scope; mutating the shared
+ * `deletionRequestedMessage` to ignore the target reddened the app's suite and nothing here, so the
+ * portal's own call site was unguarded. These two tests close that: each asserts the whole sentence
+ * the screen shows, built from the contract for the scope the parent chose.
+ */
+describe('PrivacyControlsPage answers a deletion with the chosen scope’s sentence', () => {
+  const accepted = (scope: 'child' | 'family') => ({
+    deletion: {
+      id: DELETION_ID,
+      scope,
+      childId: scope === 'child' ? SAM : null,
+      status: 'requested' as const,
+      requestedAt: '2026-09-24T15:00:00.000Z',
+      completeBy: COMPLETE_BY,
+      completedAt: null,
+    },
+  });
+
+  it('[repro] a child deletion is answered with that child’s sentence, not the family’s', async () => {
+    renderPage(<PrivacyControlsPage />, { api: fakeApi(undefined, () => accepted('child')) });
+    const card = await screen.findByRole('group', { name: /delete a child’s data/i });
+    await userEvent.selectOptions(within(card).getByLabelText(/child to delete/i), SAM);
+    await userEvent.type(within(card).getByLabelText(/type sam to confirm/i), 'Sam');
+    await userEvent.click(within(card).getByRole('button', { name: /delete sam’s data/i }));
+    const target = { scope: 'child' as const, childId: SAM, nickname: 'Sam' };
+    expect((await within(card).findByText(/deletion requested/i)).textContent).toBe(
+      deletionRequestedMessage(target, portalDate(COMPLETE_BY)),
+    );
+    expect((await within(card).findByText(/deletion requested/i)).textContent).not.toBe(
+      deletionRequestedMessage({ scope: 'family' }, portalDate(COMPLETE_BY)),
+    );
+  });
+
+  it('a family deletion is answered with the family’s sentence', async () => {
+    renderPage(<PrivacyControlsPage />, { api: fakeApi(undefined, () => accepted('family')) });
+    const card = await screen.findByRole('group', { name: /delete your whole family account/i });
+    await userEvent.type(within(card).getByLabelText(/type delete to confirm/i), 'DELETE');
+    await userEvent.click(within(card).getByRole('button', { name: /delete our family account/i }));
+    expect((await within(card).findByText(/deletion requested/i)).textContent).toBe(
+      deletionRequestedMessage({ scope: 'family' }, portalDate(COMPLETE_BY)),
+    );
   });
 });

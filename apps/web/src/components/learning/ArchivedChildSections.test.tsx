@@ -13,7 +13,7 @@ import type {
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { renderPage } from '../../test/render.tsx';
-import { DAILY_STATE, formatInZone } from './format.ts';
+import { DAILY_PRACTICE_COPY, formatInZone } from '@pencillift/contracts';
 import { PracticeSetsSection } from './PracticeSetsSection.tsx';
 import { ScheduleSection } from './ScheduleSection.tsx';
 import { StudyMaterialSection } from './StudyMaterialSection.tsx';
@@ -429,15 +429,16 @@ describe('[HUNT5-F-10] a practice set promises nothing to an archived child', ()
     expect(within(set).queryByText(/once the profile is active again/i)).toBeNull();
   });
 
-  it('an UNRECOGNISED status gets the conditional: only an absent prop keeps the promise', async () => {
+  it('an UNRECOGNISED status gets the conditional, because the promise needs proof', async () => {
     // HUNT6-H-3: the docstring and the inline comment in PracticeSetsSection both said "an unknown
-    // value is treated as live", which is a claim about the VALUE; the code's condition is
-    // `childStatus !== undefined && childStatus !== 'active'`, so an unrecognised value fails CLOSED
-    // and only omitting the prop keeps the promise. Asserting the documented behaviour here
-    // (/shown to your child/) went red — the card renders the conditional — which is what settled
-    // which of the two is true (L-053). Failing closed is the one worth keeping: the promise is
-    // "shown to your child", and `app.current_child_id()` requires `c.status = 'active'`, so any
-    // status the page does not recognise must not make that promise on a guess.
+    // value is treated as live", which is a claim about the VALUE; the condition failed CLOSED for an
+    // unrecognised value. Asserting the documented behaviour here (/shown to your child/) went red —
+    // the card renders the conditional — which is what settled which of the two is true (L-053).
+    // Failing closed is the one worth keeping: the promise is "shown to your child", and
+    // `app.current_child_id()` requires `c.status = 'active'`, so any status the page does not
+    // recognise must not make that promise on a guess. Since BUG-411 the condition is
+    // `!receivesPractice(childStatus)` — the planner's and the app's one definition — so this holds
+    // through that helper rather than through an expression this file owns.
     renderPage(
       <PracticeSetsSection
         childId={CHILD}
@@ -456,13 +457,39 @@ describe('[HUNT5-F-10] a practice set promises nothing to an archived child', ()
     expect(set.textContent).toContain(DAILY_TEXT);
   });
 
-  it('keeps it when no status is given at all, so an unwired caller loses nothing', async () => {
+  it('[repro] a MISSING status now gets the conditional too, and keeps the instant', async () => {
+    /*
+     * RE-AIMED, not deleted (BUG-411). This case used to assert the opposite — "keeps it when no
+     * status is given at all, so an unwired caller loses nothing" — and it was pinning the defect: this
+     * was the one region of the planner that failed OPEN on an absent status, while `receivesPractice`,
+     * `buildUpcomingView` and the Coming up card all fail closed on it, and BUG-407's residual was that
+     * this region answered the question with its own expression at all.
+     *
+     * "Loses nothing" was the wrong test. What a caller with no status loses by failing closed is a
+     * PROMISE it could not keep — `app.current_child_id()` requires `c.status = 'active'` (migration
+     * 0001), so a set opens for nobody whose status this page never learned. What it must not lose is
+     * the stored plan, and that is the coverage this case carried and still carries: the set stays
+     * listed and its release instant stays printed (HUNT5-F-10).
+     */
     renderPage(
-      <PracticeSetsSection childId={CHILD} childName="Riley" subjects={SUBJECTS} zone={ZONE} />,
+      <PracticeSetsSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        zone={ZONE}
+        // EXPLICITLY undefined, which is the whole point of the prop being required with undefined in
+        // its type: a caller that has not loaded the status has to say so, and this case is the one
+        // that proves what such a caller gets. Omitting it is now a compile error.
+        childStatus={undefined}
+      />,
       { api: setsApi() },
     );
     const set = await screen.findByRole('listitem', { name: /daily practice/i });
-    await waitFor(() => expect(set.textContent).toMatch(/shown to your child from/i));
+    await waitFor(() => expect(set.textContent).toMatch(/would open for riley from/i));
+    expect(set.textContent).not.toMatch(/shown to (your child|riley)/i);
+    // No "again": that belongs to a profile this page knows was archived.
+    expect(set.textContent).not.toMatch(/active again/i);
+    // The stored plan is not thrown away, which is what the old assertion was really protecting.
     expect(set.textContent).toContain(DAILY_TEXT);
   });
 });
@@ -873,26 +900,184 @@ describe('[HUNT7-H-3/H-4] the schedule card and the test-date card answer the sa
   });
 
   it('decides the question in ONE place, so the two sections cannot drift apart again', () => {
-    // The structural half. Both files import `receivesPractice` and neither re-derives the predicate, so
-    // a future change to what "receives practice" means reaches both cards or neither.
+    /*
+     * The structural half, re-aimed for BUG-411. It used to assert only that these files MENTION
+     * `receivesPractice` and hold no `childStatus === 'active'` of their own, which was true while the
+     * helper sat in apps/web and the phone had its own beside it — the exact shape of L-070. What it
+     * now asserts is that no region of this folder answers the question with an expression at all, and
+     * that the answer arrives from `@pencillift/contracts`, the package the app's planner imports it
+     * from too. The behavioural halves are the cases above and in
+     * apps/mobile/src/learning/planner-form.test.ts, which run against that one definition.
+     */
+    const dir = join(import.meta.dirname);
     for (const file of [
-      'apps/web/src/components/learning/TestDatesSection.tsx',
-      'apps/web/src/components/learning/ScheduleSection.tsx',
+      'TestDatesSection.tsx',
+      'ScheduleSection.tsx',
+      // BUG-407's residual: the last region on this screen that re-derived the predicate inline.
+      'PracticeSetsSection.tsx',
     ]) {
-      const source = readFileSync(
-        join(import.meta.dirname, '..', '..', '..', '..', '..', file),
-        'utf8',
-      );
-      expect(source, file).toContain('receivesPractice');
-      // Neither may carry its own copy of the expression the helper owns.
-      expect(source, file).not.toMatch(/childStatus === 'active'/);
+      const source = readFileSync(join(dir, file), 'utf8');
+      // No region may carry its own copy of the expression, in either direction.
+      expect(source, file).not.toMatch(/childStatus\s*===\s*'active'/);
+      expect(source, file).not.toMatch(/childStatus\s*!==\s*'active'/);
+      expect(source, file).not.toMatch(/child\.status\s*[!=]==\s*'active'/);
     }
+    // ...and the answer arrives from the contracts package with NOTHING IN BETWEEN. `format.ts` used
+    // to re-export `receivesPractice`, and this case used to assert that re-export existed — which
+    // validated the intermediary instead of removing it. A pointer is not a copy, but it is a second
+    // NAME for one thing, and a second name is where a second definition starts: the next person to
+    // need a local tweak edits the barrel rather than the package. The two sections that reached it
+    // through the barrel now import it directly, the block is gone, and what this asserts is the
+    // stronger claim — no file in this folder declares OR re-exports it.
+    const format = readFileSync(join(dir, 'format.ts'), 'utf8');
+    expect(format).not.toMatch(/export function receivesPractice/);
+    // What this forbids is a DECLARATION or a RE-EXPORT, not a mention: the first draft of this line
+    // was a bare /receivesPractice/ and it failed on the docblock that tells a reader where the
+    // definition lives, which is a comment doing its job. Assert the thing you mean, not a string
+    // that happens to sit near it.
+    expect(format, 'format.ts must not re-export it').not.toMatch(
+      /export\s*\{[^}]*receivesPractice[^}]*\}\s*from/,
+    );
+    expect(format, 'format.ts must not re-export it as a named alias').not.toMatch(
+      /export\s+(const|function|let|var)\s+receivesPractice\b/,
+    );
+    for (const file of ['TestDatesSection.tsx', 'PracticeSetsSection.tsx']) {
+      const source = readFileSync(join(dir, file), 'utf8');
+      expect(source, file).toMatch(
+        /import \{[\s\S]*?receivesPractice[\s\S]*?\} from '@pencillift\/contracts';/,
+      );
+    }
+    const schedule = readFileSync(join(dir, 'ScheduleSection.tsx'), 'utf8');
+    expect(schedule).toMatch(
+      /import \{[\s\S]*?dailyPracticeCopy,[\s\S]*?noWeeklyReviewsCopy,[\s\S]*?reviewReleaseReasonCopy,[\s\S]*?\} from '@pencillift\/contracts';/,
+    );
+    // The four empty-review sentences and the release-reason words are no longer written in this app.
+    for (const copy of ['No weekly review', 'regular review day', 'moved before the test on'])
+      expect(schedule, copy).not.toContain(copy);
+    expect(format, 'RELEASE_REASON').not.toMatch(/(const|let|var)\s+RELEASE_REASON\b/);
+    expect(format, 'DAILY_STATE').not.toMatch(/(const|let|var)\s+DAILY_STATE\b/);
+  });
+
+  /**
+   * BUG-411, the arm that had no hedge. `noWeeklyReviewsCopy`'s first arm claims no CAUSE — the list can
+   * be empty with a review-bearing subject on, when `reviewReleases` answers !ok for both weeks — and it
+   * used to claim nothing about the STATUS either, so the one arm of the four that a non-active profile
+   * could reach said only "No weekly review is scheduled for this week or next." The parent of a draft
+   * child was left to infer that one would arrive. The cause is still unclaimed; the blocker is named.
+   */
+  it('names the real blocker even in the arm that can claim no cause', async () => {
+    for (const childStatus of ['draft', 'archived', 'suspended'] as const) {
+      const { unmount } = renderPage(
+        <ScheduleSection
+          childId={CHILD}
+          childName="Riley"
+          subjects={SUBJECTS}
+          refreshKey={0}
+          childStatus={childStatus}
+        />,
+        { api: scheduleApi({ nextReviewReleases: [] }) },
+      );
+      const section = await screen.findByRole('region', { name: /coming up for riley/i });
+      expect(section.textContent, childStatus).toMatch(
+        /No weekly review is scheduled for this week or next\. A review is prepared once Riley’s profile is active\./,
+      );
+      // Still no claim about WHY the list is empty, which this arm cannot establish.
+      expect(section.textContent, childStatus).not.toMatch(/subject/i);
+      unmount();
+    }
+  });
+
+  /**
+   * BUG-411, divergence (1), the PORTAL half. Nothing in this app asserted the release-reason words
+   * before: the phone's suite pinned its own table, the portal's pinned only the `test_date_eve` arm on
+   * the page test, and reverting `default_schedule` to the phone's old 'review day' reddened the mobile
+   * suite alone. That is the asymmetry L-070 is about — one surface's coverage standing in for both — so
+   * the words are asserted here too, against the same shared table.
+   */
+  it('prints the shared release-reason words, with the test date the release carries', async () => {
+    const RENAMED: readonly ChildSubject[] = [{ ...SUBJECTS[0]!, displayName: 'Maths' }];
+    renderPage(
+      <ScheduleSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={RENAMED}
+        refreshKey={0}
+        childStatus="active"
+      />,
+      {
+        api: scheduleApi({
+          nextReviewReleases: [
+            {
+              subjectKey: 'math',
+              weekKey: '2026-W40',
+              releaseAt: REVIEW_AT,
+              reason: 'default_schedule',
+              testDate: null,
+            },
+            {
+              subjectKey: 'science',
+              weekKey: '2026-W40',
+              releaseAt: REVIEW_AT,
+              reason: 'test_date_eve',
+              testDate: '2026-10-01',
+            },
+            {
+              subjectKey: 'reading',
+              weekKey: '2026-W41',
+              releaseAt: null,
+              reason: 'skipped_week',
+              testDate: null,
+            },
+          ],
+        }),
+      },
+    );
+    const coming = await screen.findByRole('region', { name: /coming up for riley/i });
+    const text = coming.textContent ?? '';
+    expect(text).toContain('(regular review day)');
+    // The date, not just "before a test": this is the argument the phone's table had no room for.
+    expect(text).toContain('(moved before the test on Thu, Oct 1, 2026)');
+    expect(text).toContain('not this week (no review this week)');
+    // The parent's OWN name for the subject, which the phone printed from the standard table instead.
+    expect(text).toContain('Maths');
+    expect(text).not.toMatch(/\(before a test\)/);
+  });
+
+  /**
+   * The shared instant formatter, pinned from this surface too (BUG-411). The portal had its own, whose
+   * fallback reformatted in the DEVICE's zone and still printed a zone abbreviation, so a runtime without
+   * this family's zone data showed a DIFFERENT family's time under a heading naming theirs. The app's
+   * fallback names UTC, which is visibly not the family zone; that one is what both surfaces use now.
+   * Asserted here as well as in apps/mobile/src/learning/planner-form.test.ts, so changing it reddens
+   * both suites rather than one.
+   */
+  it('formats an instant in the family zone, and names UTC when the zone is unknown', () => {
+    expect(formatInZone('2026-07-02T23:00:00.000Z', 'America/Los_Angeles')).toMatch(/4:00\sPM PDT/);
+    expect(formatInZone('2026-07-02T23:00:00.000Z', 'Not/AZone')).toBe('2026-07-02 23:00 UTC');
+    // An unparseable instant is echoed rather than crashing the card it is printed on.
+    expect(formatInZone('not-an-instant', ZONE)).toBe('not-an-instant');
+  });
+
+  it('claims nothing at all for an ACTIVE profile in that arm', async () => {
+    renderPage(
+      <ScheduleSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        refreshKey={0}
+        childStatus="active"
+      />,
+      { api: scheduleApi({ nextReviewReleases: [] }) },
+    );
+    const section = await screen.findByRole('region', { name: /coming up for riley/i });
+    expect(section.textContent).toContain('No weekly review is scheduled for this week or next.');
+    expect(section.textContent).not.toMatch(/a review is prepared once/i);
   });
 });
 
 /**
  * HUNT7-H-1, the FOURTH occurrence of L-068's shape and the first one in a lookup TABLE. The daily line
- * is `DAILY_STATE[state](releaseAt, zone)` and only ONE of the four entries ever contained an instant
+ * was one `DAILY_STATE[state](releaseAt, zone)` call and only ONE of the four entries ever contained an instant
  * ('not_yet_released'), so the planner notice's framing — "the times below are what the schedule would
  * produce if the profile were active again" — could not reach the other three: they carry no time to
  * frame. 'available' is reachable for BOTH non-active statuses (the archived branch of GET
@@ -1001,10 +1186,15 @@ describe('[HUNT7-H-1] the daily line is a hypothetical for every profile that re
     // The table half of the fix. A test on the rendered copy passes the day a state is added and only
     // fails once someone reads that state's sentence, so the property is asserted on the table itself:
     // every entry has both variants, and no hypothetical is the prepared sentence over again.
-    const states = Object.keys(DAILY_STATE) as (keyof typeof DAILY_STATE)[];
+    //
+    // BUG-411: the table is `DAILY_PRACTICE_COPY` in packages/contracts, imported here and by the app's
+    // planner, so this property holds for the phone as well. It used to be `DAILY_STATE` in
+    // apps/web/.../format.ts with a byte-identical twin in apps/mobile/.../planner-form.ts, which is a
+    // coincidence with good odds and not an invariant (L-066).
+    const states = Object.keys(DAILY_PRACTICE_COPY) as (keyof typeof DAILY_PRACTICE_COPY)[];
     expect(states.sort()).toEqual(DAILY_STATES.map((d) => d.state).sort());
     for (const state of states) {
-      const copy = DAILY_STATE[state];
+      const copy = DAILY_PRACTICE_COPY[state];
       const prepared = copy.prepared(DAILY_AT, ZONE);
       const hedged = copy.hypothetical(DAILY_AT, ZONE, 'Riley');
       expect(hedged, state).not.toBe(prepared);

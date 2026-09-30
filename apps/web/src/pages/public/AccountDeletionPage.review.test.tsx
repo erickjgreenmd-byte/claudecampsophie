@@ -2,6 +2,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import type { ComponentType } from 'react';
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { storeSubscriptionNotice } from '@pencillift/contracts';
 import { renderPage } from '../../test/render.tsx';
 import AccountDeletionPage from './AccountDeletionPage.tsx';
 import PrivacyPage from './PrivacyPage.tsx';
@@ -85,15 +86,26 @@ describe('AccountDeletionPage review', () => {
     expect(screen.queryByRole('status')).toBeNull();
   });
 
+  /**
+   * Re-aimed for BUG-411. This asserted this page's OWN wording of the store notice, which is how a
+   * fourth wording of it survived beside the shared one. The requirement it carries — Fire tablets
+   * buy through the Amazon Appstore, deleting cancels nothing there either, and the page must say
+   * where to cancel without claiming which store the reader uses — is now asserted against the
+   * contracts' sentence, and the page is asserted to print exactly that sentence.
+   */
   it('names the Amazon Appstore subscription on Fire tablets next to the App Store and Google Play', async () => {
-    // Fire tablets buy through the Amazon Appstore (no Google Play); deleting the account cancels
-    // nothing there either, and the page must say where to cancel without claiming the store exists.
     await renderPublic(AccountDeletionPage, '/account-deletion');
     const store = screen.getByRole('region', { name: /subscription/i });
+    // The page covers all three deletions, so it is the `any` sentence, printed whole.
+    expect(store.textContent).toContain(storeSubscriptionNotice('any', null));
     expect(store.textContent).toMatch(
-      /does not cancel an App Store or Google Play subscription, or an Amazon Appstore subscription on a Fire tablet/i,
+      /does not cancel an App Store, Google Play or Amazon Appstore subscription/i,
     );
-    expect(store.textContent).toMatch(/or in the Amazon Appstore on a Fire tablet/i);
+    expect(store.textContent).toMatch(/Amazon Appstore/);
+    // A public page knows no store, so it may not name one as the reader's.
+    expect(store.textContent).not.toMatch(
+      /your (App Store|Google Play|Amazon Appstore) subscription/,
+    );
   });
 
   it('[RV-public-site-3] says that only the family owner can delete the whole family account', async () => {

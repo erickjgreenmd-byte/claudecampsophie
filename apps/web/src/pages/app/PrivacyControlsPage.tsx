@@ -9,20 +9,28 @@ import {
   exportDownloadResponseSchema,
   dataExportResponseSchema,
   dataExportsResponseSchema,
+  DELETION_INTRO,
+  deletionConfirmationCopy,
+  deletionConfirmationMatches,
+  deletionRequestedMessage,
+  deletionRequestLabel,
   deletionRequestResponseSchema,
   deletionRequestsResponseSchema,
+  deletionStatusText,
   privacyFamilyViewSchema,
+  privacyRetentionLines,
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
-  PRIVACY_RETENTION,
   SAFETY_NOTE_MAX_LENGTH,
   SAFETY_REPORT_CATEGORIES,
   safetyReportResponseSchema,
   safetyReportsResponseSchema,
   STANDARD_EXPORT_KINDS,
+  storeSubscriptionNotice,
   type AccountCloseOutcome,
   type DataExport,
   type DeletionRequest,
+  type DeletionTarget,
   type ExportKind,
   type ParentReportOutcome,
   type PrivacyFamilyView,
@@ -36,7 +44,6 @@ import {
 import { ApiRequestError } from '@pencillift/contracts/client';
 import { ErrorState, Loading, Notice } from '../../components/states.tsx';
 import { StepUpPrompt as SharedStepUpPrompt } from '../../components/StepUpPrompt.tsx';
-import { STORE_THAT_BILLS_YOU } from '../../components/stores.ts';
 import { stillSignedIn } from '../../lib/auth.ts';
 import { RequireParent, useApiQuery, useSession, type QueryState } from '../../lib/session.tsx';
 // The closure's handover to /account-deletion: that page reads the router state, so it owns the value
@@ -105,10 +112,6 @@ const EMAIL_STATE_COPY: Record<SafetyFlagEmailStatus, string> = {
   not_sent: PARENT_SAFETY_FLAG_COPY.emailNotSent,
   failed: PARENT_SAFETY_FLAG_COPY.emailFailed,
 };
-
-// WEB-R1-04: every store that can bill a family, the Amazon Appstore included.
-const STORE_SUBSCRIPTION_NOTICE =
-  'Deleting your PencilLift account does not cancel an App Store, Google Play or Amazon Appstore subscription.';
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -336,6 +339,14 @@ function PrivacyControls() {
   );
 }
 
+/**
+ * The retention facts and the deletion sentences come from the contracts
+ * (`privacyRetentionLines`, `storeSubscriptionNotice`, `deletionConfirmationCopy`,
+ * `deletionRequestedMessage`), which the app prints too. The portal is sold through no store, so it
+ * can never name one: it passes `null` and the sentence names every store that can bill a family.
+ */
+const PORTAL_STORE_CHANNEL = null;
+
 function DeletedAccount({ request }: { request: DeletionRequest }) {
   return (
     <section className="card" style={sectionStyle} aria-labelledby="deleted-title">
@@ -358,9 +369,9 @@ function DeletedAccount({ request }: { request: DeletionRequest }) {
         billing records where the law requires it.
       </p>
       <div className="notice">
+        {/* The family is what was deleted here, so the family subject is the one that is true. */}
         <p style={{ margin: 0 }}>
-          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> To stop being charged, cancel it in{' '}
-          {STORE_THAT_BILLS_YOU}.
+          <strong>{storeSubscriptionNotice('family', PORTAL_STORE_CHANNEL)}</strong>
         </p>
       </div>
     </section>
@@ -371,27 +382,9 @@ function RetentionSection() {
   return (
     <Section id="retention-title" title="How long we keep information">
       <ul>
-        <li>
-          Raw homework photos are deleted after {PRIVACY_RETENTION.rawScanDays} days by default.
-          Deleting a child or your account removes them sooner.
-        </li>
-        <li>
-          Results, practice history, points and rewards are kept while your account is active, until
-          you delete that child or your family account.
-        </li>
-        <li>
-          When you ask for deletion, processing stops at once: devices are signed out and queued
-          work is cancelled. Deletion from our active systems completes within{' '}
-          {PRIVACY_RETENTION.deletionTargetDays} days.
-        </li>
-        <li>Backups expire on a documented schedule (length to be confirmed).</li>
-        <li>
-          We may keep limited billing records where the law requires it, plus consent records and a
-          security log that uses pseudonymous ids only — never homework or answers.
-        </li>
-        <li>
-          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> Cancel it in {STORE_THAT_BILLS_YOU}.
-        </li>
+        {privacyRetentionLines(PORTAL_STORE_CHANNEL).map((line) => (
+          <li key={line}>{line}</li>
+        ))}
       </ul>
     </Section>
   );
@@ -930,19 +923,6 @@ function AccountCloseSection() {
 // Deletion
 // ---------------------------------------------------------------------------------------------
 
-function deletionStatusText(d: DeletionRequest): string {
-  switch (d.status) {
-    case 'requested':
-      return `Requested: processing has stopped. Deletion completes by ${formatDate(d.completeBy)}.`;
-    case 'processing':
-      return `Deleting now. Completes by ${formatDate(d.completeBy)}.`;
-    case 'completed':
-      return `Deleted${d.completedAt ? ` on ${formatDate(d.completedAt)}` : ''}.`;
-    case 'cancelled':
-      return 'Cancelled.';
-  }
-}
-
 function DeletionSection({
   family,
   deletionQuery,
@@ -957,16 +937,10 @@ function DeletionSection({
   const requests = deletions?.requests ?? [];
   return (
     <Section id="deletion-title" title="Delete data">
-      <p>
-        Deleting stops processing immediately and signs out the affected devices. Active data is
-        deleted within {PRIVACY_RETENTION.deletionTargetDays} days. This can’t be undone.
-      </p>
-      <div className="notice">
-        <p style={{ margin: 0 }}>
-          <strong>{STORE_SUBSCRIPTION_NOTICE}</strong> Cancel it in {STORE_THAT_BILLS_YOU} first if
-          you no longer want to be charged.
-        </p>
-      </div>
+      <p>{DELETION_INTRO}</p>
+      {/* No store-subscription notice here: what it must say depends on WHICH deletion, so each
+          form prints its own scope's sentence from `deletionConfirmationCopy`. A section-wide
+          notice is how the account-wide sentence came to stand over a single child's deletion. */}
       <DeleteChildForm family={family} requests={requests} onChanged={onChanged} />
       <DeleteFamilyForm onChanged={onChanged} />
       <h3>Deletion requests</h3>
@@ -979,12 +953,8 @@ function DeletionSection({
         <ul aria-label="Deletion requests">
           {requests.map((d) => (
             <li key={d.id}>
-              <strong>
-                {d.scope === 'family'
-                  ? 'Whole family account'
-                  : `${childName(family, d.childId)}’s data`}
-              </strong>
-              {` · ${deletionStatusText(d)}`}
+              <strong>{deletionRequestLabel(d, childName(family, d.childId))}</strong>
+              {` · ${deletionStatusText(d, formatDate)}`}
             </li>
           ))}
         </ul>
@@ -1014,27 +984,33 @@ function DeleteChildForm({
   const blocked = openDeletionChildIds(requests);
   const children = family.children.filter((c) => !blocked.has(c.id));
   const selected = children.find((c) => c.id === childId) ?? null;
+  // The chosen deletion, in the shape the shared copy branches on. Null until a child is picked,
+  // and then every sentence below is that child's: no sentence on this form is written here.
+  const target: DeletionTarget | null = selected
+    ? { scope: 'child', childId: selected.id, nickname: selected.nickname }
+    : null;
+  const copy = target ? deletionConfirmationCopy(target, PORTAL_STORE_CHANNEL) : null;
   const buttonLabel = selected ? `Delete ${selected.nickname}’s data` : 'Delete data';
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!selected) return;
+    if (!target || !copy) return;
     // Decision: typed confirmation matches the nickname ignoring case and surrounding spaces; the
-    // server-side PIN step-up is the security control, this guards against slips.
-    if (typed.trim().toLowerCase() !== selected.nickname.trim().toLowerCase()) {
-      setConfirmError(`Type ${selected.nickname} exactly to confirm.`);
+    // server-side PIN step-up is the security control, this guards against slips. The rule and its
+    // refusal sentence are the contract's, so the app cannot accept what the portal refuses.
+    if (!deletionConfirmationMatches(target, typed)) {
+      setConfirmError(copy.mismatch);
       return;
     }
     setConfirmError(null);
-    const name = selected.nickname;
     const ok = await action.run(async () => {
       const { deletion } = await api.send(
         'POST',
         '/v1/deletion',
-        { scope: 'child', childId: selected.id },
+        { scope: 'child', childId: target.childId },
         deletionRequestResponseSchema,
       );
-      return `Deletion requested. ${name}’s devices are signed out and processing has stopped. Deletion completes by ${formatDate(deletion.completeBy)}.`;
+      return deletionRequestedMessage(target, formatDate(deletion.completeBy));
     });
     if (ok) {
       setChildId('');
@@ -1046,10 +1022,6 @@ function DeleteChildForm({
   return (
     <fieldset style={fieldsetStyle}>
       <legend style={legendStyle}>Delete a child’s data</legend>
-      <p style={{ marginTop: 0 }}>
-        Removes that child’s homework photos, results, practice, points, rewards requests and
-        devices. Your other children and your account stay.
-      </p>
       {children.length === 0 ? (
         <p>There are no child profiles to delete.</p>
       ) : (
@@ -1072,9 +1044,15 @@ function DeleteChildForm({
               </option>
             ))}
           </select>
-          {selected ? (
+          {copy ? (
             <>
-              <label htmlFor={confirmId}>{`Type ${selected.nickname} to confirm`}</label>
+              <p>{copy.effect}</p>
+              <div className="notice">
+                <p style={{ margin: 0 }}>
+                  <strong>{copy.storeNotice}</strong>
+                </p>
+              </div>
+              <label htmlFor={confirmId}>{copy.typePrompt}</label>
               <input
                 id={confirmId}
                 autoComplete="off"
@@ -1108,7 +1086,8 @@ function DeleteChildForm({
   );
 }
 
-const FAMILY_CONFIRMATION = 'DELETE';
+/** The family deletion's own target: fixed, so this form's sentences are the family's. */
+const FAMILY_TARGET: DeletionTarget = { scope: 'family' };
 
 function DeleteFamilyForm({ onChanged }: { onChanged: () => void }) {
   const { api } = useSession();
@@ -1117,11 +1096,12 @@ function DeleteFamilyForm({ onChanged }: { onChanged: () => void }) {
   const [confirmError, setConfirmError] = useState<string | null>(null);
   const confirmId = useId();
   const buttonLabel = 'Delete our family account';
+  const copy = deletionConfirmationCopy(FAMILY_TARGET, PORTAL_STORE_CHANNEL);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (typed.trim() !== FAMILY_CONFIRMATION) {
-      setConfirmError('Type DELETE in capital letters to confirm.');
+    if (!deletionConfirmationMatches(FAMILY_TARGET, typed)) {
+      setConfirmError(copy.mismatch);
       return;
     }
     setConfirmError(null);
@@ -1132,7 +1112,7 @@ function DeleteFamilyForm({ onChanged }: { onChanged: () => void }) {
         { scope: 'family' },
         deletionRequestResponseSchema,
       );
-      return `Deletion requested. Deletion completes by ${formatDate(deletion.completeBy)}.`;
+      return deletionRequestedMessage(FAMILY_TARGET, formatDate(deletion.completeBy));
     });
     if (ok) onChanged();
   };
@@ -1140,12 +1120,14 @@ function DeleteFamilyForm({ onChanged }: { onChanged: () => void }) {
   return (
     <fieldset style={fieldsetStyle}>
       <legend style={legendStyle}>Delete your whole family account</legend>
-      <p style={{ marginTop: 0 }}>
-        Deletes every child’s data and your family account, and removes access for every guardian.
-        Only the family owner can do this.
-      </p>
+      <p style={{ marginTop: 0 }}>{copy.effect}</p>
+      <div className="notice">
+        <p style={{ margin: 0 }}>
+          <strong>{copy.storeNotice}</strong>
+        </p>
+      </div>
       <form onSubmit={(e) => void submit(e)} noValidate>
-        <label htmlFor={confirmId}>Type DELETE to confirm</label>
+        <label htmlFor={confirmId}>{copy.typePrompt}</label>
         <input
           id={confirmId}
           autoComplete="off"

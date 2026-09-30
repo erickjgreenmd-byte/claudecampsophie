@@ -19,9 +19,14 @@ import {
   childEditBody,
   childPickerSuffixCopy,
   childStatusCopy,
+  heldPairingCode,
   markEdited,
   NOTHING_EDITED,
+  PAIRING_STALE_COPY,
+  pairingRedeemable,
+  pairingStaleNextStep,
   type ChildCopySubject,
+  type HeldPairingCode,
 } from '@pencillift/contracts';
 import { EmptyState, ErrorState, Loading } from '../../components/states.tsx';
 import { RequireParent, useApiQuery, useSession } from '../../lib/session.tsx';
@@ -228,11 +233,11 @@ function ChildCard({
   const { api } = useSession();
   const { busy, feedback, run } = useAction();
   /**
-   * The pairing code this card minted, or 'stale' once the child left the only state that can redeem
-   * it (G-PROSE). The code string itself is dropped when that happens; 'stale' is what remains, so the
-   * parent is told the code is gone rather than left looking for it.
+   * The pairing code this card minted, as `HeldPairingCode` defines the state (G-PROSE). What is
+   * RENDERED is `shownCode` below: the decision is `heldPairingCode` in
+   * `packages/contracts/src/family.ts`, which the phone's pair-device screen imports too.
    */
-  const [code, setCode] = useState<{ code: string; expiresAt: string } | 'stale' | null>(null);
+  const [code, setCode] = useState<HeldPairingCode>(null);
   const [lastAction, setLastAction] = useState<'code' | 'activate' | 'archive' | 'edit' | null>(
     null,
   );
@@ -244,37 +249,26 @@ function ChildCard({
   /** Nothing about this profile can be changed: the edit form and the archive confirmation both go. */
   const readOnly = child.status === 'archived' || deletionPending;
   /**
-   * A NECESSARY condition for a pairing code this card is holding to be redeemable, and the only one
-   * this page can observe. `POST /v1/child-auth/pair`'s claim (apps/api/src/routes/child-auth.ts)
-   * requires FOUR things besides the code — `p.consumed_at is null`, `p.expires_at > now`,
-   * `c.status = 'active'`, `f.deleted_at is null` — and then refuses separately when
-   * `consentAllowsChildAccess` is false. This value establishes the third, and the fourth indirectly.
-   *
-   * HUNT7-G-5: it is therefore NOT "exactly the window in which the code works", as this comment used
-   * to claim. A profile that is not active cannot redeem a code, so `false` here is always right; but
-   * `true` is not a guarantee, because three things retire a code without moving the status:
-   *  - POST /v1/consent/withdraw sets `consumed_at` on every live code for the family and leaves
-   *    `child_profiles.status` alone (apps/api/src/routes/guardians.ts);
-   *  - a provider-side consent flip with no route call at all leaves the code UNCONSUMED, the child
-   *    active, and /pair answering 422 CONSENT_REQUIRED — pinned directly by the SQL-flip case in
-   *    apps/api/tests/consent-withdrawal.review.test.ts;
-   *  - minting a code for the same child on another surface consumes this one
-   *    (the pairing-code route's "one live code per child" update, apps/api/src/routes/family.ts).
-   * This page reads only GET /v1/family and never /v1/consent, so it cannot see any of them. Giving
-   * the guard the consent state is a separate decision (a /v1/consent read on this page); the copy
-   * below therefore does not claim the converse either.
+   * BUG-395/BUG-410: the necessary condition for a code this card is holding to be redeemable, and
+   * the only one this page can observe. The rule, and every reason `true` is not a guarantee, are
+   * stated once in `pairingRedeemable` (`packages/contracts/src/family.ts`) — which the phone's
+   * pair-device screen imports too, so correcting it corrects both surfaces. This page held its own
+   * copy of the predicate until BUG-411 (g); it holds none now.
    */
-  const pairingRedeemable = child.status === 'active' && !deletionPending;
+  const redeemable = pairingRedeemable(child);
   /**
-   * HUNT7-G-7: the live answer to `pairingRedeemable`, for the decision `createCode` takes when its
-   * POST RESOLVES. The effect below fires once per status change and can only act on the `code` held
-   * at that moment, and `createCode`'s closure holds the value from the render the parent pressed in —
-   * the one render where it is still true. A pairing POST in flight while a sibling component's reload
-   * lands `archived` therefore used to put a live code on a card that was simultaneously saying
-   * nothing can be paired for this child.
+   * BUG-397: what is RENDERED where a code would go, decided from the child of THIS render rather
+   * than by an effect racing the code's arrival. A code minted before the status moved resolves into
+   * this call like any other and comes back 'stale'.
    */
-  const redeemableNow = useRef(pairingRedeemable);
-  redeemableNow.current = pairingRedeemable;
+  const shownCode = heldPairingCode(code, child);
+  /**
+   * The live answer to `pairingRedeemable`, for the SENTENCE `createCode` reads out when its POST
+   * resolves: its closure holds the child from the render the parent pressed in — the one render
+   * where the profile is still redeemable — and this ref holds the latest.
+   */
+  const redeemableNow = useRef(redeemable);
+  redeemableNow.current = redeemable;
 
   /**
    * G-PROSE: the one rule every open panel on this card answers to, and it CLEARS the state rather
@@ -286,18 +280,22 @@ function ChildCard({
    * on screen for a child who can no longer redeem it; the parent would have typed it into the device
    * and been refused.
    *
-   * HUNT7-G-7: this effect closes a code ALREADY IN HAND. The rule it states — a card that cannot
-   * redeem a code never shows one — holds at the other point too because `createCode` stores 'stale'
-   * for a code that arrives after the status has moved; neither half is enough alone, and a code once
-   * turned stale is never turned back, so activating the child again does not resurrect it.
+   * BUG-397: this effect no longer DECIDES anything about the code — `shownCode` above does, at every
+   * render, so a code that arrives after the status has moved is covered by the same call as one
+   * already in hand. What is left here is the LATCH: writing the rendered answer back means a code
+   * once turned stale is never turned back, so activating the child again does not resurrect a code
+   * the server has already refused. `shownCode` is `code` itself while the profile is redeemable, so
+   * this runs only when the answer actually changes.
    */
   useEffect(() => {
     if (readOnly) {
       setEditing(false);
       setConfirmArchive(false);
     }
-    if (!pairingRedeemable) setCode((open) => (open === null ? null : 'stale'));
-  }, [readOnly, pairingRedeemable]);
+  }, [readOnly]);
+  useEffect(() => {
+    setCode(shownCode);
+  }, [shownCode]);
 
   // Spec P11 / AC_CAPACITY_03: an unused paid slot is assigned without buying again. The server
   // re-checks the slot count, consent and a recent PIN unlock; this never purchases anything.
@@ -330,12 +328,13 @@ function ChildCard({
         undefined,
         createPairingCodeResponseSchema,
       );
-      // HUNT7-G-7: the status is re-read HERE, not at the render the parent pressed in. The server
-      // minted a real code (its own `child.status !== 'active'` check passed when the request was
-      // made), and archiving does not consume it — so if the profile moved while this POST was in
-      // flight, what came back is a code the device would refuse, and the card says so instead of
-      // printing it.
-      setCode(redeemableNow.current ? result : 'stale');
+      // BUG-397: what came back is stored as it came back, and `shownCode` decides whether it may be
+      // printed — at the render, from that render's child. The server minted a real code (its own
+      // `child.status !== 'active'` check passed when the request was made) and archiving does not
+      // consume it, so a profile that moved while this POST was in flight leaves a code the device
+      // would refuse; the card says so instead of printing it. The SENTENCE below is the one thing
+      // that needs the answer at resolution time, which is what `redeemableNow` holds.
+      setCode(result);
       return redeemableNow.current
         ? `Pairing code created for ${child.nickname}.`
         : `The pairing code for ${child.nickname} was created, but their profile changed before it arrived.`;
@@ -431,7 +430,7 @@ function ChildCard({
           it on the <Link to="/app/privacy">privacy page</Link>. Deletion can’t be undone from the
           app: if you did not mean it, <Link to="/app/support">contact support</Link> straight away.
         </p>
-      ) : child.status === 'active' ? (
+      ) : redeemable ? (
         <div style={buttonRow}>
           <button
             type="button"
@@ -600,41 +599,22 @@ function ChildCard({
         }
         stepUpAction={stepUpAction}
       />
-      {code === null ? null : code === 'stale' ? (
+      {shownCode === null ? null : shownCode === 'stale' ? (
         // G-PROSE: what the parent is told instead of a code the device would refuse. Vanishing in
         // silence would be its own puzzle — the panel says a code is shown only once — so the reason
         // and the way back are both named here.
         //
-        // HUNT7-G-5: what it does NOT say is that being active is sufficient. `pairingRedeemable`
-        // above records why: the status is one of five conditions /pair checks, and a consent
-        // withdrawal or a code minted on another surface retires a code with the status untouched, so
-        // this notice names the condition it can speak for and points at the other one the parent can
-        // act on instead of promising that the next code will connect.
-        //
-        // HUNT7-G-1 (repair): `pairingRedeemable` decides the SECOND HALF of this notice, so the
-        // notice and the rest of the card cannot contradict each other. Two states reach it, and the
-        // fix that made the feedback a sibling put them both on screen at once:
-        //  - the profile is redeemable again (this card's own "Activate {nickname} again" worked, and
-        //    its success line — "You can now create a pairing code" — is now rendered beside this
-        //    notice). The code itself is gone for good and is not resurrected, but asserting that the
-        //    profile "is not" active, under a "Status: Active" line and a live Create button, is three
-        //    self-contradictions on one card.
-        //  - it is not, and then the notice defers to the notices above rather than PRESUPPOSING that
-        //    activation will become possible: this notice renders on a deletion-pending card, where
-        //    processing has stopped, nothing can be activated and deletion cannot be undone from the
-        //    app, and WEBR4-02 is this project's ledger entry for promising a recovery there. Hence
-        //    "if {nickname} is active again", round 6's conditional, and not "once … again … yet".
+        // BUG-395: what it does NOT say is that being active is sufficient, and BUG-393: its moving
+        // sentence is decided by the same predicate as the rest of the card, so the two cannot
+        // contradict each other. Every word of it, and why each is the word it is, now lives in
+        // `PAIRING_STALE_COPY` and `pairingStaleNextStep` (`packages/contracts/src/family.ts`) —
+        // imported by the phone's pair-device screen too, which had none of this work (BUG-411 (g)).
+        // The <Link> is this surface's own control for the shared `consentTarget` words.
         <div className="notice" role="status" style={{ marginTop: 12 }}>
           <p style={{ margin: '0 0 8px' }}>
-            <strong>That pairing code can’t connect a device any more.</strong> A code is never
-            redeemed for a profile that is not active, so the code was taken off the screen rather
-            than left here to fail on the device.{' '}
-            {pairingRedeemable
-              ? `${child.nickname} is active again, so you can create a new code above.`
-              : `${child.nickname}’s is not active, so you can create a new one if ${child.nickname} is active again — the notices above say whether that is possible.`}{' '}
-            A code can also stop working while a profile stays active, because a device is checked
-            against your family’s consent too: you can review that on the{' '}
-            <Link to="/app">family dashboard</Link>.
+            <strong>{PAIRING_STALE_COPY.headline}</strong> {PAIRING_STALE_COPY.reason}{' '}
+            {pairingStaleNextStep(child, child.nickname)} {PAIRING_STALE_COPY.consentLead}{' '}
+            <Link to="/app">{PAIRING_STALE_COPY.consentTarget}</Link>.
           </p>
           {/*
             HUNT7-G-1 (repair): this clears the CODE and nothing else. It used to clear `feedback`
@@ -652,7 +632,7 @@ function ChildCard({
       ) : (
         // The same rule for the live code's own Done, for the same reason: this card offers Edit and
         // Archive beside a printed code, and either one's STEP_UP_REQUIRED puts the PIN field here.
-        <PairingCodePanel nickname={child.nickname} code={code} onDone={() => setCode(null)} />
+        <PairingCodePanel nickname={child.nickname} code={shownCode} onDone={() => setCode(null)} />
       )}
     </li>
   );

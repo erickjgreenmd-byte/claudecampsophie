@@ -6,7 +6,11 @@ import {
   type FamilyOverview,
   childPickerSuffixCopy,
   childStatusCopy,
+  heldPairingCode,
+  pairingRedeemable,
+  pairingStaleNextStep,
   type ChildCopySubject,
+  type HeldPairingCode,
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 
@@ -118,7 +122,13 @@ export interface ChildRow {
   readonly nickname: string;
   readonly detail: string;
   readonly statusText: string;
-  /** Only active children (holding a paid slot) can be paired with a device. */
+  /**
+   * Whether a pairing code can be minted for this child — `pairingRedeemable`
+   * (packages/contracts/src/family.ts), the same predicate the portal's card and the pair-device
+   * screen decide on. This row held its own `status === 'active'` copy until BUG-411 (g); that copy
+   * also omitted `deletionPending`, which the Children screen happened to guard at the call site and
+   * the pair-device screen did not.
+   */
   readonly canPair: boolean;
   /** Why pairing is unavailable, shown instead of a disabled/dead button. */
   readonly pairingNote: string | null;
@@ -169,6 +179,40 @@ function draftActivationNote(family: FamilyOverview, nickname: string): string {
   return `All ${family.paidSlots} paid ${slots} in use. To activate ${nickname}, add a child slot under Plan and child slots.`;
 }
 
+/**
+ * Why a device cannot be paired for this child, or null when it can. The ANSWER to "can it" is
+ * `pairingRedeemable` and is not re-derived here; this is only the sentence.
+ *
+ * L-057: the `default:` arm exists because the old expression was `draft ? … : archived ? … : null`,
+ * so every state that is not one of those two — a deletion-pending child, and any status a later
+ * release adds — got NOTHING where the button would be. On the Children screen that was hidden by a
+ * `deletionPending ? null :` guard at the call site; on the pair-device screen, which is one child
+ * and has no such guard, it would be a screen with no control and no reason.
+ *
+ * The portal's card says more than this for an archived child (it offers the activation that brings
+ * them back, and its own words for it). That copy is NOT claimed to be shared and is not: this is the
+ * phone's sentence, and the divergence is recorded rather than asserted away.
+ */
+function pairingNoteFor(child: FamilyChild): string | null {
+  if (pairingRedeemable(child)) return null;
+  if (child.deletionPending === true)
+    return `Nothing can be paired for ${child.nickname} while the deletion request covering their data is open.`;
+  switch (child.status) {
+    case 'draft':
+      return `Pairing a device becomes available once ${child.nickname} has a paid slot.`;
+    case 'archived':
+      return 'Archived profiles can’t be paired.';
+    // 'active' cannot reach here — an active child is answered above whether or not a deletion is
+    // open — but it is NAMED, so the exhaustiveness check keeps holding the next status this project
+    // adds to account instead of letting it land here silently.
+    case 'active':
+    default:
+      // A status this release has not heard of: say that pairing is unavailable, which /pair's
+      // `c.status = 'active'` makes certain, and claim nothing about why or about what would fix it.
+      return `Pairing a device isn’t available for ${child.nickname} right now.`;
+  }
+}
+
 export function childRows(family: FamilyOverview): ChildRow[] {
   const unused = unusedPaidSlots(family);
   return family.children.map((child) => {
@@ -178,12 +222,8 @@ export function childRows(family: FamilyOverview): ChildRow[] {
       nickname: child.nickname,
       detail: `${gradeText(child.gradeLevel)} · ages ${child.ageBand}`,
       statusText: childStatusText(child),
-      canPair: child.status === 'active',
-      pairingNote: draft
-        ? `Pairing a device becomes available once ${child.nickname} has a paid slot.`
-        : child.status === 'archived'
-          ? 'Archived profiles can’t be paired.'
-          : null,
+      canPair: pairingRedeemable(child),
+      pairingNote: pairingNoteFor(child),
       // WEBR4-01: an archived child can take a free slot too, the way the portal offers it. The
       // activate route clears archived_at for any profile that is not already active, and the archive
       // confirmation on this screen promises it. The screen still withholds the control while a
@@ -195,6 +235,60 @@ export function childRows(family: FamilyOverview): ChildRow[] {
           : null,
     };
   });
+}
+
+/**
+ * WHAT THE PAIR-DEVICE SCREEN RENDERS. `app/(parent)/pair-device.tsx` imports react-native and the
+ * mobile suite is pure logic only (apps/mobile/vitest.config.ts), so the screen's every decision is
+ * taken here, where a test can assert the OUTPUT the screen is handed rather than only the rule it
+ * was handed it by (L-071).
+ *
+ * BUG-411 (g) is what this closes. That screen held a minted code in `useState` with NO staleness
+ * branch at all and no reading of the child's status — it is reached with a `childId` route param and
+ * fetched nothing — so a parent read a code the tablet would refuse, after a consent withdrawal
+ * retired it or after the child's status moved, with nothing on screen saying so. The portal had three
+ * findings' worth of work on exactly this (BUG-393, BUG-395, BUG-397) and the phone had none of it.
+ *
+ * `held` is what the screen's own state holds; `held` on the RESULT is what it may render, decided by
+ * `heldPairingCode` from the child of this render. That is BUG-397's conclusion — staleness is decided
+ * where the code is printed, not by an effect racing the code's arrival — and the screen writes the
+ * result back into its state, which is what latches a dead code dead (BUG-393).
+ */
+export interface PairDeviceView {
+  /** The LIVE nickname, not the route param's: the param is frozen at navigation and an edit moves it. */
+  readonly nickname: string;
+  readonly statusText: string;
+  /** Why no code can be created, or null when one can. Rendered ABOVE the panel. */
+  readonly pairingNote: string | null;
+  /** Whether the Create control is offered at all: `pairingRedeemable`, not a copy of it. */
+  readonly canCreate: boolean;
+  /** What goes where a code would: the code, 'stale', or nothing. */
+  readonly held: HeldPairingCode;
+  /** The stale notice's one moving sentence, for when `held` is 'stale'. */
+  readonly staleNextStep: string;
+}
+
+export function pairDeviceView(
+  family: FamilyOverview,
+  childId: string,
+  fallbackNickname: string,
+  held: HeldPairingCode,
+): PairDeviceView {
+  const child = family.children.find((c) => c.id === childId);
+  const nickname = child?.nickname ?? fallbackNickname;
+  return {
+    nickname,
+    // A child the family overview no longer lists: `childStatusCopy`'s own fall-through answers
+    // 'Status unavailable' for a status it does not know, which is exactly what is true here — this
+    // client cannot see the profile, so it claims nothing about it.
+    statusText: childStatusText(child ?? { status: '' }),
+    pairingNote: child
+      ? pairingNoteFor(child)
+      : `${nickname} is no longer listed in your family, so a pairing code can’t be created for them.`,
+    canCreate: pairingRedeemable(child),
+    held: heldPairingCode(held, child),
+    staleNextStep: pairingStaleNextStep(child, nickname),
+  };
 }
 
 /**

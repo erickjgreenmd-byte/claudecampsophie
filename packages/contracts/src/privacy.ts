@@ -741,3 +741,225 @@ export const privacyFamilyViewSchema = z.object({
   ),
 });
 export type PrivacyFamilyView = z.infer<typeof privacyFamilyViewSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// Deletion, retention and store-subscription COPY (round-7 parity, BUG-411 / L-070).
+//
+// One definition per sentence, printed unchanged by the parent portal
+// (apps/web/src/pages/app/PrivacyControlsPage.tsx, apps/web/src/pages/public/AccountDeletionPage.tsx)
+// and by the app (apps/mobile/src/privacy/parent-privacy.ts and the parent privacy route). Every
+// BRANCH those sentences need lives HERE — what is being deleted, and which store bills the family.
+// A shared lead sentence that each surface then wraps in its own conditional, or finishes with its
+// own remedy clause, is the same defect one level up (BUG-410): before this section the portal
+// appended three different remedy clauses to one local constant, the app wrote two more wordings of
+// its own, and the app's "Delete data" section showed the ACCOUNT-WIDE sentence to a parent who had
+// selected a single child — a false statement about what was about to be deleted.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which deletion a sentence is about. Wider than `DeletionScope` (the route's own two scopes)
+ * because the same sentences are said about the parent's own sign-in (POST /v1/account/close,
+ * account.ts) and, in the retention list, about all three at once.
+ */
+export const STORE_NOTICE_SUBJECTS = ['child', 'family', 'sign_in', 'any'] as const;
+export type StoreNoticeSubject = (typeof STORE_NOTICE_SUBJECTS)[number];
+
+/**
+ * The store that bills this family, as far as the surface saying the sentence can know it. `null` is
+ * "this surface cannot know": the parent portal is not sold through any store, and an app build for
+ * no store (Expo web) has no channel — both then name every store that can bill a family, the
+ * Amazon Appstore included (WEB-R1-04 / MOB-R1-10).
+ */
+export const STORE_NOTICE_CHANNELS = ['app_store', 'play_store', 'amazon_appstore'] as const;
+export type StoreNoticeChannel = (typeof STORE_NOTICE_CHANNELS)[number];
+
+const SUBSCRIPTION_NAME: Readonly<Record<StoreNoticeChannel, string>> = {
+  app_store: 'your App Store subscription',
+  play_store: 'your Google Play subscription',
+  amazon_appstore: 'your Amazon Appstore subscription',
+};
+
+const CANCEL_PLACE: Readonly<Record<StoreNoticeChannel, string>> = {
+  app_store: 'the App Store',
+  play_store: 'Google Play',
+  amazon_appstore: 'the Amazon Appstore',
+};
+
+/** Said where the store is unknown: every store that can bill a family, none of them guessed. */
+const EVERY_SUBSCRIPTION = 'an App Store, Google Play or Amazon Appstore subscription';
+const EVERY_CANCEL_PLACE = 'the store that bills you (App Store, Google Play or Amazon Appstore)';
+
+/**
+ * What deleting this does to the family's store subscription, and what the parent must do instead.
+ *
+ * The subject branch is not decoration. Deleting ONE child neither cancels the subscription nor
+ * lowers its price (the plan screens say the same, spec P11: a freed paid slot is not a refund), so
+ * the account-wide "does not cancel" alone is a half-truth there — and it also names the wrong
+ * thing as being deleted. `any`, the branch a subject nobody has added yet falls through to, carries
+ * the complete claim rather than the narrowest one (L-057).
+ */
+export function storeSubscriptionNotice(
+  subject: StoreNoticeSubject,
+  channel: StoreNoticeChannel | null,
+): string {
+  const subscription = channel ? SUBSCRIPTION_NAME[channel] : EVERY_SUBSCRIPTION;
+  const where = channel ? CANCEL_PLACE[channel] : EVERY_CANCEL_PLACE;
+  const remedy = `Cancel it in ${where} if you no longer want to be charged.`;
+  switch (subject) {
+    case 'family':
+      return `Deleting your PencilLift family account does not cancel ${subscription}. ${remedy}`;
+    case 'sign_in':
+      return `Deleting your PencilLift account does not cancel ${subscription}. ${remedy}`;
+    case 'child':
+      return `Deleting one child’s data does not cancel ${subscription} or lower its price. ${remedy}`;
+    case 'any':
+      return `Deleting a child’s data, your family account or your PencilLift account does not cancel ${subscription} or lower its price. ${remedy}`;
+  }
+}
+
+/**
+ * How long PencilLift keeps each kind of information (spec P4; mirrors migrations 0600/0620 and the
+ * public privacy page). One line per kind, in this order, printed by the portal's "How long we keep
+ * information" section and by the app's privacy screen — the same strings, not two wordings of the
+ * same six facts.
+ */
+export function privacyRetentionLines(channel: StoreNoticeChannel | null): readonly string[] {
+  return [
+    `Raw homework photos are deleted after ${PRIVACY_RETENTION.rawScanDays} days by default. Deleting a child or your account removes them sooner.`,
+    'Results, practice history, points and rewards are kept while your account is active, until you delete that child or your family account.',
+    `When you ask for deletion, processing stops at once: devices are signed out and queued work is cancelled. Deletion from our active systems completes within ${PRIVACY_RETENTION.deletionTargetDays} days.`,
+    'Backups expire on a documented schedule (length to be confirmed).',
+    'We may keep limited billing records where the law requires it, plus consent records and a security log that uses pseudonymous ids only — never homework or answers.',
+    storeSubscriptionNotice('any', channel),
+  ];
+}
+
+/**
+ * What deleting does, said once above the choice of what to delete. The 30-day target is the
+ * contract's own `PRIVACY_RETENTION.deletionTargetDays`, so the sentence cannot drift from the
+ * number the API and the retention list use.
+ */
+export const DELETION_INTRO = `Deleting stops processing immediately and signs out the affected devices. Active data is deleted within ${PRIVACY_RETENTION.deletionTargetDays} days. This can’t be undone.`;
+
+/**
+ * Which deletion the parent has chosen. Both surfaces build this value and hand it to the copy
+ * below, so neither can re-derive the scope from something else — the portal had two separate forms
+ * and the app one selection, and that is exactly how the app's copy came to ignore the scope.
+ */
+export type DeletionTarget =
+  | { readonly scope: 'family' }
+  | { readonly scope: 'child'; readonly childId: string; readonly nickname: string };
+
+/** The typed phrase that guards a whole-family deletion. */
+export const FAMILY_DELETION_CONFIRMATION = 'DELETE';
+
+/** What the parent must type before this deletion is sent. */
+export function deletionConfirmationPhrase(target: DeletionTarget): string {
+  return target.scope === 'family' ? FAMILY_DELETION_CONFIRMATION : target.nickname;
+}
+
+/**
+ * Decision: a child's nickname matches ignoring case and surrounding spaces; the family phrase must
+ * be DELETE in capitals. The server-side PIN step-up is the security control; this guards slips.
+ */
+export function deletionConfirmationMatches(target: DeletionTarget, typed: string): boolean {
+  const value = typed.trim();
+  return target.scope === 'family'
+    ? value === FAMILY_DELETION_CONFIRMATION
+    : value.toLowerCase() === target.nickname.trim().toLowerCase();
+}
+
+/**
+ * Said when what the parent typed does not match. Its own export because the app's
+ * `requestDeletionAction` refuses before it has any reason to know which store bills the family,
+ * and a `channel` argument it does not use is an argument a caller can get wrong (L-071).
+ */
+export function deletionConfirmationMismatch(target: DeletionTarget): string {
+  return target.scope === 'family'
+    ? `Type ${FAMILY_DELETION_CONFIRMATION} in capital letters to confirm.`
+    : `Type ${target.nickname} exactly to confirm.`;
+}
+
+/** Every sentence a deletion confirmation needs, for THIS target and no other. */
+export interface DeletionConfirmationCopy {
+  /** What this deletion removes, and what survives it. */
+  readonly effect: string;
+  /** The phrase to type, and the label that asks for it. */
+  readonly phrase: string;
+  readonly typePrompt: string;
+  /** Said when what was typed does not match. */
+  readonly mismatch: string;
+  /** What this deletion does NOT do to the store subscription. */
+  readonly storeNotice: string;
+}
+
+/**
+ * The confirmation a parent reads for the deletion they picked. The scope branch is here rather than
+ * on each surface: a parent deleting one child must not be told their other children, their family
+ * account and every guardian's access are going with it, and a parent deleting the family must not
+ * be told the rest of the family stays.
+ */
+export function deletionConfirmationCopy(
+  target: DeletionTarget,
+  channel: StoreNoticeChannel | null,
+): DeletionConfirmationCopy {
+  const phrase = deletionConfirmationPhrase(target);
+  const shared = {
+    phrase,
+    typePrompt: `Type ${phrase} to confirm`,
+    mismatch: deletionConfirmationMismatch(target),
+    // The subject is taken from the TARGET, never from the caller: a surface that could choose the
+    // subject is a surface that can show the account-wide sentence over one child's deletion.
+    storeNotice: storeSubscriptionNotice(target.scope, channel),
+  };
+  return target.scope === 'family'
+    ? {
+        ...shared,
+        effect:
+          'Deletes every child’s data and your family account, and removes access for every guardian. Only the family owner can do this.',
+      }
+    : {
+        ...shared,
+        effect: `Removes ${target.nickname}’s homework photos, results, practice, points, rewards requests and devices. Your other children, your family account and your own sign-in stay.`,
+      };
+}
+
+/**
+ * What the parent reads once the server has accepted the request. `completeBy` is the completion
+ * date already formatted by the surface saying it (the portal formats in the reader's locale, the
+ * app in UTC), which is the only part of this sentence a surface still decides.
+ */
+export function deletionRequestedMessage(target: DeletionTarget, completeBy: string): string {
+  return target.scope === 'family'
+    ? `Deletion requested. Every device is signed out and processing has stopped. Your family account and every child’s data are deleted from our active systems by ${completeBy}.`
+    : `Deletion requested. ${target.nickname}’s devices are signed out and processing of their data has stopped. Their data is deleted from our active systems by ${completeBy}; your other children and your account stay.`;
+}
+
+/** How a deletion request is named in the list of requests. */
+export function deletionRequestLabel(
+  request: Pick<DeletionRequest, 'scope'>,
+  childName: string,
+): string {
+  return request.scope === 'family' ? 'Whole family account' : `${childName}’s data`;
+}
+
+/**
+ * Where a deletion request has got to. `formatDate` is the surface's own date formatter; the branch
+ * on STATUS and every word of the four sentences are decided here, because two identical function
+ * bodies on two surfaces are a coincidence with good odds, not an invariant (L-066).
+ */
+export function deletionStatusText(
+  request: DeletionRequest,
+  formatDate: (iso: string) => string,
+): string {
+  switch (request.status) {
+    case 'requested':
+      return `Requested: processing has stopped. Deletion completes by ${formatDate(request.completeBy)}.`;
+    case 'processing':
+      return `Deleting now. Completes by ${formatDate(request.completeBy)}.`;
+    case 'completed':
+      return `Deleted${request.completedAt ? ` on ${formatDate(request.completedAt)}` : ''}.`;
+    case 'cancelled':
+      return 'Cancelled.';
+  }
+}

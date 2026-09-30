@@ -7,6 +7,7 @@ import {
   childSubjectsResponseSchema,
   familyOverviewResponseSchema,
   learningScheduleResponseSchema,
+  receivesPractice,
   type ChildSubject,
   type FamilyOverview,
   type LearningScheduleResponse,
@@ -34,7 +35,6 @@ import {
   WEEKDAY_OPTIONS,
   buildUpcomingView,
   plannerError,
-  receivesPractice,
   scheduleToPlannerForm,
   stepCount,
   validatePlannerForm,
@@ -197,10 +197,11 @@ function ChildPlanSections({
   const editable = childPlanEditable(child.status);
   /**
    * The OTHER question, asked once for this screen (HUNT7-H-1, L-068): does PencilLift prepare practice for
-   * this profile at all? `receivesPractice` (src/learning/planner-form.ts) is the single definition, and it
-   * is not `editable`: a draft plan is writable on purpose and receives nothing, so the screen may offer
-   * every control and must still promise nothing. It decides the notice below; the "Coming up" card gets the
-   * status and asks the same helper from inside `buildUpcomingView`, so neither of them owns a comparison.
+   * this profile at all? `receivesPractice` (packages/contracts/src/family.ts) is the single definition —
+   * SHARED with the portal since BUG-411, not mirrored beside it — and it is not `editable`: a draft plan is
+   * writable on purpose and receives nothing, so the screen may offer every control and must still promise
+   * nothing. It decides the notice below; the "Coming up" card gets the status and the subjects, and the
+   * shared copy asks the same predicate, so neither of them owns a comparison.
    */
   const practicePrepared = receivesPractice(child.status);
   const base = `/v1/children/${encodeURIComponent(child.id)}`;
@@ -214,6 +215,15 @@ function ChildPlanSections({
     [api, base],
   );
   const subjects = useLoad(loadSubjects);
+  /**
+   * The subjects as the toggles below render them, or `undefined` while that request is in flight or
+   * has failed — its own value, never `[]` standing in for both (L-071, and the caller is where the
+   * defect lives). The "Coming up" card's empty-review line reads this array to decide whether it may
+   * claim WHY no review is scheduled, and an empty array would claim "no subject that gets a weekly
+   * review is on" before this surface knows whether one is.
+   */
+  const loadedSubjects =
+    subjects.state.status === 'ready' ? subjects.state.data.subjects : undefined;
 
   return (
     <>
@@ -299,7 +309,10 @@ function ChildPlanSections({
           {/* Built from the schedule that is LOADED, not from the editor's captured copy (HUNT7-J-6):
               the editor seeds its state from `initial` once, so a reload after a subject toggle — the
               one change `nextReviewReleases` depends on — could not reach this card. */}
-          <ComingUp data={schedule.state.data} child={child} />
+          {/* The SUBJECTS go to the card too (BUG-411), as `loadedSubjects` above: its empty-review
+              line is the portal's, which names the cause only where this screen can establish it, and
+              that cause is "no subject that bears a weekly review is on". */}
+          <ComingUp data={schedule.state.data} child={child} subjects={loadedSubjects} />
           <ScheduleEditor
             api={api}
             path={`${base}/learning-schedule`}
@@ -469,21 +482,31 @@ function Field({
 /**
  * What the child's next daily practice and weekly reviews are, in the family's time zone. Every line comes
  * from `buildUpcomingView`, which takes the status: the card holds no copy of its own, so the hedge cannot
- * be applied to one line and forgotten on the next (HUNT7-H-1).
+ * be applied to one line and forgotten on the next (HUNT7-H-1). Since BUG-411 those lines are
+ * `packages/contracts`', which is what makes them the portal's lines rather than a second set that matches.
  */
 function ComingUp({
   data,
   child,
+  subjects,
 }: {
   data: LearningScheduleResponse;
   /**
-   * The child as GET /v1/family reports them. Their STATUS goes to `buildUpcomingView`, which asks
-   * `receivesPractice` — the phone's one definition of "is practice prepared for this profile" — so this
-   * card carries no status comparison of its own and cannot hedge one line while promising on the next.
+   * The child as GET /v1/family reports them. Their STATUS goes to `buildUpcomingView`, whose copy asks
+   * `receivesPractice` — the ONE definition of "is practice prepared for this profile", shared with the
+   * portal — so this card carries no status comparison of its own and cannot hedge one line while
+   * promising on the next.
    */
   child: FamilyOverview['children'][number];
+  /** The toggles' own array, or `undefined` when it is not loaded; see the call site. */
+  subjects: readonly ChildSubject[] | undefined;
 }) {
-  const upcoming = buildUpcomingView(data, child.nickname, child.status);
+  const upcoming = buildUpcomingView({
+    data,
+    childName: child.nickname,
+    childStatus: child.status,
+    subjects,
+  });
   return (
     <Card>
       <Heading>Coming up</Heading>

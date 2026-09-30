@@ -64,7 +64,13 @@ function fakeApi() {
 
 function render(api: Partial<ApiClient>) {
   return renderPage(
-    <PracticeSetsSection childId={CHILD} childName="Riley" subjects={[]} zone="America/Chicago" />,
+    <PracticeSetsSection
+      childId={CHILD}
+      childName="Riley"
+      subjects={[]}
+      zone="America/Chicago"
+      childStatus="active"
+    />,
     { api },
   );
 }

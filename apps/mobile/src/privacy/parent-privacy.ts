@@ -13,12 +13,15 @@ import {
   closeAccountResponseSchema,
   dataExportResponseSchema,
   dataExportsResponseSchema,
+  deletionConfirmationMatches,
+  deletionConfirmationMismatch,
+  deletionRequestedMessage,
   deletionRequestResponseSchema,
   deletionRequestsResponseSchema,
+  deletionStatusText as sharedDeletionStatusText,
   exportDownloadResponseSchema,
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
-  PRIVACY_RETENTION,
   privacyFamilyViewSchema,
   safetyReportResponseSchema,
   safetyReportsResponseSchema,
@@ -27,6 +30,7 @@ import {
   type CreateDeletionRequest,
   type DataExport,
   type DeletionRequest,
+  type DeletionTarget,
   type ListedSafetyReportCategory,
   type ParentReportOutcome,
   type PrivacyFamilyView,
@@ -37,15 +41,6 @@ import {
 } from '@pencillift/contracts';
 import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import type { DeviceSignOutOutcome } from '../lib/mode.ts';
-
-export const PRIVACY_RETENTION_LINES: readonly string[] = [
-  `Raw homework photos are deleted after ${PRIVACY_RETENTION.rawScanDays} days by default. Deleting a child or your account removes them sooner.`,
-  'Results, practice history, points and rewards are kept while your account is active, until you delete that child or your family account.',
-  `When you ask for deletion, processing stops at once and devices are signed out. Deletion from our active systems completes within ${PRIVACY_RETENTION.deletionTargetDays} days.`,
-  'Backups expire on a documented schedule (length to be confirmed).',
-  'We may keep limited billing records where the law requires it, plus consent records and a security log with pseudonymous ids only.',
-  'Deleting your PencilLift account does not cancel an App Store, Google Play or Amazon Appstore subscription. Cancel it in the store.',
-];
 
 /**
  * Decision: the phone screen offers whole-family exports only. Per-child review PDFs and the
@@ -75,28 +70,6 @@ const EXPORT_STATUS_LABELS: Record<DataExport['status'], string> = {
 
 export function exportLine(item: DataExport): string {
   return `${EXPORT_KIND_LABELS[item.kind]} · ${EXPORT_STATUS_LABELS[item.status]}`;
-}
-
-export type DeletionTarget =
-  | { readonly scope: 'family' }
-  | { readonly scope: 'child'; readonly childId: string; readonly nickname: string };
-
-export const FAMILY_CONFIRMATION = 'DELETE';
-
-/** What the parent must type before a deletion is sent. */
-export function confirmationPhrase(target: DeletionTarget): string {
-  return target.scope === 'family' ? FAMILY_CONFIRMATION : target.nickname;
-}
-
-/**
- * Decision: a child's nickname matches ignoring case and surrounding spaces; the family phrase must
- * be DELETE in capitals. The server-side PIN step-up is the security control; this guards slips.
- */
-export function confirmationMatches(target: DeletionTarget, typed: string): boolean {
-  const value = typed.trim();
-  return target.scope === 'family'
-    ? value === FAMILY_CONFIRMATION
-    : value.toLowerCase() === target.nickname.trim().toLowerCase();
 }
 
 export type ActionResult =
@@ -321,19 +294,20 @@ export async function closeAccountAction(
   }
 }
 
+/**
+ * Requests the deletion the parent picked. Every sentence it answers with comes from the contract's
+ * `deletionConfirmationCopy` / `deletionRequestedMessage`, which branch on the TARGET: the sentence
+ * this returned before said only "Processing has stopped and deletion completes by …" for both
+ * scopes, so a parent deleting one child was answered with the family's sentence and never read
+ * which child, nor that the rest of the family stays (round-7 parity audit / BUG-411).
+ */
 export async function requestDeletionAction(
   api: ApiClient,
   target: DeletionTarget,
   typed: string,
 ): Promise<ActionResult> {
-  if (!confirmationMatches(target, typed)) {
-    return {
-      status: 'error',
-      message:
-        target.scope === 'family'
-          ? 'Type DELETE in capital letters to confirm.'
-          : `Type ${target.nickname} exactly to confirm.`,
-    };
+  if (!deletionConfirmationMatches(target, typed)) {
+    return { status: 'error', message: deletionConfirmationMismatch(target) };
   }
   const body: CreateDeletionRequest =
     target.scope === 'family' ? { scope: 'family' } : { scope: 'child', childId: target.childId };
@@ -346,7 +320,7 @@ export async function requestDeletionAction(
     );
     return {
       status: 'done',
-      message: `Deletion requested. Processing has stopped and deletion completes by ${formatDate(deletion.completeBy)}.`,
+      message: deletionRequestedMessage(target, formatDate(deletion.completeBy)),
     };
   } catch (error) {
     return toResult(error);
@@ -432,17 +406,13 @@ export function deletableChildren(
   return family.children.filter((c) => !open.has(c.id));
 }
 
+/**
+ * Where a deletion request has got to. The four sentences and the branch on STATUS are the
+ * contract's; this binding supplies only the app's own date format (UTC, en-US). It is not a
+ * conditional wrapped around shared copy — there is nothing left here to decide.
+ */
 export function deletionStatusText(d: DeletionRequest): string {
-  switch (d.status) {
-    case 'requested':
-      return `Requested: processing has stopped. Deletion completes by ${formatDate(d.completeBy)}.`;
-    case 'processing':
-      return `Deleting now. Completes by ${formatDate(d.completeBy)}.`;
-    case 'completed':
-      return `Deleted${d.completedAt ? ` on ${formatDate(d.completedAt)}` : ''}.`;
-    case 'cancelled':
-      return 'Cancelled.';
-  }
+  return sharedDeletionStatusText(d, formatDate);
 }
 
 // ---------------------------------------------------------------------------------------------

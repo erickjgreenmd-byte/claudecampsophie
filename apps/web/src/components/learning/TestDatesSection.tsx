@@ -20,7 +20,7 @@ import {
   textareaStyle,
   useAction,
 } from './feedback.tsx';
-import { formatCalendarDate, receivesPractice } from './format.ts';
+import { formatCalendarDate, receivesPractice } from '@pencillift/contracts';
 
 const SCOPE_MAX = 2000;
 /** The recognised practice topics of one saved test date, as the two lines below print them. */

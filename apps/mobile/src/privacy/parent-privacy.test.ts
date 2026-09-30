@@ -2,8 +2,13 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  deletionConfirmationCopy,
+  deletionConfirmationPhrase,
+  deletionRequestedMessage,
   PARENT_SAFETY_FLAG_ACTIONS,
   PARENT_SAFETY_FLAG_COPY,
+  privacyRetentionLines,
+  storeSubscriptionNotice,
   type AccountCloseOutcome,
   type DeletionRequest,
   type PrivacyFamilyView,
@@ -13,7 +18,6 @@ import { ApiRequestError, type ApiClient } from '@pencillift/contracts/client';
 import {
   accountClosedDeviceMessage,
   closeAccountAction,
-  confirmationPhrase,
   deletableChildren,
   deletionStatusText,
   exportDownloadAction,
@@ -21,7 +25,6 @@ import {
   familyDeletion,
   loadPrivacyOverview,
   MOBILE_EXPORT_OPTIONS,
-  PRIVACY_RETENTION_LINES,
   reportOutcomeAction,
   requestDeletionAction,
   requestExportAction,
@@ -124,8 +127,15 @@ function fakeApi(handlers: { get?: (path: string) => unknown; send?: (call: Call
 }
 
 describe('parent privacy screen logic (spec P4, P10, P14)', () => {
+  /**
+   * Re-aimed for BUG-411. This asserted the same six facts against a LOCAL constant in
+   * parent-privacy.ts, which is how the app's wording of three of them drifted from the portal's
+   * while both suites stayed green. The facts are still asserted, against the contract the portal
+   * prints too (`privacyRetentionLines`), and the screen is asserted to print that function's
+   * output rather than a list of its own.
+   */
   it('explains retention, deletion timing, backups, billing records and store subscriptions', () => {
-    const text = PRIVACY_RETENTION_LINES.join(' ');
+    const text = privacyRetentionLines(null).join(' ');
     expect(text).toMatch(/raw homework photos are deleted after 30 days by default/i);
     expect(text).toMatch(/within 30 days/i);
     expect(text).toMatch(/backups expire on a documented schedule/i);
@@ -133,6 +143,14 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
     expect(text).toMatch(
       /does not cancel an app store, google play or amazon appstore subscription/i,
     );
+    // The store line is the only one this build's store can change; the other five are facts about
+    // the data and must read the same on every build.
+    for (const channel of ['app_store', 'play_store', 'amazon_appstore'] as const) {
+      expect(privacyRetentionLines(channel).slice(0, 5)).toEqual(
+        privacyRetentionLines(null).slice(0, 5),
+      );
+      expect(privacyRetentionLines(channel).at(-1)).toBe(storeSubscriptionNotice('any', channel));
+    }
   });
 
   it('offers family exports only; the answer key is never offered on mobile', () => {
@@ -174,8 +192,8 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
   it('never sends a deletion until the confirmation is typed exactly', async () => {
     const { api, calls } = fakeApi({ send: () => ({ deletion: request() }) });
     const sam = { scope: 'child' as const, childId: SAM, nickname: 'Sam' };
-    expect(confirmationPhrase(sam)).toBe('Sam');
-    expect(confirmationPhrase({ scope: 'family' })).toBe('DELETE');
+    expect(deletionConfirmationPhrase(sam)).toBe('Sam');
+    expect(deletionConfirmationPhrase({ scope: 'family' })).toBe('DELETE');
 
     const wrong = await requestDeletionAction(api, sam, 'Riley');
     expect(wrong).toMatchObject({ status: 'error' });
@@ -193,6 +211,70 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
 
     await requestDeletionAction(api, { scope: 'family' }, 'DELETE');
     expect(calls[1]).toEqual({ method: 'POST', path: '/v1/deletion', body: { scope: 'family' } });
+  });
+
+  /**
+   * BUG-411, the highest-severity half. The answer to a deletion request did not branch on SCOPE:
+   * one sentence, "Deletion requested. Processing has stopped and deletion completes by <date>.",
+   * was returned for a single child's deletion and for the whole family's, so a parent who had just
+   * deleted one child read a sentence that names neither the child nor what survives. The portal
+   * branched. This asserts on the OUTPUT the screen is handed, for both scopes, and that the two
+   * differ — a helper that returns the same string twice is what the defect looked like.
+   */
+  it('[repro] answers a child deletion and a family deletion with different sentences', async () => {
+    const sam = { scope: 'child' as const, childId: SAM, nickname: 'Sam' };
+    const child = fakeApi({ send: () => ({ deletion: request() }) });
+    const childResult = await requestDeletionAction(child.api, sam, 'Sam');
+    expect(childResult.status).toBe('done');
+    const childMessage = childResult.status === 'done' ? childResult.message : '';
+    expect(childMessage).toBe(deletionRequestedMessage(sam, 'Oct 24, 2026'));
+    expect(childMessage).toContain('Sam');
+    // What survives a single child's deletion is said, because the family-wide sentence saying
+    // nothing of it was read as "everything is going".
+    expect(childMessage).toMatch(/your other children and your account stay/i);
+
+    const family = fakeApi({
+      send: () => ({ deletion: request({ scope: 'family', childId: null }) }),
+    });
+    const familyResult = await requestDeletionAction(family.api, { scope: 'family' }, 'DELETE');
+    const familyMessage = familyResult.status === 'done' ? familyResult.message : '';
+    expect(familyMessage).toBe(deletionRequestedMessage({ scope: 'family' }, 'Oct 24, 2026'));
+    expect(familyMessage).not.toBe(childMessage);
+    expect(familyMessage).toMatch(/every child’s data/i);
+    expect(familyMessage).not.toMatch(/stay/i);
+  });
+
+  /**
+   * BUG-411: the app's "Delete data" section printed the ACCOUNT-WIDE store sentence above the
+   * choice of what to delete, so a parent confirming ONE child read "Deleting your PencilLift
+   * account does not cancel …" — a false statement about what was about to be deleted, and one that
+   * also hid that a child deletion does not lower the price either. The confirmation now comes from
+   * the contract keyed on the chosen target, and the screen prints that.
+   */
+  it('[repro] the confirmation a parent reads is the chosen target’s, not the account’s', () => {
+    const sam = { scope: 'child' as const, childId: SAM, nickname: 'Sam' };
+    const child = deletionConfirmationCopy(sam, 'play_store');
+    const family = deletionConfirmationCopy({ scope: 'family' }, 'play_store');
+
+    expect(child.storeNotice).not.toBe(family.storeNotice);
+    expect(child.storeNotice).toMatch(/deleting one child’s data/i);
+    expect(child.storeNotice).toMatch(/or lower its price/i);
+    expect(child.storeNotice).not.toMatch(/deleting your pencillift (family )?account/i);
+    expect(family.storeNotice).toMatch(/deleting your pencillift family account/i);
+
+    // The build's store is named where there is one, and never guessed where there is not.
+    expect(child.storeNotice).toMatch(/your Google Play subscription/);
+    expect(deletionConfirmationCopy(sam, null).storeNotice).toMatch(
+      /an App Store, Google Play or Amazon Appstore subscription/,
+    );
+
+    expect(child.effect).toMatch(/^Removes Sam’s homework photos/);
+    expect(child.effect).toMatch(
+      /your other children, your family account and your own sign-in stay/i,
+    );
+    expect(family.effect).toMatch(/removes access for every guardian/i);
+    expect(child.typePrompt).toBe('Type Sam to confirm');
+    expect(family.typePrompt).toBe('Type DELETE to confirm');
   });
 
   it('maps owner-only and step-up refusals', async () => {

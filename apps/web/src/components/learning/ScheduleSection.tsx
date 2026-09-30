@@ -1,7 +1,12 @@
 import { useEffect, useId, useState, type FormEvent, type ReactNode } from 'react';
 import {
   LEARNING_LIMITS,
+  dailyPracticeCopy,
   learningScheduleResponseSchema,
+  noWeeklyReviewsCopy,
+  reviewReleaseReasonCopy,
+  reviewReleaseWhen,
+  subjectName,
   type ChildSubject,
   type LearningScheduleResponse,
 } from '@pencillift/contracts';
@@ -15,15 +20,7 @@ import {
   sectionStyle,
   useAction,
 } from './feedback.tsx';
-import {
-  DAILY_STATE,
-  RELEASE_REASON,
-  WEEKDAYS,
-  formatInZone,
-  subjectName,
-  zoneLabel,
-  receivesPractice,
-} from './format.ts';
+import { WEEKDAYS, zoneLabel } from './format.ts';
 import {
   scheduleToForm,
   validateScheduleForm,
@@ -51,13 +48,14 @@ import {
  * because a parent sets the plan up before the slot is assigned, so a draft — and an unrecognised
  * status, which the family contract has none of — keeps the editor.
  *
- * HUNT7-H-4: that one value also decides the ADVICE this card gives when nothing is coming up, so the
- * card cannot ask for a subject toggle that the same status has made unusable in the section next to
- * it. It is computed once, below, and handed to both parts.
+ * HUNT7-H-4 and HUNT7-H-1: the status also decides the ADVICE this card gives when nothing is coming
+ * up — so it cannot ask for a subject toggle the same status has made unusable in the section next to
+ * it — and the DAILY line, which was the last unconditional present-tense claim in this region.
  *
- * HUNT7-H-1: and it decides the DAILY line, which was the last unconditional present-tense claim in this
- * region. `DAILY_STATE` (format.ts) now carries a hypothetical per state, so the choice here is which
- * variant to print, never whether a sentence happens to mention a time.
+ * BUG-411: both of those sentences, and the release-reason words beside each instant, are now
+ * `dailyPracticeCopy`, `noWeeklyReviewsCopy` and `reviewReleaseReasonCopy` in
+ * packages/contracts/src/learning.ts, which apps/mobile's planner calls too. This file holds NO copy of
+ * them and derives no status predicate of its own beyond `readOnly` below, which is the other question.
  */
 export function ScheduleSection({
   childId,
@@ -86,12 +84,16 @@ export function ScheduleSection({
   // The latest known schedule: from the last load, or from a save (which answers with the new one).
   const data = snapshot ?? ready;
   /**
-   * ONE value decides everything on this card that depends on the status, so no two parts of it can
-   * disagree (HUNT7-H-4). It is the same expression SubjectsSection's own `readOnly` uses
-   * (apps/web/src/components/learning/SubjectsSection.tsx), which is what makes the empty-review
-   * advice below agree with whether the subject checkbox it names is usable; the page-level case in
+   * "Can this plan be changed at all?" — the EDITOR's question, and only the editor's. It is the same
+   * expression SubjectsSection's own `readOnly` uses
+   * (apps/web/src/components/learning/SubjectsSection.tsx), which is what makes the empty-review advice
+   * below agree with whether the subject checkbox it names is usable; the page-level case in
    * apps/web/src/pages/app/ArchivedChildCopy.test.tsx asserts the two sections against each other so
    * they cannot drift apart again.
+   *
+   * The card below is handed `childStatus` instead of this value, because the OTHER question — does
+   * this profile receive practice — is `receivesPractice`, which a draft profile also fails while its
+   * plan stays writable. Passing this boolean where that one belongs is the confusion of L-068.
    */
   const readOnly = childStatus === 'archived';
 
@@ -118,8 +120,7 @@ export function ScheduleSection({
             data={data}
             subjects={subjects}
             childName={childName}
-            readOnly={readOnly}
-            practicePrepared={receivesPractice(childStatus)}
+            childStatus={childStatus}
           />
         </>
       ) : null}
@@ -393,34 +394,29 @@ function UpcomingReleases({
   data,
   subjects,
   childName,
-  readOnly,
-  practicePrepared,
+  childStatus,
 }: {
   data: LearningScheduleResponse;
+  /**
+   * The array the Subjects card renders, handed on unchanged. The empty-review line needs to know
+   * whether a subject that BEARS a weekly review is on, and it derives that itself from these rows
+   * rather than take a flag from here (L-071): a flag is what the first repair got wrong, claiming
+   * "no subject is on" for a child whose only enabled subject was CUSTOM, which the card beside this
+   * one printed as "On".
+   */
   subjects: readonly ChildSubject[];
   childName: string;
-  /** The card's one status value (ScheduleSection above): this profile's plan cannot be changed. */
-  readOnly: boolean;
   /**
-   * Whether this profile receives practice at all (`receivesPractice`). SEPARATE from `readOnly`, and
-   * separate on purpose: a draft profile is writable — the instruction below names a control that really
-   * is live for it — and receives nothing, so the instruction may stand while its PROMISE must not.
-   * TestDatesSection answers the same question with the same value, which is what stops the two cards in
-   * this page region telling the parent opposite things. It decides BOTH forward-looking lines here: the
-   * daily sentence and the empty-review advice (HUNT7-H-1), so the two cannot disagree either.
+   * The profile's status, NOT a boolean derived from it. Every status-dependent sentence in this card
+   * comes from `packages/contracts` and asks `receivesPractice` itself, so this card cannot hand one
+   * line a different answer from the next, and cannot hand the shared copy a `prepared` flag it
+   * computed from the wrong question — `readOnly` (above, for the EDITOR) is the wrong question, and
+   * confusing the two is what promised a draft profile practice four rounds running (L-068).
    */
-  practicePrepared: boolean;
+  childStatus: string | undefined;
 }) {
   const zone = data.timezone;
   const headingId = useId();
-  /**
-   * Whether a subject that PencilLift actually builds a weekly review for is on, read from the SAME
-   * array the Subjects card renders (HUNT7-H-4). `generatedPractice` is false for a custom subject —
-   * the subjects GET computes it as `isBankSubject(row.subject_key)` (apps/api/src/routes/learning.ts)
-   * — and it is precisely a custom-only child that has subjects on and no weekly review, which is why
-   * "no subject is on" was the wrong claim to make from an empty list.
-   */
-  const reviewSubjectOn = subjects.some((s) => s.enabled && s.generatedPractice);
   return (
     <div aria-labelledby={headingId} role="region">
       <h3 id={headingId}>Coming up for {childName}</h3>
@@ -436,58 +432,38 @@ function UpcomingReleases({
         `dailyPracticeState` from the clock on every request, and that returns 'available' on any local
         day past `daily_local_time` with no pause covering it (packages/domain/src/scheduling/daily.ts).
         The instant stays where there is one; only the claim hedges.
+
+        BUG-411: the table and the choice between its two variants are `dailyPracticeCopy`
+        (packages/contracts/src/learning.ts), which the phone's planner calls too. This card hands it
+        the STATUS, so there is no `prepared` flag here to get wrong and no second copy of the wording.
       */}
       <p>
-        {practicePrepared
-          ? DAILY_STATE[data.dailyPractice.state].prepared(data.dailyPractice.releaseAt, zone)
-          : DAILY_STATE[data.dailyPractice.state].hypothetical(
-              data.dailyPractice.releaseAt,
-              zone,
-              childName,
-            )}
+        {dailyPracticeCopy({
+          dailyPractice: data.dailyPractice,
+          zone,
+          childName,
+          childStatus,
+        })}
       </p>
       {data.nextReviewReleases.length === 0 ? (
         /*
-          HUNT7-H-4: the instruction is printed only where the control it names can be pressed, and
-          the CAUSE is stated only where this card can establish it. The list is empty when the child
-          has no enabled BANK subject — `storedPlan` builds the set from `child_subjects … and
-          enabled` and keeps only `BANK_SUBJECTS`, `scheduleResponse` drops any release whose subject
-          is not a bank subject, and with an enabled bank subject it always iterates the current AND
-          next ISO week, so a future release exists (apps/api/src/routes/learning.ts). Reachable for
-          an archived profile three ways: subjects turned off before archiving, only custom subjects,
-          or a profile archived before the planner was ever opened, since the subjects GET skips
-          `ensureLearningDefaults` for an archived one. For that profile the subject checkbox is
-          permanently disabled and the add-subject form is not rendered (SubjectsSection), which says
-          on this same page that subjects can't be turned on or off — so "Turn on at least one
-          subject" pointed at a dead control and contradicted the section that owns it. That is the
-          two-sections-disagree defect of BUG-282 and HUNT5-F-10 a third time, so the sentence names
-          the parent's real move. A draft profile keeps the instruction: the same guard keeps its
-          subjects writable.
+          HUNT7-H-4 and BUG-411: the four sentences, the fall-through order and the cause this card may
+          claim are all `noWeeklyReviewsCopy` (packages/contracts/src/learning.ts), which the phone's
+          planner calls with the same three inputs. The phone had two sentences of its own, said
+          "…are scheduled." where this card said "…are scheduled yet.", named no subject and had no
+          archived arm — HUNT7-H-1 agreed the DAILY line across the surfaces and stopped there. The
+          reasoning that settled each arm is written out at the shared function.
 
-          The first attempt at that sentence asserted "no subject is on", which is not what this list
-          being empty means and is FALSE for a child whose only enabled subject is CUSTOM — the
-          Subjects card in this same region prints that subject as "On", a fresh contradiction of the
-          same shape. `reviewSubjectOn` is computed from `subjects`, the array that card renders, so
-          one value decides both; and when a review-bearing subject IS on and the list is empty all
-          the same (`reviewReleases` answers !ok for both weeks on an invalid stored schedule or week
-          key), the line reports the list and claims no cause at all.
+          The SUBJECTS array goes in, not a flag computed here: the empty-list cause is the shared
+          function's to establish, and a flag is what the first repair got wrong.
         */
-        <p>
-          {reviewSubjectOn
-            ? 'No weekly review is scheduled for this week or next.'
-            : readOnly
-              ? `No weekly reviews are scheduled: no subject that gets a weekly review is on, and subjects can’t be turned on or off while ${childName}’s profile is archived. Activate ${childName} again on the Children page, while a paid slot is free, to change that.`
-              : practicePrepared
-                ? 'No weekly reviews are scheduled yet. Turn on at least one subject that PencilLift makes practice for to get a review.'
-                : `No weekly reviews are scheduled yet. Turn on at least one subject that PencilLift makes practice for; a review is prepared once ${childName}’s profile is active.`}
-        </p>
+        <p>{noWeeklyReviewsCopy({ childName, childStatus, subjects })}</p>
       ) : (
         <ul>
           {data.nextReviewReleases.map((r) => (
             <li key={`${r.subjectKey}-${r.weekKey}`}>
-              <strong>{subjectName(r.subjectKey, subjects)}</strong>:{' '}
-              {r.releaseAt ? formatInZone(r.releaseAt, zone) : 'not this week'} (
-              {RELEASE_REASON[r.reason](r.testDate)})
+              <strong>{subjectName(r.subjectKey, subjects)}</strong>: {reviewReleaseWhen(r, zone)} (
+              {reviewReleaseReasonCopy(r)})
             </li>
           ))}
         </ul>

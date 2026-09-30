@@ -14,17 +14,26 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
-import { ACCOUNT_CLOSE_COPY, PARENT_SAFETY_FLAG_COPY } from '@pencillift/contracts';
-import type { ParentReportOutcome, StandardExportKind } from '@pencillift/contracts';
+import {
+  ACCOUNT_CLOSE_COPY,
+  DELETION_INTRO,
+  deletionConfirmationCopy,
+  deletionRequestLabel,
+  PARENT_SAFETY_FLAG_COPY,
+  privacyRetentionLines,
+} from '@pencillift/contracts';
+import type {
+  DeletionTarget,
+  ParentReportOutcome,
+  StandardExportKind,
+} from '@pencillift/contracts';
 import { colors, minTouchTarget, radii, spacing, typography } from '@pencillift/ui-tokens';
 import { storeChannelForBuild } from '../../src/billing/revenuecat.ts';
-import { STORE_LABEL } from '../../src/billing/store.ts';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { ParentAccessState, useParentAccess } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
 import { signOutClosedAccountOnDevice } from '../../src/family/runtime.ts';
 import {
-  confirmationPhrase,
   deletableChildren,
   deletionStatusText,
   exportDownloadAction,
@@ -33,7 +42,6 @@ import {
   loadPrivacyOverview,
   MOBILE_EXPORT_OPTIONS,
   parentErrorMessage,
-  PRIVACY_RETENTION_LINES,
   reportOutcomeAction,
   requestDeletionAction,
   requestExportAction,
@@ -42,7 +50,6 @@ import {
   safetyReportView,
   unlockAction,
   type ActionResult,
-  type DeletionTarget,
   type PrivacyOverview,
 } from '../../src/privacy/parent-privacy.ts';
 import { parentPrivacyTokenSource } from '../../src/privacy/session.ts';
@@ -97,6 +104,13 @@ export default function ParentPrivacyScreen() {
   const [feedbackCount, setFeedbackCount] = useState(0);
   const [target, setTarget] = useState<DeletionTarget | null>(null);
   const [typed, setTyped] = useState('');
+  /**
+   * The store this build sells through (App Store, Google Play or, on Fire tablets, the Amazon
+   * Appstore), or null for a build sold through no store (Expo web), which then names every store
+   * rather than guessing one (MOB-R1-10). It is only ever handed to the contracts' copy functions,
+   * which decide the sentence; the screen never turns it into words of its own.
+   */
+  const buildStore = useMemo(() => storeChannelForBuild(), []);
   const [closeConfirmed, setCloseConfirmed] = useState(false);
   /**
    * The closure has started, so this screen is its outcome and nothing else (HUNT6-J-2). A ref, not
@@ -244,6 +258,9 @@ export default function ParentPrivacyScreen() {
 
   const data = state.status === 'ready' ? state.data : null;
   const deleted = data && !data.family ? familyDeletion(data.deletions) : null;
+  // Every sentence the chosen deletion is confirmed with, for THAT target: the contracts branch on
+  // the scope, so this screen cannot print the family's sentence over one child's deletion.
+  const confirmCopy = target ? deletionConfirmationCopy(target, buildStore) : null;
 
   if (access.status !== 'ready') {
     return (
@@ -334,7 +351,7 @@ export default function ParentPrivacyScreen() {
 
           {state.status !== 'account_closed' && state.status !== 'closing' ? (
             <Section title="How long we keep information">
-              {PRIVACY_RETENTION_LINES.map((line) => (
+              {privacyRetentionLines(buildStore).map((line) => (
                 <Text key={line} style={[styles.body, styles.bullet]}>
                   {`• ${line}`}
                 </Text>
@@ -459,13 +476,11 @@ export default function ParentPrivacyScreen() {
               </Section>
 
               <Section title="Delete data">
-                <View style={styles.warning}>
-                  <Text style={[styles.body, styles.bold]}>{deletionStoreWarning()}</Text>
-                </View>
-                <Text style={[styles.body, styles.spaced]}>
-                  Deleting stops processing immediately and signs out the affected devices. This
-                  can’t be undone. Choose what to delete:
-                </Text>
+                {/* No store-subscription sentence here: what it must say depends on WHICH deletion,
+                    and this section showed the account-wide one over a single child's deletion. It
+                    is printed below with the rest of the chosen target's confirmation. */}
+                <Text style={[styles.body, styles.spaced]}>{DELETION_INTRO}</Text>
+                <Text style={[styles.body, styles.spaced]}>Choose what to delete:</Text>
                 {deletableChildren(data.family, data.deletions).map((child) => (
                   <Choice
                     key={child.id}
@@ -487,13 +502,20 @@ export default function ParentPrivacyScreen() {
                     setFeedback(null);
                   }}
                 />
-                {target ? (
+                {target && confirmCopy ? (
                   <>
+                    {/* Every sentence below is the chosen TARGET's, decided in the contracts and
+                        printed unchanged: what this deletion removes, what survives it, what it
+                        does not do to the store subscription, and what to type. */}
+                    <Text style={[styles.body, styles.spaced]}>{confirmCopy.effect}</Text>
+                    <View style={styles.warning}>
+                      <Text style={[styles.body, styles.bold]}>{confirmCopy.storeNotice}</Text>
+                    </View>
                     <Text nativeID="confirm-label" style={[styles.body, styles.spaced]}>
-                      {`Type ${confirmationPhrase(target)} to confirm`}
+                      {confirmCopy.typePrompt}
                     </Text>
                     <TextInput
-                      accessibilityLabel={`Type ${confirmationPhrase(target)} to confirm`}
+                      accessibilityLabel={confirmCopy.typePrompt}
                       accessibilityLabelledBy="confirm-label"
                       autoCapitalize={target.scope === 'family' ? 'characters' : 'none'}
                       autoCorrect={false}
@@ -520,11 +542,11 @@ export default function ParentPrivacyScreen() {
                 ) : (
                   data.deletions.map((d) => (
                     <Text key={d.id} style={[styles.body, styles.bullet]}>
-                      {`• ${
-                        d.scope === 'family'
-                          ? 'Whole family account'
-                          : `${data.family?.children.find((c) => c.id === d.childId)?.nickname ?? 'A removed child profile'}’s data`
-                      }: ${deletionStatusText(d)}`}
+                      {`• ${deletionRequestLabel(
+                        d,
+                        data.family?.children.find((c) => c.id === d.childId)?.nickname ??
+                          'A removed child profile',
+                      )}: ${deletionStatusText(d)}`}
                     </Text>
                   ))
                 )}
@@ -800,15 +822,3 @@ const styles = StyleSheet.create({
   success: { color: colors.success, fontWeight: '800', marginTop: spacing.sm },
   problem: { color: colors.danger, marginTop: spacing.sm },
 });
-
-/**
- * The store this build sells through (App Store, Google Play or, on Fire tablets, the Amazon
- * Appstore) is the one to cancel in; a build for no store (web) names all three (MOB-R1-10).
- */
-function deletionStoreWarning(): string {
-  const channel = storeChannelForBuild();
-  const store = channel
-    ? `your ${STORE_LABEL[channel]} subscription`
-    : 'an App Store, Google Play or Amazon Appstore subscription';
-  return `Deleting your PencilLift account does not cancel ${store}. Cancel it in the store first.`;
-}

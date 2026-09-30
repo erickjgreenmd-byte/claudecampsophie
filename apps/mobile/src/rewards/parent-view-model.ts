@@ -1,8 +1,10 @@
-import type {
-  ParentRewardRequest,
-  RewardDecisionAction,
-  RewardRequestState,
-  RewardsOverview,
+import {
+  rewardBalanceStatusNote,
+  type ParentRewardRequest,
+  type RewardChildBalance,
+  type RewardDecisionAction,
+  type RewardRequestState,
+  type RewardsOverview,
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 
@@ -99,6 +101,27 @@ function card(request: ParentRewardRequest, timeZone: string | undefined): Paren
   };
 }
 
+/**
+ * One line of the Balances list: the nickname, the points, and — unless the profile is active — the
+ * note that says the number is a closed total.
+ *
+ * GET /v1/rewards returns every profile's balance, archived and draft included (spec P11), and this
+ * list printed all of them as a bare "Jordan: 30 points" while the portal printed a status beside
+ * the same number. The note is `rewardBalanceStatusNote` in packages/contracts/src/family.ts, which
+ * the portal's `BalancesSection` (apps/web/src/pages/app/RewardsPage.tsx) calls too and neither
+ * surface shadows; its docblock holds the evidence that nothing can be added to a non-active
+ * profile's total from the child's side.
+ *
+ * The note goes INSIDE `label` rather than into a field of its own because the screen prints one
+ * `Text` per balance (`{b.label}`, app/(parent)/rewards.tsx): a second field is a field the screen
+ * can silently not render, and not rendering it is the defect this closes.
+ */
+function balanceLine(child: RewardChildBalance): { childId: string; label: string } {
+  const note = rewardBalanceStatusNote(child);
+  const line = `${child.nickname}: ${points(child.balance)}`;
+  return { childId: child.childId, label: note === null ? line : `${line} ${note}` };
+}
+
 /** `timeZone` defaults to the device zone; tests pass 'UTC' for stable dates. */
 export function buildParentApprovalsView(
   overview: RewardsOverview,
@@ -109,10 +132,7 @@ export function buildParentApprovalsView(
   return {
     pending: pending.map((r) => card(r, timeZone)),
     approved: approved.map((r) => card(r, timeZone)),
-    balances: overview.children.map((c) => ({
-      childId: c.childId,
-      label: `${c.nickname}: ${points(c.balance)}`,
-    })),
+    balances: overview.children.map((c) => balanceLine(c)),
     emptyMessage:
       overview.openRequests.length === 0
         ? 'No requests waiting. When a child asks for a reward, it appears here.'

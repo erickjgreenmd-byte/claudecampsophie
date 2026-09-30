@@ -1,7 +1,12 @@
 import {
   LEARNING_LIMITS,
-  SUBJECT_DISPLAY_NAMES,
+  dailyPracticeCopy,
+  noWeeklyReviewsCopy,
+  reviewReleaseReasonCopy,
+  reviewReleaseWhen,
+  subjectName,
   updateLearningScheduleRequestSchema,
+  type ChildSubject,
   type LearningSchedule,
   type LearningScheduleResponse,
   type UpdateLearningScheduleRequest,
@@ -164,133 +169,62 @@ export function validatePlannerForm(form: PlannerForm): PlannerValidation {
   return { ok: true, value: parsed.data };
 }
 
-/** An instant in the family zone, e.g. "Thu, Sep 24, 4:00 PM EDT" (falls back if Intl lacks zones). */
-export function formatInZone(iso: string, zone: string): string {
-  const date = new Date(iso);
-  const options: Intl.DateTimeFormatOptions = {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    timeZoneName: 'short',
-  };
-  try {
-    return new Intl.DateTimeFormat('en-US', { ...options, timeZone: zone }).format(date);
-  } catch {
-    return date.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
-  }
-}
-
 export interface UpcomingView {
   readonly zoneLine: string;
   readonly dailyLine: string;
   readonly reviewLines: readonly string[];
-  /** Printed in place of `reviewLines` when there are none; hedged for the same reason as `dailyLine`. */
+  /**
+   * Printed in place of `reviewLines` when there are none. The portal's four sentences, shared
+   * (`noWeeklyReviewsCopy`): the cause where this screen can establish it, the instruction only where
+   * the subject toggles above can be pressed, and the promise only for a profile that receives one.
+   */
   readonly noReviewsLine: string;
   readonly pointsLine: string;
 }
 
 /**
- * Whether PencilLift prepares practice and weekly reviews for a profile in this state — the ONE
- * definition of that question on the phone, mirroring the portal's `receivesPractice`
- * (apps/web/src/components/learning/format.ts) sentence for sentence. It is here, beside the copy it
- * decides, because the alternative was each card in app/(parent)/planner.tsx comparing the status itself,
- * which is how the portal's cards came to contradict each other four rounds running (L-068).
+ * The "Coming up" card's lines.
  *
- * It is `active`, and these statements in the product decide it, none of them about whether the parent may
- * EDIT anything:
- *   * `loadChildContext` (apps/api/src/jobs/learning-jobs.ts) returns null unless the child is active, for
- *     every caller except the planner preview in routes/learning.ts, which passes `requireActive: false`;
- *   * the nightly sweep selects `where c.status = 'active'`;
- *   * the practice-set insert re-checks `status = 'active'` under FOR SHARE;
- *   * `app.current_child_id()` refuses a non-active child's own device
- *     (supabase/migrations/0001_core_identity.sql).
+ * BUG-411: every sentence here is `packages/contracts`' — `dailyPracticeCopy`, `noWeeklyReviewsCopy`,
+ * `reviewReleaseReasonCopy`, `reviewReleaseWhen` and `subjectName` — and the portal's planner calls the
+ * same five. This module holds NO copy of any of them and derives no status predicate of its own. It
+ * used to hold four: a `receivesPractice` beside the portal's, a `DAILY_STATE` table byte-identical to
+ * the portal's, a `RELEASE_REASON` table that was NOT (it mapped each reason to a plain string, so it
+ * threw away the `testDate` the same contract carries and the portal prints), and an empty-review line
+ * the portal's HUNT7-H-4 arms had outgrown. Two identical bodies are a coincidence with good odds
+ * (L-066); a test that greps the other surface's source guards the words and not the meaning (L-070).
  *
- * The nearby question this is NOT: `childPlanEditable` (src/family/family-view.ts), which is
- * `status !== 'archived'` because `ownedChild(c, 'write')` keeps a DRAFT plan writable on purpose. The two
- * facts agree for 'archived' today and disagree for every draft: that profile can be planned and receives
- * nothing. A card that PROMISES practice answers to this predicate; a control that can be pressed answers
- * to `childPlanEditable`.
+ * `childStatus` and `subjects` are REQUIRED and both accept the "I do not know" value, so a caller must
+ * say so rather than get the promising copy by omission: the shared functions then hedge every
+ * forward-looking line and claim no cause (fail closed).
  */
-export function receivesPractice(childStatus: string | undefined): boolean {
-  return childStatus === 'active';
-}
-
-/**
- * The two sentences a daily-practice state has, in the portal's words (`DAILY_STATE` in
- * apps/web/src/components/learning/format.ts). A hypothetical PER STATE, not one string per state, is the
- * shape of the fix (HUNT7-H-1): the phone printed 'Today’s daily practice is available.' for an archived
- * or draft child, and only the `not_yet_released` sentence carried a time, so the archived notice's "the
- * times below" framing could not reach the rest — and a draft child had no notice at all. The instant
- * stays wherever there is one; only the claim hedges. 'vacation' had no sentence of its own here at all
- * and fell through to the plain paused line, which the portal has always distinguished.
- */
-interface DailyStateCopy {
-  readonly prepared: (releaseAt: string, zone: string) => string;
-  readonly hypothetical: (releaseAt: string, zone: string, childName: string) => string;
-}
-
-const DAILY_STATE: Record<LearningScheduleResponse['dailyPractice']['state'], DailyStateCopy> = {
-  available: {
-    prepared: () => 'Today’s daily practice is available.',
-    hypothetical: (_releaseAt, _zone, childName) =>
-      `Today’s daily practice would be available if ${childName}’s profile were active.`,
-  },
-  not_yet_released: {
-    prepared: (releaseAt, zone) => `Today’s daily practice opens ${formatInZone(releaseAt, zone)}.`,
-    hypothetical: (releaseAt, zone, childName) =>
-      `Today’s daily practice would open at ${formatInZone(releaseAt, zone)} if ${childName}’s profile were active.`,
-  },
-  paused: {
-    prepared: () => 'Daily practice is paused today.',
-    hypothetical: (_releaseAt, _zone, childName) =>
-      `Daily practice would be paused today even if ${childName}’s profile were active.`,
-  },
-  vacation: {
-    prepared: () => 'Daily practice is paused today (vacation).',
-    hypothetical: (_releaseAt, _zone, childName) =>
-      `Daily practice would be paused today (vacation) even if ${childName}’s profile were active.`,
-  },
-};
-
-const RELEASE_REASON: Record<
-  LearningScheduleResponse['nextReviewReleases'][number]['reason'],
-  string
-> = {
-  default_schedule: 'review day',
-  test_date_eve: 'before a test',
-  skipped_week: 'no review this week',
-};
-
-/**
- * The "Coming up" card's lines. `childStatus` is required, and undefined is a legal value for it, so a
- * caller that has no status must say so rather than get the promising copy by omission: every
- * forward-looking line here then hedges (fail closed, as the portal's sections do).
- */
-export function buildUpcomingView(
-  data: LearningScheduleResponse,
-  childName: string,
-  childStatus: string | undefined,
-): UpcomingView {
+export function buildUpcomingView(input: {
+  readonly data: LearningScheduleResponse;
+  readonly childName: string;
+  /** The profile's status as GET /v1/family reports it; `undefined` fails closed. */
+  readonly childStatus: string | undefined;
+  /**
+   * The child's subjects as the Subject toggles above the card render them, or `undefined` while that
+   * second request is still in flight or has failed. Passing `[]` for "not loaded" would claim a cause
+   * the screen cannot establish, which is why the unknown is its own value (L-071).
+   */
+  readonly subjects: readonly ChildSubject[] | undefined;
+}): UpcomingView {
+  const { data, childName, childStatus, subjects } = input;
   const zone = data.timezone;
-  const daily = data.dailyPractice;
-  const prepared = receivesPractice(childStatus);
-  const copy = DAILY_STATE[daily.state];
-  const dailyLine = prepared
-    ? copy.prepared(daily.releaseAt, zone)
-    : copy.hypothetical(daily.releaseAt, zone, childName);
   return {
     zoneLine: `Times are in your family’s time zone: ${zone}.`,
-    dailyLine,
-    noReviewsLine: prepared
-      ? 'No weekly reviews are scheduled yet.'
-      : `No weekly reviews are scheduled. A review is prepared once ${childName}’s profile is active.`,
-    reviewLines: data.nextReviewReleases.map((r) => {
-      const name = SUBJECT_DISPLAY_NAMES[r.subjectKey];
-      const when = r.releaseAt ? formatInZone(r.releaseAt, zone) : 'not this week';
-      return `${name}: ${when} (${RELEASE_REASON[r.reason]})`;
+    dailyLine: dailyPracticeCopy({
+      dailyPractice: data.dailyPractice,
+      zone,
+      childName,
+      childStatus,
     }),
+    noReviewsLine: noWeeklyReviewsCopy({ childName, childStatus, subjects }),
+    reviewLines: data.nextReviewReleases.map(
+      (r) =>
+        `${subjectName(r.subjectKey, subjects ?? [])}: ${reviewReleaseWhen(r, zone)} (${reviewReleaseReasonCopy(r)})`,
+    ),
     pointsLine: `Pausing or missing a day never removes points ${childName} already earned.`,
   };
 }

@@ -1,6 +1,7 @@
 import { cleanup, render, screen } from '@testing-library/react';
 import type { ComponentType } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { storeSubscriptionNotice } from '@pencillift/contracts';
 import { DraftBanner, isLegalReviewed } from '../../components/DraftBanner.tsx';
 import { renderPage } from '../../test/render.tsx';
 import AccountDeletionPage from './AccountDeletionPage.tsx';
@@ -168,11 +169,14 @@ describe('AccountDeletionPage (spec P4, P11, P15)', () => {
     expect(text).toMatch(/within 30 days/i);
     expect(text).toMatch(/backups expire on a documented schedule/i);
 
+    // Re-aimed for BUG-411: the requirement is that the page says PencilLift cancels no store
+    // subscription and where to cancel it, which is the contracts' sentence — the same one the
+    // parent area and the app print. Pinning this page's own words is what let a fourth wording of
+    // it live here.
     const store = screen.getByRole('region', { name: /subscription/i });
-    expect(store.textContent).toMatch(
-      /deleting your PencilLift account does not cancel an App Store or Google Play subscription/i,
-    );
-    expect(store.textContent).toMatch(/cancel it in the App Store or Google Play/i);
+    expect(store.textContent).toContain(storeSubscriptionNotice('any', null));
+    expect(store.textContent).toMatch(/does not cancel/i);
+    expect(store.textContent).toMatch(/Cancel it in the store that bills you/i);
   });
 });
 

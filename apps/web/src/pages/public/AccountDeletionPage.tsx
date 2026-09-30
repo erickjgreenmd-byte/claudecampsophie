@@ -2,6 +2,7 @@ import { Link, useLocation } from 'react-router';
 import {
   ACCOUNT_CLOSE_OUTCOME_COPY,
   SIGN_OUT_NOT_TOLD_COPY,
+  storeSubscriptionNotice,
   type AccountCloseOutcome,
 } from '@pencillift/contracts';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
@@ -223,14 +224,13 @@ export default function AccountDeletionPage() {
 
       <Section title="Your App Store, Google Play or Amazon Appstore subscription">
         <div className="notice">
+          {/* This page covers all three deletions, so it says the sentence that is true of all
+              three (`any`). It is the contracts' sentence, the same one the parent area and the app
+              print, rather than a fourth wording of it (BUG-411). This page is public and knows no
+              store, so it names every store that can bill a family. */}
           <p style={{ margin: 0 }}>
-            <strong>
-              Deleting your PencilLift account does not cancel an App Store or Google Play
-              subscription, or an Amazon Appstore subscription on a Fire tablet.
-            </strong>{' '}
-            To stop being charged, cancel it in the App Store or Google Play (or in the Amazon
-            Appstore on a Fire tablet), in your Apple, Google Play or Amazon subscription settings.
-            We recommend cancelling before you delete your account.
+            <strong>{storeSubscriptionNotice('any', null)}</strong> We recommend cancelling before
+            you delete your account.
           </p>
         </div>
       </Section>

@@ -189,17 +189,34 @@ describe('parent screens need the PIN after a restart (MOB-R1-09)', () => {
   });
 });
 
+/**
+ * MOB-R1-10, re-aimed for BUG-411 / L-070. This used to grep this screen for `STORE_LABEL[channel]`
+ * and for the sentence's own words, which guarded the WORDS on this surface and nothing about the
+ * portal's: the two wordings drifted with the whole suite green. The sentence itself is now the
+ * contracts' `storeSubscriptionNotice`, asserted on its OUTPUT over a representative set of stores
+ * in packages/contracts/src/privacy.test.ts and in src/privacy/parent-privacy.test.ts. What is left
+ * to pin HERE is the call site (L-071): that this screen reads the build's store and hands it to
+ * that function, and that it writes no store sentence of its own.
+ */
 describe('the deletion warning names this build’s store (MOB-R1-10)', () => {
   const privacy = screen('(parent)', 'privacy.tsx');
 
-  it('uses the build’s store channel and label, Amazon Appstore included', () => {
-    expect(privacy).toMatch(/storeChannelForBuild\(\)/);
-    expect(privacy).toMatch(/STORE_LABEL\[channel\]/);
-    expect(privacy).not.toMatch(/does not cancel an App Store or Google Play\s+subscription/);
+  it('reads the build’s store once and hands it to the shared copy', () => {
+    expect(privacy).toMatch(
+      /const buildStore = useMemo\(\(\) => storeChannelForBuild\(\), \[\]\);/,
+    );
+    expect(privacy).toMatch(/privacyRetentionLines\(buildStore\)/);
+    expect(privacy).toMatch(/deletionConfirmationCopy\(target, buildStore\)/);
   });
 
-  it('a build for no store names all three stores rather than guessing one', () => {
-    expect(privacy).toMatch(/App Store, Google Play or Amazon Appstore subscription/);
+  it('writes no store sentence, and no deletion sentence, of its own', () => {
+    // Any literal here is a second wording by construction, whichever stores it happens to name.
+    expect(privacy).not.toMatch(/does not cancel/i);
+    expect(privacy).not.toMatch(/STORE_LABEL/);
+    expect(privacy).not.toMatch(/Appstore subscription/);
+    // The account-wide sentence must not be able to stand over a single child's deletion again: the
+    // only store sentence in the delete-data section is the chosen target's.
+    expect(privacy).not.toMatch(/deletionStoreWarning/);
   });
 });
 

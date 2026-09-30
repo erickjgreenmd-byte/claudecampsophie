@@ -3,22 +3,43 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   CHILD_PROFILE_STATUSES,
+  DAILY_PRACTICE_COPY,
   LEARNING_LIMITS,
+  REVIEW_RELEASE_REASON_COPY,
+  dailyPracticeStatusSchema,
+  formatInZone,
+  receivesPractice,
+  reviewReleaseSchema,
+  type ChildSubject,
   type LearningSchedule,
   type LearningScheduleResponse,
 } from '@pencillift/contracts';
 import { ApiRequestError } from '@pencillift/contracts/client';
 import {
   buildUpcomingView,
-  formatInZone,
   normalizeTimeInput,
   plannerError,
-  receivesPractice,
   scheduleToPlannerForm,
   stepCount,
   validatePlannerForm,
   type PlannerForm,
 } from './planner-form.ts';
+
+/** Synthetic subjects, as GET /v1/children/:id/subjects reports them. */
+const MATH: ChildSubject = {
+  id: '11111111-1111-4111-8111-111111111111',
+  subjectKey: 'math',
+  displayName: 'Mathematics',
+  enabled: true,
+  generatedPractice: true,
+};
+const BAND: ChildSubject = {
+  id: '22222222-2222-4222-8222-222222222222',
+  subjectKey: 'custom',
+  displayName: 'Band',
+  enabled: true,
+  generatedPractice: false,
+};
 
 const SCHEDULE: LearningSchedule = {
   reviewWeekday: 4,
@@ -135,17 +156,86 @@ describe('mobile planner form (mirrors PUT /v1/children/:id/learning-schedule)',
       },
       pointsPolicy: { expireEarnedPoints: false, penalizeMissedDays: false },
     };
-    // The status is named, not omitted: HUNT7-H-1 made every forward-looking line depend on it, and this
-    // case is about the ZONE arithmetic for a profile that really does receive practice.
-    const view = buildUpcomingView(data, 'Sam', 'active');
+    // The status and the subjects are named, not omitted: HUNT7-H-1 made every forward-looking line
+    // depend on the status, BUG-411 made the empty-review line depend on the subjects, and this case is
+    // about the ZONE arithmetic for a profile that really does receive practice.
+    const view = buildUpcomingView({
+      data,
+      childName: 'Sam',
+      childStatus: 'active',
+      subjects: [MATH],
+    });
     expect(view.zoneLine).toBe('Times are in your family’s time zone: America/Los_Angeles.');
-    expect(view.reviewLines[0]).toMatch(/^Math: Wed, Nov 4, 4:00\sPM PST \(review day\)$/);
+    // BUG-411: 'regular review day' is the PORTAL's word, and the phone said 'review day'. The subject
+    // name is the parent's own, for the same reason: the phone printed SUBJECT_DISPLAY_NAMES' 'Math'
+    // where the portal printed the child's 'Mathematics'.
+    expect(view.reviewLines[0]).toMatch(
+      /^Mathematics: Wed, Nov 4, 4:00\sPM PST \(regular review day\)$/,
+    );
     expect(view.reviewLines[1]).toBe('Science: not this week (no review this week)');
     expect(view.dailyLine).toBe('Daily practice is paused today.');
     expect(view.pointsLine).toMatch(/never removes points Sam already earned/);
     // Summer time in the same zone.
     expect(formatInZone('2026-07-02T23:00:00.000Z', 'America/Los_Angeles')).toMatch(/4:00\sPM PDT/);
+    // A zone this runtime cannot resolve names UTC rather than silently reformatting in the DEVICE's
+    // zone, which is what the portal's copy of this function did (BUG-411).
     expect(formatInZone('2026-07-02T23:00:00.000Z', 'Not/AZone')).toBe('2026-07-02 23:00 UTC');
+  });
+
+  /**
+   * BUG-411, divergence (1). `reviewReleaseSchema` carries `testDate` BESIDE `reason`, and the portal
+   * printed it — "moved before the test on Thu, Oct 1, 2026" — while the phone's table was keyed to a
+   * plain string, so `RELEASE_REASON[r.reason]` dropped the date and said only "before a test". The
+   * shared function takes the RELEASE, so there is no argument left to drop.
+   */
+  it('[repro] the phone prints the test date the release carries, as the portal does', () => {
+    const data: LearningScheduleResponse = {
+      schedule: SCHEDULE,
+      timezone: 'America/Los_Angeles',
+      nextReviewReleases: [
+        {
+          subjectKey: 'math',
+          weekKey: '2026-W40',
+          releaseAt: '2026-09-30T23:00:00.000Z',
+          reason: 'test_date_eve',
+          testDate: '2026-10-01',
+        },
+      ],
+      dailyPractice: {
+        localDate: '2026-09-30',
+        state: 'paused',
+        releaseAt: '2026-09-30T22:30:00.000Z',
+      },
+      pointsPolicy: { expireEarnedPoints: false, penalizeMissedDays: false },
+    };
+    const line = buildUpcomingView({
+      data,
+      childName: 'Sam',
+      childStatus: 'active',
+      subjects: [MATH],
+    }).reviewLines[0] as string;
+    expect(line).toContain('moved before the test on Thu, Oct 1, 2026');
+    expect(line).not.toBe('Mathematics: not this week (before a test)');
+    expect(line).not.toMatch(/\(before a test\)/);
+  });
+
+  /**
+   * The fall-through halves of the two shared tables (L-057). Neither can gain a case that silently
+   * inherits a sentence written for another: the Records are keyed on the schema's own enums, so a fifth
+   * daily state or a fourth release reason is a compile error at the table, and these assert the key SET
+   * rather than the names in any one brief.
+   */
+  it('pins the two shared copy tables to the schema enums they answer for', () => {
+    const states = dailyPracticeStatusSchema.shape.state.options;
+    expect(Object.keys(DAILY_PRACTICE_COPY).sort()).toEqual([...states].sort());
+    const reasons = reviewReleaseSchema.shape.reason.options;
+    expect(Object.keys(REVIEW_RELEASE_REASON_COPY).sort()).toEqual([...reasons].sort());
+    // Every state has BOTH variants, which is the shape HUNT7-H-1 settled: a state with no hypothetical
+    // is a state that can make an unconditional present-tense claim again.
+    for (const state of states) {
+      expect(typeof DAILY_PRACTICE_COPY[state].prepared, state).toBe('function');
+      expect(typeof DAILY_PRACTICE_COPY[state].hypothetical, state).toBe('function');
+    }
   });
 
   it('[repro] a NOT_FOUND offers the retry the planner has, not a gesture it does not (HUNT7-J-2)', () => {
@@ -231,58 +321,121 @@ describe('[HUNT7-H-1] the phone hedges the daily line for a profile that receive
   for (const { state, prepared, hedged } of DAILY_LINES) {
     it(`hedges the ${state} line for a non-active profile and keeps it plain for an active one`, () => {
       const data = scheduleResponse(state);
-      expect(buildUpcomingView(data, 'Sam', 'active').dailyLine).toBe(prepared);
+      expect(
+        buildUpcomingView({
+          data,
+          childName: 'Sam',
+          childStatus: 'active',
+          subjects: [MATH],
+        }).dailyLine,
+      ).toBe(prepared);
       for (const status of ['archived', 'draft', 'suspended', undefined])
-        expect(buildUpcomingView(data, 'Sam', status).dailyLine, String(status)).toBe(hedged);
+        expect(
+          buildUpcomingView({ data, childName: 'Sam', childStatus: status, subjects: [MATH] })
+            .dailyLine,
+          String(status),
+        ).toBe(hedged);
     });
   }
 
   it('keeps the release instant in the hedged line, as the portal does (HUNT5-F-10)', () => {
-    const line = buildUpcomingView(
-      scheduleResponse('not_yet_released'),
-      'Sam',
-      'archived',
-    ).dailyLine;
+    const line = buildUpcomingView({
+      data: scheduleResponse('not_yet_released'),
+      childName: 'Sam',
+      childStatus: 'archived',
+      subjects: [MATH],
+    }).dailyLine;
     expect(line).toContain(formatInZone('2026-11-04T23:30:00.000Z', 'America/Los_Angeles'));
   });
 
-  it('hedges the empty-review line too, so no line on the card promises what the status refuses', () => {
-    const data = scheduleResponse('paused');
-    expect(buildUpcomingView(data, 'Sam', 'active').noReviewsLine).toBe(
-      'No weekly reviews are scheduled yet.',
-    );
-    expect(buildUpcomingView(data, 'Sam', 'archived').noReviewsLine).toBe(
-      'No weekly reviews are scheduled. A review is prepared once Sam’s profile is active.',
+  /**
+   * BUG-411, divergence (2). HUNT7-H-1 agreed the DAILY line across the surfaces and stopped, leaving
+   * this weekly half behind: the phone had TWO sentences against the portal's four, said
+   * "No weekly reviews are scheduled." where the portal said "…scheduled yet.", named no subject, and
+   * had no archived arm at all. All four are `noWeeklyReviewsCopy` now, and the phone gets every one.
+   *
+   * The cases run over a representative SET — a review-bearing subject on, only a custom subject on,
+   * nothing on, subjects not loaded — crossed with the statuses, rather than the arms named in a brief.
+   */
+  const NO_REVIEWS = scheduleResponse('paused');
+  const line = (childStatus: string | undefined, subjects: readonly ChildSubject[] | undefined) =>
+    buildUpcomingView({ data: NO_REVIEWS, childName: 'Sam', childStatus, subjects }).noReviewsLine;
+
+  it('claims no cause while a review-bearing subject is on, and still hedges the promise', () => {
+    expect(line('active', [MATH])).toBe('No weekly review is scheduled for this week or next.');
+    for (const status of ['draft', 'archived', 'suspended', undefined])
+      expect(line(status, [MATH]), String(status)).toBe(
+        'No weekly review is scheduled for this week or next. A review is prepared once Sam’s profile is active.',
+      );
+  });
+
+  it('claims no cause while the subjects are NOT LOADED, whatever the status', () => {
+    // The screen renders this card as soon as the SCHEDULE arrives; the subjects are a second request.
+    // An empty array would have claimed "no subject that gets a weekly review is on", which is not
+    // known yet, so `undefined` is its own value (L-071: the caller is where the defect lives).
+    expect(line('active', undefined)).toBe('No weekly review is scheduled for this week or next.');
+    expect(line('archived', undefined)).toBe(
+      'No weekly review is scheduled for this week or next. A review is prepared once Sam’s profile is active.',
     );
   });
 
-  it('prints the SAME hedged words as the portal, which is the parity this stage exists for', () => {
-    // No module can be shared across the two apps without a contracts export, which is the lead's to
-    // wire; what can be pinned from here is that the portal's table carries a hypothetical per state and
-    // that both surfaces hedge in the same words. The fragments are the ones the phone prints above.
-    const web = readFileSync(
-      join(
-        import.meta.dirname,
-        '..',
-        '..',
-        '..',
-        'web',
-        'src',
-        'components',
-        'learning',
-        'format.ts',
-      ),
-      'utf8',
+  it('names the cause and the parent’s real move for an ARCHIVED profile', () => {
+    // The subject toggles are disabled for this one status, so "Turn on at least one subject" would
+    // point at a dead control on this very screen — the two-parts-disagree defect the portal's arm was
+    // written to remove, which the phone did not have.
+    expect(line('archived', [BAND])).toBe(
+      'No weekly reviews are scheduled: no subject that gets a weekly review is on, and subjects can’t be turned on or off while Sam’s profile is archived. Activate Sam again on the Children page, while a paid slot is free, to change that.',
     );
-    expect(web).toContain('hypothetical');
-    for (const fragment of [
-      'Today’s daily practice would be available if ',
-      'Today’s daily practice would open at ',
-      'Daily practice would be paused today even if ',
-      'Daily practice would be paused today (vacation) even if ',
-      '’s profile were active.',
+    expect(line('archived', [])).toContain('while Sam’s profile is archived');
+  });
+
+  it('keeps the instruction for a DRAFT profile, whose toggles work, and drops the promise', () => {
+    // A custom-only child has subjects ON and no weekly review, which is why the cause is read from
+    // `generatedPractice` and not from "is the list empty".
+    for (const subjects of [[BAND], []] as const)
+      expect(line('draft', subjects), JSON.stringify(subjects)).toBe(
+        'No weekly reviews are scheduled yet. Turn on at least one subject that PencilLift makes practice for; a review is prepared once Sam’s profile is active.',
+      );
+    expect(line('draft', [BAND])).not.toMatch(/makes practice for to get a review/);
+    expect(line('suspended', [BAND])).toBe(line('draft', [BAND]));
+  });
+
+  it('keeps the unconditional instruction for an ACTIVE profile, which really does get one', () => {
+    expect(line('active', [BAND])).toBe(
+      'No weekly reviews are scheduled yet. Turn on at least one subject that PencilLift makes practice for to get a review.',
+    );
+  });
+
+  it('holds NO copy of the shared copy, and pins no other surface’s source text', () => {
+    /*
+     * This replaces the case that read apps/web/src/components/learning/format.ts and asserted the
+     * portal's sentences were spelled the same. That was a SOURCE PIN: it guarded the words and not the
+     * meaning (L-070), it left the portal free to widen the predicate behind them, and reverting one
+     * portal sentence once left this whole suite green at 859/859. The coverage it carried — "both
+     * surfaces print the same sentence" — is now carried by the sentences ABOVE being asserted against
+     * the ONE definition in packages/contracts that the portal also calls, which is a guarantee rather
+     * than an assertion about another file's text.
+     *
+     * What is left to check on this side is that the phone kept no copy, since a copy is how the
+     * divergence started.
+     */
+    const src = readFileSync(join(import.meta.dirname, 'planner-form.ts'), 'utf8');
+    for (const copy of [
+      'Today’s daily practice',
+      'Daily practice is paused',
+      'profile were active',
+      'No weekly review',
+      'regular review day',
+      'before a test',
+      "=== 'active'",
     ])
-      expect(web, fragment).toContain(fragment);
+      expect(src, copy).not.toContain(copy);
+    // Nor may either table come back as a declaration (the prose above names them by design).
+    expect(src).not.toMatch(/(const|let|var)\s+(DAILY_STATE|RELEASE_REASON)\b/);
+    // ...and that it reaches the shared definitions by importing them.
+    expect(src).toMatch(
+      /import \{[\s\S]*?dailyPracticeCopy[\s\S]*?noWeeklyReviewsCopy[\s\S]*?reviewReleaseReasonCopy[\s\S]*?\} from '@pencillift\/contracts';/,
+    );
   });
 });
 
@@ -301,12 +454,28 @@ describe('[HUNT7-H-1] the planner screen passes the predicate and frames a draft
 
   it('hands the Coming up card the one predicate, and re-derives it nowhere', () => {
     expect(planner).toMatch(/receivesPractice\(child\.status\)/);
-    expect(planner).toMatch(/<ComingUp data=\{schedule\.state\.data\} child=\{child\} \/>/);
-    // The card is handed the child and asks the shared helper from inside `buildUpcomingView`; it owns no
-    // comparison, and neither does the screen beyond the one `receivesPractice` call above.
-    expect(planner).toMatch(/buildUpcomingView\(data, child\.nickname, child\.status\)/);
+    // BUG-411: the predicate is imported from the package the PORTAL imports it from, not from a copy
+    // beside the copy it decides. A `from '../../src/learning/planner-form.ts'` import of it would mean
+    // the phone had its own again.
+    expect(planner).toMatch(
+      /import \{[\s\S]*?receivesPractice,[\s\S]*?\} from '@pencillift\/contracts';/,
+    );
+    expect(planner).toMatch(
+      /<ComingUp data=\{schedule\.state\.data\} child=\{child\} subjects=\{loadedSubjects\} \/>/,
+    );
+    // The card is handed the child and the subjects and asks the shared copy from inside
+    // `buildUpcomingView`; it owns no comparison, and neither does the screen beyond the one
+    // `receivesPractice` call above.
+    expect(planner).toMatch(
+      /buildUpcomingView\(\{\s*data,\s*childName: child\.nickname,\s*childStatus: child\.status,\s*subjects,\s*\}\)/,
+    );
     expect(planner).not.toMatch(/child\.status === 'active'/);
     expect(planner).not.toMatch(/No weekly reviews are scheduled yet/);
+    // The subjects reach it as the loaded ARRAY or as the unknown, never as `[]` standing in for both
+    // (L-071: the caller is what would restore the defect — an empty array claims a cause).
+    expect(planner).toMatch(
+      /const loadedSubjects =\s*subjects\.state\.status === 'ready' \? subjects\.state\.data\.subjects : undefined;/,
+    );
   });
 
   it('pins the status list the draft notice’s REASON depends on', () => {

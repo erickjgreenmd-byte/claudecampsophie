@@ -99,6 +99,67 @@ export function childPickerSuffixCopy(child: ChildCopySubject): string {
 }
 
 /**
+ * THE NOTE BESIDE A CHILD'S POINTS BALANCE — ONE DEFINITION, BOTH SURFACES.
+ *
+ * This was the THIRD independently written wording of the status claim above, and the last one still
+ * inline in a page: `BalancesSection` (apps/web/src/pages/app/RewardsPage.tsx) built it from its own
+ * expression — `({child.status === 'archived' ? 'archived' : 'no paid slot'} — history only)` —
+ * while the phone's `buildParentApprovalsView` (apps/mobile/src/rewards/parent-view-model.ts)
+ * printed the nickname and the points and NOTHING about the status at all.
+ *
+ * WHY THE PHONE HAS TO PRINT IT — from what the status means, not from symmetry. GET /v1/rewards
+ * returns EVERY profile's balance, archived and draft included, because earned points are history
+ * (spec P11; its `children` query filters on `notBeingDeleted` alone, apps/api/src/routes/rewards.ts).
+ * For a profile that is not 'active' nothing can be added to that number from the child's side:
+ * `app.current_child_id()` requires `c.status = 'active'` (migration 0001), so no child device
+ * resolves a session, practises or asks for a reward under it; and POST /v1/rewards refuses a new
+ * reward for an archived profile ('CHILD_ARCHIVED'). So the number is a closed total, and a bare
+ * number reads as a live one on whichever surface prints it — the note is the whole difference
+ * between "Jordan has 30 points to spend" and "Jordan's 30 points are what is left on a closed
+ * profile". A parent on the phone was reading the first sentence about the second profile.
+ *
+ * 'active' is `null`: a live balance needs no note. The parentheses are part of the copy so both
+ * surfaces print the same bytes instead of each framing the words their own way.
+ */
+export const REWARD_BALANCE_STATUS_NOTE: Readonly<Record<ChildProfileStatus, string | null>> = {
+  draft: '(no paid slot — history only)',
+  active: null,
+  archived: '(archived — history only)',
+};
+
+/**
+ * What the note says while a purge is running. It must NOT say "history only", which claims the
+ * history is KEPT, about the one child whose history is being deleted — the same reason
+ * `childStatusCopy` and `childPickerSuffixCopy` test this flag before the status.
+ *
+ * `rewardChildBalanceSchema` (./rewards.ts) cannot carry the flag today: it is a strictObject
+ * without one, and GET /v1/rewards drops a deletion-pending child from `children` altogether. So
+ * this arm is unreachable from that response and is asserted on the function directly in
+ * family.test.ts. It exists so that a response which ever starts carrying the flag — or any other
+ * caller of this helper — prints the deletion instead of the kept-history sentence, rather than the
+ * change to the contract silently choosing the wrong sentence.
+ */
+export const REWARD_BALANCE_DELETION_PENDING_NOTE =
+  '(data deletion under way — these points are being deleted)';
+
+/**
+ * A status neither surface has heard of. It names the CONSEQUENCE, which is certain for every
+ * non-active status (`app.current_child_id()` requires 'active', so nothing new is earned), and no
+ * CAUSE, which is not. Answering with the draft arm's "no paid slot" is how "no paid child slots
+ * yet" reached a family whose plan had lapsed (BUG-406), and it is what the portal's `? :` did here
+ * for anything that was not 'archived' — including a status added after it was written.
+ */
+export const REWARD_BALANCE_UNKNOWN_STATUS_NOTE = '(history only)';
+
+/** The one note both the portal and the app print beside a points balance. */
+export function rewardBalanceStatusNote(child: ChildCopySubject): string | null {
+  if (child.deletionPending === true) return REWARD_BALANCE_DELETION_PENDING_NOTE;
+  if (!Object.hasOwn(REWARD_BALANCE_STATUS_NOTE, child.status))
+    return REWARD_BALANCE_UNKNOWN_STATUS_NOTE;
+  return REWARD_BALANCE_STATUS_NOTE[child.status as ChildProfileStatus];
+}
+
+/**
  * Whether PencilLift prepares practice for this child. The single definition of the question that four
  * separate screen regions were each deciding for themselves (BUG-402, L-068), now shared by the portal
  * and the app rather than mirrored in each.
@@ -114,6 +175,116 @@ export function childPickerSuffixCopy(child: ChildCopySubject): string {
  */
 export function receivesPractice(childStatus: string | undefined): boolean {
   return childStatus === 'active';
+}
+
+// ---------------------------------------------------------------------------------------------
+// A pairing code a parent screen is holding — ONE DEFINITION, BOTH SURFACES
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * WHETHER A PAIRING CODE A PARENT SCREEN IS HOLDING COULD STILL BE REDEEMED — a NECESSARY condition,
+ * and the only one a parent screen can observe.
+ *
+ * `POST /v1/child-auth/pair`'s claim (apps/api/src/routes/child-auth.ts) requires FOUR things besides
+ * the code — `p.consumed_at is null`, `p.expires_at > now`, `c.status = 'active'`, `f.deleted_at is
+ * null` — and then refuses separately when `consentAllowsChildAccess` is false. This value establishes
+ * the third, and the fourth indirectly.
+ *
+ * It is therefore NOT "exactly the window in which the code works" (BUG-395): a profile that is not
+ * active cannot redeem a code, so `false` here is always right, but `true` is not a guarantee, because
+ * three things retire a code without moving the status:
+ *  - POST /v1/consent/withdraw sets `consumed_at` on every live code for the family and leaves
+ *    `child_profiles.status` alone (apps/api/src/routes/guardians.ts);
+ *  - a provider-side consent flip with no route call at all leaves the code UNCONSUMED, the child
+ *    active, and /pair answering 422 CONSENT_REQUIRED — pinned by the SQL-flip case in
+ *    apps/api/tests/consent-withdrawal.review.test.ts;
+ *  - minting a code for the same child on another surface consumes this one (the pairing-code route's
+ *    "one live code per child" update, apps/api/src/routes/family.ts).
+ * Neither surface reads /v1/consent on a pairing screen, so neither can see any of them. That is why
+ * the copy below names the condition it can speak for and points at the other one, and why it never
+ * claims the converse.
+ *
+ * THIS LIVES HERE, not in either app. BUG-410 is this project's ledger entry for the alternative: two
+ * byte-identical helpers tied together by tests that read each other's source left the entire mobile
+ * suite green at 859/859 when the portal's sentence was reverted, because a source pin guards the
+ * WORDS and not the MEANING (L-070), and two identical bodies are a coincidence with good odds (L-066).
+ * BUG-393, BUG-395 and BUG-397 are three findings' worth of work on this rule inside `apps/web`, and
+ * the phone's pair-device screen had none of it (BUG-411 (g)).
+ *
+ * `child` is OPTIONAL because a screen that looks a child up by id can fail to find the row — the
+ * phone's pair-device screen is reached with a `childId` route param and finds the row in GET
+ * /v1/family, which may no longer list it. An absent row is NOT redeemable: that is the fall-through
+ * (L-057), and it is the honest answer, because a profile this client cannot see is one it cannot
+ * claim anything about.
+ */
+export function pairingRedeemable(child: ChildCopySubject | undefined): boolean {
+  return child !== undefined && child.status === 'active' && child.deletionPending !== true;
+}
+
+/**
+ * What a parent screen holds after minting a pairing code: the code, the fact that the code is dead
+ * ('stale'), or nothing. The code string itself is dropped when it dies; 'stale' is what remains, so
+ * the parent is told the code is gone rather than left looking for it.
+ */
+export type HeldPairingCode =
+  { readonly code: string; readonly expiresAt: string } | 'stale' | null;
+
+/**
+ * THE HELD CODE AS IT MUST BE RENDERED, decided from the child the screen is looking at RIGHT NOW.
+ *
+ * BUG-397's conclusion, and the reason this is a function of the render's own inputs rather than an
+ * effect: round 6's effect turned a code already in hand stale but could not touch one that ARRIVES
+ * after the status change, so the panel the fix existed to close could still open on an archived child
+ * — the enumerated case was fixed and the fall-through was not (L-057). A code that resolves into a
+ * screen whose child has since moved is decided by this call like any other, because the deciding fact
+ * is read where the code is printed and not where it was requested.
+ *
+ * A caller that ALSO writes the answer back into its own state gets the latch BUG-393's notice needs:
+ * 'stale' in, 'stale' out for every child, so activating the child again never resurrects a code the
+ * server has already refused. One rule, both jobs; there is no second body to keep in step.
+ */
+export function heldPairingCode(
+  held: HeldPairingCode,
+  child: ChildCopySubject | undefined,
+): HeldPairingCode {
+  if (held === null) return null;
+  return pairingRedeemable(child) ? held : 'stale';
+}
+
+/**
+ * The stale notice's fixed sentences. `consentLead` and `consentTarget` are split because the portal
+ * renders the target as a react-router <Link> and the phone as a navigation button: the WORDS are
+ * shared, the control is each surface's own.
+ */
+export const PAIRING_STALE_COPY = {
+  headline: 'That pairing code can’t connect a device any more.',
+  reason:
+    'A code is never redeemed for a profile that is not active, so the code was taken off the screen rather than left here to fail on the device.',
+  consentLead:
+    'A code can also stop working while a profile stays active, because a device is checked against your family’s consent too: you can review that on the',
+  consentTarget: 'family dashboard',
+} as const;
+
+/**
+ * The stale notice's one moving sentence, decided by `pairingRedeemable` so the notice cannot
+ * contradict the rest of the screen it is on (BUG-393). Two states reach it:
+ *  - the profile is redeemable again (the parent activated the child from this very screen, and the
+ *    success line — "You can now create a pairing code" — renders beside this notice). The code itself
+ *    is gone for good and is not resurrected, but asserting that the profile "is not" active under a
+ *    "Status: Active" line and a live Create button is three self-contradictions on one screen.
+ *  - it is not, and the sentence then DEFERS to the notices beside it rather than PRESUPPOSING that
+ *    activation will become possible: it also renders for a deletion-pending child, where processing
+ *    has stopped, nothing can be activated and deletion cannot be undone from the app, and WEBR4-02 is
+ *    this project's ledger entry for promising a recovery there. Hence "if {nickname} is active
+ *    again", and not "once … again … yet".
+ */
+export function pairingStaleNextStep(
+  child: ChildCopySubject | undefined,
+  nickname: string,
+): string {
+  return pairingRedeemable(child)
+    ? `${nickname} is active again, so you can create a new code above.`
+    : `${nickname}’s is not active, so you can create a new one if ${nickname} is active again — the notices above say whether that is possible.`;
 }
 
 /** The three editable fields of a child profile, as a form holds them. */

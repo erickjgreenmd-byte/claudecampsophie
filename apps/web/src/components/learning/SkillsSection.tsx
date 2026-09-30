@@ -8,7 +8,8 @@ import {
 import { useApiQuery } from '../../lib/session.tsx';
 import { ErrorState, Loading } from '../states.tsx';
 import { hintStyle, listReset, rowStyle, sectionStyle } from './feedback.tsx';
-import { formatInZone, percent, questionsLabel, subjectName, subjectOrder } from './format.ts';
+import { formatInZone, subjectName } from '@pencillift/contracts';
+import { percent, questionsLabel, subjectOrder } from './format.ts';
 
 /** Minimum distinct independent questions before a skill gets a status (spec P7, AC_LEARNING_02). */
 const EVIDENCE_MINIMUM = 5;

@@ -15,6 +15,7 @@ import {
   rewardResponseSchema,
   rewardRulesResponseSchema,
   rewardRulesUpdateResponseSchema,
+  rewardBalanceStatusNote,
   rewardTextContainsLink,
   rewardsOverviewResponseSchema,
   type FamilyRewardRules,
@@ -384,45 +385,53 @@ function BalancesSection({
         </p>
       ) : (
         <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-          {childBalances.map((child) => (
-            <li
-              key={child.childId}
-              style={{
-                display: 'flex',
-                flexWrap: 'wrap',
-                alignItems: 'center',
-                gap: 12,
-                padding: '8px 0',
-              }}
-            >
-              <strong>{child.nickname}</strong>
-              <span>{pointsLabel(child.balance)}</span>
-              {/*
-                HUNT6-G-2 asked whether this line, like the Children card's, can say "history only"
-                about history a purge is deleting. It cannot: GET /v1/rewards builds this list with
-                `notBeingDeleted(tx, 'c.id')` (apps/api/src/routes/rewards.ts), so a child whose
-                deletion is `requested` or `processing` is not in `children` at all, and
-                `rewardChildBalanceSchema` is a strictObject with no `deletionPending` field
-                (packages/contracts/src/rewards.ts) — there is no flag to branch on and no row to
-                print. If that response ever starts carrying such a child, the contract has to change
-                first, and this is the line that needs the branch `childStatusLabel` now has.
-              */}
-              {child.status === 'active' ? null : (
-                <span style={{ color: 'var(--muted)' }}>
-                  ({child.status === 'archived' ? 'archived' : 'no paid slot'} — history only)
-                </span>
-              )}
-              <button
-                type="button"
-                className="btn secondary"
-                aria-label={`View ${child.nickname}’s history`}
-                aria-pressed={selected === child.childId}
-                onClick={() => onShowHistory(child)}
+          {childBalances.map((child) => {
+            /*
+              The note is `rewardBalanceStatusNote` in packages/contracts/src/family.ts, which the
+              phone's `buildParentApprovalsView` (apps/mobile/src/rewards/parent-view-model.ts)
+              calls too and neither surface shadows. This line used to build its own sentence —
+              `(${status === 'archived' ? 'archived' : 'no paid slot'} — history only)` — which was
+              a third wording of the claim the Children card and both pickers already made, told
+              anything that was not 'archived' it had "no paid slot" (BUG-406's mistake, in a
+              `? :` instead of a `default:`), and had no counterpart on the phone at all.
+
+              HUNT6-G-2 asked whether this line, like the Children card's, can say "history only"
+              about history a purge is deleting. It cannot from THIS response: GET /v1/rewards
+              builds `children` with `notBeingDeleted(tx, 'c.id')` (apps/api/src/routes/rewards.ts),
+              so a child whose deletion is `requested` or `processing` is not in the list, and
+              `rewardChildBalanceSchema` is a strictObject with no `deletionPending` field. The
+              branch for it now exists anyway, in the shared helper rather than here, so a contract
+              change that starts carrying such a child cannot pick the kept-history sentence.
+            */
+            const statusNote = rewardBalanceStatusNote(child);
+            return (
+              <li
+                key={child.childId}
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: '8px 0',
+                }}
               >
-                View history
-              </button>
-            </li>
-          ))}
+                <strong>{child.nickname}</strong>
+                <span>{pointsLabel(child.balance)}</span>
+                {statusNote === null ? null : (
+                  <span style={{ color: 'var(--muted)' }}>{statusNote}</span>
+                )}
+                <button
+                  type="button"
+                  className="btn secondary"
+                  aria-label={`View ${child.nickname}’s history`}
+                  aria-pressed={selected === child.childId}
+                  onClick={() => onShowHistory(child)}
+                >
+                  View history
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>
