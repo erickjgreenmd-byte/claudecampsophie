@@ -125,13 +125,28 @@ metered usage, so these are reservations and not money):
 | Extraction | extraction | 216,816 | $0.216816 |
 | Grading group | grading + verification | 316,816 | $0.316816 |
 | Coaching, per question | coaching | 407,520 | $0.407520 |
-| Practice personalization | daily_set | 483,240 | $0.483240 |
+| Practice personalization, daily | daily_set | 483,240 | $0.483240 |
+| **Practice personalization, Thursday review** | **thursday_bundle** | **933,600** | **$0.933600** |
 
-The largest single hold a family can hit is the personalization stage at 483,240 micro-USD ($0.48). Reserving
-the admission cap instead — which the personalization hold still did after the split, until `F-HOLD` caught
-it — left that hold 133,240 micros short of what the stage may spend, so the hold stopped bounding the spend,
-which is the only thing a hold is for. `runStage` now throws a `RangeError` if it is handed a budget below the
-admission bound, so no caller can reintroduce that ordering for a single call.
+The largest single hold a family can hit is the **Thursday review's personalization at 933,600 micro-USD
+($0.93)** — 93% larger than the daily one. HUNT7-B-2: this table omitted that row and this paragraph named
+483,240 as the largest, which understated the biggest reservation in the product by almost half. It is not a
+hypothetical path: `personalizeItems` takes its hold as
+`acquireSpendHold(deps, PROPOSED_STAGE_COST_BUDGET_MICROS[stage])` and its `stage` parameter is
+`'daily_set' | 'thursday_bundle'`; `generateThursdayReview` is registered as the `thursday_review_generate`
+job handler, is enqueued by the scheduled tick, and calls `personalizeItems` with `'thursday_bundle'`.
+`PROPOSED_STAGE_COST_BUDGET_MICROS.thursday_bundle` is 933,600 in `packages/ai/src/routing.ts`.
+
+Reserving the admission cap instead — which the personalization hold still did after the split, until
+`F-HOLD` caught it — left that hold 133,240 micros short of what the daily stage may spend, so the hold
+stopped bounding the spend, which is the only thing a hold is for. `runStage` now throws a `RangeError` if it
+is handed a budget below the admission bound, so no caller can reintroduce that ordering for a single call.
+
+Every number in the two tables above is generated from `packages/ai/src/routing.ts` by
+`packages/ai/src/cost-doc.test.ts`, which reds when a budget constant changes without this file changing
+with it. That test exists because this row was missing: a hold table maintained by hand drifts from the
+constants it describes, and the drift is invisible until someone reads a $0.48 figure for a $0.93
+reservation.
 
 Known gap, deliberate and owner-visible (owner action #46): grading is bounded by QUESTIONS, not pages, because it
 sends no image. On the same ceiling the full retry is reachable to about 85 questions of average length and to none

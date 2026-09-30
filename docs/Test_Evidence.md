@@ -239,3 +239,26 @@ dispatcher's late-removal list on `status === 'queued'` rather than `!== 'ready'
 
 Suite totals after this slice: api 1176, db 450; the rest unchanged. **7069 tests**, floors raised.
 
+## The cost tables are checked against the code (HUNT7-B-2) — 2026-09-30
+
+`docs/Cost_Analysis.md` carries two hand-maintained tables of the AI stage constants, and the owner
+reads them to set spend ceilings. `packages/ai/src/cost-doc.test.ts` generates its assertions from
+`packages/ai/src/routing.ts`, so the document cannot drift from the code without a red test:
+
+- every stage in `AI_STAGES` must have a row in the stage table carrying its real `maxCostMicros`,
+  its `PROPOSED_STAGE_COST_BUDGET_MICROS` and its `fullRaiseCeiling(...)`;
+- every stage a single `acquireSpendHold` can be taken for — coaching, daily_set and thursday_bundle,
+  the last two because `personalizeItems` takes `PROPOSED_STAGE_COST_BUDGET_MICROS[stage]` and its
+  `stage` is `'daily_set' | 'thursday_bundle'` — must have a row in the worst-case-hold table;
+- the "largest single hold" sentence must carry the largest of those figures and must not name a
+  smaller one.
+
+Five mutations, each restored with `sha256sum -c`: delete the Thursday hold row; restore the
+understated sentence; change `thursday_bundle`'s budget without touching the document; change
+coaching's admission cap without touching the document; delete a stage-table row. **The first passed
+on the first attempt** — the hold-table search was bounded to any table line carrying the stage name
+and the figure, and the STAGE table's own `| thursday_bundle | 700,000 | 933,600 | 933,600 |` row
+satisfied it once the hold row was gone, so the test could not see the defect it was written for. It
+is now bounded to the table with the header `| Hold | Stages summed | Micro-USD | USD |`, after which
+all five go red. ai 94 tests, floor raised.
+
