@@ -295,7 +295,8 @@ describe('parent privacy screen logic (spec P4, P10, P14)', () => {
   });
 
   /**
-   * HUNT5-N6 / L-037. `ACCOUNT_CLOSE_COPY.closed` and `.pending` both end "and this device is signed
+   * HUNT5-N6 / L-037. `ACCOUNT_CLOSE_COPY.closed` and every arm of `ACCOUNT_CLOSE_OUTCOME_COPY` end
+   * "and this device is signed
    * out", which is the APP's half of closing an account, not the server's: the app clears the parent
    * session, the biometric PIN and the adult secrets afterwards. The screen used to print that
    * sentence before the sign-out had even run, and swallowed its failure, so a parent could read that

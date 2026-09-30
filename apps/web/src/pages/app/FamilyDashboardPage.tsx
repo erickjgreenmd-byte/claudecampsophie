@@ -144,6 +144,14 @@ function FamilySummary({ data, onChanged }: { data: FamilyOverview; onChanged: (
             HUNT6-G-2: the branch is inside `childStatusLabel` now, not here. Wrapping this one call
             left the Children page — the other caller, in the file that defines the label — printing
             the sentence this comment describes; one helper decides it for every surface (L-037).
+
+            "EVERY SURFACE" WAS FALSE WHEN WRITTEN and is true as of `71e49e2`. It meant every
+            surface in apps/web, while the phone printed the older sentence from its own copy — the
+            shape seven of round 7's sixty findings were made of. The helper is `childStatusLabel`
+            in ChildrenPage.tsx, which delegates to `childStatusCopy` in
+            packages/contracts/src/family.ts; the app's `childStatusText` calls the same function.
+            Named rather than implied, because a claim a reader cannot check is how this one
+            survived a round.
           */}
           {data.children.map((child) => (
             <li key={child.id}>

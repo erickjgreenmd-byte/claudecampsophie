@@ -180,7 +180,8 @@ export type CloseAccountResult =
  * decided by what this DEVICE managed to do (HUNT6-J-1; L-037, since the portal draws the same
  * distinction in PrivacyControlsPage).
  *
- * `ACCOUNT_CLOSE_COPY.closed` and `.pending` both end "and this device is signed out", which is the
+ * `ACCOUNT_CLOSE_COPY.closed` and every arm of `ACCOUNT_CLOSE_OUTCOME_COPY` end "and this device is
+ * signed out", which is the
  * app's own half of the job: the server closed the sign-in, and the app then ends the parent session
  * and clears the biometric PIN and the store identity. When that second half did not finish, the first
  * sentence is still true and the second is not — and it is the dangerous half to get wrong, because a
@@ -282,6 +283,11 @@ export async function runAccountClosure(
  * used to build the unconditional `ACCOUNT_CLOSE_COPY.closed`/`.pending` as well, which no caller had
  * read since round 6 — a sentence still produced, still documented as what the status means, and still
  * pinned by a test, on the screen whose whole point is that it may not be said unconditionally.
+ *
+ * `.pending` no longer EXISTS at all: HUNT7-E-1 replaced it with the two arms of
+ * `ACCOUNT_CLOSE_OUTCOME_COPY`, because a pending closure has two causes — a family purge running, or
+ * a refused close the queue is retrying — and one sentence was being printed for both. Noted because
+ * a reader chasing the old member would find nothing and wonder which of us is wrong.
  */
 export async function closeAccountAction(
   api: ApiClient,

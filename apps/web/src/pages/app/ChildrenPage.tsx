@@ -88,6 +88,18 @@ export function childPickerSuffix(child: ChildCopySubject): string {
  * deleting, two lines above this page's own notice that it is being deleted. HUNT5-F-2 removed that
  * sentence from the dashboard row by wrapping the CALL there; the sibling call on this page kept it,
  * so the branch lives in the one helper both surfaces print from (L-037).
+ *
+ * THAT LAST CLAUSE WAS FALSE FOR A ROUND, and it is worth saying so here rather than only in the
+ * ledger, because the vagueness is what hid it: "the one helper both surfaces print from" named
+ * neither the helper nor its file, so nobody could check it — and the phone held a byte-identical
+ * copy of this switch the whole time. Round 7's parity audit found six claims of this shape and
+ * called this the reason the next round would repeat round 6.
+ *
+ * It is TRUE as of `71e49e2`, and now says which helper so a reader can verify it in one grep: the
+ * decision is `childStatusCopy` in `packages/contracts/src/family.ts`, which this function and the
+ * app's `childStatusText` (apps/mobile/src/family/family-view.ts) both call and neither shadows.
+ * The evidence is not this sentence: mutating the shared sentence reds three cases under apps/web
+ * AND three under apps/mobile, which two coincidentally-equal helpers could not do.
  */
 export function childStatusLabel(child: ChildCopySubject): string {
   // Delegates to the ONE definition in packages/contracts/src/family.ts, which the app imports too.
