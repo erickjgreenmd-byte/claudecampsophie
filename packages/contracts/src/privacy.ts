@@ -335,9 +335,27 @@ export const INACTIVE_CHILD_SCAN_COPY =
  * Both name the Children page, where a slot is assigned and an archived profile activated again, and
  * neither promises capacity this portal cannot sell (WEB-R1-04). Here rather than in a page so the
  * portal and the app say the same thing, beside the two lines they replace the advice of.
+ *
+ * HUNT7-I-1 / HUNT7-E-2: and both STOP at that step. They used to end "and these pages can go through
+ * then", which asserts that the profile is the only thing left in the way. For three of the five
+ * outcomes they are printed for it is not: a PDF or HEIC file is still unreadable after activation
+ * (L-063 — NOT `HomeworkMimeType`, which ACCEPTS both: `HOMEWORK_MIME_TYPES` in
+ * packages/contracts/src/homework.ts lists image/heic and application/pdf and
+ * DEFAULT_HOMEWORK_UPLOAD_LIMITS.allowedMimeTypes is that same tuple. The refusal is `validatePages`
+ * at POST /v1/assignments/:id/uploads, which throws BUSINESS_RULE FORMAT_NOT_SUPPORTED_YET for any
+ * page outside `HOMEWORK_READABLE_MIME_TYPES` — jpeg and png only — apps/api/src/routes/homework.ts.
+ * Refused before the pages are registered, so the conclusion is stronger: the scan never starts), a
+ * worksheet with more questions than one check handles still exceeds the stage limit
+ * (packages/ai/src/routing.ts), and the same blurred
+ * photos are still blurred — while the composition that printed this line had just TRIMMED the one
+ * instruction that would have worked. A parent who assigned or bought a slot on the strength of that
+ * sentence re-sent the same pages and met the identical failure with no advice left on screen. Each
+ * outcome's own requirement is re-appended AFTER this line instead, by
+ * `OUTCOME_WITHOUT_NEW_SCAN_ADVICE` (apps/web/src/pages/app/HomeworkPage.tsx), so the condition that
+ * makes the advice true survives without this line promising anything about these pages.
  */
 export const ARCHIVED_CHILD_NO_NEW_SCAN_COPY =
-  'A new scan can’t help while this child’s profile is archived: PencilLift takes no new scans for them and their paired devices are signed out. Activate the profile again on the Children page, while a paid slot is free, and these pages can go through then.';
+  'A new scan can’t help while this child’s profile is archived: PencilLift takes no new scans for them and their paired devices are signed out. Activate the profile again on the Children page, while a paid slot is free.';
 
 /**
  * G-DRAFT: `draft` is the only status this line is printed for — the family contract has three
@@ -359,7 +377,86 @@ export const ARCHIVED_CHILD_NO_NEW_SCAN_COPY =
  * that page says where a slot comes from when none is free.
  */
 export const INACTIVE_CHILD_NO_NEW_SCAN_COPY =
-  'A new scan can’t help while this child has no paid slot: PencilLift takes no new scans for them. Assign one of your family’s unused paid slots to this profile on the Children page, while one is free, and these pages can go through then.';
+  'A new scan can’t help while this child has no paid slot: PencilLift takes no new scans for them. Assign one of your family’s unused paid slots to this profile on the Children page, while one is free.';
+
+/**
+ * HUNT7-I-3: the permanent outcomes where nothing about the pages is wrong and no parent action
+ * changes anything, so the generic `failed_final` line — "This scan could not be processed after
+ * several tries. Please start a new scan with clear photos." — is false in both halves. The codes
+ * (apps/web/src/pages/app/HomeworkPage.tsx names them) are AI_NOT_AVAILABLE, thrown when
+ * `checkChildDataGate` refuses: a missing, switch-like or future-dated ZDR approval reference, or a
+ * mock provider configured in production (packages/ai/src/gate.ts, via scan-process.ts's
+ * `assertMayProcess`); MODERATION_NOT_AVAILABLE, the same gate refusing the safety screen or a
+ * moderation provider that is non-retryably unavailable (apps/api/src/jobs/scan-process.ts); and
+ * UNKNOWN_MODEL, router configuration (packages/ai/src/run.ts). Each is one refusal, not several
+ * tries, and none of them is about these pages — so when the owner's ZDR evidence lapses, the old line
+ * told every parent in the product that their child's homework photos were not clear enough. It asks
+ * for nothing, because nothing the parent does helps. The pages are not lost either way — every
+ * PermanentFailure settles the reservation to `failed_final`, which releases the allowance.
+ *
+ * The OUTCOME is separate from what follows it, because what follows depends on the profile. For a
+ * child who cannot scan at all, the page appends that child's own blocker instead (HUNT7-I-3's repair:
+ * the first version put these codes in the page's code table only, so an archived child's row claimed
+ * "new scans stop the same way until that is fixed. There is nothing for you to change" directly under
+ * the page's own "new scans are not taken … Activate Riley again on the Children page" — two regions,
+ * opposite causes, opposite calls to action, and false besides, since that child's scans stop before
+ * any provider is reached and keep stopping after the outage is over).
+ */
+export const PROVIDER_UNAVAILABLE_SCAN_OUTCOME =
+  'PencilLift could not check this scan, and its pages were given back to your monthly allowance. Nothing was wrong with the photos: the check stopped on PencilLift’s side.';
+
+/**
+ * The same outcome for a profile that CAN scan, with what follows from it.
+ *
+ * "Sending these pages again" rather than the first draft's "new scans stop the same way": that draft
+ * asserted a standing product-wide state, and MODERATION_NOT_AVAILABLE is also the code for a
+ * moderation provider answering non-retryably about THIS request — moderation.ts maps a 400 or 401 to
+ * `retryable: false` and apps/api/src/jobs/scan-process.ts turns that into the same PermanentFailure.
+ * Resending the identical pages meets the identical refusal in every one of the three cases, which is
+ * the part the parent needs (it spends allowance), so the narrower claim is the true one.
+ */
+export const PROVIDER_UNAVAILABLE_SCAN_COPY = `${PROVIDER_UNAVAILABLE_SCAN_OUTCOME} Sending these pages again would stop the same way until that is fixed. There is nothing for you to change — you can ask support about this scan.`;
+
+/**
+ * HUNT7-I-6: the FALL-THROUGH of the two lines above, for a status that is neither 'active' nor one of
+ * the two the family contract has today (packages/contracts/src/family.ts). The page used to print no
+ * blocker at all for such a value while its uploader asserted "needs a paid child slot" in the next
+ * region — two regions of one screen keyed differently on one profile. This says only what the gate
+ * really establishes: `readPaidProfile`'s `entitled` requires `status = 'active'`
+ * (apps/api/src/routes/homework.ts), so anything else takes no new scan, and it names neither of the
+ * two reasons it cannot know to be the one.
+ */
+export const NO_NEW_SCAN_WITHOUT_ACTIVE_PROFILE_COPY =
+  'A new scan can’t help while this child’s profile is not active: PencilLift takes no new scans for them. You can check this child’s profile on the Children page.';
+
+/**
+ * HUNT7-I-2: why "Fix transcription" is not offered for a scan that HAS finished checking. The
+ * correction route re-runs a paid AI check of child data, so POST /v1/questions/:id/correction calls
+ * `assertCanCollect` (apps/api/src/routes/homework.ts) exactly as a new scan does, and
+ * `readPaidProfile`'s `entitled` requires `status = 'active'` plus an unreleased paid slot — so for an
+ * archived or slotless profile the parent retyped an answer, saved, and was answered "Assign a paid
+ * slot to this child before scanning homework", in reply to a correction. The sibling controls are NOT
+ * affected and stay offered: POST /questions/:id/override, the cancel route and GET
+ * /assignments/:id/solutions call no such gate.
+ *
+ * Three lines rather than one because the blocker differs, and the third is the FALL-THROUGH: it is
+ * what any status this page does not recognise gets, and it asserts no particular reason — "archived"
+ * and "no paid slot" are the two non-active values the family contract has today
+ * (packages/contracts/src/family.ts), and a future one must not be described as either. All three say
+ * the results already on screen stay readable, because they do (AC_CAPACITY_08).
+ *
+ * One condition none of them can see: an ACTIVE profile whose paid slot was released still fails
+ * `entitled`, and the child's status alone cannot tell. That case keeps the API's own refusal, which
+ * the panel renders verbatim.
+ */
+export const ARCHIVED_CHILD_NO_CORRECTION_COPY =
+  'Fixing a transcription has PencilLift check the work again, and no check runs while this child’s profile is archived. The answers and results already here stay readable. Activate the profile again on the Children page, while a paid slot is free, to fix a transcription.';
+
+export const INACTIVE_CHILD_NO_CORRECTION_COPY =
+  'Fixing a transcription has PencilLift check the work again, and no check runs while this child has no paid slot. The answers and results already here stay readable. Assign one of your family’s unused paid slots to this profile on the Children page, while one is free, to fix a transcription.';
+
+export const NO_CORRECTION_WITHOUT_ACTIVE_PROFILE_COPY =
+  'Fixing a transcription has PencilLift check the work again, which needs a profile that is active and holds a paid slot. The answers and results already here stay readable. You can check this child’s profile on the Children page.';
 
 /**
  * The two actions a guardian can take on an unresolved flag (portal and app; both need a recent PIN

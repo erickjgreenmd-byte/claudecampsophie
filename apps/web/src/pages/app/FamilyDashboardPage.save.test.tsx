@@ -218,7 +218,7 @@ describe('[HUNT5-F-2] the dashboard row of a child under deletion does not claim
 });
 
 describe('[HUNT6-G-8] the zone the form is showing can still be saved after a concurrent change', () => {
-  it('re-enables Save when the parent edits the field back, and names what the other guardian changed', async () => {
+  it('re-enables Save when the parent edits the field back, and names what changed under the form', async () => {
     // The state HUNT5-F-1 left behind: the summary above the form reads Europe/Berlin, the field
     // reads the America/Chicago this form was opened with, and `nothingChanged` diffed the field
     // against that seed — so the value the parent can SEE, and wants, could not be saved by any
@@ -250,9 +250,13 @@ describe('[HUNT6-G-8] the zone the form is showing can still be saved after a co
       'disabled',
       true,
     );
+    // HUNT7-G-2: what LANDED, not who landed it. GET /v1/family carries no actor (the schema is
+    // strict and the route selects no such column), so the notice names the value and the fact that
+    // it came from somewhere other than this form.
     expect(
-      screen.getByText(/another guardian changed the time zone to Europe\/Berlin/i),
+      screen.getByText(/this family changed somewhere else while this form was open/i),
     ).toBeTruthy();
+    expect(screen.getByText(/the time zone is now Europe\/Berlin/i)).toBeTruthy();
 
     // The parent edits the zone field back to the value it is showing them. That is an explicit
     // statement about that field, so Save works and sends that field alone.
@@ -267,5 +271,92 @@ describe('[HUNT6-G-8] the zone the form is showing can still be saved after a co
     // The name was not edited in this reopened form, so it is not sent: only the field the parent
     // touched travels (WEBR4-03, HUNT5-F-1).
     expect(sends[1]!.body).toEqual({ timezone: 'America/Chicago' });
+  });
+});
+
+/**
+ * HUNT7-G-2: the notice said "Another guardian changed …" for ANY difference between the live prop and
+ * the seed, and the response cannot establish an actor: `familyOverviewResponseSchema` is a strict
+ * object with no actor field (packages/contracts/src/family.ts) and GET /v1/family selects no actor
+ * column (apps/api/src/routes/family.ts) — the same fact that made the portal's deletion notices name
+ * the open request instead of the reader (G-I3-WEB). Two writers that are not another guardian reach
+ * it: the reader on a second surface (the phone app PATCHes the same family, and a second tab does
+ * too), and — the path below — the reader's own save whose RELOAD failed, where `useLastGood` keeps the
+ * pre-save values, the reopened form is seeded from them, and the retry's good GET lands the parent's
+ * own new name under it. For a one-guardian family the sentence also asserted that a second adult can
+ * write to the family. Synthetic names only.
+ */
+describe('[HUNT7-G-2] the concurrent-change notice names no actor the response cannot name', () => {
+  /**
+   * A fake whose PATCH changes the family it SERVES, as the server does. `fakeApi` above leaves the
+   * served overview untouched by a save, which is why no existing case can see the reader's own
+   * change come back as drift.
+   */
+  function selfMutatingApi(options: { failReloadOnce?: boolean } = {}) {
+    const sends: Call[] = [];
+    let served: FamilyOverview = family;
+    let gets = 0;
+    const api: Partial<ApiClient> = {
+      get: <S extends z.ZodType>(path: string, schema: S) => {
+        if (path.startsWith('/v1/consent')) return Promise.resolve(schema.parse(consent));
+        gets += 1;
+        if (options.failReloadOnce === true && gets === 2) {
+          return Promise.reject(new ApiRequestError('NETWORK', 'Network request failed', 0));
+        }
+        return Promise.resolve(schema.parse(served));
+      },
+      send: <S extends z.ZodType>(
+        method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+        path: string,
+        body: unknown,
+        schema: S,
+      ) => {
+        sends.push({ method, path, body });
+        const patch = (body ?? {}) as Partial<Pick<FamilyOverview, 'displayName' | 'timezone'>>;
+        served = {
+          ...served,
+          ...(patch.displayName === undefined ? {} : { displayName: patch.displayName }),
+          ...(patch.timezone === undefined ? {} : { timezone: patch.timezone }),
+        };
+        return Promise.resolve(
+          schema.parse({
+            family: { id: FAMILY, displayName: served.displayName, timezone: served.timezone },
+          }),
+        );
+      },
+    };
+    return { api, sends };
+  }
+
+  it('does not tell the parent another guardian made the change they made themselves', async () => {
+    const user = userEvent.setup();
+    const { api, sends } = selfMutatingApi({ failReloadOnce: true });
+    renderPage(<FamilyDashboardPage />, { api });
+    await openForm(user);
+    const name = screen.getByLabelText(/family name/i);
+    await user.clear(name);
+    await user.type(name, 'The Riveras');
+    await user.click(screen.getByRole('button', { name: /^save family details$/i }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    // The save WORKED and its reload failed: the pre-save name is still on screen beside a retry
+    // (WEBR4-04), and reopening the form seeds it from those stale values.
+    const retry = await screen.findByRole('button', { name: /try again/i });
+    await openForm(user);
+    expect(screen.getByLabelText(/family name/i)).toHaveProperty('value', 'Test Family');
+    await user.click(retry);
+    // The reader's own saved name lands under the open form, which the page reads as drift.
+    expect(await screen.findByRole('heading', { name: 'The Riveras' })).toBeTruthy();
+
+    // L-054: the sentence the product used to render, over the WHOLE page rather than the notice
+    // alone, so moving the claim elsewhere does not pass.
+    expect(document.body.textContent).not.toMatch(/another guardian/i);
+    // And no attribution to any adult inside the notice itself.
+    const notice = screen.getByRole('note');
+    expect(notice.textContent).not.toMatch(/guardian|someone else|somebody/i);
+    // What the data supports: the value, and that it did not come from this form.
+    expect(notice.textContent).toMatch(
+      /this family changed somewhere else while this form was open/i,
+    );
+    expect(notice.textContent).toMatch(/the family name is now “The Riveras”/i);
   });
 });

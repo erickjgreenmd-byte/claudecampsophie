@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
 import {
   CHILD_ACTIVATION_RULES,
@@ -209,7 +209,7 @@ function ChildCard({
   onChanged: () => void;
 }) {
   const { api } = useSession();
-  const { busy, feedback, run, setFeedback } = useAction();
+  const { busy, feedback, run } = useAction();
   /**
    * The pairing code this card minted, or 'stale' once the child left the only state that can redeem
    * it (G-PROSE). The code string itself is dropped when that happens; 'stale' is what remains, so the
@@ -227,11 +227,37 @@ function ChildCard({
   /** Nothing about this profile can be changed: the edit form and the archive confirmation both go. */
   const readOnly = child.status === 'archived' || deletionPending;
   /**
-   * Whether a pairing code this card is holding could still be redeemed. The redeem claim matches
-   * `c.status = 'active'` (apps/api/src/routes/child-auth.ts) and archiving does not consume an
-   * unexpired code, so "active and not being deleted" is exactly the window in which the code works.
+   * A NECESSARY condition for a pairing code this card is holding to be redeemable, and the only one
+   * this page can observe. `POST /v1/child-auth/pair`'s claim (apps/api/src/routes/child-auth.ts)
+   * requires FOUR things besides the code — `p.consumed_at is null`, `p.expires_at > now`,
+   * `c.status = 'active'`, `f.deleted_at is null` — and then refuses separately when
+   * `consentAllowsChildAccess` is false. This value establishes the third, and the fourth indirectly.
+   *
+   * HUNT7-G-5: it is therefore NOT "exactly the window in which the code works", as this comment used
+   * to claim. A profile that is not active cannot redeem a code, so `false` here is always right; but
+   * `true` is not a guarantee, because three things retire a code without moving the status:
+   *  - POST /v1/consent/withdraw sets `consumed_at` on every live code for the family and leaves
+   *    `child_profiles.status` alone (apps/api/src/routes/guardians.ts);
+   *  - a provider-side consent flip with no route call at all leaves the code UNCONSUMED, the child
+   *    active, and /pair answering 422 CONSENT_REQUIRED — pinned directly by the SQL-flip case in
+   *    apps/api/tests/consent-withdrawal.review.test.ts;
+   *  - minting a code for the same child on another surface consumes this one
+   *    (the pairing-code route's "one live code per child" update, apps/api/src/routes/family.ts).
+   * This page reads only GET /v1/family and never /v1/consent, so it cannot see any of them. Giving
+   * the guard the consent state is a separate decision (a /v1/consent read on this page); the copy
+   * below therefore does not claim the converse either.
    */
   const pairingRedeemable = child.status === 'active' && !deletionPending;
+  /**
+   * HUNT7-G-7: the live answer to `pairingRedeemable`, for the decision `createCode` takes when its
+   * POST RESOLVES. The effect below fires once per status change and can only act on the `code` held
+   * at that moment, and `createCode`'s closure holds the value from the render the parent pressed in —
+   * the one render where it is still true. A pairing POST in flight while a sibling component's reload
+   * lands `archived` therefore used to put a live code on a card that was simultaneously saying
+   * nothing can be paired for this child.
+   */
+  const redeemableNow = useRef(pairingRedeemable);
+  redeemableNow.current = pairingRedeemable;
 
   /**
    * G-PROSE: the one rule every open panel on this card answers to, and it CLEARS the state rather
@@ -242,6 +268,11 @@ function ChildCard({
    * twice. The pairing-code panel had no condition at all, so a code minted before the reload stayed
    * on screen for a child who can no longer redeem it; the parent would have typed it into the device
    * and been refused.
+   *
+   * HUNT7-G-7: this effect closes a code ALREADY IN HAND. The rule it states — a card that cannot
+   * redeem a code never shows one — holds at the other point too because `createCode` stores 'stale'
+   * for a code that arrives after the status has moved; neither half is enough alone, and a code once
+   * turned stale is never turned back, so activating the child again does not resurrect it.
    */
   useEffect(() => {
     if (readOnly) {
@@ -282,8 +313,15 @@ function ChildCard({
         undefined,
         createPairingCodeResponseSchema,
       );
-      setCode(result);
-      return `Pairing code created for ${child.nickname}.`;
+      // HUNT7-G-7: the status is re-read HERE, not at the render the parent pressed in. The server
+      // minted a real code (its own `child.status !== 'active'` check passed when the request was
+      // made), and archiving does not consume it — so if the profile moved while this POST was in
+      // flight, what came back is a code the device would refuse, and the card says so instead of
+      // printing it.
+      setCode(redeemableNow.current ? result : 'stale');
+      return redeemableNow.current
+        ? `Pairing code created for ${child.nickname}.`
+        : `The pairing code for ${child.nickname} was created, but their profile changed before it arrived.`;
     });
   };
 
@@ -525,45 +563,79 @@ function ChildCard({
           </p>
         </div>
       ) : null}
-      {code === null ? (
-        <ActionFeedback
-          feedback={
-            activationError?.rule === CHILD_ACTIVATION_RULES.consentRequired ? null : feedback
-          }
-          stepUpAction={stepUpAction}
-        />
-      ) : code === 'stale' ? (
+      {/*
+        HUNT7-G-1: an UNCONDITIONAL sibling, the way every other card in the portal renders it
+        (Devices, Guardians, Family, Support, Security and the five learning sections) — it returns
+        null for a null feedback itself (ActionFeedback, apps/web/src/pages/app/SecurityPage.tsx).
+        While it was the `code === null` arm of one three-way ternary, a card holding a code or the
+        stale notice swallowed EVERY outcome of activate(), archive(), saveProfile() and createCode():
+        the success line, an ErrorState for a business rule or a network failure, and the inline PIN
+        field a STEP_UP_REQUIRED needs. That is not a rare window — POST /children/:childId/activate
+        calls assertRecentUnlock (apps/api/src/routes/family.ts) and an unlock lasts a few minutes, so
+        a refusal is the routine outcome of "Activate {nickname} again", and the stale notice is
+        standing on exactly the cards that offer that button. StepUpPrompt exists so the PIN is
+        entered on the page the parent was already on (WEB-R2-05), which a swallowed notice undoes.
+        The consentRequired substitution stays: that rule has its own notice above.
+      */}
+      <ActionFeedback
+        feedback={
+          activationError?.rule === CHILD_ACTIVATION_RULES.consentRequired ? null : feedback
+        }
+        stepUpAction={stepUpAction}
+      />
+      {code === null ? null : code === 'stale' ? (
         // G-PROSE: what the parent is told instead of a code the device would refuse. Vanishing in
         // silence would be its own puzzle — the panel says a code is shown only once — so the reason
-        // and the way back are both named here. A new code is one press away once the profile is
-        // active, and the notice above this one says why it is not.
+        // and the way back are both named here.
+        //
+        // HUNT7-G-5: what it does NOT say is that being active is sufficient. `pairingRedeemable`
+        // above records why: the status is one of five conditions /pair checks, and a consent
+        // withdrawal or a code minted on another surface retires a code with the status untouched, so
+        // this notice names the condition it can speak for and points at the other one the parent can
+        // act on instead of promising that the next code will connect.
+        //
+        // HUNT7-G-1 (repair): `pairingRedeemable` decides the SECOND HALF of this notice, so the
+        // notice and the rest of the card cannot contradict each other. Two states reach it, and the
+        // fix that made the feedback a sibling put them both on screen at once:
+        //  - the profile is redeemable again (this card's own "Activate {nickname} again" worked, and
+        //    its success line — "You can now create a pairing code" — is now rendered beside this
+        //    notice). The code itself is gone for good and is not resurrected, but asserting that the
+        //    profile "is not" active, under a "Status: Active" line and a live Create button, is three
+        //    self-contradictions on one card.
+        //  - it is not, and then the notice defers to the notices above rather than PRESUPPOSING that
+        //    activation will become possible: this notice renders on a deletion-pending card, where
+        //    processing has stopped, nothing can be activated and deletion cannot be undone from the
+        //    app, and WEBR4-02 is this project's ledger entry for promising a recovery there. Hence
+        //    "if {nickname} is active again", round 6's conditional, and not "once … again … yet".
         <div className="notice" role="status" style={{ marginTop: 12 }}>
           <p style={{ margin: '0 0 8px' }}>
-            <strong>That pairing code can’t connect a device any more.</strong> A code is only
-            redeemed for a profile that is active, and {child.nickname}’s is not, so the code was
-            taken off the screen rather than left here to fail on the device. Create a new one if{' '}
-            {child.nickname} is active again — the notice above says whether that is possible.
+            <strong>That pairing code can’t connect a device any more.</strong> A code is never
+            redeemed for a profile that is not active, so the code was taken off the screen rather
+            than left here to fail on the device.{' '}
+            {pairingRedeemable
+              ? `${child.nickname} is active again, so you can create a new code above.`
+              : `${child.nickname}’s is not active, so you can create a new one if ${child.nickname} is active again — the notices above say whether that is possible.`}{' '}
+            A code can also stop working while a profile stays active, because a device is checked
+            against your family’s consent too: you can review that on the{' '}
+            <Link to="/app">family dashboard</Link>.
           </p>
-          <button
-            type="button"
-            className="btn secondary"
-            onClick={() => {
-              setCode(null);
-              setFeedback(null);
-            }}
-          >
+          {/*
+            HUNT7-G-1 (repair): this clears the CODE and nothing else. It used to clear `feedback`
+            too, which was invisible while a code or this notice stood in front of ActionFeedback and
+            is not any more: `feedback` is the sole input to ActionFeedback -> StepUpNotice ->
+            StepUpPrompt (apps/web/src/pages/app/SecurityPage.tsx), so dismissing a notice about a
+            dead code threw away the inline PIN field — and the PIN the parent had typed into it —
+            that this card's own "Activate {nickname} again" refusal had just put there (WEB-R2-05).
+            Nothing needs it: `run` in useAction clears the previous feedback before every action.
+          */}
+          <button type="button" className="btn secondary" onClick={() => setCode(null)}>
             Done
           </button>
         </div>
       ) : (
-        <PairingCodePanel
-          nickname={child.nickname}
-          code={code}
-          onDone={() => {
-            setCode(null);
-            setFeedback(null);
-          }}
-        />
+        // The same rule for the live code's own Done, for the same reason: this card offers Edit and
+        // Archive beside a printed code, and either one's STEP_UP_REQUIRED puts the PIN field here.
+        <PairingCodePanel nickname={child.nickname} code={code} onDone={() => setCode(null)} />
       )}
     </li>
   );
@@ -589,7 +661,7 @@ function ChildCard({
  * save carried grade 3 and reverted the change WEBR4-03 was filed to protect. HUNT6-G-8: diffing
  * against the SEED instead fixed that and made the value the parent can see unsavable, so `touched`
  * below replaced the diff altogether. The seed is still read, by `drifted`, for the one job of naming
- * what another guardian changed since the form opened.
+ * what changed under the form since it opened — what changed, not who changed it (HUNT7-G-2).
  */
 function EditChildForm({
   child,
@@ -605,7 +677,7 @@ function EditChildForm({
    * this and never reseeded, so a reload cannot move them under the parent's hands. What this form
    * SENDS is decided by `touched` alone (HUNT6-G-8), not by comparing anything. `child` — the live
    * prop the page query refreshes under the open form — is read in exactly one place, `drifted`, and
-   * only to name what another guardian changed since; it never decides what travels.
+   * only to name what changed under the form since it opened; it never decides what travels.
    */
   const [seed] = useState(child);
   const [nickname, setNickname] = useState(seed.nickname);
@@ -642,16 +714,29 @@ function EditChildForm({
   const nothingEdited = Object.keys(changes(nickname.trim())).length === 0;
 
   /**
-   * What another guardian changed while this form was open: the live prop against the seed
-   * (HUNT6-G-8). The card above the form shows the new values and the fields show the old ones;
-   * without this, nothing on screen said the two were about the same child.
+   * What changed under this form since it was seeded: the live prop against the seed (HUNT6-G-8). The
+   * card above the form shows the new values and the fields show the old ones; without this, nothing
+   * on screen said the two were about the same child.
+   *
+   * HUNT7-G-2: it says WHAT changed and not WHO changed it, because the response cannot carry a who.
+   * `familyChildSchema` and `familyOverviewResponseSchema` are strict objects with no actor field
+   * (packages/contracts/src/family.ts) and GET /v1/family selects no actor column
+   * (apps/api/src/routes/family.ts) — the same fact that made the deletion notice above name the open
+   * request instead of the reader (G-I3-WEB). "Another guardian changed …" was asserted for any
+   * difference, including two the reader causes themselves: the same parent editing this child in the
+   * phone app or a second tab (this card is keyed on `child.id`, so the open form is never remounted),
+   * and a save whose RELOAD failed, where `useLastGood` keeps the pre-save values, the reopened form is
+   * seeded from them, and the next good GET lands the parent's own new name under it. In a
+   * one-guardian family the sentence also asserted that a second adult has write access to the child's
+   * profile, which neither this page nor /v1/family can establish. Reseeding the form instead is NOT
+   * the fix — that is BUG-330, the value on screen becoming unsavable — so only the actor claim goes.
    */
   const drifted = [
-    ...(child.nickname === seed.nickname ? [] : [`the nickname to “${child.nickname}”`]),
+    ...(child.nickname === seed.nickname ? [] : [`the nickname is now “${child.nickname}”`]),
     ...(child.gradeLevel === seed.gradeLevel
       ? []
-      : [`the grade to ${gradeLabel(child.gradeLevel)}`]),
-    ...(child.ageBand === seed.ageBand ? [] : [`the age band to ages ${child.ageBand}`]),
+      : [`the grade is now ${gradeLabel(child.gradeLevel)}`]),
+    ...(child.ageBand === seed.ageBand ? [] : [`the age band is now ages ${child.ageBand}`]),
   ];
 
   const submit = async (event: FormEvent) => {
@@ -723,10 +808,10 @@ function EditChildForm({
       {drifted.length > 0 ? (
         <p className="notice" role="note" style={{ margin: '8px 0 0' }}>
           <strong>
-            Another guardian changed {drifted.join(' and ')} while this form was open.
+            This profile changed somewhere else while this form was open: {drifted.join(' and ')}.
           </strong>{' '}
           The fields above still show what you opened. Saving sends only the fields you edit here,
-          so their change stays unless you edit that field too.
+          so that change stays unless you edit that field too.
         </p>
       ) : null}
       <div style={buttonRow}>

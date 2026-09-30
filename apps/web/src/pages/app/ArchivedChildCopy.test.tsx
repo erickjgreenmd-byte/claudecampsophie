@@ -381,6 +381,107 @@ describe('[HUNT6-H-4] the draft notice does not claim the child never had a paid
 });
 
 /**
+ * HUNT7-H-4: two sections of ONE page must not tell the parent opposite things. The schedule section's
+ * empty-review line asked for a subject to be turned on; the subjects section, disabled by round 6's
+ * fix for the same status, says on the same page that subjects can't be turned on or off. The state
+ * that reaches the empty list is a profile with no ENABLED bank subject, which is why the fixtures
+ * below turn the subject off and empty `nextReviewReleases` together — that is what
+ * `scheduleResponse` answers for such a profile (apps/api/src/routes/learning.ts). Asserted at PAGE
+ * level, over the pair, because the contradiction is between two components and neither one can see
+ * it: this is the third time this shape has been filed (BUG-282, HUNT5-F-10). Synthetic names only.
+ */
+const subjectTurnedOff = {
+  subjects: [{ ...oneSubject.subjects[0]!, enabled: false }],
+};
+const noReviewsScheduled = { ...scheduleWithReleases, nextReviewReleases: [] };
+
+function noSubjectOnApi(overview?: unknown) {
+  return api(
+    (path) =>
+      path.endsWith('/subjects')
+        ? subjectTurnedOff
+        : path.endsWith('/learning-schedule')
+          ? noReviewsScheduled
+          : path.endsWith('/test-dates')
+            ? oneTestDate
+            : path.includes('/practice-sets')
+              ? oneSet
+              : undefined,
+    overview ?? family,
+  );
+}
+
+describe('[HUNT7-H-4] the archived planner’s two cards agree about the subject toggle', () => {
+  it('never asks for a subject to be turned on beside the notice that says it can’t be', async () => {
+    renderPage(<LearningPlannerPage />, { api: noSubjectOnApi() });
+    const plan = await screen.findByRole('region', { name: /learning plan for riley/i });
+    await within(plan).findByRole('region', { name: /coming up for riley/i });
+    // Both halves of the contradiction would be in this one region, so the assertion is over the pair.
+    expect(plan.textContent).toMatch(/can’t be turned on or off/i);
+    expect(plan.textContent).not.toMatch(/turn on at least one subject/i);
+    // The control the old sentence named really is dead, which is what made it a contradiction.
+    for (const box of within(plan).getAllByRole('checkbox')) {
+      expect(box).toHaveProperty('disabled', true);
+    }
+    // And the parent's real move is on the page, as the other notices already say it.
+    expect(within(plan).getAllByRole('link', { name: /children page/i }).length).toBeGreaterThan(0);
+  });
+
+  it('does not deny the custom subject the Subjects card beside it prints as On', async () => {
+    // The state the first repair got wrong: a custom subject is enabled, so "no subject is on" is
+    // false, and this page renders the refutation in the very next card. `generatedPractice` is false
+    // for it — the subjects GET computes that as `isBankSubject(row.subject_key)`
+    // (apps/api/src/routes/learning.ts) — so it yields no weekly review, which is what the line may
+    // say. Asserted over the whole plan region, so the pair is read together.
+    const custom = {
+      subjects: [
+        {
+          id: '2f6a7b8c-9d0e-4f12-8345-67890abcdef1',
+          subjectKey: 'custom',
+          displayName: 'Band',
+          enabled: true,
+          generatedPractice: false,
+        },
+      ],
+    };
+    renderPage(<LearningPlannerPage />, {
+      api: api(
+        (path) =>
+          path.endsWith('/subjects')
+            ? custom
+            : path.endsWith('/learning-schedule')
+              ? noReviewsScheduled
+              : path.endsWith('/test-dates')
+                ? oneTestDate
+                : path.includes('/practice-sets')
+                  ? oneSet
+                  : undefined,
+        family,
+      ),
+    });
+    const plan = await screen.findByRole('region', { name: /learning plan for riley/i });
+    await within(plan).findByRole('region', { name: /coming up for riley/i });
+    // The Subjects card really does say this subject is on, which is the other half of the pair.
+    expect(plan.textContent).toMatch(/Band/);
+    expect(plan.textContent).toMatch(/On/);
+    expect(plan.textContent).not.toMatch(/no subject is on/i);
+    expect(plan.textContent).toMatch(/no subject that gets a weekly review is on/i);
+  });
+
+  it('keeps the instruction on a DRAFT child’s planner, where the toggle works', async () => {
+    const draftRiley = familyWith({ ...archivedRiley, status: 'draft' });
+    renderPage(<LearningPlannerPage />, { api: noSubjectOnApi(draftRiley) });
+    const plan = await screen.findByRole('region', { name: /learning plan for riley/i });
+    await within(plan).findByRole('region', { name: /coming up for riley/i });
+    expect(plan.textContent).toMatch(/turn on at least one subject/i);
+    expect(plan.textContent).not.toMatch(/can’t be turned on or off/i);
+    for (const box of within(plan).getAllByRole('checkbox')) {
+      expect(box).toHaveProperty('disabled', false);
+    }
+  });
+});
+
+/**
  * G-THIRD-NOTICE: the portal has THREE deletion notices off the same `deletionPending` flag, and
  * G-I3-WEB corrected two. `deletionPending` carries no requester — GET /v1/family computes it from
  * the open request's scope and target and never exposes `deletion_requests.requested_by`
@@ -392,15 +493,104 @@ describe('[HUNT6-H-4] the draft notice does not claim the child never had a paid
  */
 const PORTAL_SRC = resolve(import.meta.dirname, '../..');
 
-/** Every portal source file (not its tests), as { path, text }. */
-function portalSources(): { path: string; text: string }[] {
+/**
+ * Every portal source file (not its tests), as { path, text } — with COMMENTS REMOVED, so the sweeps
+ * below read what the product says to a parent and not what this repo says to the next engineer. Block
+ * comments (including JSX `{/* … *\/}`) and whole-line `//` comments go; a `//` inside a string, such
+ * as a URL, stays, because only lines that BEGIN with it are dropped (HUNT7-G-6).
+ */
+function portalCopy(): { path: string; text: string }[] {
   return readdirSync(PORTAL_SRC, { recursive: true, encoding: 'utf8' })
     .filter((rel) => /\.tsx?$/.test(rel) && !/\.test\.tsx?$/.test(rel))
-    .map((rel) => ({ path: rel, text: readFileSync(join(PORTAL_SRC, rel), 'utf8') }));
+    .map((rel) => ({
+      path: rel,
+      text: readFileSync(join(PORTAL_SRC, rel), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/^[ \t]*\/\/.*$/gm, ' '),
+    }));
 }
 
-/** The words every deletion notice leads with, and the status label the pickers print. */
-const NOTICE_MARKER = 'Data deletion under way';
+/**
+ * The deletion notice's lead sentence AS RENDERED COPY, which is what makes this a count of notices.
+ *
+ * HUNT7-G-6: the sweep used to find blocks by the bare string 'Data deletion under way', which also
+ * appears as a `return 'Data deletion under way';` inside childStatusLabel and as HomeworkPage's
+ * section aria-label — so its `notices >= 3` floor was met by a status label, an aria-label and ONE
+ * real notice, and two of the three paragraphs could be deleted with the floor still green. For the
+ * label occurrence the "paragraph" was not copy at all: `indexOf('</p>')` from it ran to the deletion
+ * notice's closing tag hundreds of lines later and was cut off by the character cap, so the block
+ * scanned was code and comments.
+ */
+const NOTICE_LEAD = '<strong>Data deletion under way.</strong>';
+
+/** How many deletion notices the portal has. Pinned exactly, so a deleted notice fails here. */
+const DELETION_NOTICES = 3;
+
+/**
+ * Attributing a deletion REQUEST to the reader, as a set rather than as the one phrase the last defect
+ * happened to use (L-057). "you asked" was all the round-6 sweep knew, so "you requested", "you’ve
+ * asked", "at your request" and "your deletion request" all passed it.
+ */
+const READER_ASKED =
+  /\byou(?:’ve|'ve| have)? (?:asked|requested|chose|started)\b|\bat your request\b|\byour (?:deletion )?request\b|\byou deleted\b/gi;
+
+/**
+ * Attributing a CHANGE to another adult (HUNT7-G-2). The actor phrase alone is not the defect — the
+ * guardian invite legitimately says "The other adult must sign in with this email" — so an offender is
+ * an actor phrase and a writing verb in ONE sentence, which is the shape of "Another guardian changed
+ * the grade to Grade 4".
+ */
+const OTHER_ADULT = /\b(?:another|the other|a second) (?:guardian|adult|parent)\b/gi;
+const WROTE_IT =
+  /\b(?:changed|changes|edited|updated|renamed|deleted|archived|asked|requested|set)\b/i;
+
+/** Where each named function of a file starts, in order. The unit the sweep below is bounded to. */
+function functionStarts(text: string): { name: string; at: number }[] {
+  return [...text.matchAll(/function (\w+)/g)].map((match) => ({
+    name: match[1]!,
+    at: match.index,
+  }));
+}
+
+/** The innermost named function a position sits in — the LAST one declared before it. */
+function enclosingFunction(text: string, at: number): string {
+  let name = '';
+  for (const start of functionStarts(text)) if (start.at < at) name = start.name;
+  return name;
+}
+
+/**
+ * The COMPONENT a match sits in: from the function declaration that encloses it to the next one, or
+ * the end of the file.
+ *
+ * L-054, and the same mechanism the lead condemned in HUNT7-G-6: a negative assertion is only as good
+ * as its window, and this one used to be a "sentence" ending at the first '.' after the match. In JSX
+ * that '.' is almost always inside an interpolation — `{drifted.join(' and ')}`,
+ * `{gradeLabel(child.gradeLevel)}` — so "Another guardian {drifted.join(' and ')} changed this profile
+ * while this form was open." was cut at `{drifted.` and the writing verb after the interpolation was
+ * never seen: the offending copy this case exists to stop passed it. Its green run depended on the
+ * accident that "changed" happened to precede the interpolation. Widening the window to the whole
+ * function cannot be evaded by moving words around inside the copy, and it costs nothing here: the
+ * portal's one legitimate actor phrase is in `InviteForm` (GuardiansPage), whose body has no writing
+ * verb at all. A future component that needs both has to say so, the way `stillSignedInCopy` is named
+ * in the case above.
+ */
+function componentAround(text: string, at: number): { name: string; body: string } {
+  const starts = functionStarts(text);
+  let from = 0;
+  let name = '';
+  let to = text.length;
+  for (const start of starts) {
+    if (start.at <= at) {
+      from = start.at;
+      name = start.name;
+    } else {
+      to = start.at;
+      break;
+    }
+  }
+  return { name, body: text.slice(from, to).replace(/\s+/g, ' ') };
+}
 
 describe('[G-THIRD-NOTICE] no deletion notice in the portal claims the reader asked for it', () => {
   it('names the open request on the planner, in the words the other two notices use', async () => {
@@ -416,36 +606,81 @@ describe('[G-THIRD-NOTICE] no deletion notice in the portal claims the reader as
     expect(within(plan).getByRole('link', { name: /contact support/i })).toBeTruthy();
   });
 
-  it('holds for every deletion notice in the portal source, so a fourth cannot slip in', () => {
+  it('holds for every deletion notice in the portal source, and counts the notices exactly', () => {
     const offenders: string[] = [];
-    let notices = 0;
-    for (const { path, text } of portalSources()) {
-      for (
-        let at = text.indexOf(NOTICE_MARKER);
-        at !== -1;
-        at = text.indexOf(NOTICE_MARKER, at + 1)
-      ) {
-        // The notice's own paragraph: to its closing tag, and never more than one block of copy.
+    const found: string[] = [];
+    for (const { path, text } of portalCopy()) {
+      for (let at = text.indexOf(NOTICE_LEAD); at !== -1; at = text.indexOf(NOTICE_LEAD, at + 1)) {
         const close = text.indexOf('</p>', at);
-        const block = text.slice(at, Math.min(close === -1 ? text.length : close, at + 900));
-        notices += 1;
-        if (/\byou asked\b/i.test(block)) offenders.push(`${path}: ${block.slice(0, 120)}`);
+        const block = text.slice(at, close === -1 ? text.length : close);
+        found.push(path);
+        // Each notice says what the response can establish: that a request covering this child's data
+        // is open. A notice that stopped saying it would fail here as loudly as one that blamed the
+        // reader.
+        if (!/deletion request covering/i.test(block))
+          offenders.push(`${path}: no open-request line`);
+        for (const match of block.matchAll(READER_ASKED)) {
+          offenders.push(`${path}: “${match[0]}” in ${block.slice(0, 90)}`);
+        }
       }
     }
     expect(offenders).toEqual([]);
-    // Not vacuous: the three notices (plus the pickers' status label) are really being read.
-    expect(notices).toBeGreaterThanOrEqual(3);
+    // Not vacuous, and not satisfied by a status label or an aria-label: these are the rendered lead
+    // sentences of the three notices, one per surface, and the count is exact in both directions.
+    expect(found).toHaveLength(DELETION_NOTICES);
+    expect([...found].sort()).toEqual([
+      'pages/app/ChildrenPage.tsx',
+      'pages/app/HomeworkPage.tsx',
+      'pages/app/LearningPlannerPage.tsx',
+    ]);
   });
 
   it('and no other portal copy tells the reader they asked for a deletion', () => {
+    /**
+     * The one sentence that may: `stillSignedInCopy` (PrivacyControlsPage) reports the outcome of the
+     * account closure the reader has just pressed in that same flow, so "Your request is recorded" is
+     * the reader's own request by construction — unlike a `deletionPending` flag, which GET /v1/family
+     * computes from the request's scope and target and serves to every adult in the family
+     * (apps/api/src/routes/family.ts). Named here rather than excluded by a narrower pattern, so a
+     * FOURTH copy still has to come past this case; asserted below, so it cannot quietly stop existing.
+     */
+    const allowedInside = 'stillSignedInCopy';
     const offenders: string[] = [];
-    for (const { path, text } of portalSources()) {
-      for (const match of text.matchAll(/\byou asked\b/gi)) {
+    const allowed: string[] = [];
+    for (const { path, text } of portalCopy()) {
+      for (const match of text.matchAll(READER_ASKED)) {
         const at = match.index;
         const around = text.slice(Math.max(0, at - 600), at + 600);
-        if (/delet/i.test(around)) offenders.push(`${path}:${at} ${match[0]}`);
+        if (!/delet/i.test(around)) continue;
+        const enclosing = enclosingFunction(text, at);
+        (enclosing === allowedInside ? allowed : offenders).push(`${path}:${at} ${match[0]}`);
       }
     }
     expect(offenders).toEqual([]);
+    expect(allowed).toHaveLength(1);
+  });
+
+  it('and no portal copy attributes a change to an adult the response cannot name', () => {
+    // HUNT7-G-2: GET /v1/family carries no actor — `familyChildSchema` and
+    // `familyOverviewResponseSchema` are strict objects with no such field
+    // (packages/contracts/src/family.ts) and the route selects no such column — so no copy driven by
+    // it may name one. Two writers that are not another guardian reach the same diff: the reader on
+    // the phone app or a second tab, and the reader's own save whose reload failed.
+    //
+    // L-054: bounded to the enclosing COMPONENT, not to a sentence — see `componentAround` for the
+    // interpolation that made a sentence window evadable by the very copy this case exists to stop.
+    const offenders: string[] = [];
+    const scanned: string[] = [];
+    for (const { path, text } of portalCopy()) {
+      for (const match of text.matchAll(OTHER_ADULT)) {
+        const { name, body } = componentAround(text, match.index);
+        scanned.push(`${path}:${name}`);
+        if (WROTE_IT.test(body)) offenders.push(`${path}: ${name}: ${match[0]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Not vacuous: the portal's one legitimate actor phrase is still there and still being read, so a
+    // sweep that stopped matching anything at all would fail here.
+    expect(scanned).toEqual(['pages/app/GuardiansPage.tsx:InviteForm']);
   });
 });

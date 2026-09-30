@@ -219,13 +219,26 @@ function EditFamilyForm({
   const nothingEdited = Object.keys(changes(name.trim(), timezone.trim())).length === 0;
 
   /**
-   * What another guardian changed while this form was open: the live prop against the seed
-   * (HUNT6-G-8). Without this the divergence was invisible — the summary above the form showed the
-   * new value, the field showed the old one, and nothing said the two were about the same thing.
+   * What changed under this form since it was seeded: the live prop against the seed (HUNT6-G-8).
+   * Without this the divergence was invisible — the summary above the form showed the new value, the
+   * field showed the old one, and nothing said the two were about the same thing.
+   *
+   * HUNT7-G-2: it says WHAT changed and not WHO changed it, because the response cannot carry a who.
+   * `familyOverviewResponseSchema` is a strict object with no actor field
+   * (packages/contracts/src/family.ts) and GET /v1/family selects no actor column
+   * (apps/api/src/routes/family.ts). "Another guardian changed …" was asserted for any difference,
+   * including the reader's own change on the phone app or a second tab, and — the path this file's own
+   * [HUNT5-F-1] case walks — their own save whose RELOAD failed: `useLastGood` keeps the pre-save
+   * values, the reopened form is seeded from them, and the retry's good GET lands the parent's own new
+   * name under it as "drift". For a one-guardian family the sentence additionally asserted that a
+   * second adult can write to the family, which this page cannot establish. Reseeding the form instead
+   * is NOT the fix (BUG-330: the value on screen becomes unsavable), so only the actor claim goes.
    */
   const drifted = [
-    ...(data.displayName === seed.displayName ? [] : [`the family name to “${data.displayName}”`]),
-    ...(data.timezone === seed.timezone ? [] : [`the time zone to ${data.timezone}`]),
+    ...(data.displayName === seed.displayName
+      ? []
+      : [`the family name is now “${data.displayName}”`]),
+    ...(data.timezone === seed.timezone ? [] : [`the time zone is now ${data.timezone}`]),
   ];
 
   const submit = async (event: FormEvent) => {
@@ -291,10 +304,10 @@ function EditFamilyForm({
       {drifted.length > 0 ? (
         <p className="notice" role="note" style={{ margin: '8px 0 0' }}>
           <strong>
-            Another guardian changed {drifted.join(' and ')} while this form was open.
+            This family changed somewhere else while this form was open: {drifted.join(' and ')}.
           </strong>{' '}
           The fields above still show what you opened. Saving sends only the fields you edit here,
-          so their change stays unless you edit that field too.
+          so that change stays unless you edit that field too.
         </p>
       ) : null}
       <div style={buttonRow}>

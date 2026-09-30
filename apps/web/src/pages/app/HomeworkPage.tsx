@@ -27,11 +27,17 @@ import {
   correctTranscriptionResponseSchema,
   homeworkImageSizeProblem,
   homeworkRubricSchema,
+  ARCHIVED_CHILD_NO_CORRECTION_COPY,
   ARCHIVED_CHILD_NO_NEW_SCAN_COPY,
   ARCHIVED_CHILD_SCAN_COPY,
   CONSENT_WITHDRAWN_SCAN_COPY,
+  INACTIVE_CHILD_NO_CORRECTION_COPY,
   INACTIVE_CHILD_NO_NEW_SCAN_COPY,
   INACTIVE_CHILD_SCAN_COPY,
+  NO_CORRECTION_WITHOUT_ACTIVE_PROFILE_COPY,
+  NO_NEW_SCAN_WITHOUT_ACTIVE_PROFILE_COPY,
+  PROVIDER_UNAVAILABLE_SCAN_COPY,
+  PROVIDER_UNAVAILABLE_SCAN_OUTCOME,
   homeworkScanFits,
   overrideResultResponseSchema,
   uploadLimitsResponseSchema,
@@ -142,11 +148,18 @@ const STATUS_COPY: Record<AssignmentStatus, { label: string; explain: (name: str
  * what the parent can do next; the code itself is never shown, and a code with no line here falls
  * back to the state's own copy (JOBS-R2-02, JOBS-R2-06).
  */
+/**
+ * Shared by SCAN_TOO_MANY_QUESTIONS and STAGE_LIMIT, which are one outcome with two codes: the stage
+ * cap refused the request, before it was sent (STAGE_LIMIT) or after the answer was cut off
+ * (SCAN_TOO_MANY_QUESTIONS). Splitting the worksheet is the remedy for both (HUNT7-I-3).
+ */
+const TOO_MANY_QUESTIONS_COPY =
+  'This worksheet has more questions than one check can handle, so its pages were given back. Split it into two scans with fewer pages each.';
+
 const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
   FORMAT_NEEDS_CONVERSION:
     'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back. Scan the pages again as JPEG or PNG photos.',
-  SCAN_TOO_MANY_QUESTIONS:
-    'This worksheet has more questions than one check can handle, so its pages were given back. Split it into two scans with fewer pages each.',
+  SCAN_TOO_MANY_QUESTIONS: TOO_MANY_QUESTIONS_COPY,
   AI_PAUSED_TOO_LONG:
     'PencilLift could not check this scan in time and its pages were given back. Send the pages again.',
   // CS-R4-03: a scan the family's own consent withdrawal stopped. The generic line is untrue twice
@@ -161,6 +174,18 @@ const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
   // this list. Wording in the contract, beside the consent line, for the same reason.
   CHILD_ARCHIVED: ARCHIVED_CHILD_SCAN_COPY,
   CHILD_NOT_ACTIVE: INACTIVE_CHILD_SCAN_COPY,
+  // HUNT7-I-3: the pre-flight admission refusal. `runStage` refuses attempt 1 outright with
+  // STAGE_LIMIT and ZERO provider calls when the request is too large for the stage's cap
+  // (packages/ai/src/run.ts, priced in packages/ai/src/routing.ts), which scan-process.ts converts
+  // to a PermanentFailure. The pages were never read, "several tries" never happened, and the one
+  // thing that works is the SCAN_TOO_MANY_QUESTIONS remedy — the same sentence, deliberately shared,
+  // because routing.ts's own comment records a bare STAGE_LIMIT as the case with no copy of its own.
+  STAGE_LIMIT: TOO_MANY_QUESTIONS_COPY,
+  // HUNT7-I-3: the three operator-side refusals. See PROVIDER_UNAVAILABLE_SCAN_COPY
+  // (packages/contracts/src/privacy.ts) for where each is thrown and why no parent action helps.
+  AI_NOT_AVAILABLE: PROVIDER_UNAVAILABLE_SCAN_COPY,
+  MODERATION_NOT_AVAILABLE: PROVIDER_UNAVAILABLE_SCAN_COPY,
+  UNKNOWN_MODEL: PROVIDER_UNAVAILABLE_SCAN_COPY,
 };
 
 /**
@@ -179,17 +204,100 @@ const FAILED_FINAL_COPY: Readonly<Record<string, string>> = {
  * code that runs out of attempts all reach it too (apps/api/src/jobs/scan-process.ts), as does a row
  * that recorded no code at all. The state's own line is the answer for all of them, so no future code
  * has to be added here to stay covered.
+ *
+ * HUNT7-I-1 / HUNT7-E-2: each entry has TWO parts, because the round-6 trim took the whole second
+ * half of the line — the requirement as well as the instruction. `outcome` is what happened, with the
+ * "scan again" imperative gone; `then` is the same outcome's own requirement, kept, and moved behind
+ * the profile step so it reads as what becomes possible once that step is done rather than as
+ * something to do now. `failed_final` and `uploading` have no `then`: neither names a requirement of
+ * the pages, so there is nothing to defer.
  */
-const OUTCOME_WITHOUT_NEW_SCAN_ADVICE: Readonly<Record<string, string>> = {
-  needs_rescan:
-    'Some pages were hard to read (blur, glare, rotation or cut-off edges), and PencilLift will not guess.',
-  uploading: 'Pages are still being sent. If sending stopped, it can’t be finished from here.',
-  failed_final: 'This scan could not be processed after several tries.',
-  FORMAT_NEEDS_CONVERSION:
-    'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back.',
-  SCAN_TOO_MANY_QUESTIONS:
+/** The one outcome SCAN_TOO_MANY_QUESTIONS and STAGE_LIMIT share, trimmed (HUNT7-I-1, HUNT7-I-3). */
+const TOO_MANY_QUESTIONS_OUTCOME = {
+  outcome:
     'This worksheet has more questions than one check can handle, so its pages were given back.',
-  AI_PAUSED_TOO_LONG: 'PencilLift could not check this scan in time and its pages were given back.',
+  then: 'Once the profile is active, this worksheet can be checked as two scans with fewer pages each.',
+} as const;
+
+const OUTCOME_WITHOUT_NEW_SCAN_ADVICE: Readonly<
+  Record<string, { readonly outcome: string; readonly then?: string }>
+> = {
+  needs_rescan: {
+    outcome:
+      'Some pages were hard to read (blur, glare, rotation or cut-off edges), and PencilLift will not guess.',
+    then: 'Once the profile is active, PencilLift can check these pages from a clearer photo.',
+  },
+  uploading: {
+    outcome: 'Pages are still being sent. If sending stopped, it can’t be finished from here.',
+  },
+  failed_final: { outcome: 'This scan could not be processed after several tries.' },
+  FORMAT_NEEDS_CONVERSION: {
+    outcome:
+      'PencilLift can’t read PDF or HEIC files yet, so this scan was not checked and its pages were given back.',
+    then: 'Once the profile is active, PencilLift can check these pages as JPEG or PNG photos.',
+  },
+  SCAN_TOO_MANY_QUESTIONS: TOO_MANY_QUESTIONS_OUTCOME,
+  // HUNT7-I-3: STAGE_LIMIT is the SAME outcome as SCAN_TOO_MANY_QUESTIONS and belongs in BOTH tables
+  // with it. Giving it the split-the-worksheet line in FAILED_FINAL_COPY alone would have handed a
+  // non-active child's parent that imperative through path 2, which is the very advice HUNT6-H-2
+  // removed — one outcome, two codes, one entry each side.
+  STAGE_LIMIT: TOO_MANY_QUESTIONS_OUTCOME,
+  AI_PAUSED_TOO_LONG: {
+    outcome: 'PencilLift could not check this scan in time and its pages were given back.',
+    then: 'Once the profile is active, these pages can go for checking again.',
+  },
+  /*
+    HUNT7-I-3 (repair): the three operator-side codes belong in BOTH tables too, for the opposite
+    reason to STAGE_LIMIT's. Their line asks for nothing, so it was left out of this table — but what
+    it DOES do is explain why every scan stops, and for a child who cannot scan at all that explanation
+    is wrong and the page contradicts itself: the row said "Sending these pages again would stop the
+    same way until that is fixed. There is nothing for you to change" under this page's own "Riley's
+    profile is archived, so new scans are not taken … Activate Riley again on the Children page to scan
+    homework". That child's scans stop at `assertCanCollect` before any provider is reached and go on
+    stopping after the outage is fixed. The OUTCOME — the pages came back, the photos were fine, it
+    stopped on PencilLift's side — is true for them, so it is what survives, and the profile's own
+    blocker follows it. No `then`: nothing about these pages is a requirement to defer.
+  */
+  AI_NOT_AVAILABLE: { outcome: PROVIDER_UNAVAILABLE_SCAN_OUTCOME },
+  MODERATION_NOT_AVAILABLE: { outcome: PROVIDER_UNAVAILABLE_SCAN_OUTCOME },
+  UNKNOWN_MODEL: { outcome: PROVIDER_UNAVAILABLE_SCAN_OUTCOME },
+};
+
+/**
+ * The ONE reading of the profile status that every region of this page blocks on, so that no two of
+ * them can key the same profile differently (HUNT7-I-6). `null` is "this child can scan"; everything
+ * else is a reason they cannot, and the three reasons are the three the copy tables below are written
+ * for.
+ *
+ * The test is `=== 'active'`, not `!== 'archived'`: POST /v1/assignments and
+ * POST /v1/questions/:id/correction both reach `readPaidProfile`, whose `entitled` requires
+ * `status = 'active'` plus an unreleased paid slot (apps/api/src/routes/homework.ts), so a status this
+ * page has never heard of is refused exactly like the two it knows — and must not be DESCRIBED as
+ * either of them. That fall-through is what was missing: the uploader treated every non-active status
+ * as a missing paid slot while the rows printed a blocker only for 'archived' and 'draft', so a value
+ * outside the pair got a reason in one region and none in the other.
+ */
+type ScanBlocker = 'archived' | 'no-paid-slot' | 'not-active';
+
+function scanBlocker(childStatus?: string): ScanBlocker | null {
+  if (childStatus === 'active') return null;
+  if (childStatus === 'archived') return 'archived';
+  if (childStatus === 'draft') return 'no-paid-slot';
+  return 'not-active';
+}
+
+/** The row-level line for each blocker, shared with the app through the contract package. */
+const NO_NEW_SCAN_COPY: Readonly<Record<ScanBlocker, string>> = {
+  archived: ARCHIVED_CHILD_NO_NEW_SCAN_COPY,
+  'no-paid-slot': INACTIVE_CHILD_NO_NEW_SCAN_COPY,
+  'not-active': NO_NEW_SCAN_WITHOUT_ACTIVE_PROFILE_COPY,
+};
+
+/** The correction panel's line for each blocker, keyed by the same value. */
+const NO_CORRECTION_COPY: Readonly<Record<ScanBlocker, string>> = {
+  archived: ARCHIVED_CHILD_NO_CORRECTION_COPY,
+  'no-paid-slot': INACTIVE_CHILD_NO_CORRECTION_COPY,
+  'not-active': NO_CORRECTION_WITHOUT_ACTIVE_PROFILE_COPY,
 };
 
 /**
@@ -202,9 +310,9 @@ const OUTCOME_WITHOUT_NEW_SCAN_ADVICE: Readonly<Record<string, string>> = {
  * child under an open deletion), so the advice sat directly under this page's own "new scans are not
  * taken" notice.
  *
- * Only 'archived' and 'draft' are named: those are the two non-active values the family contract has
- * (packages/contracts/src/family.ts), and each names its own blocker. An unrecognised status keeps the
- * generic copy rather than asserting a reason — "no paid slot" — that might not be true of it.
+ * 'archived' and 'draft' each name their own blocker, because those are the two non-active values the
+ * family contract has today (packages/contracts/src/family.ts); anything else gets the fall-through,
+ * which asserts neither reason.
  *
  * G-H2: the lookup is by code AND THEN by state, which is the whole point. Keying it on the code alone
  * meant a code in neither table — PROCESSING_ERROR and the rest, see the table above — walked past
@@ -212,11 +320,8 @@ const OUTCOME_WITHOUT_NEW_SCAN_ADVICE: Readonly<Record<string, string>> = {
  * entry answers every such row, so the advice cannot come back through a code nobody listed.
  */
 function noNewScanCopy(childStatus?: string): string | null {
-  return childStatus === 'archived'
-    ? ARCHIVED_CHILD_NO_NEW_SCAN_COPY
-    : childStatus === 'draft'
-      ? INACTIVE_CHILD_NO_NEW_SCAN_COPY
-      : null;
+  const blocker = scanBlocker(childStatus);
+  return blocker === null ? null : NO_NEW_SCAN_COPY[blocker];
 }
 
 /**
@@ -231,6 +336,38 @@ function noNewScanCopy(childStatus?: string): string | null {
  * already ("Delayed", "Could not finish"), and an ACTIVE child keeps this one, because for them a new
  * scan is the next step.
  */
+/**
+ * HUNT7-I-2: why "Fix transcription" is not offered, and it is a TRUE sentence for every reason it can
+ * be missing. The control has two independent blockers and the panel used to name only one of them:
+ * the assignment status, so a finished scan of an archived or slotless child offered the button and
+ * the save was refused by `assertCanCollect` with "Assign a paid slot to this child before scanning
+ * homework" — in reply to a correction, and on a `needs_parent_review` row whose own explanation asks
+ * the parent to open the scan and check the answers. Keyed the same way `noNewScanCopy` is, and the
+ * final branch is the fall-through: any status this page does not recognise is non-active as far as
+ * the correction route is concerned, so it gets a line that states the requirement without asserting
+ * which of the two named reasons applies.
+ */
+function whyNotCorrectable(status: AssignmentStatus, childStatus: string): string {
+  /*
+    The PROFILE is tested first (the repair). With the status branch first, a non-active child whose
+    scan was terminal or mid-flight read "Transcriptions can be fixed once checking has finished" — and
+    GET /v1/assignments/:id calls readParentQuestions with no status filter, while questions are
+    persisted at extraction, so a `checking`, `verifying` or `failed_final` row really does render
+    QuestionCards. That sentence promised SUFFICIENCY the profile does not grant: finishing the check
+    changes nothing for an archived or slotless child, whose blocker is the one that survives it.
+
+    And the status sentence itself no longer promises. `CORRECTABLE_ASSIGNMENT_STATUSES` is
+    ['ready', 'needs_parent_review'] and `failed_final` is in no resume set
+    (packages/contracts/src/homework.ts), so for that row the check will never finish; and even a
+    `checking` row may end in `needs_rescan` or `failed_final` rather than in a correctable state. So
+    the line states the NECESSARY condition and stops — the shape HUNT7-G-5 settled on for the pairing
+    notice — which is also true of any status this page has never heard of.
+  */
+  const blocker = scanBlocker(childStatus);
+  if (blocker !== null) return NO_CORRECTION_COPY[blocker];
+  return 'A transcription can be fixed only on a scan PencilLift has finished checking.';
+}
+
 function statusLabel(status: AssignmentStatus, childStatus?: string): string {
   if (status === 'needs_rescan' && noNewScanCopy(childStatus) !== null) return 'Couldn’t be read';
   return STATUS_COPY[status].label;
@@ -243,16 +380,31 @@ function explainStatus(
 ): string {
   const blocked = noNewScanCopy(childStatus);
   const code = assignment.status === 'failed_final' ? assignment.errorCode : null;
-  // 1. A code whose own line ENDS in the advice this replaces (three of FAILED_FINAL_COPY's six), so
+  /**
+   * HUNT7-I-1 / HUNT7-E-2: what the trimming leaves out is the IMPERATIVE, never the condition that
+   * made the advice true. `outcome` says what happened, `blocked` says what stands in the way and
+   * where the parent acts, and `then` restates the outcome's own requirement as what becomes possible
+   * after that step — so a parent who activates the profile and re-sends the same PDF, the same
+   * oversized worksheet or the same blurred photos has been told, on the screen they acted from, why
+   * that will fail again. Composed in that order so nothing between the blocker and its action can be
+   * read as a promise about THESE pages.
+   */
+  const composed = (entry: { outcome: string; then?: string }, why: string): string =>
+    entry.then === undefined ? `${entry.outcome} ${why}` : `${entry.outcome} ${why} ${entry.then}`;
+  // 1. A code whose own line ENDS in the advice this replaces (four of FAILED_FINAL_COPY's ten: the
+  //    two format/size codes, AI_PAUSED_TOO_LONG, and STAGE_LIMIT, which shares one of them), so
   //    it is trimmed before that table can print it.
   if (blocked !== null && code !== null) {
     const trimmed = OUTCOME_WITHOUT_NEW_SCAN_ADVICE[code];
-    if (trimmed !== undefined) return `${trimmed} ${blocked}`;
+    if (trimmed !== undefined) return composed(trimmed, blocked);
   }
   // 2. A code with a line of its own and no such advice keeps it whole. CHILD_ARCHIVED and
   //    CHILD_NOT_ACTIVE already name this very profile as the blocker, and CONSENT_REQUIRED names
   //    consent, a prior blocker of its own whose remedy the parent still needs; each says what to do
-  //    before scanning again rather than asking for a scan now.
+  //    before scanning again rather than asking for a scan now. HUNT7-I-3's three operator-side codes
+  //    reach this arm for an ACTIVE child only: their full line explains why every scan stops, which
+  //    is true for a child who can scan and false for one who cannot, so for a blocked profile the
+  //    entry above trims it to the outcome and path 1 appends that profile's own blocker.
   if (code !== null) {
     const copy = FAILED_FINAL_COPY[code];
     if (copy !== undefined) return copy;
@@ -261,7 +413,7 @@ function explainStatus(
   //    which is what used to fall through to the generic advice below.
   if (blocked !== null) {
     const trimmed = OUTCOME_WITHOUT_NEW_SCAN_ADVICE[assignment.status];
-    if (trimmed !== undefined) return `${trimmed} ${blocked}`;
+    if (trimmed !== undefined) return composed(trimmed, blocked);
   }
   return STATUS_COPY[assignment.status].explain(name);
 }
@@ -979,11 +1131,43 @@ function progressCopy(state: { phase: UploadPhase; done: number; total: number }
 /** Why new scans can’t start for this child right now, or null. Never offers a purchase. */
 function uploadBlockedReason(child: FamilyChild, allowance: PageAllowance | null): ReactNode {
   const name = child.nickname;
-  if (child.status !== 'active') {
+  const blocker = scanBlocker(child.status);
+  if (blocker !== null) {
+    // HUNT7-I-6: the same hedge the page's three other draft remedies carry. "You can set that up on
+    // the Children page" promised capacity this portal cannot sell (WEB-R1-04): POST
+    // /v1/children/:id/activate assigns only an unused verified slot and answers BUSINESS_RULE
+    // NEEDS_PAID_SLOT when the family has none (packages/contracts/src/family.ts), so with no free
+    // slot there is nothing to set up there. A draft child renders this region AND the Scans card at
+    // once, so the unhedged sentence sat beside INACTIVE_CHILD_NO_NEW_SCAN_COPY's hedged one and the
+    // hedged `NoScans` line.
+    //
+    // And it is keyed on `scanBlocker` (the repair), not on `!== 'active'` with one sentence for all of
+    // them: this branch used to say "needs a paid child slot" for EVERY non-active status, while
+    // `noNewScanCopy` printed a blocker only for 'archived' and 'draft' — so for any other value this
+    // region asserted a reason the rows beside it did not support and the rows asserted none. One value
+    // decides both now. 'archived' is here for completeness: that profile gets the "Scanning paused"
+    // notice in place of this whole region (WEBR4-10), so this arm is not reached for it today.
+    if (blocker === 'no-paid-slot') {
+      return (
+        <>
+          {name} needs a paid child slot before homework can be scanned. Assign one of your family’s
+          unused paid slots to this profile on the <Link to="/app/children">Children page</Link>,
+          while one is free.
+        </>
+      );
+    }
+    if (blocker === 'archived') {
+      return (
+        <>
+          {name}’s profile is archived, so homework can’t be scanned for them. Activate {name} again
+          on the <Link to="/app/children">Children page</Link>, while a paid slot is free.
+        </>
+      );
+    }
     return (
       <>
-        {name} needs a paid child slot before homework can be scanned. You can set that up on the{' '}
-        <Link to="/app/children">Children page</Link>.
+        {name}’s profile is not active, so homework can’t be scanned for them. You can check this
+        profile on the <Link to="/app/children">Children page</Link>.
       </>
     );
   }
@@ -1014,14 +1198,16 @@ function uploadBlockedReason(child: FamilyChild, allowance: PageAllowance | null
  * It is the two-regions-disagree defect HUNT6-H-2 and G-H2 closed for this list's ROWS, left in the
  * branch that renders when there are none.
  *
- * Split the same way as `uploadBlockedReason` — archived, then every other non-active status —
- * because this sentence is about that region: "no paid slot" is the reason it gives for all of them,
- * and it asserts no history of the slot, since a draft may never have held one or may have lost one
- * to a downgrade (`releaseSlotlessProfiles`, apps/api/src/services/billing-sync.ts).
+ * Keyed on `scanBlocker`, the one value `uploadBlockedReason` and `noNewScanCopy` also read, so the
+ * three regions of this screen cannot give one profile three readings (HUNT7-I-6). The draft line
+ * asserts no history of the slot, since a draft may never have held one or may have lost one to a
+ * downgrade (`releaseSlotlessProfiles`, apps/api/src/services/billing-sync.ts), and the fall-through
+ * asserts no reason at all.
  */
 function NoScans({ child }: { child: FamilyChild }) {
   const name = child.nickname;
-  if (child.status === 'active') {
+  const blocker = scanBlocker(child.status);
+  if (blocker === null) {
     return (
       <p>
         No scans for {name} yet. Add one above, or {name} can scan homework in the PencilLift app on
@@ -1032,18 +1218,24 @@ function NoScans({ child }: { child: FamilyChild }) {
   return (
     <p>
       No scans for {name}.{' '}
-      {child.status === 'archived'
+      {blocker === 'archived'
         ? `PencilLift takes no new scans while ${name}’s profile is archived, and their paired devices are signed out, so none can be added here or in the app. `
-        : `PencilLift takes no new scans while ${name} has no paid slot, so none can be added here or in the app. `}
-      {child.status === 'archived' ? (
+        : blocker === 'no-paid-slot'
+          ? `PencilLift takes no new scans while ${name} has no paid slot, so none can be added here or in the app. `
+          : `PencilLift takes no new scans while ${name}’s profile is not active, so none can be added here or in the app. `}
+      {blocker === 'archived' ? (
         <>
           Activate {name} again on the <Link to="/app/children">Children page</Link>, while a paid
           slot is free
         </>
-      ) : (
+      ) : blocker === 'no-paid-slot' ? (
         <>
           Assign one of your family’s unused paid slots to this profile on the{' '}
           <Link to="/app/children">Children page</Link>, while one is free
+        </>
+      ) : (
+        <>
+          Check this profile on the <Link to="/app/children">Children page</Link>
         </>
       )}
       , and new scans will appear here as they are processed.
@@ -1384,7 +1576,14 @@ function AssignmentDetail({
 }: {
   assignmentId: string;
   childName: string;
-  /** HUNT6-H-2: the same status the list rows use, so the panel does not ask for a refused rescan. */
+  /**
+   * HUNT6-H-2: the same status the list rows use, so the panel does not ask for a refused rescan.
+   *
+   * HUNT7-I-2: and so it does not OFFER one either. The prop reached the label and the explanation
+   * only, while the correction control — which re-checks the work through the same gate a new scan
+   * goes through — was still decided by the assignment status alone. It is part of `correctable`
+   * below now, and of the reason printed when that is false.
+   */
   childStatus: string;
   onChanged: () => void;
 }) {
@@ -1463,9 +1662,16 @@ function AssignmentDetail({
                   question={q}
                   solution={solutions?.get(q.id) ?? null}
                   solutionsShown={solutions !== null}
-                  correctable={CORRECTABLE_ASSIGNMENT_STATUSES.includes(
-                    query.data.assignment.status,
-                  )}
+                  // HUNT7-I-2: the STATUS is part of the decision, not only of the label beside it.
+                  // POST /v1/questions/:id/correction queues a paid AI re-check and goes through the
+                  // same `assertCanCollect` → `readPaidProfile` gate as a new scan, whose `entitled`
+                  // requires `status = 'active'` (apps/api/src/routes/homework.ts). "active" rather
+                  // than "not archived", so a status this page has never heard of fails closed.
+                  correctable={
+                    childStatus === 'active' &&
+                    CORRECTABLE_ASSIGNMENT_STATUSES.includes(query.data.assignment.status)
+                  }
+                  whyNotCorrectable={whyNotCorrectable(query.data.assignment.status, childStatus)}
                   onChanged={refresh}
                 />
               ))}
@@ -1491,6 +1697,7 @@ function QuestionCard({
   solution,
   solutionsShown = false,
   correctable,
+  whyNotCorrectable,
   onChanged,
 }: {
   question: ParentQuestion;
@@ -1498,6 +1705,11 @@ function QuestionCard({
   /** True once the parent unlocked and loaded the solutions for this scan. */
   solutionsShown?: boolean;
   correctable: boolean;
+  /**
+   * The true reason the correction control is not offered, for whichever of its two blockers applies
+   * (HUNT7-I-2). Read only when `correctable` is false, and never a guess: see `whyNotCorrectable`.
+   */
+  whyNotCorrectable: string;
   onChanged: () => void;
 }) {
   const [mode, setMode] = useState<'view' | 'override' | 'correct'>('view');
@@ -1596,9 +1808,7 @@ function QuestionCard({
         ) : null}
       </div>
       {!correctable ? (
-        <p style={{ margin: '4px 0', fontSize: '0.9rem' }}>
-          Transcriptions can be fixed once checking has finished.
-        </p>
+        <p style={{ margin: '4px 0', fontSize: '0.9rem' }}>{whyNotCorrectable}</p>
       ) : null}
       {mode === 'override' && result ? (
         <OverrideForm

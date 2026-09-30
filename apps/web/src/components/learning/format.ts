@@ -167,3 +167,26 @@ export function choiceLetter(index: number): string {
 export function questionsLabel(count: number): string {
   return `${count} ${count === 1 ? 'question' : 'questions'}`;
 }
+
+/**
+ * Whether PencilLift prepares practice and weekly reviews for a profile in this state — the ONE
+ * definition of that question for the whole planner, because two cards in one page region were
+ * answering it differently and telling the parent opposite things (found on the re-check of round-7
+ * stage 3, and it is the two-sections-disagree defect of BUST-282 / HUNT5-F-10 for the fourth time).
+ *
+ * It is `active`, and four statements in the product decide it, none of which is about whether the
+ * parent may EDIT anything:
+ *   * `loadChildContext` (apps/api/src/jobs/learning-jobs.ts) returns null unless the child is active,
+ *     for every caller except routes/learning.ts's preview, which passes `requireActive: false`;
+ *   * the nightly sweep selects `where c.status = 'active'`;
+ *   * the practice-set insert re-checks `status = 'active'` under FOR SHARE;
+ *   * `app.current_child_id()` refuses a non-active child's own device.
+ *
+ * So `readOnly` is NOT this question. A draft profile is writable on purpose — its subjects, schedule
+ * and test dates can all be changed while the parent waits for a paid slot — and it still receives
+ * nothing. Any card that promises future practice answers to THIS, and any card that enables or
+ * disables a control answers to `readOnly`. Keeping them apart is the whole point.
+ */
+export function receivesPractice(childStatus: string | undefined): boolean {
+  return childStatus === 'active';
+}

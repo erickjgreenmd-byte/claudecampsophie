@@ -496,7 +496,7 @@ describe('[HUNT6-G-5] a status change closes the archive confirmation, not just 
 });
 
 describe('[HUNT6-G-8] the grade the form is showing can still be saved after a concurrent change', () => {
-  it('re-enables Save when the parent puts the grade back, and names what the other guardian changed', async () => {
+  it('re-enables Save when the parent puts the grade back, and names what changed under the form', async () => {
     // HUNT5-F-1 stopped the silent revert by diffing against the seed, and in doing so made the
     // value the parent can SEE unsavable: the select still reads Grade 3, the card above it reads
     // Grade 4, and no sequence of keystrokes could enable Save for Grade 3 — the diff against the
@@ -536,9 +536,12 @@ describe('[HUNT6-G-8] the grade the form is showing can still be saved after a c
       'disabled',
       true,
     );
+    // HUNT7-G-2: the value that landed, and that it did not land in this form — not an actor the
+    // response cannot name.
     expect(
-      within(reloaded).getByText(/another guardian changed the grade to Grade 4/i),
+      within(reloaded).getByText(/this profile changed somewhere else while this form was open/i),
     ).toBeTruthy();
+    expect(within(reloaded).getByText(/the grade is now Grade 4/i)).toBeTruthy();
 
     // The parent puts the grade back to the one the form is showing them.
     const grade = within(reloaded).getByLabelText(/grade/i);
@@ -633,6 +636,18 @@ describe('[G-PROSE] one status change closes every open panel, and clears it', (
     expect(within(reloaded).queryByText('ABCD-EFGH')).toBeNull();
     expect(within(reloaded).getByText(/can’t connect a device/i)).toBeTruthy();
     expect(sends.filter((c) => c.path.endsWith('/pairing-code'))).toHaveLength(1);
+
+    // HUNT7-G-5: the notice states the condition this page can speak for — a profile that is not
+    // active never redeems a code — and NOT the converse. /pair's claim also requires an unconsumed,
+    // unexpired code and then verified consent (apps/api/src/routes/child-auth.ts), and a consent
+    // withdrawal consumes every live code for the family while leaving `child_profiles.status` alone
+    // (apps/api/src/routes/guardians.ts; the SQL-flip case in
+    // apps/api/tests/consent-withdrawal.review.test.ts pairs an ACTIVE child's UNCONSUMED code and
+    // gets CONSENT_REQUIRED). This page reads only GET /v1/family, so it cannot see any of that — and
+    // must not promise that the next code will connect.
+    expect(reloaded.textContent).not.toMatch(/only redeemed for a profile that is active/i);
+    expect(reloaded.textContent).toMatch(/never redeemed for a profile that is not active/i);
+    expect(reloaded.textContent).toMatch(/checked against your family’s consent too/i);
   });
 
   it('clears the archive confirmation rather than hiding it, so it cannot reopen itself', async () => {
@@ -695,5 +710,325 @@ describe('[G-I3-WEB] the deletion notice does not tell the reader they asked for
     // The rest of the notice is unchanged: what is true, and where a mistake is handled.
     expect(within(riley).getByRole('link', { name: /privacy page/i })).toBeTruthy();
     expect(within(riley).getByRole('link', { name: /contact support/i })).toBeTruthy();
+  });
+});
+
+/**
+ * HUNT7-G-1: the card's feedback was the first arm of a three-way ternary — `code === null ?
+ * <ActionFeedback/> : code === 'stale' ? <stale notice> : <PairingCodePanel/>` — and ActionFeedback is
+ * the only renderer of this card's feedback and the only place StepUpNotice -> StepUpPrompt can appear
+ * (apps/web/src/pages/app/SecurityPage.tsx, apps/web/src/components/StepUpPrompt.tsx). So whenever the
+ * card held a code, every outcome of activate(), archive(), saveProfile() and createCode() was
+ * discarded: the success line, an ErrorState for a business rule or a network failure, and the inline
+ * PIN field. Round 6 made that window reachable with no press on this card and standing until the
+ * parent presses Done, and it exists exactly on the cards whose only offered control is "Activate
+ * {nickname} again" — a control whose routine refusal is STEP_UP_REQUIRED, because
+ * POST /v1/children/:childId/activate calls assertRecentUnlock (apps/api/src/routes/family.ts) and an
+ * unlock lasts a few minutes. WEBR4-01 exists because an archived child with no way back loses their
+ * device access, and WEB-R2-05 exists so the PIN is entered on the page the parent is already on.
+ *
+ * HUNT7-G-7: and the same describe pins the other half of the pairing rule — a code that arrives AFTER
+ * the status moved. Synthetic names only.
+ */
+describe('[HUNT7-G-1] no panel on the card is the reason a refusal is invisible', () => {
+  const rileyAt = (
+    status: 'active' | 'archived',
+    extra: { deletionPending?: true } = {},
+  ): FamilyOverview['children'][number] => ({
+    id: RILEY,
+    nickname: 'Riley',
+    gradeLevel: 3,
+    ageBand: '8-10',
+    status,
+    ...extra,
+  });
+
+  /**
+   * One card's fake: GET answers whatever `serving.current` holds, `/pairing-code` resolves through
+   * `code` (a promise the test can hold open), and `/activate` can refuse the way the server routinely
+   * does.
+   */
+  function cardApi(
+    serving: { current: FamilyOverview },
+    options: {
+      activateFails?: () => ApiRequestError;
+      code?: () => Promise<{ code: string; expiresAt: string }>;
+    } = {},
+  ): { api: Partial<ApiClient>; sends: Call[] } {
+    const sends: Call[] = [];
+    const api: Partial<ApiClient> = {
+      get: <S extends z.ZodType>(_path: string, schema: S) =>
+        Promise.resolve(schema.parse(serving.current)),
+      send: async <S extends z.ZodType>(
+        method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+        path: string,
+        body: unknown,
+        schema: S,
+      ) => {
+        sends.push({ method, path, body });
+        if (path.endsWith('/pairing-code')) {
+          const value = options.code
+            ? await options.code()
+            : { code: 'ABCD-EFGH', expiresAt: '2026-09-24T15:10:00.000Z' };
+          return schema.parse(value);
+        }
+        if (path.endsWith('/activate')) {
+          if (options.activateFails) throw options.activateFails();
+          return schema.parse({ childId: RILEY, status: 'active', paidSlots: 2, assignedSlots: 1 });
+        }
+        return schema.parse({ childId: SAM, status: 'draft' });
+      },
+    };
+    return { api, sends };
+  }
+
+  /** A sibling action on the page, which is what reloads GET /v1/family under the open panels. */
+  async function addAChild(user: ReturnType<typeof userEvent.setup>, nickname: string) {
+    const add = screen.getByRole('region', { name: 'Add a child' });
+    await user.type(within(add).getByLabelText(/nickname/i), nickname);
+    await user.click(within(add).getByRole('checkbox', { name: /parent or legal guardian/ }));
+    await user.click(within(add).getByRole('button', { name: /add draft child/i }));
+  }
+
+  /** An archived card holding the stale pairing-code notice: the state round 6 made standing. */
+  async function archivedCardHoldingAStaleCode(
+    user: ReturnType<typeof userEvent.setup>,
+    serving: { current: FamilyOverview },
+  ): Promise<HTMLElement> {
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: 'Create pairing code' }));
+    expect(await within(riley).findByText('ABCD-EFGH')).toBeTruthy();
+    serving.current = overview([rileyAt('archived')], 2);
+    await addAChild(user, 'Sam');
+    const archived = await card('Riley');
+    await waitFor(() => expect(archived.textContent).toMatch(/can’t connect a device/i));
+    return archived;
+  }
+
+  it('offers the inline PIN field when the activation under a stale notice is refused', async () => {
+    const user = userEvent.setup();
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api } = cardApi(serving, {
+      activateFails: () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403),
+    });
+    renderPage(<ChildrenPage />, { api });
+    const archived = await archivedCardHoldingAStaleCode(user, serving);
+
+    await user.click(within(archived).getByRole('button', { name: /Activate Riley again/i }));
+    // The whole point of StepUpPrompt: the PIN is entered here, not behind a link that unmounts this
+    // page (WEB-R2-05). Without it the press does nothing at all — no field, no error, no success.
+    expect(await within(archived).findByLabelText('Parent PIN')).toBeTruthy();
+    // The control the PIN prompt tells the parent to press again is still there, and so is the notice
+    // the panel used to replace.
+    expect(within(archived).getByRole('button', { name: /Activate Riley again/i })).toBeTruthy();
+    expect(archived.textContent).toMatch(/can’t connect a device/i);
+  });
+
+  it('shows the success line for an activation that worked under a stale notice', async () => {
+    const user = userEvent.setup();
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api } = cardApi(serving);
+    renderPage(<ChildrenPage />, { api });
+    const archived = await archivedCardHoldingAStaleCode(user, serving);
+
+    serving.current = overview([rileyAt('active')], 2);
+    await user.click(within(archived).getByRole('button', { name: /Activate Riley again/i }));
+    const back = await card('Riley');
+    expect(
+      await within(back).findByText(/uses one of your paid slots \(1 of 2 in use\)/i),
+    ).toBeTruthy();
+    // The dead code is still not printed: the feedback became a sibling, it did not replace the rule.
+    expect(within(back).queryByText('ABCD-EFGH')).toBeNull();
+
+    // L-057 / two regions on one screen: making the feedback a sibling put the success line on the
+    // same card as the stale notice, and the notice still asserted the profile's status itself. The
+    // card now reads "Status: Active", "You can now create a pairing code" and a live Create button,
+    // so a notice saying Riley's profile is not active — or telling the parent to wait until it is —
+    // contradicts three things beside it. `pairingRedeemable` decides the notice too.
+    expect(back.textContent).toMatch(/Status: Active/i);
+    expect(back.textContent).toMatch(/can’t connect a device any more/i);
+    expect(back.textContent).not.toMatch(/and Riley’s is not/i);
+    expect(back.textContent).not.toMatch(/(once|if) Riley is active again/i);
+    // What holds instead: the code is gone, and the control above it is the way to get another.
+    expect(back.textContent).toMatch(/Riley is active again, so you can create a new code/i);
+  });
+
+  it('keeps the inline PIN field when Done dismisses the stale notice beside it', async () => {
+    // The other newly reachable side effect of making the feedback a sibling: the notice's Done
+    // handler cleared `feedback` as well as the code, and `feedback` is the sole input to
+    // ActionFeedback -> StepUpNotice -> StepUpPrompt (apps/web/src/pages/app/SecurityPage.tsx). So the
+    // press that dismisses a notice about a dead code also threw away the PIN field the parent was
+    // typing into — and the PIN is entered here on purpose (WEB-R2-05). `useAction`'s `run` clears the
+    // previous feedback itself, so nothing needs this handler to do it.
+    const user = userEvent.setup();
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api } = cardApi(serving, {
+      activateFails: () => new ApiRequestError('STEP_UP_REQUIRED', 'Enter your parent PIN', 403),
+    });
+    renderPage(<ChildrenPage />, { api });
+    const archived = await archivedCardHoldingAStaleCode(user, serving);
+
+    await user.click(within(archived).getByRole('button', { name: /Activate Riley again/i }));
+    const pin = await within(archived).findByLabelText('Parent PIN');
+    await user.type(pin, '135790');
+    await user.click(within(archived).getByRole('button', { name: 'Done' }));
+
+    // The notice went; the PIN prompt and what the parent typed into it stayed.
+    expect(archived.textContent).not.toMatch(/can’t connect a device any more/i);
+    expect(within(archived).getByLabelText('Parent PIN')).toHaveProperty('value', '135790');
+  });
+
+  it('a network refusal of the same press is read out, not swallowed', async () => {
+    const user = userEvent.setup();
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api } = cardApi(serving, {
+      activateFails: () => new ApiRequestError('NETWORK', 'Network request failed', 0),
+    });
+    renderPage(<ChildrenPage />, { api });
+    const archived = await archivedCardHoldingAStaleCode(user, serving);
+
+    await user.click(within(archived).getByRole('button', { name: /Activate Riley again/i }));
+    expect(await within(archived).findByText(/Network request failed/i)).toBeTruthy();
+  });
+
+  it('never puts a code minted before the status moved on a card that cannot redeem it', async () => {
+    // HUNT7-G-7: the effect that turns a held code stale runs once per status change and can only act
+    // on the `code` held at that moment, so a POST still in flight resolved AFTERWARDS and put a live
+    // code on a card that was simultaneously saying nothing can be paired for this child. The server
+    // really does mint it: POST /v1/children/:childId/pairing-code passed its own
+    // `child.status !== 'active'` check when the request was made, and archiving does not consume an
+    // unexpired code — only the redeem claim's `c.status = 'active'` blocks it.
+    const user = userEvent.setup();
+    let release: ((value: { code: string; expiresAt: string }) => void) | null = null;
+    const pending = new Promise<{ code: string; expiresAt: string }>((resolve) => {
+      release = resolve;
+    });
+    const serving = { current: overview([rileyAt('active')], 2) };
+    const { api } = cardApi(serving, { code: () => pending });
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: 'Create pairing code' }));
+
+    // The other guardian files a child-scope deletion, which archives the child; a sibling action on
+    // the page is what lands it, because this card's own controls are disabled while it is busy.
+    serving.current = overview([rileyAt('archived', { deletionPending: true })], 2);
+    await addAChild(user, 'Sam');
+    await waitFor(async () =>
+      expect((await card('Riley')).textContent).toMatch(/data deletion under way/i),
+    );
+
+    release!({ code: 'ABCD-EFGH', expiresAt: '2026-09-24T15:10:00.000Z' });
+    const reloaded = await card('Riley');
+    await waitFor(() => expect(reloaded.textContent).toMatch(/can’t connect a device/i));
+    expect(within(reloaded).queryByText('ABCD-EFGH')).toBeNull();
+    // And the parent is told what became of the press, rather than left with a silent card.
+    expect(reloaded.textContent).toMatch(/their profile changed before it arrived/i);
+
+    // WEBR4-02 is this project's ledger entry for promising a recovery this card cannot deliver, and
+    // this is the card it was filed on: the notice above says processing has stopped, nothing can be
+    // activated for them, and deletion can't be undone from the app. So the stale notice may put the
+    // next code behind a CONDITION — "if Riley is active again" — and may not presuppose that the
+    // condition will be met ("once … again", "not … yet").
+    expect(reloaded.textContent).toMatch(/data deletion under way/i);
+    expect(reloaded.textContent).not.toMatch(/once Riley is active again/i);
+    expect(reloaded.textContent).not.toMatch(/whether that is possible yet/i);
+    expect(reloaded.textContent).toMatch(
+      /create a new one if Riley is active again — the notices above say whether that is possible/i,
+    );
+  });
+});
+
+/**
+ * HUNT7-G-2: the notice said "Another guardian changed …" for ANY difference between the live prop and
+ * the seed, and the response cannot establish an actor — `familyChildSchema` is a strict object with no
+ * actor field (packages/contracts/src/family.ts) and GET /v1/family selects no actor column
+ * (apps/api/src/routes/family.ts), which is why the deletion notice on this same card names the open
+ * request instead of the reader (G-I3-WEB). The path below is the reader's OWN save: the PATCH
+ * succeeded, its reload failed, `useLastGood` kept the pre-save profile on screen beside "Try again",
+ * the parent reopened the form and was seeded from those stale values, and the retry's good GET landed
+ * their own new nickname under it. The phone app PATCHing the same child, and a second portal tab, do
+ * the same thing. Synthetic names only.
+ */
+describe('[HUNT7-G-2] the child form’s concurrent-change notice names no actor', () => {
+  /** A fake whose PATCH changes the child it SERVES, as the server does, and whose reload can fail. */
+  function selfMutatingApi(options: { failReloadOnce?: boolean } = {}): {
+    api: Partial<ApiClient>;
+    sends: Call[];
+  } {
+    const sends: Call[] = [];
+    let served = overview(
+      [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' }],
+      2,
+    );
+    let gets = 0;
+    const api: Partial<ApiClient> = {
+      get: <S extends z.ZodType>(_path: string, schema: S) => {
+        gets += 1;
+        if (options.failReloadOnce === true && gets === 2) {
+          return Promise.reject(new ApiRequestError('NETWORK', 'Network request failed', 0));
+        }
+        return Promise.resolve(schema.parse(served));
+      },
+      send: <S extends z.ZodType>(
+        method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+        path: string,
+        body: unknown,
+        schema: S,
+      ) => {
+        sends.push({ method, path, body });
+        const nickname = nicknameOf(body);
+        served = overview(
+          served.children.map((c) => (c.id === RILEY ? { ...c, nickname } : c)),
+          2,
+        );
+        return Promise.resolve(
+          schema.parse({
+            child: {
+              id: RILEY,
+              nickname,
+              gradeLevel: 3,
+              ageBand: '8-10',
+              status: 'active',
+            },
+          }),
+        );
+      },
+    };
+    return { api, sends };
+  }
+
+  it('does not tell the parent another guardian made the change they made themselves', async () => {
+    const user = userEvent.setup();
+    const { api, sends } = selfMutatingApi({ failReloadOnce: true });
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    await user.click(within(riley).getByRole('button', { name: /edit Riley/i }));
+    const nickname = within(riley).getByLabelText(/nickname/i);
+    await user.clear(nickname);
+    await user.type(nickname, 'Robin');
+    await user.click(within(riley).getByRole('button', { name: /save Riley/i }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+
+    // The save WORKED; its reload failed, so the pre-save profile is still on screen with a retry.
+    const retry = await screen.findByRole('button', { name: /try again/i });
+    await user.click(within(riley).getByRole('button', { name: /edit Riley/i }));
+    expect(within(riley).getByLabelText(/nickname/i)).toHaveProperty('value', 'Riley');
+    await user.click(retry);
+
+    // The reader's own saved nickname lands under the open form, and the page reads it as drift.
+    const renamed = await screen.findByRole('heading', { name: 'Robin' });
+    const robin = renamed.closest('li')!;
+    // L-054: the sentence the product used to render, over the whole page rather than the notice
+    // alone, so moving the claim elsewhere would not pass.
+    expect(document.body.textContent).not.toMatch(/another guardian/i);
+    const notice = within(robin).getByRole('note');
+    expect(notice.textContent).not.toMatch(/guardian|someone else|somebody/i);
+    expect(notice.textContent).toMatch(
+      /this profile changed somewhere else while this form was open/i,
+    );
+    expect(notice.textContent).toMatch(/the nickname is now “Robin”/i);
+    // HUNT7-G-1: the parent's own confirmation of that very save is on screen beside it, which is what
+    // made the actor claim so plainly wrong — and it is only visible because the feedback is a sibling.
+    expect(within(robin).getByRole('status').textContent).toMatch(/Saved\. Robin is in/i);
   });
 });
