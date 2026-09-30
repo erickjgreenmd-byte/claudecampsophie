@@ -73,6 +73,7 @@ export {
   hasGenerator,
   subjectGrade,
   subjectStartsAtGrade,
+  SUBJECT_GRADE_REACH,
   isKnownSkill,
   type CandidateOptions,
   type FamilyMaterial,

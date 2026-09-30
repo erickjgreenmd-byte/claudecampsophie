@@ -163,35 +163,58 @@ export function generateCandidates(options: CandidateOptions): BankItem[] {
 }
 
 /**
- * The grade whose items a subject uses for a child: THE CHILD'S OWN GRADE, always, clamped to the
- * 0-8 band by `bankGrade`.
+ * How far the bank may reach from a child's own grade when that grade has no content for a subject.
  *
- * OWNER RULE (2026-09-30): no practice above a child's grade is ever put in front of them. This
- * function used to reach UPWARD when a subject had no skill at the child's grade — "the nearest
- * supported grade is used and the coverage report says so" — which in practice meant a KINDERGARTEN
- * child was given grade-1 spelling and grade-1 grammar. Those were the only two cases in the whole
- * band (measured: grade 0 spelling_vocabulary and grade 0 grammar_writing, and nothing else at any
- * grade), and a coverage report the parent never reads is not consent for it.
+ * OWNER RULE (2026-09-30, amended): "we can reach up or down 1 or 2." So a subject with nothing at the
+ * child's grade uses the NEAREST grade that has content, provided it is within two grades; beyond that
+ * the subject offers nothing and `subjectStartsAtGrade` says where it does begin.
  *
- * What replaces it is honesty rather than substitution: the subject offers NOTHING at that grade, and
- * `subjectStartsAtGrade` below says where it does start so the product can tell the parent
- * "Spelling and vocabulary starts at grade 1" instead of quietly handing their five-year-old a
- * grade-1 word list. A kindergarten family therefore gets maths, reading and science practice and is
- * told plainly that two subjects begin later.
+ * This bounds the SUBSTITUTION only — the grade the generator aims at when the child's own grade is
+ * empty. It is NOT a cap on revision. A child's prerequisite work comes from skills they have actually
+ * got wrong, and a grade-8 child with a grade-2 gap must still be given grade-2 practice; capping that
+ * at two grades would forbid exactly the remediation the evidence calls for. The two are different
+ * things: one is an assumption about a grade, the other is a response to a child.
+ */
+export const SUBJECT_GRADE_REACH = 2;
+
+/**
+ * The grade whose items a subject uses for a child: the child's own grade when it has content, else the
+ * nearest grade within `SUBJECT_GRADE_REACH`, else the child's own grade (which yields nothing).
  *
- * `packages/domain/src/bank/grade-isolation.test.ts` asserts the property over every grade and every
- * subject, on the ITEMS rather than on this function, so a later change anywhere in the generation
- * path that reintroduces an above-grade item reds.
+ * This used to reach UPWARD without any bound — "the nearest supported grade is used and the coverage
+ * report says so" — which put grade-1 spelling and grammar in front of KINDERGARTEN children with no
+ * limit on how far it could go and no notice a parent would ever see. Those two were the only cases in
+ * the band, and both are within the reach the owner has now set, so both are covered again; what has
+ * changed is that the distance is bounded, asserted, and stated.
+ *
+ * Ties go DOWN. When the child's grade is equally far from content above and below, the lower grade is
+ * chosen: easier practice is the safer error for a child whose own grade the bank cannot serve.
+ *
+ * `packages/domain/src/bank/grade-isolation.test.ts` asserts the bound on the ITEMS, over every grade
+ * and subject, so a change anywhere in the generation path that reaches further reds.
  */
 export function subjectGrade(subject: BankSubject, grade: number): number {
-  return bankGrade(grade);
+  const g = bankGrade(grade);
+  if (hasBankContent(subject, g)) return g;
+  for (let distance = 1; distance <= SUBJECT_GRADE_REACH; distance += 1) {
+    const down = bankGrade(g - distance);
+    if (down !== g && hasBankContent(subject, down)) return down;
+    const up = bankGrade(g + distance);
+    if (up !== g && hasBankContent(subject, up)) return up;
+  }
+  return g;
+}
+
+/** Whether a subject has any bank skill at a grade (family material is the parent's, not the bank's). */
+function hasBankContent(subject: BankSubject, grade: number): boolean {
+  return skillsForGrade(subject, grade).some((d) => d.source !== 'family_material');
 }
 
 /**
- * The lowest grade at which a subject has any bank skill, or null when it has none at all. This is
- * what the product tells a parent whose child's grade is below a subject's start, in place of the
- * silent upward substitution `subjectGrade` used to make. Family material is excluded: a parent's own
- * spelling list is theirs to set at any grade and is not what "the bank starts here" means.
+ * The lowest grade at which a subject has any bank skill, or null when it has none at all. What the
+ * product tells a parent whose child's grade is further than `SUBJECT_GRADE_REACH` below a subject's
+ * start, in place of a silent substitution. Family material is excluded: a parent's own spelling list is
+ * theirs to set at any grade and is not what "the bank starts here" means.
  */
 export function subjectStartsAtGrade(subject: BankSubject): number | null {
   const mins = SKILLS.filter((d) => d.subject === subject && d.source !== 'family_material').map(
