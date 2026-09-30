@@ -194,11 +194,31 @@ describe('[HUNT6-B-2] public.request_deletion withdraws the deleted child’s fi
     // A family-wide export lists every child, so it holds the deleted child's rows too.
     const familyWide = await readyExport(fam.familyId, fam.ownerId, null);
     const siblingExport = await readyExport(fam.familyId, fam.ownerId, sibling.id, 'progress_pdf');
-    // Still building: the builder leaves out every child with an open deletion request, so a queued
-    // row must be left alone rather than expired.
+    // A FAMILY-WIDE export that is still building when a CHILD's deletion lands (HUNT7-D-1). This
+    // function leaves it alone, and the reason is not 0920/0930's — theirs was "the builder already
+    // leaves out every child with an open deletion request", which is false of a file the builder had
+    // already composed. The reason is a division of labour: whether this row is safe depends on what
+    // its bytes contain, which this function cannot see and the builder can. The builder's settle
+    // compares the requests open at publish time against the snapshot the bytes were composed from,
+    // so it publishes a file that already leaves the child out and refuses one that does not
+    // (apps/api/tests/privacy-r2.review.test.ts). Failing the row here instead would destroy every
+    // family export a parent had in flight, which spec P4 says must stay deliverable minus the
+    // deleted child (apps/api/tests/export-build.test.ts).
     const [queued] = await db.sql<{ id: string }[]>`
       insert into public.data_exports (family_id, requested_by, kind, child_id, status)
       values (${fam.familyId}, ${fam.ownerId}, 'family_data', null, 'queued')
+      returning id`;
+    // And the sibling's own queued export, which this child's deletion must NOT settle: it carries
+    // no row of the deleted child (progressRows excludes them and its child_id is the sibling's).
+    const [siblingQueued] = await db.sql<{ id: string }[]>`
+      insert into public.data_exports (family_id, requested_by, kind, child_id, status)
+      values (${fam.familyId}, ${fam.ownerId}, 'progress_pdf', ${sibling.id}, 'queued')
+      returning id`;
+    // And the DELETED child's own queued export, which needs no file inspection to judge: the export is
+    // about the child whose data is going, so this function settles it here.
+    const [childQueued] = await db.sql<{ id: string }[]>`
+      insert into public.data_exports (family_id, requested_by, kind, child_id, status)
+      values (${fam.familyId}, ${fam.ownerId}, 'progress_csv', ${childId}, 'queued')
       returning id`;
 
     // The Data API's own call: `authenticated`, the parent's claims, no API handler in the path.
@@ -214,10 +234,31 @@ describe('[HUNT6-B-2] public.request_deletion withdraws the deleted child’s fi
     // The storage object is still named: removing the file is the handler's half (withdrawExports)
     // and the purge job's, and the row stays refusable meanwhile.
     expect((await exportRow(childExport)).storage_path).not.toBeNull();
-    // Scoped: the sibling's export is not this child's deletion to withdraw, and a queued row is
-    // left for the builder's own deletion check.
+    // Scoped: the sibling's export is not this child's deletion to withdraw.
     expect(await exportRow(siblingExport)).toMatchObject({ status: 'ready' });
-    expect(await exportRow(queued!.id)).toMatchObject({ status: 'queued' });
+    expect(await exportRow(siblingQueued!.id)).toMatchObject({ status: 'queued' });
+
+    // The family-wide queued row is LEFT for the builder, which is the only party that can judge it.
+    expect(await exportRow(queued!.id)).toMatchObject({ status: 'queued', storage_path: null });
+
+    // HUNT7-D-1: the DELETED CHILD's OWN queued export is settled here, in the same transaction as the
+    // request, because no file's contents are needed to judge it — the export is about that child. So
+    // the builder's own compare-and-set can never publish it. The statement below IS the builder's
+    // settle (apps/api/src/jobs/export-build.ts, `where id = .. and status = 'queued'`), run here
+    // exactly as the job would run it a moment after the deletion committed — the window 0960 exists to
+    // close. Before 0960 it returned the row, and export-download.ts then served a signed URL for a
+    // file holding the deleted child's homework for seven days.
+    const settled = await db.sql<{ id: string }[]>`
+      update public.data_exports
+         set status = 'ready', storage_path = 'exports/synthetic-late.json',
+             expires_at = now() + interval '7 days'
+       where id = ${childQueued!.id} and family_id = ${fam.familyId} and status = 'queued'
+      returning id`;
+    expect(settled).toEqual([]);
+    expect(await exportRow(childQueued!.id)).toMatchObject({
+      status: 'failed',
+      storage_path: null,
+    });
   });
 
   it('expires every finished export of a whole-family deletion and leaves an expired one untouched', async () => {

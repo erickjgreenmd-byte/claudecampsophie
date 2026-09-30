@@ -212,3 +212,30 @@ file's cases use as a reload lever, so each case does more work between its `wai
 timeout was widened and no assertion relaxed; this is noted so a recurrence is read as the second
 sighting of a known timing sensitivity rather than as a fresh mystery.
 
+## Export withdrawal on deletion (migration 0960) — 2026-09-30
+
+The defect and the correction are both pinned, in the two places that judge a queued export:
+
+- **The database half** — `supabase/tests/hardening_r5_db.test.ts` runs the BUILDER's own settle
+  statement (`where id = .. and status = 'queued'`) through a client-role connection, exactly as the job
+  would run it a moment after the deletion committed. For the deleted child's own queued export it
+  returns no row and the export reads `failed` with a null storage_path. For the FAMILY-WIDE queued
+  export it deliberately leaves the row `queued`, for the builder to judge.
+- **The API half** — `apps/api/tests/privacy-r2.review.test.ts` covers the race (the file is composed,
+  then the deletion lands, then the settle runs → the publish is refused, `GET /v1/exports/:id/download`
+  answers 409, and the bytes the builder had already uploaded are removed rather than left for the
+  purge) and the division of labour (the child's own row settled by 0960, the family-wide row left
+  standing, and `deletion_purge` scheduling a late storage pass for BOTH).
+- **The behaviour the correction preserves** — `apps/api/tests/export-build.test.ts`'s spec-P4 case
+  passes unchanged: on a child-scope deletion the family-wide export still becomes `ready`, its body
+  carries the sibling and does not carry the deleted child. That test is what caught the first, blunter
+  fix, which failed the row outright.
+
+Mutation testing, four mutations, each shown red and each file restored with `sha256sum -c`: drop the
+settle's deletion check (the original defect, 1 case red); re-read the deletion set at settle instead of
+carrying the snapshot the bytes were composed from (the READ COMMITTED race — 8 cases red); give
+migration 0960 the broad `or child_id is null` arm back (1 case red, the spec-P4 one); key the
+dispatcher's late-removal list on `status === 'queued'` rather than `!== 'ready'` (1 case red).
+
+Suite totals after this slice: api 1176, db 450; the rest unchanged. **7069 tests**, floors raised.
+

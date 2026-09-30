@@ -17,8 +17,13 @@ import {
   seedOwnerAdmin,
   type SeededFamily,
 } from '@pencillift/db/testing/fixtures';
-import { runJobs, type JobDeps, type JobHandler } from '../src/jobs/dispatcher.ts';
-import { createExportBuildHandler } from '../src/jobs/export-build.ts';
+import {
+  deletionPurgeHandler,
+  runJobs,
+  type JobDeps,
+  type JobHandler,
+} from '../src/jobs/dispatcher.ts';
+import { createExportBuildHandler, exportPath } from '../src/jobs/export-build.ts';
 import { createScanProcessHandler } from '../src/jobs/scan-process.ts';
 import { UNRESOLVED_REPORTS_PAGE_SIZE } from '../src/routes/privacy.ts';
 import { createTestApi, json, parentToken, type TestApi } from './helpers.ts';
@@ -1310,6 +1315,135 @@ describe('HUNT6-B-2 a deletion filed through the Data API withdraws the finished
     expect(row!.status).toBe('expired');
     // The file is still named: removing it is the handler's half and the purge job's.
     expect(row!.storage_path).not.toBeNull();
+  });
+});
+
+/**
+ * HUNT7-D-1, the API halves. 0920/0930 withdrew only the exports that were ALREADY 'ready' and left
+ * the 'queued' ones, on this justification, in three places: "a 'queued' export is untouched: the
+ * builder leaves out every child with an open deletion request (privacy.ts)". The check is not in
+ * privacy.ts — it is `childrenBeingDeleted` in jobs/export-build.ts — it is a plain SELECT taken
+ * inside the BUILD transaction under READ COMMITTED and BEFORE the file is composed, and for a
+ * FAMILY-scope request it checks nothing at all (it requires `target_child_id is not null`). So a
+ * deletion that committed after that SELECT left the excluded-children list empty, the settle's only
+ * guard was `status = 'queued'` — exactly what the migration had left standing — and the row flipped
+ * to 'ready' with a live path and a seven-day expiry AFTER the request. Migration 0960 settles the
+ * in-scope 'queued' rows in the request's own transaction; these two cases are the halves that live
+ * in this package.
+ */
+describe('HUNT7-D-1 an export that finishes after the deletion request is never published', () => {
+  it('refuses to publish the file when a deletion request appeared during the upload', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const child = fam.children[0]!;
+    const parent = await unlockedParent(fam.ownerId);
+    // A family-wide export: the kind POST /v1/exports accepts while a child deletion is pending,
+    // and the kind that lists every child, so it is the one that can carry the deleted child's rows.
+    const requested = await api.request('/v1/exports', {
+      method: 'POST',
+      token: parent,
+      body: { kind: 'family_data' },
+    });
+    expect(requested.status).toBe(202);
+    const [queued] = await api.db.sql<{ id: string }[]>`
+      select id from public.data_exports
+       where family_id = ${fam.familyId} and kind = 'family_data' and status = 'queued'`;
+
+    // The deletion lands BETWEEN the build transaction and the settle — the window the builder's own
+    // check cannot see, because its snapshot was taken inside the build. The row is written directly
+    // rather than through public.request_deletion on purpose: this case is the BUILDER's guard, so
+    // the function's own statement (which would settle this row itself) must not be what closes it.
+    // A direct writer of public.deletion_requests is not hypothetical — app.inactivity_delete_family
+    // is one, and it had no data_exports statement at all before 0960.
+    let uploadedPath: string | null = null;
+    await runJobs(deps, {
+      export_build: createExportBuildHandler({
+        upload: async (path, bytes) => {
+          uploadedPath = path;
+          api.providers.storage.put(path, bytes);
+          await api.db.sql`
+            insert into public.deletion_requests (family_id, scope, child_id, target_child_id, requested_by)
+            values (${fam.familyId}, 'child', ${child.id}, ${child.id}, ${fam.ownerId})`;
+        },
+      }),
+    });
+    expect(uploadedPath).toBe(exportPath(fam.familyId, queued!.id, 'json'));
+
+    const [row] = await api.db.sql<{ status: string; storage_path: string | null }[]>`
+      select status, storage_path from public.data_exports where id = ${queued!.id}`;
+    // Before the fix: ('ready', 'exports/<family>/<id>.json') with a seven-day expiry, and the next
+    // line was a 200 with a signed URL for a file holding the deleted child's homework prompts, the
+    // transcriptions of their answers, their grading verdicts and the fact a safety notice was
+    // placed on a question.
+    expect(row!.status).toBe('failed');
+    expect(row!.storage_path).toBeNull();
+    const download = await api.request(`/v1/exports/${queued!.id}/download`, { token: parent });
+    expect(download.status).toBe(409);
+    // And the bytes the builder had already uploaded do not stay in private storage waiting for the
+    // purge: the builder that refused to publish removes what it wrote.
+    expect([...api.providers.storage.objects]).not.toContain(uploadedPath);
+  });
+
+  it('still schedules the late storage pass for the export the deletion settled mid-build', async () => {
+    const fam = await seedFamily(api.db, { childCount: 1 });
+    const child = fam.children[0]!;
+    const parent = await unlockedParent(fam.ownerId);
+    const requested = await api.request('/v1/exports', {
+      method: 'POST',
+      token: parent,
+      body: { kind: 'family_data' },
+    });
+    expect(requested.status).toBe(202);
+    const [queued] = await api.db.sql<{ id: string }[]>`
+      select id from public.data_exports
+       where family_id = ${fam.familyId} and kind = 'family_data' and status = 'queued'`;
+    // And this child's OWN export, also still building. The two are judged by different parties, which
+    // is what the assertions below pin.
+    const ownRequested = await api.request('/v1/exports', {
+      method: 'POST',
+      token: parent,
+      body: { kind: 'progress_csv', childId: child.id },
+    });
+    expect(ownRequested.status).toBe(202);
+    const [ownQueued] = await api.db.sql<{ id: string }[]>`
+      select id from public.data_exports
+       where family_id = ${fam.familyId} and kind = 'progress_csv' and status = 'queued'`;
+
+    // The parent asks for this child's data to be deleted while both exports are still building.
+    const deletion = await api.request('/v1/deletion', {
+      method: 'POST',
+      token: parent,
+      body: { scope: 'child', childId: child.id },
+    });
+    expect(deletion.status).toBe(202);
+    // Migration 0960 settles the row it can judge without reading any file — the export ABOUT the
+    // deleted child — so that one can never be published.
+    const [ownSettled] = await api.db.sql<{ status: string }[]>`
+      select status from public.data_exports where id = ${ownQueued!.id}`;
+    expect(ownSettled!.status).toBe('failed');
+    // The FAMILY-WIDE row is deliberately left standing: whether it is safe depends on what its bytes
+    // contain, and only the builder knows that (the case above proves the builder refuses it when the
+    // bytes were composed before the request; tests/export-build.test.ts proves it publishes when they
+    // were composed after, which is what spec P4 requires — the family keeps that export, minus the
+    // deleted child). If 0960 failed this row too, every parent with a family export in flight would
+    // lose it to one child's deletion.
+    const [famSettled] = await api.db.sql<{ status: string }[]>`
+      select status from public.data_exports where id = ${queued!.id}`;
+    expect(famSettled!.status).toBe('queued');
+
+    // And the purge must still schedule the SECOND storage pass for BOTH. A worker that was mid-upload
+    // when the deletion committed can put bytes at the deterministic path after the purge has run;
+    // jobs/dispatcher.ts built that late-removal list from `status === 'queued'` alone, so the row
+    // 0960 had just settled to 'failed' lost its private.storage_removals entry and the file would
+    // have been left behind for ever (nothing else removes an object of a non-'ready' row). The rule is
+    // now `status !== 'ready'`, which is why the 'failed' row is covered as well as the 'queued' one —
+    // the very distinction that made the old predicate wrong.
+    await runJobs(deps, { deletion_purge: deletionPurgeHandler });
+    const removals = await api.db.sql<{ storage_path: string }[]>`
+      select storage_path from private.storage_removals where reason = 'deletion_late_upload'`;
+    const scheduled = removals.map((r) => r.storage_path);
+    expect(scheduled).toContain(exportPath(fam.familyId, queued!.id, 'json'));
+    // The row 0960 settled to 'failed' is the one `status === 'queued'` would have missed.
+    expect(scheduled).toContain(exportPath(fam.familyId, ownQueued!.id, 'csv'));
   });
 });
 

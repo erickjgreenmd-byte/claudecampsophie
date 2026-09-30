@@ -243,6 +243,56 @@ describe('inactivity deletion re-checks under the row lock (RV-lead-jobs-ai-12, 
     expect(job!.status).toBe('queued');
   });
 
+  /**
+   * HUNT7-D-4. `app.inactivity_delete_family` is the OTHER writer of a family-scope
+   * public.deletion_requests row, and 0920's L-037 sweep stopped at `public.request_deletion`: this
+   * body wrote deletion_requests, child_sessions, child_devices, jobs, assignments, families,
+   * family_memberships, the purge job and the audit row, and no statement at all about
+   * public.data_exports. A finished export therefore stayed 'ready' with its storage_path and its
+   * seven-day expiry until the purge job ran — the same residual 0920 was written to remove, on the
+   * one surface 0920 did not sweep.
+   *
+   * The instant is the one the caller STATES (p_now), not the database wall clock: this function is
+   * driven by the tick, whose clock is the application's, and a date comparison on an unstated clock
+   * is a defect this project has paid for twice (the job-retention step of round 7 stage 1).
+   */
+  it('withdraws the family’s finished exports, at the instant the caller stated', async () => {
+    const fam = await idle();
+    const [ready] = await db.sql<{ id: string }[]>`
+      insert into public.data_exports (family_id, requested_by, kind, child_id, status,
+                                       storage_path, expires_at)
+      values (${fam.familyId}, ${fam.ownerId}, 'family_data', null, 'ready',
+              'exports/synthetic-inactivity.json', ${new Date(NOW.getTime() + 7 * 86_400_000)})
+      returning id`;
+    // And one still building when the tick deleted the family: the builder's compare-and-set must
+    // find nothing to publish afterwards (HUNT7-D-1, the same statement as in request_deletion).
+    const [queued] = await db.sql<{ id: string }[]>`
+      insert into public.data_exports (family_id, requested_by, kind, child_id, status)
+      values (${fam.familyId}, ${fam.ownerId}, 'progress_csv', null, 'queued')
+      returning id`;
+
+    const [row] = await del(fam.familyId);
+    expect(row!.id).not.toBeNull();
+
+    const [after] = await db.sql<
+      { status: string; expires_at: Date; storage_path: string | null }[]
+    >`
+      select status, expires_at, storage_path from public.data_exports where id = ${ready!.id}`;
+    expect(after!.status).toBe('expired');
+    // Pulled back to the STATED instant, not to now(): the assertion that a wall-clock comparison
+    // cannot satisfy, because NOW is 2026-09-24 and the real clock is not.
+    expect(after!.expires_at.getTime()).toBe(NOW.getTime());
+    // The file is still named: removing the object is the purge job's half.
+    expect(after!.storage_path).toBe('exports/synthetic-inactivity.json');
+    const settled = await db.sql<{ id: string }[]>`
+      update public.data_exports
+         set status = 'ready', storage_path = 'exports/synthetic-late.csv',
+             expires_at = ${NOW} + interval '7 days'
+       where id = ${queued!.id} and family_id = ${fam.familyId} and status = 'queued'
+      returning id`;
+    expect(settled).toEqual([]);
+  });
+
   it('skips (null, never raises) without a notice, after activity, inside the notice period or while paid', async () => {
     const noNotice = await idle({ notifiedAt: null });
     const answered = await idle();

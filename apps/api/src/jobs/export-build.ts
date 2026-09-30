@@ -135,6 +135,16 @@ interface Built {
   readonly bytes: Uint8Array;
   readonly contentType: string;
   readonly ext: string;
+  /**
+   * HUNT7-D-1: the children this file was composed WITHOUT, read once for the whole build. The settle
+   * compares this against the deletion requests open at publish time, so a request that arrived after
+   * the snapshot — the one the file could not have excluded — refuses the publish, while a request the
+   * file already honoured does not. Without the snapshot there is nothing to compare and the only
+   * safe predicate is "any open request fails the row", which throws away every family-wide export a
+   * family asked for before one child's deletion (spec P4's own case: that export must still be
+   * deliverable, minus the deleted child).
+   */
+  readonly excludedChildren: readonly string[];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -341,8 +351,12 @@ interface ProgressRow {
   lastPracticed: string | null;
 }
 
-async function progressRows(tx: Tx, row: ExportRow, now: Date): Promise<ProgressRow[]> {
-  const excluded = await childrenBeingDeleted(tx, row.family_id);
+async function progressRows(
+  tx: Tx,
+  row: ExportRow,
+  now: Date,
+  excluded: readonly string[],
+): Promise<ProgressRow[]> {
   const children = await tx<{ id: string; nickname: string }[]>`
     select id, nickname from public.child_profiles
      where family_id = ${row.family_id} and (${row.child_id}::uuid is null or id = ${row.child_id}::uuid)
@@ -442,9 +456,13 @@ function renderProgressPdf(rows: readonly ProgressRow[]): Uint8Array {
  * a pending deletion request is left out of every section (spec P4: deletion stops processing
  * immediately), so a family-wide export never carries data that is about to be purged.
  */
-async function familyData(tx: Tx, row: ExportRow, now: Date): Promise<Uint8Array> {
+async function familyData(
+  tx: Tx,
+  row: ExportRow,
+  now: Date,
+  skip: readonly string[],
+): Promise<Uint8Array> {
   const fam = row.family_id;
-  const skip = await childrenBeingDeleted(tx, fam);
   const data = {
     exportedAt: now.toISOString(),
     family:
@@ -567,11 +585,14 @@ async function childrenBeingDeleted(tx: Tx, familyId: string): Promise<string[]>
 // ---------------------------------------------------------------------------------------------
 
 async function build(tx: Tx, row: ExportRow, setId: string | undefined, now: Date): Promise<Built> {
+  // HUNT7-D-1: ONE read of the deletion state for the whole build, taken before any section is
+  // composed. It used to be read separately by `progressRows` and by `familyData`, so two sections of
+  // one family_data file could honour different sets if a request committed between them, and nothing
+  // downstream knew which set the bytes reflected. The settle compares this snapshot against the
+  // requests open at publish time.
+  const excludedChildren = await childrenBeingDeleted(tx, row.family_id);
   // A child-specific export is never built once that child's deletion was requested (spec P4).
-  if (
-    row.child_id !== null &&
-    (await childrenBeingDeleted(tx, row.family_id)).includes(row.child_id)
-  ) {
+  if (row.child_id !== null && excludedChildren.includes(row.child_id)) {
     throw new PermanentExportFailure('CHILD_DELETION_PENDING');
   }
   switch (row.kind) {
@@ -581,6 +602,7 @@ async function build(tx: Tx, row: ExportRow, setId: string | undefined, now: Dat
         bytes: renderQuestionsPdf(sets, await loadQuestions(tx, row, sets)),
         contentType: 'application/pdf',
         ext: 'pdf',
+        excludedChildren,
       };
     }
     case 'review_answer_key_pdf': {
@@ -589,25 +611,29 @@ async function build(tx: Tx, row: ExportRow, setId: string | undefined, now: Dat
         bytes: renderAnswerKeyPdf(sets, await loadAnswerKey(tx, row, sets)),
         contentType: 'application/pdf',
         ext: 'pdf',
+        excludedChildren,
       };
     }
     case 'progress_csv':
       return {
-        bytes: renderProgressCsv(await progressRows(tx, row, now)),
+        bytes: renderProgressCsv(await progressRows(tx, row, now, excludedChildren)),
         contentType: 'text/csv',
         ext: 'csv',
+        excludedChildren,
       };
     case 'progress_pdf':
       return {
-        bytes: renderProgressPdf(await progressRows(tx, row, now)),
+        bytes: renderProgressPdf(await progressRows(tx, row, now, excludedChildren)),
         contentType: 'application/pdf',
         ext: 'pdf',
+        excludedChildren,
       };
     case 'family_data':
       return {
-        bytes: await familyData(tx, row, now),
+        bytes: await familyData(tx, row, now, excludedChildren),
         contentType: 'application/json',
         ext: 'json',
+        excludedChildren,
       };
   }
 }
@@ -725,12 +751,67 @@ export function createExportBuildHandler(options: ExportBuildOptions = {}): JobH
       }
       throw error instanceof Error ? error : new RetryableExportFailure('UPLOAD_FAILED');
     }
-    await deps.db.asService(
-      (tx) => tx`
+    // HUNT7-D-1: the settle is a compare-and-set on the DELETION STATE as well as on the status, and
+    // what it compares against is the snapshot the FILE WAS COMPOSED FROM (`built.excludedChildren`),
+    // not merely "is any deletion open".
+    //
+    // The defect: `childrenBeingDeleted` runs inside the build transaction under READ COMMITTED and
+    // before the file is composed, so a deletion committing after it left the excluded list empty and
+    // the file held exactly the rows the request was meant to stop; and for a FAMILY-scope request that
+    // check sees nothing at all, because it reads `target_child_id`. The settle's only guard was
+    // `status = 'queued'`, so the row flipped to 'ready' with a live path and a seven-day expiry AFTER
+    // the request, and routes/export-download.ts served it.
+    //
+    // Why the snapshot rather than "any open request fails the row": a family-wide export (child_id
+    // null) lists every child, and a child-scope deletion filed BEFORE this job ran is already honoured
+    // — `excludedChildren` contains that child and the bytes leave them out. Failing the row anyway
+    // destroys an export the family asked for and is entitled to, which is the case spec P4 states
+    // explicitly (tests/export-build.test.ts: the family-wide file stays deliverable, carrying the
+    // other child and not the deleted one). Comparing against the snapshot refuses exactly the
+    // dangerous case — a request this file could NOT have honoured — and no other.
+    //
+    // The two arms:
+    //   * `d.target_child_id is null` — a FAMILY-scope request. Nothing of this family is deliverable,
+    //     whatever the file contains, so it always refuses.
+    //   * a CHILD-scope request whose target is NOT in the snapshot — it arrived after the read, so the
+    //     file cannot have left that child out. It refuses.
+    // A child-scope request already in the snapshot matches neither arm and the row publishes.
+    //
+    // Migration 0960 settles the in-scope 'queued' rows inside the request's own transaction, which
+    // closes the window for both of PencilLift's deletion writers (public.request_deletion and
+    // app.inactivity_delete_family) without needing to know what any file contains. This predicate is
+    // the WRITER's half, so a deletion filed by anything else is covered too (L-037), and it is the
+    // half that can be PRECISE, because only the builder knows which children the bytes exclude.
+    const published = await deps.db.asService(
+      (tx) => tx<{ id: string }[]>`
         update public.data_exports
            set status = 'ready', storage_path = ${path}, expires_at = ${new Date(now.getTime() + EXPORT_TTL_DAYS * DAY_MS)}
-         where id = ${row.id} and family_id = ${row.family_id} and status = 'queued'`,
+         where id = ${row.id} and family_id = ${row.family_id} and status = 'queued'
+           and not exists (
+             select 1 from public.deletion_requests d
+              where d.family_id = ${row.family_id} and d.status in ('requested', 'processing')
+                and (d.target_child_id is null
+                     or not (d.target_child_id = any(${[...built.excludedChildren]}::uuid[]))))
+        returning id`,
     );
+    if (published.length === 0) {
+      // Either a deletion invalidated this file, or another worker settled the row meanwhile. Only
+      // the first case may remove the object: a row another worker built is 'ready' and its file
+      // must stay (the rule the upload-failure branch above follows for the same reason).
+      const [current] = await deps.db.asService(
+        (tx) => tx<{ status: string }[]>`
+          select status from public.data_exports
+           where id = ${row.id} and family_id = ${row.family_id}`,
+      );
+      if (current?.status !== 'ready') {
+        // 0960 has normally settled the row already, so this is a no-op on its status; it is the arm
+        // that closes the same window for a deletion filed by any other writer. The bytes this
+        // attempt uploaded go either way — the purge removes them too, but not until it runs.
+        await markFailed(deps, row, 'DELETION_PENDING');
+        await removeExportObjects(deps, row.family_id, row.id);
+      }
+      return;
+    }
     deps.log({ level: 'info', event: 'export_ready', code: row.kind });
   };
 }
