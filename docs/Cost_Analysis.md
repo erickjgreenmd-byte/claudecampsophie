@@ -127,7 +127,25 @@ Of the three, only `escalation` and `identity_document` would actually FAIL the 
 excuse; `identity_face_compare`'s budget already clears its ceiling and is excused only because the
 `maxAttempts < 2` branch is tested first. That partition is asserted in
 `packages/ai/src/run-truncation.test.ts`, so "excused" is not read as "would have failed" for a stage where
-it would not have. Each cap is sized from the largest request its stage really sends — two photographs —
+it would not have.
+
+**WHAT IS ACTUALLY SPENT PER VERIFICATION, since the owner's decision of 2026-09-30.** The product's
+adult check is the document read PLUS the holder's legal declaration (migration 0990), and it sends no
+selfie, so `POST /v1/identity/verification` makes ONE provider call and `identity_face_compare` is
+**never entered**. Per verification the real ceiling is `identity_document` alone — 20,000 micro-USD of
+budget, 21,704 of measured full-raise ceiling — not the 35,000 the two rows above sum to. That is a 43%
+reduction in the worst case of establishing an adult, and it comes with no vendor fee, because the
+face comparison would have needed a contracted identity provider that the owner has now stood down
+(owner action #47).
+
+The `identity_face_compare` row is KEPT here and the stage is kept in `packages/ai/src/routing.ts`,
+deliberately and not by oversight. It is the machinery of the stronger biometric standard, which
+migration 0980 still holds intact and which `public.adult_identity_basis` can still report: if counsel
+answers owner action #48 the strict way, contracting a vendor turns that standard back on, and a stage
+deleted for tidiness would have to be re-derived, re-measured and re-excused to do it. A dormant stage
+with its numbers recorded costs nothing; re-deriving a deleted one costs a round. What would be
+dishonest is leaving this section implying both stages are spent on every check, which is what it said
+before this paragraph existed. Each cap is sized from the largest request its stage really sends — two photographs —
 not from this ceiling, which is derived from the text-only floor; a cap is never shrunk to move a stage
 across that line.
 

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
 import {
@@ -237,6 +239,34 @@ describe('what it refuses, and whose fault each refusal says it is', () => {
     } finally {
       await bare.db.drop();
     }
+  });
+});
+
+describe('the cost claim in docs/Cost_Analysis.md is true of this route', () => {
+  it('sends no selfie, so the identity_face_compare stage is never entered', async () => {
+    // docs/Cost_Analysis.md states that one provider call happens per verification and that the
+    // 15,000-micro `identity_face_compare` stage is never spent — a 43% reduction in the worst case
+    // of establishing an adult. That is a claim about THIS route, so it is asserted here rather than
+    // left as prose in a document (the round-7 cost-doc work found the document understating the
+    // largest hold by 93% precisely because nothing related the two).
+    //
+    // Two independent facts establish it, and both are checked: the request schema has no `selfie`
+    // (a strict object, so sending one is a 400 — asserted above), and the route's own source passes
+    // no selfie to the provider. The ADAPTER's behaviour with an absent selfie is
+    // `identity-openai.ts`'s to test; what is this file's business is that the route never supplies
+    // one.
+    const source = readFileSync(
+      join(import.meta.dirname, '..', 'src', 'routes', 'identity.ts'),
+      'utf8',
+    );
+    const call = /provider\.check\(\{([\s\S]*?)\}\)/.exec(source);
+    expect(
+      call,
+      'the route no longer calls provider.check the way this test expects',
+    ).not.toBeNull();
+    expect(call![1]).toMatch(/document:/);
+    expect(call![1]).toMatch(/statedDateOfBirth:/);
+    expect(call![1]).not.toMatch(/selfie/);
   });
 });
 
