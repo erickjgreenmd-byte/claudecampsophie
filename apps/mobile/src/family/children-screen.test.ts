@@ -21,6 +21,26 @@ const plan = readFileSync(
   join(import.meta.dirname, '..', '..', 'app', '(parent)', 'plan.tsx'),
   'utf8',
 );
+/**
+ * The parent home renders the same `childRows` view model as the Children screen, so it is read here
+ * too: HUNT7-G-3/HUNT7-J-1 is a defect that reached the parent through BOTH printers, and a check of
+ * one of them would have passed while the other one lied.
+ */
+const home = readFileSync(
+  join(import.meta.dirname, '..', '..', 'app', '(parent)', 'home.tsx'),
+  'utf8',
+);
+/**
+ * The portal card the phone card was written from, read the way
+ * src/family/consent-attestation.test.ts reads it: the point of these checks is that the wiring
+ * exists on BOTH surfaces, which a test of one surface cannot show (L-037).
+ */
+const portal = readFileSync(
+  join(import.meta.dirname, '..', '..', '..', 'web', 'src', 'pages', 'app', 'ChildrenPage.tsx'),
+  'utf8',
+);
+/** The one view model both parent screens print from. */
+const view = readFileSync(join(import.meta.dirname, 'family-view.ts'), 'utf8');
 
 describe('editing a child profile on the Children screen (WEB-R2-03)', () => {
   it('sends PATCH /v1/children/:id through the contract response schema', () => {
@@ -49,7 +69,11 @@ describe('archiving a child on the Children screen (WEB-R2-03)', () => {
 
   it('confirms first and says history is kept and the slot freed', () => {
     expect(children).toMatch(/confirmArchive/);
-    expect(children).toMatch(/Archive \(keeps history, frees the slot\)/);
+    // HUNT7-G-4 (WEBR4-12, mobile half): the label is no longer a literal here — it is decided by
+    // `childArchiveLabel` in src/family/family-view.ts, which says "frees the slot" only for an
+    // active child, because this row is rendered for a draft that holds none. The two labels
+    // themselves are pinned behaviourally in src/family/family-view.test.ts.
+    expect(children).toMatch(/label=\{childArchiveLabel\(child\.status\)\}/);
     expect(children).toMatch(/Yes, archive/);
     // JSX text wraps across source lines, so whitespace is matched loosely.
     expect(children).toMatch(/store\s+subscription\s+is\s+unchanged/i);
@@ -115,5 +139,98 @@ describe('a deletion-pending child on the Children screen (ACC-FAM-03)', () => {
     expect(children).toMatch(/\{deletionPending \? null : row\.canPair \?/);
     expect(children).toMatch(/\{deletionPending \? null : row\.canActivate \?/);
     expect(children).toMatch(/child\.status === 'archived' \|\| deletionPending \? null :/);
+  });
+});
+
+/**
+ * HUNT7-G-3 / HUNT7-J-1 (the source pin the finding asks for). The sentence a parent reads about a
+ * deletion-pending child must come from the ONE helper both parent screens print from, so that
+ * correcting it once corrects it everywhere — the claim HUNT6-G-2 made for the portal
+ * (apps/web/src/pages/app/ChildrenPage.tsx `childStatusLabel`) and did not carry to the phone.
+ *
+ * The behaviour of the helper is pinned in src/family/family-view.test.ts. What is checked HERE is
+ * what that suite cannot see: that neither screen holds status copy of its own, and that both take
+ * their rows from `childRows`. The home screen is the sharper of the two — `grep -n deletion
+ * home.tsx` finds nothing, so it renders no counter-notice at all and the status line is the parent's
+ * only word on the matter.
+ */
+describe('neither parent screen can print “history only” for a deletion-pending child (HUNT7-G-3)', () => {
+  it('[repro] the phone helper reads the flag in the same statement as the portal helper', () => {
+    // L-037: one wording per state across the surfaces. The portal's `childStatusLabel` answers
+    // 'Data deletion under way' before its status switch; the phone's `childStatusText` must decide
+    // it the same way, in the helper both screens print from. family-view.test.ts asserts the
+    // resulting sentence behaviourally; this is the pin that the DECISION is the portal's, not a
+    // second one that can drift again.
+    expect(portal).toMatch(
+      /if \(child\.deletionPending === true\) return 'Data deletion under way';/,
+    );
+    expect(view).toMatch(
+      /if \(child\.deletionPending === true\) return 'Data deletion under way';/,
+    );
+  });
+
+  it('both screens print that one helper’s sentence and hold no status copy of their own', () => {
+    expect(children).toMatch(/Status: \{row\.statusText\}/);
+    expect(home).toMatch(/Status: \{row\.statusText\}/);
+    expect(children).toMatch(/childRows\(family\)/);
+    expect(home).toMatch(/childRows\(family\)/);
+    // The false sentence exists in exactly one place in the app — the helper's archived branch — so
+    // neither screen can reach it except through the flag-first helper above.
+    expect(children).not.toMatch(/history only/i);
+    expect(home).not.toMatch(/history only/i);
+  });
+});
+
+/**
+ * HUNT7-G-4. The phone form seeded all three fields from the live prop once and PATCHed all three
+ * unconditionally, so a nickname fix reverted the other guardian's grade — BUG-222/WEBR4-03 three
+ * rounds after the portal was fixed. The rule the body hangs on is pure and pinned in
+ * src/family/family-view.test.ts (`childEditBody`); what is checked here is the wiring this suite
+ * cannot render: every field marks itself touched, the body comes from the helper, Save is off until
+ * something is edited, and the fields are NOT reseeded from the live prop (that is BUG-330).
+ */
+describe('the phone child form sends only what the parent edited (HUNT7-G-4)', () => {
+  it('[repro] builds the PATCH body with the touched-fields helper, not from the seed', () => {
+    expect(children).toMatch(/childEditBody\(/);
+    // The old body: all three fields, unconditionally, from a mount-time snapshot.
+    expect(children).not.toMatch(
+      /onSave\(\{\s*nickname: name,\s*gradeLevel: Number\(grade\),\s*ageBand\s*\}\)/,
+    );
+  });
+
+  it('marks each of the three fields touched from its own handler', () => {
+    for (const field of ['nickname', 'gradeLevel', 'ageBand']) {
+      expect(children).toContain(`...t, ${field}: true`);
+    }
+  });
+
+  it('keeps Save off until something is edited, so reopening it cannot revert anything', () => {
+    expect(children).toMatch(/nothingEdited/);
+    expect(children).toMatch(/disabled=\{nothingEdited\}/);
+  });
+
+  it('seeds the fields once and never reseeds them from the live prop (BUG-330)', () => {
+    // HUNT5-F-1's fix, kept: `seed` is captured with useState and the fields come from it. A
+    // useEffect that pushed `child` back into the fields would put the other guardian's value under
+    // the parent's hands mid-edit, which is the defect that fix was filed for.
+    expect(children).toMatch(/const \[seed\] = useState\(child\);/);
+    expect(children).toMatch(/useState\(seed\.nickname\)/);
+    expect(children).not.toMatch(/useEffect\(\(\) => \{\s*setNickname/);
+  });
+
+  it('tells the parent what changed under the open form, naming no actor (HUNT7-G-2)', () => {
+    expect(children).toMatch(/childEditDriftNote\(seed, child\)/);
+    expect(children).not.toMatch(/another guardian/i);
+  });
+
+  it('is the rule the portal form already had, so the two surfaces decide alike', () => {
+    // apps/web/src/pages/app/ChildrenPage.tsx EditChildForm: `touched` decides the body and
+    // `nothingEdited` the button. The phone now hangs on the same two names.
+    expect(portal).toMatch(
+      /const \[touched, setTouched\] = useState\(\{ nickname: false, gradeLevel: false, ageBand: false \}\);/,
+    );
+    expect(children).toMatch(
+      /const \[touched, setTouched\] = useState\(\{ nickname: false, gradeLevel: false, ageBand: false \}\);/,
+    );
   });
 });

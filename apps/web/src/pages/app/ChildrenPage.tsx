@@ -190,10 +190,26 @@ function ChildrenContent({ data, onChanged }: { data: FamilyOverview; onChanged:
 /**
  * Why activation is not on offer, for a draft and for an archived child alike: this portal never
  * sells capacity, so the only honest answer is where a slot comes from (WEB-R1-04).
+ *
+ * HUNT7-G-8: the no-slot branch does not say "yet". That word asserted the family has never held a
+ * paid slot, and `releaseSlotlessProfiles` (apps/api/src/services/billing-sync.ts) makes it false: it
+ * sets `status = 'draft'` on a previously ACTIVE child whenever verified provider state releases its
+ * slot (release_reason 'expired' or 'downgrade'), and `family_capacity.paid_slots` is then 0 for a
+ * family that has been paying. So this sentence — printed once per child, on both branches below —
+ * told exactly the lapsed population they had never paid for the children they had been paying for.
+ * It is the same word and the same premise HUNT6-H-4 removed from the planner's draft branch
+ * (LearningPlannerPage.tsx), whose own fix named THIS file as the model for naming the remedy without
+ * anyone grepping it for the word being removed (L-057).
+ *
+ * What it still does not do is promise capacity: it names where a slot comes from and never says one
+ * is waiting. "Choose or renew" covers a family that has never subscribed and one whose plan lapsed
+ * without asserting which is reading it. The phone twin `draftActivationNote`
+ * (apps/mobile/src/family/family-view.ts) carries the same decision, pointing at the app's own Plan
+ * and child slots screen.
  */
 function noFreeSlotText(nickname: string, paidSlots: number): string {
   return paidSlots === 0
-    ? `Your family has no paid child slots yet. To activate ${nickname}, subscribe in the PencilLift app.`
+    ? `Your family has no paid child slots right now. To activate ${nickname}, choose or renew a plan in the PencilLift app.`
     : `All ${paidSlots} paid ${paidSlots === 1 ? 'slot is' : 'slots are'} in use. To activate ${nickname}, add a child slot to your plan in the PencilLift app.`;
 }
 

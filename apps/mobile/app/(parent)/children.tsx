@@ -20,6 +20,9 @@ import { colors } from '@pencillift/ui-tokens';
 import {
   activationError,
   activationMessage,
+  childArchiveLabel,
+  childEditBody,
+  childEditDriftNote,
   childRows,
   gradeText,
   parentActionError,
@@ -328,7 +331,13 @@ function ChildCard({
             </Notice>
           ) : (
             <Button
-              label="Archive (keeps history, frees the slot)"
+              // HUNT7-G-4 (WEBR4-12, the mobile half): this row is rendered for a DRAFT child too,
+              // and a draft holds no slot, so archiving one frees nothing — `slotSummary` returns
+              // unchanged counts after it. The confirmation body above already branched on the
+              // status; the label did not. The portal's card has branched since round 4
+              // (apps/web/src/pages/app/ChildrenPage.tsx, ChildCard's archive button), and the two
+              // labels now come from one helper so they cannot drift apart again.
+              label={childArchiveLabel(child.status)}
               accessibilityLabel={`Archive ${row.nickname}`}
               secondary
               disabled={busy}
@@ -351,7 +360,24 @@ function ChildCard({
 /**
  * Correcting one child's nickname, grade and age band (WEB-R2-03). The menus come from the contract
  * (L-036), so widening the launch scope in packages/contracts reaches this screen with no second
- * edit. The server re-checks the recent PIN unlock, the contract bounds and the archived rule.
+ * edit. Only the fields the parent edited here are sent, so a concurrent edit by the other guardian
+ * is not overwritten wholesale. The server re-checks the recent PIN unlock, the contract bounds and
+ * the archived rule.
+ *
+ * HUNT7-G-4: that promise used to be false on this surface. The fields were seeded from the live prop
+ * once and all three were then PATCHed unconditionally from that seed — and the card above is keyed on
+ * `row.id` (ChildrenContent), so a reload never remounts it and the seed is as old as the open form.
+ * Guardian B moved the child up a grade on the portal while parent A had this form open on the old
+ * grade; A fixed a typo in the nickname and the PATCH put the grade back, which is the value new
+ * practice is built for. That is BUG-222/WEBR4-03 verbatim — fixed on the portal in round 4, again in
+ * round 5 (HUNT5-F-1) and again in round 6 (HUNT6-G-8), every time inside apps/web only.
+ *
+ * What travels now is decided by `touched` and built by `childEditBody`
+ * (src/family/family-view.ts), where it can be tested: this app's suite cannot render react-native
+ * (vitest.config.ts), so a rule living inside this component could not be pinned at all. The fields
+ * are NOT reseeded from the live prop — that is the loss HUNT5-F-1 was filed for — so
+ * `childEditDriftNote` names what moved under the open form instead (BUG-330), saying WHAT changed
+ * and not WHO changed it, because the response carries no actor (HUNT7-G-2).
  */
 function EditChild({
   child,
@@ -362,10 +388,36 @@ function EditChild({
   busy: boolean;
   onSave: (body: UpdateChildProfileRequest) => void;
 }) {
-  const [nickname, setNickname] = useState(child.nickname);
-  const [grade, setGrade] = useState(String(child.gradeLevel));
-  const [ageBand, setAgeBand] = useState<AgeBand>(child.ageBand);
+  /**
+   * The profile this form was opened on, captured once (HUNT5-F-1). The fields below are seeded from
+   * this and never reseeded, so a reload cannot move them under the parent's hands. `child` — the
+   * live prop this screen's reload refreshes under the open form — is read only to name what changed
+   * and to address the parent; it never decides what travels.
+   */
+  const [seed] = useState(child);
+  const [nickname, setNickname] = useState(seed.nickname);
+  const [grade, setGrade] = useState(String(seed.gradeLevel));
+  const [ageBand, setAgeBand] = useState<AgeBand>(seed.ageBand);
   const [fieldError, setFieldError] = useState<string | null>(null);
+  /**
+   * Which fields the parent has edited in THIS form, the portal's rule (HUNT6-G-8, BUG-330). "Edited"
+   * and not "differs from the seed": those two agree until a concurrent change lands, and after it a
+   * seed diff makes the value the parent can SEE unsavable, with nothing on screen saying why.
+   *
+   * `Choice` (src/family/ui.tsx) calls onChange for a press on the ALREADY selected chip, so tapping
+   * the grade the form is showing marks it edited and sends it. That is deliberate here and it is
+   * where this form is not identical to the portal's, whose `<select>` fires no change for the option
+   * already chosen: a press is an explicit act on that field, and re-asserting the value on screen is
+   * exactly the dead end BUG-330 was filed for. It cannot revert anything the parent has not touched.
+   */
+  const [touched, setTouched] = useState({ nickname: false, gradeLevel: false, ageBand: false });
+
+  /** Only the fields the parent edited here (WEBR4-03, HUNT5-F-1, HUNT6-G-8, HUNT7-G-4). */
+  const changes = (name: string) =>
+    childEditBody({ nickname: name, gradeLevel: Number(grade), ageBand }, touched);
+  const nothingEdited = Object.keys(changes(nickname.trim())).length === 0;
+  /** What moved under this form since it opened, for the notice below. */
+  const drift = childEditDriftNote(seed, child);
 
   const submit = () => {
     const name = nickname.trim();
@@ -374,7 +426,10 @@ function EditChild({
       return;
     }
     setFieldError(null);
-    onSave({ nickname: name, gradeLevel: Number(grade), ageBand });
+    const body = changes(name);
+    // The contract's refine rejects an empty body anyway; Save is already off in this state.
+    if (Object.keys(body).length === 0) return;
+    onSave(body);
   };
 
   return (
@@ -391,6 +446,7 @@ function EditChild({
         autoCorrect={false}
         onChangeText={(text) => {
           setNickname(text);
+          setTouched((t) => ({ ...t, nickname: true }));
           setFieldError(null);
         }}
         placeholderTextColor={colors.muted}
@@ -399,16 +455,33 @@ function EditChild({
         label={`Grade (${gradeText(Number(grade))})`}
         options={GRADE_OPTIONS}
         value={grade}
-        onChange={setGrade}
+        onChange={(value) => {
+          setGrade(value);
+          setTouched((t) => ({ ...t, gradeLevel: true }));
+        }}
       />
-      <Choice label="Age band" options={AGE_OPTIONS} value={ageBand} onChange={setAgeBand} />
+      <Choice
+        label="Age band"
+        options={AGE_OPTIONS}
+        value={ageBand}
+        onChange={(value) => {
+          setAgeBand(value);
+          setTouched((t) => ({ ...t, ageBand: true }));
+        }}
+      />
       <Body muted>
         New practice is built for the grade saved here, so update it each school year.
       </Body>
+      {drift ? (
+        <Notice>
+          <Body>{drift}</Body>
+        </Notice>
+      ) : null}
       {fieldError ? <ErrorBox message={fieldError} /> : null}
       <Button
         label={busy ? 'Saving…' : `Save ${child.nickname}’s details`}
         busy={busy}
+        disabled={nothingEdited}
         onPress={submit}
       />
     </>

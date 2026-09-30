@@ -107,15 +107,50 @@ export const RELEASE_REASON: Record<
   skipped_week: () => 'no review this week',
 };
 
+/**
+ * The two sentences a daily-practice state has: what is true for a profile PencilLift prepares practice
+ * for, and what is true for one it does not (`receivesPractice`, below, is the single definition of
+ * which). Both variants exist for every state on purpose (HUNT7-H-1): the old table held one string per
+ * state and only `not_yet_released` carried an instant, so the planner notice's framing sentence — which
+ * speaks about "the times below" — could not reach the other three, and 'available' asserted in the
+ * present tense that today's practice is ready for a profile that receives none. A state with no
+ * hypothetical is a state that can make that claim again, so the shape, not the wording, is the fix.
+ *
+ * The hypothetical keeps the instant wherever the plain sentence has one (HUNT5-F-10: the stored plan is
+ * what the parent came to read) and says nothing about WHY the profile is not active: "again" would
+ * assert that it once was, which is true of an archived profile and only of SOME drafts —
+ * `releaseSlotlessProfiles` (apps/api/src/services/billing-sync.ts) returns a previously active child to
+ * 'draft' — and deriving that here would be a second status question in a card that has one.
+ */
+export interface DailyStateCopy {
+  readonly prepared: (releaseAt: string, zone: string) => string;
+  readonly hypothetical: (releaseAt: string, zone: string, childName: string) => string;
+}
+
 export const DAILY_STATE: Record<
   LearningScheduleResponse['dailyPractice']['state'],
-  (releaseAt: string, zone: string) => string
+  DailyStateCopy
 > = {
-  available: () => 'Today’s daily practice is available.',
-  not_yet_released: (releaseAt, zone) =>
-    `Today’s daily practice opens ${formatInZone(releaseAt, zone)}.`,
-  paused: () => 'Daily practice is paused today.',
-  vacation: () => 'Daily practice is paused today (vacation).',
+  available: {
+    prepared: () => 'Today’s daily practice is available.',
+    hypothetical: (_releaseAt, _zone, childName) =>
+      `Today’s daily practice would be available if ${childName}’s profile were active.`,
+  },
+  not_yet_released: {
+    prepared: (releaseAt, zone) => `Today’s daily practice opens ${formatInZone(releaseAt, zone)}.`,
+    hypothetical: (releaseAt, zone, childName) =>
+      `Today’s daily practice would open at ${formatInZone(releaseAt, zone)} if ${childName}’s profile were active.`,
+  },
+  paused: {
+    prepared: () => 'Daily practice is paused today.',
+    hypothetical: (_releaseAt, _zone, childName) =>
+      `Daily practice would be paused today even if ${childName}’s profile were active.`,
+  },
+  vacation: {
+    prepared: () => 'Daily practice is paused today (vacation).',
+    hypothetical: (_releaseAt, _zone, childName) =>
+      `Daily practice would be paused today (vacation) even if ${childName}’s profile were active.`,
+  },
 };
 
 export const SET_KIND_LABEL: Record<ParentPracticeSet['kind'], string> = {

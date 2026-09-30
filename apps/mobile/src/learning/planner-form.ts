@@ -186,8 +186,73 @@ export interface UpcomingView {
   readonly zoneLine: string;
   readonly dailyLine: string;
   readonly reviewLines: readonly string[];
+  /** Printed in place of `reviewLines` when there are none; hedged for the same reason as `dailyLine`. */
+  readonly noReviewsLine: string;
   readonly pointsLine: string;
 }
+
+/**
+ * Whether PencilLift prepares practice and weekly reviews for a profile in this state — the ONE
+ * definition of that question on the phone, mirroring the portal's `receivesPractice`
+ * (apps/web/src/components/learning/format.ts) sentence for sentence. It is here, beside the copy it
+ * decides, because the alternative was each card in app/(parent)/planner.tsx comparing the status itself,
+ * which is how the portal's cards came to contradict each other four rounds running (L-068).
+ *
+ * It is `active`, and these statements in the product decide it, none of them about whether the parent may
+ * EDIT anything:
+ *   * `loadChildContext` (apps/api/src/jobs/learning-jobs.ts) returns null unless the child is active, for
+ *     every caller except the planner preview in routes/learning.ts, which passes `requireActive: false`;
+ *   * the nightly sweep selects `where c.status = 'active'`;
+ *   * the practice-set insert re-checks `status = 'active'` under FOR SHARE;
+ *   * `app.current_child_id()` refuses a non-active child's own device
+ *     (supabase/migrations/0001_core_identity.sql).
+ *
+ * The nearby question this is NOT: `childPlanEditable` (src/family/family-view.ts), which is
+ * `status !== 'archived'` because `ownedChild(c, 'write')` keeps a DRAFT plan writable on purpose. The two
+ * facts agree for 'archived' today and disagree for every draft: that profile can be planned and receives
+ * nothing. A card that PROMISES practice answers to this predicate; a control that can be pressed answers
+ * to `childPlanEditable`.
+ */
+export function receivesPractice(childStatus: string | undefined): boolean {
+  return childStatus === 'active';
+}
+
+/**
+ * The two sentences a daily-practice state has, in the portal's words (`DAILY_STATE` in
+ * apps/web/src/components/learning/format.ts). A hypothetical PER STATE, not one string per state, is the
+ * shape of the fix (HUNT7-H-1): the phone printed 'Today’s daily practice is available.' for an archived
+ * or draft child, and only the `not_yet_released` sentence carried a time, so the archived notice's "the
+ * times below" framing could not reach the rest — and a draft child had no notice at all. The instant
+ * stays wherever there is one; only the claim hedges. 'vacation' had no sentence of its own here at all
+ * and fell through to the plain paused line, which the portal has always distinguished.
+ */
+interface DailyStateCopy {
+  readonly prepared: (releaseAt: string, zone: string) => string;
+  readonly hypothetical: (releaseAt: string, zone: string, childName: string) => string;
+}
+
+const DAILY_STATE: Record<LearningScheduleResponse['dailyPractice']['state'], DailyStateCopy> = {
+  available: {
+    prepared: () => 'Today’s daily practice is available.',
+    hypothetical: (_releaseAt, _zone, childName) =>
+      `Today’s daily practice would be available if ${childName}’s profile were active.`,
+  },
+  not_yet_released: {
+    prepared: (releaseAt, zone) => `Today’s daily practice opens ${formatInZone(releaseAt, zone)}.`,
+    hypothetical: (releaseAt, zone, childName) =>
+      `Today’s daily practice would open at ${formatInZone(releaseAt, zone)} if ${childName}’s profile were active.`,
+  },
+  paused: {
+    prepared: () => 'Daily practice is paused today.',
+    hypothetical: (_releaseAt, _zone, childName) =>
+      `Daily practice would be paused today even if ${childName}’s profile were active.`,
+  },
+  vacation: {
+    prepared: () => 'Daily practice is paused today (vacation).',
+    hypothetical: (_releaseAt, _zone, childName) =>
+      `Daily practice would be paused today (vacation) even if ${childName}’s profile were active.`,
+  },
+};
 
 const RELEASE_REASON: Record<
   LearningScheduleResponse['nextReviewReleases'][number]['reason'],
@@ -198,18 +263,29 @@ const RELEASE_REASON: Record<
   skipped_week: 'no review this week',
 };
 
-export function buildUpcomingView(data: LearningScheduleResponse, childName: string): UpcomingView {
+/**
+ * The "Coming up" card's lines. `childStatus` is required, and undefined is a legal value for it, so a
+ * caller that has no status must say so rather than get the promising copy by omission: every
+ * forward-looking line here then hedges (fail closed, as the portal's sections do).
+ */
+export function buildUpcomingView(
+  data: LearningScheduleResponse,
+  childName: string,
+  childStatus: string | undefined,
+): UpcomingView {
   const zone = data.timezone;
   const daily = data.dailyPractice;
-  const dailyLine =
-    daily.state === 'available'
-      ? 'Today’s daily practice is available.'
-      : daily.state === 'not_yet_released'
-        ? `Today’s daily practice opens ${formatInZone(daily.releaseAt, zone)}.`
-        : 'Daily practice is paused today.';
+  const prepared = receivesPractice(childStatus);
+  const copy = DAILY_STATE[daily.state];
+  const dailyLine = prepared
+    ? copy.prepared(daily.releaseAt, zone)
+    : copy.hypothetical(daily.releaseAt, zone, childName);
   return {
     zoneLine: `Times are in your family’s time zone: ${zone}.`,
     dailyLine,
+    noReviewsLine: prepared
+      ? 'No weekly reviews are scheduled yet.'
+      : `No weekly reviews are scheduled. A review is prepared once ${childName}’s profile is active.`,
     reviewLines: data.nextReviewReleases.map((r) => {
       const name = SUBJECT_DISPLAY_NAMES[r.subjectKey];
       const when = r.releaseAt ? formatInZone(r.releaseAt, zone) : 'not this week';

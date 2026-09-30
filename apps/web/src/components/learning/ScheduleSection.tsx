@@ -54,6 +54,10 @@ import {
  * HUNT7-H-4: that one value also decides the ADVICE this card gives when nothing is coming up, so the
  * card cannot ask for a subject toggle that the same status has made unusable in the section next to
  * it. It is computed once, below, and handed to both parts.
+ *
+ * HUNT7-H-1: and it decides the DAILY line, which was the last unconditional present-tense claim in this
+ * region. `DAILY_STATE` (format.ts) now carries a hypothetical per state, so the choice here is which
+ * variant to print, never whether a sentence happens to mention a time.
  */
 export function ScheduleSection({
   childId,
@@ -115,7 +119,7 @@ export function ScheduleSection({
             subjects={subjects}
             childName={childName}
             readOnly={readOnly}
-            receivesReview={receivesPractice(childStatus)}
+            practicePrepared={receivesPractice(childStatus)}
           />
         </>
       ) : null}
@@ -390,7 +394,7 @@ function UpcomingReleases({
   subjects,
   childName,
   readOnly,
-  receivesReview,
+  practicePrepared,
 }: {
   data: LearningScheduleResponse;
   subjects: readonly ChildSubject[];
@@ -402,9 +406,10 @@ function UpcomingReleases({
    * separate on purpose: a draft profile is writable — the instruction below names a control that really
    * is live for it — and receives nothing, so the instruction may stand while its PROMISE must not.
    * TestDatesSection answers the same question with the same value, which is what stops the two cards in
-   * this page region telling the parent opposite things.
+   * this page region telling the parent opposite things. It decides BOTH forward-looking lines here: the
+   * daily sentence and the empty-review advice (HUNT7-H-1), so the two cannot disagree either.
    */
-  receivesReview: boolean;
+  practicePrepared: boolean;
 }) {
   const zone = data.timezone;
   const headingId = useId();
@@ -419,7 +424,28 @@ function UpcomingReleases({
   return (
     <div aria-labelledby={headingId} role="region">
       <h3 id={headingId}>Coming up for {childName}</h3>
-      <p>{DAILY_STATE[data.dailyPractice.state](data.dailyPractice.releaseAt, zone)}</p>
+      {/*
+        HUNT7-H-1: the daily line used to be one string per state, and three of the four carried no time
+        at all, so the planner's framing sentence — "the times below are what the schedule would produce
+        if the profile were active again" — could not cover them; 'available' then told the parent of an
+        archived or draft child that today's practice was ready, a few inches under a notice saying no
+        new practice is prepared for them. It is false for both: `app.current_child_id()` requires
+        `c.status = 'active'` (migration 0001_core_identity), so no request from the child's device can
+        open a set, and `loadChildContext` (apps/api/src/jobs/learning-jobs.ts) prepares none. It is not
+        a stale value either — the archived branch of GET /learning-schedule recomputes
+        `dailyPracticeState` from the clock on every request, and that returns 'available' on any local
+        day past `daily_local_time` with no pause covering it (packages/domain/src/scheduling/daily.ts).
+        The instant stays where there is one; only the claim hedges.
+      */}
+      <p>
+        {practicePrepared
+          ? DAILY_STATE[data.dailyPractice.state].prepared(data.dailyPractice.releaseAt, zone)
+          : DAILY_STATE[data.dailyPractice.state].hypothetical(
+              data.dailyPractice.releaseAt,
+              zone,
+              childName,
+            )}
+      </p>
       {data.nextReviewReleases.length === 0 ? (
         /*
           HUNT7-H-4: the instruction is printed only where the control it names can be pressed, and
@@ -451,7 +477,7 @@ function UpcomingReleases({
             ? 'No weekly review is scheduled for this week or next.'
             : readOnly
               ? `No weekly reviews are scheduled: no subject that gets a weekly review is on, and subjects can’t be turned on or off while ${childName}’s profile is archived. Activate ${childName} again on the Children page, while a paid slot is free, to change that.`
-              : receivesReview
+              : practicePrepared
                 ? 'No weekly reviews are scheduled yet. Turn on at least one subject that PencilLift makes practice for to get a review.'
                 : `No weekly reviews are scheduled yet. Turn on at least one subject that PencilLift makes practice for; a review is prepared once ${childName}’s profile is active.`}
         </p>

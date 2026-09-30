@@ -108,7 +108,17 @@ describe('ChildrenPage', () => {
     const sam = (await screen.findByRole('heading', { name: 'Sam' })).closest('li')!;
     // As above (WEB-R2-03): no pairing or slot button, while Edit profile and Archive stay.
     expect(within(sam).queryByRole('button', { name: /pair|slot/i })).toBeNull();
-    expect(within(sam).getByText(/no paid child slots yet/)).toBeTruthy();
+    expect(within(sam).getByText(/no paid child slots right now/)).toBeTruthy();
+    // HUNT7-G-8: and never “yet”, which asserted this family had NEVER held a paid slot.
+    // `releaseSlotlessProfiles` returns a previously ACTIVE child to 'draft' when the verified
+    // provider state releases its slot (an expiry or a store-confirmed downgrade), and
+    // family_capacity.paid_slots is 0 for that family — so the old wording was false for exactly
+    // the population that had been paying. This assertion is the stale half of that fix: it was
+    // pinning the sentence the fix removed, in a file the parity agent did not own.
+    // Bounded to THAT SENTENCE, not to the card: the status label beside it says “Draft: not
+    // active yet, no charge”, which is a different claim and a true one. A card-wide negative
+    // here would have failed on it — L-054 cuts both ways, and the first draft of this line did.
+    expect(within(sam).getByText(/no paid child slots/).textContent).not.toMatch(/\byet\b/i);
   });
 
   it('assigns an unused paid slot to a draft child and reloads the list', async () => {

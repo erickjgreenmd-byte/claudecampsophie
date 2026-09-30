@@ -34,6 +34,7 @@ import {
   WEEKDAY_OPTIONS,
   buildUpcomingView,
   plannerError,
+  receivesPractice,
   scheduleToPlannerForm,
   stepCount,
   validatePlannerForm,
@@ -194,6 +195,14 @@ function ChildPlanSections({
   // The API refuses every learning write for an archived profile (HUNT6-H-1), so no control for one is
   // offered: the stored plan stays readable, which is what archiving promises.
   const editable = childPlanEditable(child.status);
+  /**
+   * The OTHER question, asked once for this screen (HUNT7-H-1, L-068): does PencilLift prepare practice for
+   * this profile at all? `receivesPractice` (src/learning/planner-form.ts) is the single definition, and it
+   * is not `editable`: a draft plan is writable on purpose and receives nothing, so the screen may offer
+   * every control and must still promise nothing. It decides the notice below; the "Coming up" card gets the
+   * status and asks the same helper from inside `buildUpcomingView`, so neither of them owns a comparison.
+   */
+  const practicePrepared = receivesPractice(child.status);
   const base = `/v1/children/${encodeURIComponent(child.id)}`;
   const loadSchedule = useCallback(
     () => api.get(`${base}/learning-schedule`, learningScheduleResponseSchema),
@@ -226,6 +235,32 @@ function ChildPlanSections({
           </Body>
         </Notice>
       )}
+      {editable && !practicePrepared ? (
+        // HUNT7-H-1: the portal has framed this profile since HUNT6-H-4 and the phone did not, so a draft
+        // child's parent read "Today's daily practice is available." with nothing around it. The wording is
+        // the portal's, and state-neutral: `releaseSlotlessProfiles` (apps/api/src/services/billing-sync.ts)
+        // returns a previously ACTIVE child to 'draft' when an expiry or a store-confirmed downgrade frees
+        // its slot, so neither "yet" nor "again" is true of both draft populations. Every control stays —
+        // `ownedChild(c, 'write')` admits a draft, which is the point of planning before activation.
+        //
+        // "Editable and not prepared" is exactly 'draft' while `CHILD_PROFILE_STATUSES`
+        // (packages/contracts/src/family.ts) holds three values, which is what makes the paid-slot REASON
+        // true here; a fourth status would need its own sentence rather than this one, and the planner
+        // form's suite pins that list so it cannot be added silently.
+        //
+        // BOTH remedies are named, as the portal's notice names them: the Children screen only offers
+        // "Assign an unused paid slot" while one is unused (`childRows`, src/family/family-view.ts), so a
+        // family with none would otherwise be sent to a control that is not there — capacity is bought on
+        // the Plan and child slots screen.
+        <Notice>
+          <Body>
+            {child.nickname} doesn’t have a paid slot right now, so no practice is prepared for
+            them, and the times below are what the schedule would produce while they hold one. You
+            can still set things up: assign an unused paid slot in Children — no new purchase — or
+            add capacity in Plan and child slots.
+          </Body>
+        </Notice>
+      ) : null}
       {family.timezone ? (
         <Body muted>Times are in your family’s time zone: {family.timezone}.</Body>
       ) : null}
@@ -264,7 +299,7 @@ function ChildPlanSections({
           {/* Built from the schedule that is LOADED, not from the editor's captured copy (HUNT7-J-6):
               the editor seeds its state from `initial` once, so a reload after a subject toggle — the
               one change `nextReviewReleases` depends on — could not reach this card. */}
-          <ComingUp data={schedule.state.data} childName={child.nickname} />
+          <ComingUp data={schedule.state.data} child={child} />
           <ScheduleEditor
             api={api}
             path={`${base}/learning-schedule`}
@@ -431,15 +466,30 @@ function Field({
   );
 }
 
-/** What the child's next daily practice and weekly reviews are, in the family's time zone. */
-function ComingUp({ data, childName }: { data: LearningScheduleResponse; childName: string }) {
-  const upcoming = buildUpcomingView(data, childName);
+/**
+ * What the child's next daily practice and weekly reviews are, in the family's time zone. Every line comes
+ * from `buildUpcomingView`, which takes the status: the card holds no copy of its own, so the hedge cannot
+ * be applied to one line and forgotten on the next (HUNT7-H-1).
+ */
+function ComingUp({
+  data,
+  child,
+}: {
+  data: LearningScheduleResponse;
+  /**
+   * The child as GET /v1/family reports them. Their STATUS goes to `buildUpcomingView`, which asks
+   * `receivesPractice` — the phone's one definition of "is practice prepared for this profile" — so this
+   * card carries no status comparison of its own and cannot hedge one line while promising on the next.
+   */
+  child: FamilyOverview['children'][number];
+}) {
+  const upcoming = buildUpcomingView(data, child.nickname, child.status);
   return (
     <Card>
       <Heading>Coming up</Heading>
       <Body>{upcoming.dailyLine}</Body>
       {upcoming.reviewLines.length === 0 ? (
-        <Body muted>No weekly reviews are scheduled yet.</Body>
+        <Body muted>{upcoming.noReviewsLine}</Body>
       ) : (
         upcoming.reviewLines.map((line) => <Body key={line}>{line}</Body>)
       )}

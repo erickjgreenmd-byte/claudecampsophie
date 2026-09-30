@@ -1032,3 +1032,113 @@ describe('[HUNT7-G-2] the child form’s concurrent-change notice names no actor
     expect(within(robin).getByRole('status').textContent).toMatch(/Saved\. Robin is in/i);
   });
 });
+
+/**
+ * HUNT7-G-8. `noFreeSlotText` told a family with no paid slot that they have "no paid child slots
+ * YET", which asserts they never had one. `releaseSlotlessProfiles`
+ * (apps/api/src/services/billing-sync.ts) sets `status = 'draft'` on a previously ACTIVE child
+ * whenever verified provider state releases its slot (release_reason 'expired' or 'downgrade'), and
+ * `family_capacity.paid_slots` is then 0 for a family that has been paying — so the sentence was
+ * false for exactly the lapsed population, once per child, on the page where they manage the children
+ * they were paying for. It is the same word and the same premise HUNT6-H-4 removed from the planner
+ * (apps/web/src/pages/app/LearningPlannerPage.tsx), in the file that fix named as its model.
+ *
+ * The remedy is unchanged and stays honest: this portal never sells capacity (WEB-R1-04), so the
+ * sentence points at the app to choose or renew a plan and never claims a slot exists. The phone twin
+ * `draftActivationNote` (apps/mobile/src/family/family-view.ts) carries the same decision, pinned in
+ * apps/mobile/src/family/family-view.test.ts.
+ */
+describe('[HUNT7-G-8] the no-slot sentence does not tell a lapsed family they never paid', () => {
+  it('states it state-neutrally for a draft, with no “yet”', async () => {
+    const { api } = fakeApi(
+      overview([{ id: SAM, nickname: 'Sam', gradeLevel: 2, ageBand: '5-7', status: 'draft' }], 0),
+    );
+    renderPage(<ChildrenPage />, { api });
+    const sam = await card('Sam');
+    expect(sam.textContent).not.toMatch(/no paid child slots yet/i);
+    expect(
+      within(sam).getByText(
+        'Your family has no paid child slots right now. To activate Sam, choose or renew a plan in the PencilLift app.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('says the same thing on an archived card, which the same helper serves', async () => {
+    const { api } = fakeApi(
+      overview(
+        [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'archived' }],
+        0,
+      ),
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    expect(riley.textContent).not.toMatch(/\byet\b/i);
+    expect(riley.textContent).toMatch(/no paid child slots right now/);
+    expect(riley.textContent).toMatch(/choose or renew a plan in the PencilLift app/);
+  });
+
+  it('leaves the branch where the family demonstrably HAS slots alone', async () => {
+    const { api } = fakeApi(
+      overview(
+        [
+          { id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'active' },
+          { id: SAM, nickname: 'Sam', gradeLevel: 2, ageBand: '5-7', status: 'draft' },
+        ],
+        1,
+      ),
+    );
+    renderPage(<ChildrenPage />, { api });
+    const sam = await card('Sam');
+    expect(
+      within(sam).getByText(
+        'All 1 paid slot is in use. To activate Sam, add a child slot to your plan in the PencilLift app.',
+      ),
+    ).toBeTruthy();
+  });
+});
+
+/**
+ * HUNT7-G-3 / HUNT7-J-1 (the portal half). HUNT6-G-2 put the `deletionPending` branch in
+ * `childStatusLabel` and claimed one helper decides the sentence for every surface; the phone kept
+ * printing 'Archived: history only' for a child whose history the purge is deleting until HUNT7-G-3.
+ * Nothing on this page asserted the STATUS LINE itself — the WEBR4-02 case above reads the whole
+ * card, which the deletion notice satisfies on its own — so the portal's half of the claim was
+ * unpinned too, and this is what stops it regressing while the phone is corrected.
+ */
+describe('[HUNT7-G-3] the portal status line never says the history is kept while it is being deleted', () => {
+  it('reads the deletion first, and never “history only”, for an archived deletion-pending child', async () => {
+    const { api } = fakeApi(
+      overview(
+        [
+          {
+            id: RILEY,
+            nickname: 'Riley',
+            gradeLevel: 3,
+            ageBand: '8-10',
+            // `public.request_deletion` archives a child-scope target in the same transaction
+            // (migrations 0600, 0890), so this pair is the only reachable shape.
+            status: 'archived',
+            deletionPending: true,
+          },
+        ],
+        1,
+      ),
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    expect(within(riley).getByText('Status: Data deletion under way')).toBeTruthy();
+    expect(riley.textContent).not.toMatch(/history only/i);
+  });
+
+  it('still says “Archived: history only” for an archive no deletion covers', async () => {
+    const { api } = fakeApi(
+      overview(
+        [{ id: RILEY, nickname: 'Riley', gradeLevel: 3, ageBand: '8-10', status: 'archived' }],
+        1,
+      ),
+    );
+    renderPage(<ChildrenPage />, { api });
+    const riley = await card('Riley');
+    expect(within(riley).getByText('Status: Archived: history only')).toBeTruthy();
+  });
+});

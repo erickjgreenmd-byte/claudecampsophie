@@ -2,9 +2,9 @@
   "@pencillift/domain": 3665,
   "@pencillift/api": 1183,
   "@pencillift/db": 467,
-  "@pencillift/web": 849,
-  "@pencillift/mobile": 823,
-  "@pencillift/ai": 94,
+  "@pencillift/web": 922,
+  "@pencillift/mobile": 856,
+  "@pencillift/ai": 96,
   "@pencillift/contracts": 20,
   "@pencillift/ui-tokens": 4
 }

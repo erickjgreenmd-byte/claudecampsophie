@@ -13,7 +13,7 @@ import type {
 } from '@pencillift/contracts';
 import type { ApiClient } from '@pencillift/contracts/client';
 import { renderPage } from '../../test/render.tsx';
-import { formatInZone } from './format.ts';
+import { DAILY_STATE, formatInZone } from './format.ts';
 import { PracticeSetsSection } from './PracticeSetsSection.tsx';
 import { ScheduleSection } from './ScheduleSection.tsx';
 import { StudyMaterialSection } from './StudyMaterialSection.tsx';
@@ -154,7 +154,11 @@ describe('[HUNT5-F-10] the schedule section keeps the release times whatever the
     const coming = await screen.findByRole('region', { name: /coming up for riley/i });
     expect(coming.textContent).toContain(REVIEW_TEXT);
     expect(coming.textContent).toContain(DAILY_TEXT);
-    expect(coming.textContent).toMatch(/daily practice opens/i);
+    // HUNT7-H-1: the INSTANT stays, which is what HUNT5-F-10 settled and what this case is for; the
+    // sentence around it is now the hypothetical, because "Today's daily practice opens <time>." is a
+    // present-tense claim about a profile the API prepares nothing for. The states that carry no instant
+    // are covered in their own describe below, over every non-active status.
+    expect(coming.textContent).toMatch(/would open at .* if Riley’s profile were active\./i);
     // No stand-in region: the times are what the planner's archived notice frames.
     expect(screen.queryByRole('region', { name: /nothing is coming up/i })).toBeNull();
     // The stored schedule itself stays readable — an archived profile is history, not a blank.
@@ -162,14 +166,42 @@ describe('[HUNT5-F-10] the schedule section keeps the release times whatever the
   });
 
   it('lists them for an active child, and for a draft child that has no slot yet', async () => {
-    renderPage(
-      <ScheduleSection childId={CHILD} childName="Riley" subjects={SUBJECTS} refreshKey={0} />,
+    const { unmount } = renderPage(
+      <ScheduleSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        refreshKey={0}
+        childStatus="active"
+      />,
       { api: scheduleApi() },
     );
     const coming = await screen.findByRole('region', { name: /coming up for riley/i });
     expect(coming.textContent).toContain(REVIEW_TEXT);
     expect(coming.textContent).toMatch(/Math/);
+    // The status is named rather than left out: an ACTIVE profile is the one this plain sentence is true
+    // of, and HUNT7-H-1 made the sentence depend on that (an absent prop fails closed to the
+    // hypothetical, like every other forward-looking line in the planner).
     expect(coming.textContent).toMatch(/daily practice opens/i);
+    unmount();
+
+    renderPage(
+      <ScheduleSection
+        childId={CHILD}
+        childName="Riley"
+        subjects={SUBJECTS}
+        refreshKey={0}
+        childStatus="draft"
+      />,
+      { api: scheduleApi() },
+    );
+    const draft = await screen.findByRole('region', { name: /coming up for riley/i });
+    // The draft child's stored plan stays listed in full — the times are the point of this describe —
+    // and only the claim about them hedges.
+    expect(draft.textContent).toContain(REVIEW_TEXT);
+    expect(draft.textContent).toContain(DAILY_TEXT);
+    expect(draft.textContent).toMatch(/Math/);
+    expect(draft.textContent).not.toMatch(/daily practice opens/i);
   });
 });
 
@@ -854,6 +886,130 @@ describe('[HUNT7-H-3/H-4] the schedule card and the test-date card answer the sa
       expect(source, file).toContain('receivesPractice');
       // Neither may carry its own copy of the expression the helper owns.
       expect(source, file).not.toMatch(/childStatus === 'active'/);
+    }
+  });
+});
+
+/**
+ * HUNT7-H-1, the FOURTH occurrence of L-068's shape and the first one in a lookup TABLE. The daily line
+ * is `DAILY_STATE[state](releaseAt, zone)` and only ONE of the four entries ever contained an instant
+ * ('not_yet_released'), so the planner notice's framing — "the times below are what the schedule would
+ * produce if the profile were active again" — could not reach the other three: they carry no time to
+ * frame. 'available' is reachable for BOTH non-active statuses (the archived branch of GET
+ * /learning-schedule recomputes `dailyPracticeState` from the clock on every request, and
+ * `dailyPracticeState` answers 'available' on any local day past `daily_local_time` with no pause), and
+ * it is false for both, because `app.current_child_id()` requires `c.status = 'active'` (migration 0001)
+ * and `loadChildContext` prepares nothing for a non-active profile (apps/api/src/jobs/learning-jobs.ts).
+ * So a few inches under "no new practice is prepared for them", the same region said today's practice is
+ * available.
+ *
+ * The table now carries a hypothetical PER STATE, so no state can print an unconditional present-tense
+ * sentence, and `receivesPractice` — the planner's one definition of "is practice prepared for this
+ * child" (format.ts) — chooses between them, the same value the empty-review advice above uses. The
+ * instants stay wherever there is one: HUNT5-F-10's ruling is unchanged.
+ *
+ * The cases below run over the whole non-active SET rather than the one status that was reported, which
+ * is what HUNT7-H-3's and H-4's repairs each got wrong in turn. Synthetic names only (Riley).
+ */
+const DAILY_STATES = [
+  {
+    state: 'available' as const,
+    prepared: 'Today’s daily practice is available.',
+    hedged: 'Today’s daily practice would be available if Riley’s profile were active.',
+  },
+  {
+    state: 'not_yet_released' as const,
+    prepared: `Today’s daily practice opens ${DAILY_TEXT}.`,
+    hedged: `Today’s daily practice would open at ${DAILY_TEXT} if Riley’s profile were active.`,
+  },
+  {
+    state: 'paused' as const,
+    prepared: 'Daily practice is paused today.',
+    hedged: 'Daily practice would be paused today even if Riley’s profile were active.',
+  },
+  {
+    state: 'vacation' as const,
+    prepared: 'Daily practice is paused today (vacation).',
+    hedged: 'Daily practice would be paused today (vacation) even if Riley’s profile were active.',
+  },
+];
+
+function dailyApi(state: (typeof DAILY_STATES)[number]['state']): Partial<ApiClient> {
+  return scheduleApi({
+    dailyPractice: { localDate: '2026-09-28', state, releaseAt: DAILY_AT },
+  });
+}
+
+describe('[HUNT7-H-1] the daily line is a hypothetical for every profile that receives no practice', () => {
+  for (const { state, prepared, hedged } of DAILY_STATES) {
+    for (const childStatus of ['archived', 'draft', 'suspended'] as const) {
+      it(`hedges the ${state} line for a ${childStatus} profile`, async () => {
+        renderPage(
+          <ScheduleSection
+            childId={CHILD}
+            childName="Riley"
+            subjects={SUBJECTS}
+            refreshKey={0}
+            childStatus={childStatus}
+          />,
+          { api: dailyApi(state) },
+        );
+        const coming = await screen.findByRole('region', { name: /coming up for riley/i });
+        // The present-tense claim is gone from the whole region (L-054), not merely reworded nearby.
+        expect(coming.textContent).not.toContain(prepared);
+        expect(coming.textContent).toContain(hedged);
+      });
+    }
+
+    it(`keeps the plain ${state} line for an ACTIVE profile, which does receive practice`, async () => {
+      renderPage(
+        <ScheduleSection
+          childId={CHILD}
+          childName="Riley"
+          subjects={SUBJECTS}
+          refreshKey={0}
+          childStatus="active"
+        />,
+        { api: dailyApi(state) },
+      );
+      const coming = await screen.findByRole('region', { name: /coming up for riley/i });
+      expect(coming.textContent).toContain(prepared);
+      expect(coming.textContent).not.toContain(hedged);
+    });
+  }
+
+  it('keeps the release instant in the hedged line, for every status (HUNT5-F-10)', async () => {
+    for (const childStatus of ['archived', 'draft', 'active'] as const) {
+      const { unmount } = renderPage(
+        <ScheduleSection
+          childId={CHILD}
+          childName="Riley"
+          subjects={SUBJECTS}
+          refreshKey={0}
+          childStatus={childStatus}
+        />,
+        { api: dailyApi('not_yet_released') },
+      );
+      const coming = await screen.findByRole('region', { name: /coming up for riley/i });
+      // Blanking the stored plan would throw away what the parent came to read; only the claim hedges.
+      expect(coming.textContent, childStatus).toContain(DAILY_TEXT);
+      unmount();
+    }
+  });
+
+  it('gives EVERY state a hypothetical, so a fifth state cannot print a present-tense claim', () => {
+    // The table half of the fix. A test on the rendered copy passes the day a state is added and only
+    // fails once someone reads that state's sentence, so the property is asserted on the table itself:
+    // every entry has both variants, and no hypothetical is the prepared sentence over again.
+    const states = Object.keys(DAILY_STATE) as (keyof typeof DAILY_STATE)[];
+    expect(states.sort()).toEqual(DAILY_STATES.map((d) => d.state).sort());
+    for (const state of states) {
+      const copy = DAILY_STATE[state];
+      const prepared = copy.prepared(DAILY_AT, ZONE);
+      const hedged = copy.hypothetical(DAILY_AT, ZONE, 'Riley');
+      expect(hedged, state).not.toBe(prepared);
+      expect(hedged, state).toMatch(/would/);
+      expect(hedged, state).toMatch(/if Riley’s profile were active/);
     }
   });
 });

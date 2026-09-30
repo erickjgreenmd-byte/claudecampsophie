@@ -801,3 +801,67 @@ describe('LearningPlannerPage (spec P7, P8, P10; AC_LEARNING_01/02/07/10, AC_UX_
     expect(gets.filter((p) => p.endsWith('/skills'))).toHaveLength(2);
   });
 });
+
+/**
+ * HUNT7-H-1 at the PAGE, which is the only place the contradiction was readable: the notice and the
+ * schedule card are two regions of one screen answering the same question about the same child. The
+ * notice says "no new practice is prepared for them"; the card, three inches down, said "Today's daily
+ * practice is available." Neither region was wrong on its own, which is L-068's whole point, so the
+ * assertion has to read them TOGETHER.
+ *
+ * 'available' is the ordinary afternoon value for either non-active status, not an edge case: the archived
+ * branch of GET /learning-schedule recomputes `dailyPracticeState` from `deps.clock()` on every request
+ * and that answers 'available' on any local day past `daily_local_time` with no pause covering it, while
+ * `app.current_child_id()` requires `c.status = 'active'` (migration 0001_core_identity) so no request
+ * from the child's device can open the set it names. Synthetic names only.
+ */
+const availableToday = () =>
+  schedule({
+    dailyPractice: {
+      localDate: '2026-09-24',
+      state: 'available',
+      releaseAt: '2026-09-24T19:30:00.000Z',
+    },
+  });
+
+function onlyRiley(status: string) {
+  return { ...family, children: [{ ...family.children[0], status }] };
+}
+
+describe('[HUNT7-H-1] the planner’s notice and its daily line agree about one child', () => {
+  for (const status of ['archived', 'draft'] as const) {
+    it(`does not tell a ${status} child’s parent that today’s practice is available`, async () => {
+      const { api } = fakeApi({
+        get: (p) =>
+          p === '/v1/family'
+            ? onlyRiley(status)
+            : p.includes('/learning-schedule')
+              ? availableToday()
+              : undefined,
+      });
+      renderPage(<LearningPlannerPage />, { api });
+      const plan = await region(/learning plan for riley/i);
+      // The schedule card loads after the page, so the region is read once its own heading is there.
+      await within(plan).findByRole('region', { name: /coming up for riley/i });
+      // The notice's half of the contradiction, in the words each status uses.
+      expect(plan.textContent).toMatch(/no (new )?practice is prepared/i);
+      // The other half, gone from the whole region (L-054) and replaced by the hypothetical the notice
+      // licenses. The claim is what changes; nothing the parent came to read is blanked.
+      expect(plan.textContent).not.toContain('Today’s daily practice is available.');
+      expect(plan.textContent).toContain(
+        'Today’s daily practice would be available if Riley’s profile were active.',
+      );
+    });
+  }
+
+  it('keeps the plain sentence for an ACTIVE child, who really does get today’s practice', async () => {
+    const { api } = fakeApi({
+      get: (p) => (p.includes('/learning-schedule') ? availableToday() : undefined),
+    });
+    renderPage(<LearningPlannerPage />, { api });
+    const plan = await region(/learning plan for riley/i);
+    await within(plan).findByRole('region', { name: /coming up for riley/i });
+    expect(plan.textContent).toContain('Today’s daily practice is available.');
+    expect(plan.textContent).not.toMatch(/would be available if/i);
+  });
+});

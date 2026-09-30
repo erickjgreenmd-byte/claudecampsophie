@@ -6,8 +6,12 @@ import { ApiRequestError } from '@pencillift/contracts/client';
 import {
   activationError,
   activationMessage,
+  childArchiveLabel,
+  childEditBody,
+  childEditDriftNote,
   childPlanEditable,
   childRows,
+  childStatusText,
   deviceRows,
   loadStateForRun,
   parentActionError,
@@ -62,9 +66,10 @@ describe('family view models', () => {
     const twoSlots = { ...family, paidSlots: 2 };
     expect(unusedPaidSlots(twoSlots)).toBe(1);
     expect(childRows(twoSlots)[1]).toMatchObject({ canActivate: true, activationNote: null });
-    // No subscription at all.
+    // No paid slot in the family at all. HUNT7-G-8: the sentence is state-neutral — the literal
+    // wording, and why "yet" cannot be said here, are pinned in their own case below.
     const none = { ...family, paidSlots: 0, children: [family.children[1]!] };
-    expect(childRows(none)[0]?.activationNote).toMatch(/no paid child slots yet/);
+    expect(childRows(none)[0]?.activationNote).toMatch(/no paid child slots right now/);
     // WEBR4-01 (lead, round 4): an archived child IS offered a free slot here, the way the portal
     // does. POST /children/:childId/activate clears archived_at for any profile that is not already
     // active, and the archive confirmation on both clients promises exactly this ("You can activate
@@ -251,5 +256,228 @@ describe('a planner write is offered only where the API accepts one (HUNT6-H-1)'
     // "only active children".
     expect(childPlanEditable('draft')).toBe(true);
     expect(childPlanEditable('archived')).toBe(false);
+  });
+});
+
+/**
+ * HUNT7-G-3 / HUNT7-J-1. `childStatusText` took only the status, so it answered
+ * 'Archived: history only' — that the history is KEPT — for a child whose history the purge is
+ * deleting. `public.request_deletion` archives a child-scope target in the same transaction
+ * (migrations 0600, 0890) and GET /v1/family returns that same row with `deletionPending: true`
+ * (apps/api/src/routes/family.ts), so EVERY deletion-pending child reads as archived here. Both
+ * mobile printers of `row.statusText` rendered the false sentence: the Children screen two lines
+ * above its own notice that the data is being deleted, and the parent home with no counter-notice
+ * anywhere on the screen.
+ *
+ * HUNT6-G-2 put the branch in the portal's `childStatusLabel` (apps/web/src/pages/app/ChildrenPage.tsx)
+ * and claimed one helper decides the sentence for every surface (L-037). This is that claim made true
+ * on the phone: the branch is in the one helper `childRows` prints from, tested BEFORE the status.
+ */
+describe('a deletion-pending child is never told their history is kept (HUNT7-G-3, HUNT7-J-1)', () => {
+  const archivedPending: FamilyOverview = {
+    ...family,
+    children: [{ ...family.children[0]!, status: 'archived', deletionPending: true }],
+  };
+
+  it('[repro] the row both parent screens print says the deletion is under way', () => {
+    const [riley] = childRows(archivedPending);
+    expect(riley?.statusText).toBe('Data deletion under way');
+    expect(riley?.statusText).not.toMatch(/history only/i);
+  });
+
+  it('reads the flag BEFORE the status, and leaves the archived sentence otherwise intact', () => {
+    // The reachable case: archived AND deletion-pending, which is every deletion-pending child.
+    expect(childStatusText({ status: 'archived', deletionPending: true })).toBe(
+      'Data deletion under way',
+    );
+    // The branch it overrides is untouched for an archive with no deletion request.
+    expect(childStatusText({ status: 'archived' })).toBe('Archived: history only');
+    expect(childStatusText({ status: 'archived', deletionPending: false })).toBe(
+      'Archived: history only',
+    );
+    // The flag wins over every status, so no future reordering of the two can bring the sentence
+    // back for a family-scope request that has not archived the child yet.
+    expect(childStatusText({ status: 'active', deletionPending: true })).toBe(
+      'Data deletion under way',
+    );
+    expect(childStatusText({ status: 'draft', deletionPending: true })).toBe(
+      'Data deletion under way',
+    );
+    // And the two statuses no deletion covers still say what they said.
+    expect(childStatusText({ status: 'active' })).toBe('Active: uses a paid slot');
+    expect(childStatusText({ status: 'draft' })).toBe('Draft: not active yet, no charge');
+  });
+
+  it('does not let the deletion branch swallow the activation note the archived row still needs', () => {
+    // HUNT7-G-8 touches the archived branch's note; this pins that the G-3 branch runs first for
+    // the status text WITHOUT changing which controls the row offers — children.tsx decides those
+    // from `child.deletionPending` itself (its `deletionPending ? null : …` rows).
+    const withSlot: FamilyOverview = { ...archivedPending, paidSlots: 2 };
+    expect(childRows(withSlot)[0]).toMatchObject({
+      statusText: 'Data deletion under way',
+      canActivate: true,
+    });
+    // Both branches on ONE row, the other way round: the flag decides the status sentence and the
+    // archived-with-no-slot branch HUNT7-G-8 rewords still decides the note, independently.
+    expect(childRows({ ...archivedPending, paidSlots: 0 })[0]).toMatchObject({
+      statusText: 'Data deletion under way',
+      canActivate: false,
+      activationNote:
+        'Your family has no paid child slots right now. To activate Riley, choose or renew a plan under Plan and child slots.',
+    });
+  });
+});
+
+/**
+ * HUNT7-G-8. `draftActivationNote` said a family with `paidSlots === 0` has "no paid child slots
+ * YET", which asserts they never had one. `releaseSlotlessProfiles`
+ * (apps/api/src/services/billing-sync.ts) sets `status = 'draft'` on a previously ACTIVE child
+ * whenever verified provider state releases its slot (release_reason 'expired' or 'downgrade'), and
+ * `family_capacity.paid_slots` is then 0 for a family that has been paying — so the sentence was
+ * false for exactly the lapsed population, on the screen where they manage the children they were
+ * paying for. Same word, same premise, as HUNT6-H-4 removed from the planner
+ * (apps/web/src/pages/app/LearningPlannerPage.tsx) and HUNT7-G-8 removes from the portal's
+ * `noFreeSlotText` (apps/web/src/pages/app/ChildrenPage.tsx).
+ *
+ * The remedy is unchanged and still honest: this app is where capacity is bought (WEB-R1-04), so
+ * the note points at Plan and child slots to choose or renew a plan. It never says a slot exists.
+ */
+describe('the no-slot note does not tell a lapsed family they never paid (HUNT7-G-8)', () => {
+  const noSlots: FamilyOverview = {
+    ...family,
+    paidSlots: 0,
+    children: [{ ...family.children[1]!, nickname: 'Sam' }],
+  };
+
+  it('[repro] states the literal sentence, with no "yet" in it', () => {
+    expect(childRows(noSlots)[0]?.activationNote).toBe(
+      'Your family has no paid child slots right now. To activate Sam, choose or renew a plan under Plan and child slots.',
+    );
+  });
+
+  it('never claims a slot is waiting, and never says the family has never had one', () => {
+    const note = childRows(noSlots)[0]?.activationNote ?? '';
+    expect(note).not.toMatch(/\byet\b/i);
+    // WEB-R1-04: the note points at where capacity comes from; it promises no capacity itself.
+    expect(note).not.toMatch(/slot is (free|available|waiting)/i);
+    expect(note).toMatch(/choose or renew a plan/);
+    // The other branch, where the family demonstrably HAS slots, is unchanged: Riley holds the
+    // family's one paid slot, so Sam's draft has none to take and the note names where another
+    // comes from.
+    expect(childRows(family)[1]?.activationNote).toBe(
+      'All 1 paid slot is in use. To activate Sam, add a child slot under Plan and child slots.',
+    );
+  });
+});
+
+/**
+ * HUNT7-G-4. The phone's EditChild seeded all three fields from the live prop once and then PATCHed
+ * all three unconditionally, so a nickname fix on the phone reverted the other guardian's grade
+ * change — BUG-222/WEBR4-03 verbatim, three rounds after the portal was fixed (WEBR4-03, HUNT5-F-1,
+ * HUNT6-G-8). The card is keyed on `row.id` (app/(parent)/children.tsx), so a reload never remounts
+ * it and the seed is as old as the open form.
+ *
+ * The phone now sends what the parent EDITED, like the portal's `changes()`
+ * (apps/web/src/pages/app/ChildrenPage.tsx, EditChildForm). The decision lives here, as a pure
+ * value-in/value-out helper, because this suite cannot render react-native (see vitest.config.ts)
+ * and a rule that only exists inside a screen cannot be tested at all.
+ *
+ * Reseeding the fields from the live prop is NOT the fix: that is BUG-330, the value on screen
+ * becoming unsavable, whose repair was `touched`. So the note below carries the drift instead.
+ */
+describe('a phone child edit sends only the fields the parent edited (HUNT7-G-4)', () => {
+  const fields = { nickname: 'Riley R.', gradeLevel: 3, ageBand: '8-10' } as const;
+  const nothing = { nickname: false, gradeLevel: false, ageBand: false } as const;
+
+  it('[repro] a nickname-only edit carries the nickname alone, so the other guardian’s grade survives', () => {
+    expect(childEditBody(fields, { ...nothing, nickname: true })).toEqual({ nickname: 'Riley R.' });
+  });
+
+  it('carries each field on its own, and all three together', () => {
+    expect(childEditBody(fields, { ...nothing, gradeLevel: true })).toEqual({ gradeLevel: 3 });
+    expect(childEditBody(fields, { ...nothing, ageBand: true })).toEqual({ ageBand: '8-10' });
+    expect(childEditBody(fields, { nickname: true, gradeLevel: true, ageBand: true })).toEqual({
+      nickname: 'Riley R.',
+      gradeLevel: 3,
+      ageBand: '8-10',
+    });
+  });
+
+  it('carries nothing at all when nothing was edited, which is what disables Save', () => {
+    // An empty body is also what the contract's refine rejects
+    // (updateChildProfileRequestSchema, packages/contracts/src/family.ts), so a screen that sent it
+    // would earn a 422 instead of reverting anything — but the button must never offer that.
+    expect(childEditBody(fields, nothing)).toEqual({});
+    expect(Object.keys(childEditBody(fields, nothing))).toHaveLength(0);
+  });
+
+  it('sends an edited field even when the parent typed the seeded value back', () => {
+    // BUG-330: "edited" is not "differs from the seed". A parent who retypes the value the form
+    // opened on is putting it back deliberately — most sharply when the other guardian's value
+    // landed under the open form — and that save must reach the server.
+    expect(childEditBody({ ...fields, gradeLevel: 3 }, { ...nothing, gradeLevel: true })).toEqual({
+      gradeLevel: 3,
+    });
+  });
+});
+
+/**
+ * HUNT7-G-4, the other half of the portal's rule: once Save hangs on `touched`, an untouched field
+ * keeps showing what the form opened on while the card above it shows the new value, and nothing on
+ * screen says the two are about the same child (BUG-330). The portal renders that as a `role="note"`
+ * notice; the phone renders this sentence.
+ *
+ * HUNT7-G-2: it says WHAT changed, never WHO changed it. `familyChildSchema` carries no actor field
+ * and GET /v1/family selects no actor column (packages/contracts/src/family.ts,
+ * apps/api/src/routes/family.ts), and the reader can be the cause themselves — the same parent
+ * editing this child in the portal or after a failed reload.
+ */
+describe('the phone form says what changed under it while it was open (HUNT7-G-4)', () => {
+  const seed = { nickname: 'Riley', gradeLevel: 3, ageBand: '8-10' } as const;
+
+  it('[repro] names the new nickname and no actor', () => {
+    const note = childEditDriftNote(seed, { ...seed, nickname: 'Robin' });
+    expect(note).toBe(
+      'This profile changed somewhere else while this form was open: the nickname is now “Robin”. The fields above still show what you opened. Saving sends only the fields you edit here, so that change stays unless you edit that field too.',
+    );
+    expect(note).not.toMatch(/guardian|someone else|somebody|you asked/i);
+  });
+
+  it('joins two changes and spells the grade the way the screens do', () => {
+    expect(childEditDriftNote(seed, { nickname: 'Robin', gradeLevel: 0, ageBand: '8-10' })).toMatch(
+      /the nickname is now “Robin” and the grade is now Kindergarten\./,
+    );
+    expect(childEditDriftNote(seed, { ...seed, gradeLevel: 4 })).toMatch(
+      /the grade is now Grade 4\./,
+    );
+    expect(childEditDriftNote(seed, { ...seed, ageBand: '11-13' })).toMatch(
+      /the age band is now ages 11-13\./,
+    );
+  });
+
+  it('is absent while nothing has moved under the form', () => {
+    expect(childEditDriftNote(seed, { ...seed })).toBeNull();
+  });
+});
+
+/**
+ * HUNT7-G-4 (WEBR4-12, the mobile half). The phone's archive button said "Archive (keeps history,
+ * frees the slot)" unconditionally, and that row is rendered for a DRAFT child too — a draft holds
+ * no slot, so archiving one frees nothing (`slotSummary` returns unchanged counts). The portal
+ * branched on the status at ChildrenPage.tsx (ChildCard's archive button) from round 4 and the phone
+ * never got it.
+ */
+describe('the archive button promises a freed slot only where there is one (HUNT7-G-4)', () => {
+  it('[repro] a draft is not promised a freed slot; an active child is', () => {
+    expect(childArchiveLabel('draft')).toBe('Archive (keeps history)');
+    expect(childArchiveLabel('active')).toBe('Archive (keeps history, frees the slot)');
+    // The archived row offers no archive control at all, but the label must not lie if it ever does.
+    expect(childArchiveLabel('archived')).toBe('Archive (keeps history)');
+  });
+
+  it('always keeps the promise archiving actually makes', () => {
+    for (const status of ['draft', 'active', 'archived'] as const) {
+      expect(childArchiveLabel(status)).toMatch(/keeps history/);
+    }
   });
 });

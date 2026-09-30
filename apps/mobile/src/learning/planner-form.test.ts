@@ -1,5 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  CHILD_PROFILE_STATUSES,
   LEARNING_LIMITS,
   type LearningSchedule,
   type LearningScheduleResponse,
@@ -10,6 +13,7 @@ import {
   formatInZone,
   normalizeTimeInput,
   plannerError,
+  receivesPractice,
   scheduleToPlannerForm,
   stepCount,
   validatePlannerForm,
@@ -131,7 +135,9 @@ describe('mobile planner form (mirrors PUT /v1/children/:id/learning-schedule)',
       },
       pointsPolicy: { expireEarnedPoints: false, penalizeMissedDays: false },
     };
-    const view = buildUpcomingView(data, 'Sam');
+    // The status is named, not omitted: HUNT7-H-1 made every forward-looking line depend on it, and this
+    // case is about the ZONE arithmetic for a profile that really does receive practice.
+    const view = buildUpcomingView(data, 'Sam', 'active');
     expect(view.zoneLine).toBe('Times are in your family’s time zone: America/Los_Angeles.');
     expect(view.reviewLines[0]).toMatch(/^Math: Wed, Nov 4, 4:00\sPM PST \(review day\)$/);
     expect(view.reviewLines[1]).toBe('Science: not this week (no review this week)');
@@ -161,5 +167,163 @@ describe('mobile planner form (mirrors PUT /v1/children/:id/learning-schedule)',
       plannerError(new ApiRequestError('CONFLICT', 'That name is already used', 409)).message,
     ).toBe('That name is already used');
     expect(plannerError(new Error('boom')).needsPin).toBe(false);
+  });
+});
+
+/**
+ * HUNT7-H-1, the phone half — one agent owning both surfaces, because the daily sentence diverged in the
+ * first place by being fixed on one of them. `buildUpcomingView` built the line from the state alone, and
+ * only 'not_yet_released' carried an instant, so the archived notice's "the times below" framing could not
+ * reach the other states: for an archived or draft child the card said "Today's daily practice is
+ * available." while nothing can open a set for them — `app.current_child_id()` requires `c.status =
+ * 'active'` (supabase/migrations/0001_core_identity.sql) and `loadChildContext`
+ * (apps/api/src/jobs/learning-jobs.ts) prepares nothing for a non-active profile. A DRAFT child got no
+ * notice at all on this screen, so the claim stood entirely unframed.
+ *
+ * The literal sentences are written out once here (L-067) and the hedged/plain choice is then derived from
+ * `receivesPractice`, the phone's one definition of the question — the same words the portal prints, which
+ * the parity case below reads out of the portal's own source.
+ */
+const DAILY_LINES = [
+  {
+    state: 'available' as const,
+    prepared: 'Today’s daily practice is available.',
+    hedged: 'Today’s daily practice would be available if Sam’s profile were active.',
+  },
+  {
+    state: 'not_yet_released' as const,
+    prepared: 'Today’s daily practice opens Wed, Nov 4, 3:30 PM PST.',
+    hedged:
+      'Today’s daily practice would open at Wed, Nov 4, 3:30 PM PST if Sam’s profile were active.',
+  },
+  {
+    state: 'paused' as const,
+    prepared: 'Daily practice is paused today.',
+    hedged: 'Daily practice would be paused today even if Sam’s profile were active.',
+  },
+  {
+    state: 'vacation' as const,
+    prepared: 'Daily practice is paused today (vacation).',
+    hedged: 'Daily practice would be paused today (vacation) even if Sam’s profile were active.',
+  },
+];
+
+function scheduleResponse(state: (typeof DAILY_LINES)[number]['state']): LearningScheduleResponse {
+  return {
+    schedule: SCHEDULE,
+    timezone: 'America/Los_Angeles',
+    nextReviewReleases: [],
+    dailyPractice: { localDate: '2026-11-04', state, releaseAt: '2026-11-04T23:30:00.000Z' },
+    pointsPolicy: { expireEarnedPoints: false, penalizeMissedDays: false },
+  };
+}
+
+describe('[HUNT7-H-1] the phone hedges the daily line for a profile that receives no practice', () => {
+  it('decides the question in ONE place on this surface, and it is not "can the plan be edited"', () => {
+    // `receivesPractice` is the phone's single definition; `childPlanEditable` (src/family/family-view.ts)
+    // is the DIFFERENT question — a draft profile is editable on purpose and still receives nothing, so
+    // the two facts agree today only for 'archived' (L-068).
+    expect(receivesPractice('active')).toBe(true);
+    for (const status of ['draft', 'archived', 'suspended', '', undefined])
+      expect(receivesPractice(status), String(status)).toBe(false);
+  });
+
+  for (const { state, prepared, hedged } of DAILY_LINES) {
+    it(`hedges the ${state} line for a non-active profile and keeps it plain for an active one`, () => {
+      const data = scheduleResponse(state);
+      expect(buildUpcomingView(data, 'Sam', 'active').dailyLine).toBe(prepared);
+      for (const status of ['archived', 'draft', 'suspended', undefined])
+        expect(buildUpcomingView(data, 'Sam', status).dailyLine, String(status)).toBe(hedged);
+    });
+  }
+
+  it('keeps the release instant in the hedged line, as the portal does (HUNT5-F-10)', () => {
+    const line = buildUpcomingView(
+      scheduleResponse('not_yet_released'),
+      'Sam',
+      'archived',
+    ).dailyLine;
+    expect(line).toContain(formatInZone('2026-11-04T23:30:00.000Z', 'America/Los_Angeles'));
+  });
+
+  it('hedges the empty-review line too, so no line on the card promises what the status refuses', () => {
+    const data = scheduleResponse('paused');
+    expect(buildUpcomingView(data, 'Sam', 'active').noReviewsLine).toBe(
+      'No weekly reviews are scheduled yet.',
+    );
+    expect(buildUpcomingView(data, 'Sam', 'archived').noReviewsLine).toBe(
+      'No weekly reviews are scheduled. A review is prepared once Sam’s profile is active.',
+    );
+  });
+
+  it('prints the SAME hedged words as the portal, which is the parity this stage exists for', () => {
+    // No module can be shared across the two apps without a contracts export, which is the lead's to
+    // wire; what can be pinned from here is that the portal's table carries a hypothetical per state and
+    // that both surfaces hedge in the same words. The fragments are the ones the phone prints above.
+    const web = readFileSync(
+      join(
+        import.meta.dirname,
+        '..',
+        '..',
+        '..',
+        'web',
+        'src',
+        'components',
+        'learning',
+        'format.ts',
+      ),
+      'utf8',
+    );
+    expect(web).toContain('hypothetical');
+    for (const fragment of [
+      'Today’s daily practice would be available if ',
+      'Today’s daily practice would open at ',
+      'Daily practice would be paused today even if ',
+      'Daily practice would be paused today (vacation) even if ',
+      '’s profile were active.',
+    ])
+      expect(web, fragment).toContain(fragment);
+  });
+});
+
+/**
+ * The screen half (the Expo screens import react-native, which this pure suite cannot render, so its
+ * source is read — the same technique as src/family/screens.test.ts). Two properties: the card is told
+ * whether practice is prepared, through the one predicate rather than its own comparison, and the DRAFT
+ * profile finally gets the notice the portal has had since HUNT6-H-4 — without it, the hedged line was the
+ * only thing on the screen saying that nothing is prepared for a child with no paid slot.
+ */
+describe('[HUNT7-H-1] the planner screen passes the predicate and frames a draft profile', () => {
+  const planner = readFileSync(
+    join(import.meta.dirname, '..', '..', 'app', '(parent)', 'planner.tsx'),
+    'utf8',
+  );
+
+  it('hands the Coming up card the one predicate, and re-derives it nowhere', () => {
+    expect(planner).toMatch(/receivesPractice\(child\.status\)/);
+    expect(planner).toMatch(/<ComingUp data=\{schedule\.state\.data\} child=\{child\} \/>/);
+    // The card is handed the child and asks the shared helper from inside `buildUpcomingView`; it owns no
+    // comparison, and neither does the screen beyond the one `receivesPractice` call above.
+    expect(planner).toMatch(/buildUpcomingView\(data, child\.nickname, child\.status\)/);
+    expect(planner).not.toMatch(/child\.status === 'active'/);
+    expect(planner).not.toMatch(/No weekly reviews are scheduled yet/);
+  });
+
+  it('pins the status list the draft notice’s REASON depends on', () => {
+    // The notice is rendered for "editable and not prepared", which is 'draft' exactly while these are the
+    // three statuses; a fourth would inherit a sentence about paid slots that may not be its reason. Adding
+    // one has to fail here and be given its own copy (L-068: name the fact, do not let it drift).
+    expect(CHILD_PROFILE_STATUSES).toEqual(['draft', 'active', 'archived']);
+  });
+
+  it('frames a profile with no paid slot, in the portal’s words, and keeps the archived notice', () => {
+    // The draft notice says what is true of BOTH draft populations (HUNT6-H-4): a profile that never held
+    // a slot and one that lost it to `releaseSlotlessProfiles` (apps/api/src/services/billing-sync.ts), so
+    // no "yet" and no "again".
+    expect(planner).toMatch(/doesn’t have a paid slot right now/);
+    expect(planner).toMatch(/what the schedule would produce while they hold one/);
+    expect(planner).not.toMatch(/doesn’t have a paid slot yet/);
+    // The archived notice HUNT7-J-3 landed is untouched.
+    expect(planner).toMatch(/no new practice is prepared or released/);
   });
 });
