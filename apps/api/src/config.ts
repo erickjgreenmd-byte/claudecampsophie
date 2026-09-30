@@ -55,6 +55,19 @@ export interface ApiConfig {
     /** CONSENT_PROVIDER when `consent` is `configured`, otherwise null. */
     readonly consentAdapter: string | null;
     /**
+     * The adult ID check that gates every child pairing code (migration 0980), selected explicitly:
+     * - `development_mock`: the labeled double. Development and test only; its rows are
+     *   is_test_provider and readiness blocks while it is wired.
+     * - `openai_document`: the real document read. It establishes ADULTHOOD from a government photo ID
+     *   and cannot compare faces (OpenAI's policies forbid biometric comparison), so on its own it can
+     *   never confirm an adult and readiness stays blocked. Useful in staging, not sufficient for
+     *   production.
+     * - `vendor`: an identity vendor that can do both. None is implemented yet, so selecting it is a
+     *   configuration error rather than a silent downgrade.
+     * - `unavailable`: nothing configured. Every check is refused with FACE_CHECK_UNAVAILABLE.
+     */
+    readonly identity: 'development_mock' | 'openai_document' | 'vendor' | 'unavailable';
+    /**
      * Store subscription state, selected explicitly like consent (AC_DEPLOY_07):
      * - `development_mock`: the labeled subscriber-state mock, only in development and test;
      * - `unavailable`: staging/production without REVENUECAT_SECRET_API_KEY; every fetch fails, so
@@ -220,6 +233,7 @@ export function loadConfig(
       // No real consent adapter is implemented yet, so nothing can mark consent as configured;
       // naming an unknown provider is a configuration error rather than a silent mock.
       ...consentProvider(env.CONSENT_PROVIDER, environment, errors),
+      identity: identityProvider(env.IDENTITY_PROVIDER, environment, errors),
       billing: env.REVENUECAT_SECRET_API_KEY ? 'revenuecat' : mockOrUnavailable(environment),
       webBilling: env.STRIPE_SECRET_KEY ? 'stripe' : mockOrUnavailable(environment),
       ai: env.OPENAI_API_KEY ? 'openai' : 'development_mock',
@@ -293,6 +307,34 @@ function consentProvider(
   return MOCK_ENVIRONMENTS.has(environment)
     ? { consent: 'development_mock', consentAdapter: null }
     : { consent: 'unavailable', consentAdapter: null };
+}
+
+/**
+ * IDENTITY_PROVIDER, failing closed. An unrecognised value is a configuration ERROR rather than a
+ * fallback to the mock: a deployment that meant to verify adults must not quietly stop doing so.
+ */
+function identityProvider(
+  value: string | undefined,
+  environment: Environment,
+  errors: ConfigError[],
+): ApiConfig['providers']['identity'] {
+  if (value === 'openai_document') return 'openai_document';
+  if (value === 'development_mock') {
+    if (MOCK_ENVIRONMENTS.has(environment)) return 'development_mock';
+    errors.push({
+      name: 'IDENTITY_PROVIDER',
+      problem: 'the development identity mock cannot be wired outside development and test',
+    });
+    return 'unavailable';
+  }
+  if (value !== undefined && value !== '') {
+    errors.push({
+      name: 'IDENTITY_PROVIDER',
+      problem: `no adapter is implemented for "${value}" (expected development_mock or openai_document)`,
+    });
+    return 'unavailable';
+  }
+  return MOCK_ENVIRONMENTS.has(environment) ? 'development_mock' : 'unavailable';
 }
 
 export interface ReadinessItem {
@@ -380,6 +422,15 @@ export function productionReadiness(
       'consent_provider',
       config.providers.consent === 'configured',
       'Verifiable parental consent provider (mock is development-only)',
+    ),
+    item(
+      'identity_provider',
+      // Blocked unless the configured provider can do BOTH halves of the check. `openai_document`
+      // establishes adulthood and cannot compare faces, so it can never confirm an adult and a
+      // deployment running only it would refuse every family at the last step — which is honest, and
+      // is exactly what this check has to report before anyone tries to serve real families.
+      config.providers.identity === 'vendor',
+      `Adult ID check (${config.providers.identity}): confirming an adult needs a government photo ID read AND a face comparison against a selfie. The development mock is development-only; openai_document reads the document but cannot compare faces (OpenAI's policies forbid biometric comparison), so an identity vendor is required before production`,
     ),
     item(
       'billing_provider',

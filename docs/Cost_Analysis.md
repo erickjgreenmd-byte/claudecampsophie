@@ -110,12 +110,30 @@ the whole point:
 | semantic_check | 40,000 | 40,800 | 40,800 |
 | escalation | 500,000 | 500,000 | 660,000 |
 | adult_summary | 20,000 | 20,000 | 5,861 |
+| identity_document | 20,000 | 20,000 | 21,704 |
+| identity_face_compare | 15,000 | 15,000 | 8,036 |
 
-`escalation` is the ONE stage excused from the ceiling, by name inside the check itself and for a stated
-reason: it has `maxAttempts: 1`, so it never retries and no budget makes a raise reachable for it. Give it a
-second attempt and the worker refuses to start until the owner sets both of its numbers. The comment this
-replaced claimed the invariant held for every stage while `escalation` sat 160,000 micros below its own
-ceiling, silently excused (HUNT6-D-ESCALATION).
+**Two** stages are excused from the ceiling, both by name inside the check itself and each for a stated
+reason, because each has `maxAttempts: 1` and so never retries — no budget makes a raise reachable:
+
+- `escalation`: a severe-risk escalation is not retried automatically.
+- `identity_document` and `identity_face_compare` (the adult ID check, migration 0980): a document the
+  vision model could not read is not read better on a second identical try, and every attempt re-sends an
+  adult's government photo ID to the provider. A retry is therefore the PARENT's, taken by photographing
+  the document again, not ours taken silently. Each stage's budget equals its admission cap for the same
+  reason `escalation`'s does.
+
+Of the three, only `escalation` and `identity_document` would actually FAIL the ceiling check without the
+excuse; `identity_face_compare`'s budget already clears its ceiling and is excused only because the
+`maxAttempts < 2` branch is tested first. That partition is asserted in
+`packages/ai/src/run-truncation.test.ts`, so "excused" is not read as "would have failed" for a stage where
+it would not have. Each cap is sized from the largest request its stage really sends — two photographs —
+not from this ceiling, which is derived from the text-only floor; a cap is never shrunk to move a stage
+across that line.
+
+Give any of them a second attempt — or add a fourth single-attempt stage — and the worker refuses to start
+until the owner sets its numbers. The comment this pattern replaced claimed the invariant held for every stage
+while `escalation` sat 160,000 micros below its own ceiling, silently excused (HUNT6-D-ESCALATION).
 
 Worst-case spend HOLDS, which is where the budget column is actually spent (and every one of them settles to
 metered usage, so these are reservations and not money):

@@ -1,3 +1,4 @@
+import type { IdentityProvider } from './identity.ts';
 import type { Db } from '../db.ts';
 import type { StripeBillingClient, SubscriberStateProvider } from './billing.ts';
 
@@ -186,6 +187,12 @@ export interface AuthAdminProvider {
 
 export interface Providers {
   readonly consent: ConsentProvider;
+  /**
+   * The adult ID check that gates every child pairing code (migration 0980). Optional for the same
+   * reason `authAdmin` is: dependency sets built by hand in tests do not all need one, and the route
+   * fails closed without it. The Worker always selects one (src/index.ts selectIdentityProvider).
+   */
+  readonly identity?: IdentityProvider;
   readonly storage: StorageProvider;
   readonly email: EmailProvider;
   readonly subscriptions: SubscriberStateProvider;

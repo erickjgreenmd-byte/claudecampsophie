@@ -277,16 +277,41 @@ describe('every stage that can retry affords the ONE full raise (HUNT6-D-1)', ()
 
   it('excuses only the stages that cannot retry at all', () => {
     const oneAttempt = AI_STAGES.filter((s) => PROPOSED_STAGE_LIMITS[s].maxAttempts < 2);
-    expect(oneAttempt).toEqual(['escalation']);
-    // And the excused stage is excused for that reason and no other: `escalation` sits below its own
-    // ceiling (500,000 against 660,000) and is named in `defineStageCostBudgets`, which is why the
-    // case above may skip it. A second attempt for it, and routing.ts throws at import.
-    expect(PROPOSED_STAGE_COST_BUDGET_MICROS.escalation).toBe(
-      PROPOSED_STAGE_LIMITS.escalation.maxCostMicros,
+    // Exactly the stages `defineStageCostBudgets` names, and the only ones the case above may skip.
+    // Add a fourth single-attempt stage, or give one of these a second attempt, and both this and
+    // routing.ts's import-time check say so.
+    //   * escalation — a severe-risk escalation is not retried automatically.
+    //   * identity_document, identity_face_compare — a document the vision model could not read is not
+    //     read better on a second identical try, and each attempt re-sends an adult's government photo
+    //     ID to the provider; a retry is the parent's, taken by photographing the document again.
+    expect([...oneAttempt].sort()).toEqual([
+      'escalation',
+      'identity_document',
+      'identity_face_compare',
+    ]);
+    // The property that holds for EVERY one of them, and the only one that follows from the excuse: the
+    // budget IS the admission cap, because there is no raised retry to afford.
+    for (const stage of oneAttempt) {
+      expect(PROPOSED_STAGE_COST_BUDGET_MICROS[stage], stage).toBe(
+        PROPOSED_STAGE_LIMITS[stage].maxCostMicros,
+      );
+    }
+    // And the partition, which is what says whether each excuse is actually LOAD-BEARING. A stage
+    // whose budget is below its ceiling would throw at import if it were not excused; one above it
+    // would pass the check anyway and is excused only because `maxAttempts < 2` is tested first. Both
+    // are legitimate, and the difference is asserted rather than left for a reader to assume, because
+    // "excused" reads as "would have failed" and for one of these it does not.
+    //
+    // Their caps are sized from the real worst case each stage sends, not from this ceiling:
+    // identity_face_compare's 15,000 admits its two-image request (9,524 micro-USD measured), while
+    // the ceiling is derived from the text-only floor and so is smaller. Do not shrink a cap to move a
+    // stage across this line.
+    const wouldFailWithoutTheExcuse = oneAttempt.filter(
+      (s) =>
+        PROPOSED_STAGE_COST_BUDGET_MICROS[s] <
+        fullRaiseCeiling(s, PROPOSED_STAGE_LIMITS[s].maxOutputTokens),
     );
-    expect(PROPOSED_STAGE_COST_BUDGET_MICROS.escalation).toBeLessThan(
-      fullRaiseCeiling('escalation', PROPOSED_STAGE_LIMITS.escalation.maxOutputTokens),
-    );
+    expect([...wouldFailWithoutTheExcuse].sort()).toEqual(['escalation', 'identity_document']);
   });
 
   /**
@@ -353,8 +378,16 @@ describe('every stage that can retry affords the ONE full raise (HUNT6-D-1)', ()
    * The invariant is about a real run, not only arithmetic: at its floor input every stage with a
    * prompt must make exactly TWO calls, the second at the full multiple. Red for coaching, daily_set
    * and thursday_bundle before the caps were raised (one call, OUTPUT_TRUNCATED at once).
+   *
+   * A prompt whose STAGE cannot retry at all is excluded, and the exclusion is derived from
+   * `PROPOSED_STAGE_LIMITS` rather than written out as a list of prompt names: the two are the same
+   * fact, and a hand-written list is the thing that goes stale when a stage's attempts change. The
+   * case above pins WHICH stages may have `maxAttempts: 1` and asserts that set exactly, so nothing
+   * can be excluded from here without being named there.
    */
-  const PROMPTED_STAGES = Object.keys(PROMPTS) as (keyof typeof PROMPTS)[];
+  const PROMPTED_STAGES = (Object.keys(PROMPTS) as (keyof typeof PROMPTS)[]).filter(
+    (id) => PROPOSED_STAGE_LIMITS[PROMPTS[id].stage].maxAttempts >= 2,
+  );
 
   it.each(PROMPTED_STAGES)(
     '%s really retries a cut-off answer at the FULL raised budget at its floor input',

@@ -170,3 +170,46 @@ export function toStrictJsonSchema(schema: z.ZodType): JsonSchema {
   assertStrict(json, '$');
   return json;
 }
+
+/**
+ * What the adult ID check asks the vision model for, and the whole of it (migration 0980).
+ *
+ * Note what it does NOT ask for: no name, no address, no document number, no photograph description
+ * and no face comparison. The model returns the date of birth and the expiry date because the SERVER
+ * has to compute adulthood and currency against its own clock rather than trust a model's arithmetic;
+ * `apps/api/src/providers/identity-openai.ts` uses both and returns only booleans, so neither date
+ * reaches the database, a log or the response. Asking for less than this would mean trusting the model
+ * to do date arithmetic; asking for more would mean carrying identity data the product does not need.
+ */
+export const identityDocumentReadSchema = z.strictObject({
+  /** Is this a genuine government-issued photo identity document (licence, state ID, passport)? */
+  isGovernmentPhotoId: z.boolean(),
+  /** Which kind, for the audit trail's provider reference only. 'other' covers anything unlisted. */
+  documentKind: z.enum(['drivers_licence', 'state_id', 'passport', 'other']),
+  /** Could the model read the document at all? False means retake the photo, not that it failed. */
+  readable: z.boolean(),
+  /** The printed date of birth, `YYYY-MM-DD`, or null when it is absent or unreadable. */
+  dateOfBirth: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullable(),
+  /** The printed expiry date, `YYYY-MM-DD`, or null for a document that carries none. */
+  expiryDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullable(),
+});
+
+/**
+ * What the face comparison asks for. It is a SEPARATE call from the document read, for two reasons
+ * that both matter: the two questions have different answers available to different providers, and a
+ * provider that refuses the comparison must not take the document read down with it.
+ *
+ * `refused` is a first-class answer. OpenAI's usage policies prohibit biometric identification and
+ * their vision models decline to compare faces, so that adapter records `refused` and the check cannot
+ * confirm — by construction, since `adult_confirmed` in migration 0980 is generated and requires
+ * `matched`. A dedicated identity vendor answers `same_person` or `different_person`.
+ */
+export const identityFaceCompareSchema = z.strictObject({
+  verdict: z.enum(['same_person', 'different_person', 'cannot_tell', 'declined']),
+});

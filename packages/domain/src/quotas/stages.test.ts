@@ -28,6 +28,8 @@ describe('P12/F4 per-stage attempt and cost limits (AC_FIN_09)', () => {
         'thursday_bundle',
         'semantic_check',
         'escalation',
+        'identity_document',
+        'identity_face_compare',
         'adult_summary',
       ].sort(),
     );

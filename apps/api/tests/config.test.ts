@@ -58,6 +58,73 @@ describe('provider configuration is honest (AC_DEPLOY_07)', () => {
     });
   });
 
+  /**
+   * The adult ID check (migration 0980) is a PRODUCTION GATE: without a provider that can do both halves
+   * of it, no family can be given a child pairing code. These cases pin the gate itself, because a
+   * readiness item nothing asserts can be deleted with CI green — and this one is the difference between
+   * verifying adults and not.
+   */
+  describe('the adult ID check is selected explicitly and readiness reports it', () => {
+    const identity = (env: Record<string, string>) => {
+      const loaded = loadConfig({ ...TEST_ENV, ...env });
+      if (!loaded.ok) return { ok: false as const, errors: loaded.errors.map((e) => e.name) };
+      return {
+        ok: true as const,
+        selected: loaded.config.providers.identity,
+        readiness: productionReadiness(loaded.config).find((i) => i.check === 'identity_provider'),
+      };
+    };
+
+    it('defaults to the labeled mock in development and test, and to unavailable elsewhere', () => {
+      for (const APP_ENV of ['development', 'test']) {
+        const out = identity({ APP_ENV });
+        expect(out.ok, APP_ENV).toBe(true);
+        if (out.ok) expect(out.selected, APP_ENV).toBe('development_mock');
+      }
+      for (const APP_ENV of ['staging', 'production']) {
+        const out = identity({ APP_ENV });
+        expect(out.ok, APP_ENV).toBe(true);
+        if (out.ok) expect(out.selected, APP_ENV).toBe('unavailable');
+      }
+    });
+
+    it('refuses to wire the mock outside development and test, as a configuration error', () => {
+      for (const APP_ENV of ['staging', 'production']) {
+        const out = identity({ APP_ENV, IDENTITY_PROVIDER: 'development_mock' });
+        expect(out.ok, APP_ENV).toBe(false);
+        if (!out.ok) expect(out.errors, APP_ENV).toContain('IDENTITY_PROVIDER');
+      }
+    });
+
+    it('refuses to load at all for an unrecognised provider name', () => {
+      // A deployment that meant to verify adults must not quietly stop doing so. What carries that is
+      // the CONFIGURATION FAILING, not the value the branch returns: on a failure the Worker never
+      // starts (src/index.ts returns NOT_CONFIGURED), so whatever `identityProvider` returns there is
+      // unreachable. Asserting the returned value instead would be asserting dead code — proved by
+      // mutating that branch to return the mock, which changed nothing observable (L-054).
+      const out = identity({ APP_ENV: 'staging', IDENTITY_PROVIDER: 'some-vendor' });
+      expect(out.ok).toBe(false);
+      if (!out.ok) expect(out.errors).toContain('IDENTITY_PROVIDER');
+    });
+
+    it('is BLOCKED for the mock and for openai_document, and its detail says why', () => {
+      // openai_document reads the document and cannot compare faces, so it can never confirm an adult.
+      // Readiness must say so before anyone tries to serve real families on it.
+      const mock = identity({ APP_ENV: 'test' });
+      expect(mock.ok && mock.readiness?.status).toBe('blocked');
+      const openai = identity({ APP_ENV: 'staging', IDENTITY_PROVIDER: 'openai_document' });
+      expect(openai.ok).toBe(true);
+      if (!openai.ok) return;
+      expect(openai.selected).toBe('openai_document');
+      // The item must EXIST — a deleted readiness item would leave `find` undefined and every
+      // status assertion vacuous, which is how a production gate disappears with CI green.
+      expect(openai.readiness, 'the identity_provider readiness item is missing').toBeDefined();
+      expect(openai.readiness?.status).toBe('blocked');
+      expect(openai.readiness?.detail).toMatch(/face comparison/i);
+      expect(openai.readiness?.detail).toMatch(/identity vendor is required/i);
+    });
+  });
+
   it('email is Resend only with a well-formed key and a sender; the mock never outside development/test', () => {
     const withKey = loadConfig({
       ...TEST_ENV,

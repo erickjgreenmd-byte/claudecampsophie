@@ -12,6 +12,21 @@ export const AI_STAGES = [
   'semantic_check',
   'escalation',
   'adult_summary',
+  /**
+   * The adult ID check (migration 0980): reading a government photo ID to establish adulthood. Its own
+   * stage rather than a reuse of `extraction` because it is an ADULT's document rather than a child's
+   * homework, and conflating the two would put identity spend in the family's homework metering and
+   * the homework ceiling on the identity check.
+   */
+  'identity_document',
+  /**
+   * The face comparison half of the same check, metered separately because it is a DIFFERENT question
+   * with a different answer available to different providers: OpenAI's policies forbid biometric
+   * comparison and its models decline, while an identity vendor answers it. Separate stages keep the
+   * spend of the half that may be bought from a vendor visible on its own, and keep one prompt per
+   * stage — `STAGE_FLOOR_INPUT_TOKENS` is per stage and the two prompts do not share a floor.
+   */
+  'identity_face_compare',
 ] as const;
 export type AiStage = (typeof AI_STAGES)[number];
 

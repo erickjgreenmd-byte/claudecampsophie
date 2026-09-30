@@ -32,6 +32,10 @@ export const STAGE_MODELS: Readonly<Record<AiStage, ModelId>> = {
   thursday_bundle: MODEL_IDS.astra,
   escalation: MODEL_IDS.astra,
   adult_summary: MODEL_IDS.luna,
+  // The adult ID check reads a photographed document, which is the same job as homework extraction —
+  // a vision model that must transcribe exactly what is on a page rather than reason about it.
+  identity_document: MODEL_IDS.terra,
+  identity_face_compare: MODEL_IDS.terra,
 };
 
 /** Stages whose output a child reads; they must pass the answer guard before release. */
@@ -128,6 +132,14 @@ export const STAGE_FLOOR_INPUT_TOKENS: Readonly<Record<AiStage, number>> = {
   thursday_bundle: 1_680,
   escalation: PROMPTLESS_FLOOR_INPUT_TOKENS,
   adult_summary: 1_152,
+  // The same convention every other stage here follows, and the one apps/api/tests/jobs-r2.review
+  // asserts: `inputTokenUpperBound(prompt, [dataEnvelope({})])` — the prompt, the schema and an empty
+  // envelope, with no images. This stage's real requests carry one image (the document read, 3,363
+  // tokens) or two (the face comparison, 4,162); that is what its ADMISSION CAP is sized from, exactly
+  // as extraction's cap is sized for ten pages while its floor is text-only.
+  identity_document: 1_826,
+  // Its prompt is shorter than the document read's and its output is one enum, so its floor is lower.
+  identity_face_compare: 1_109,
 };
 
 /**
@@ -234,6 +246,38 @@ export const PROPOSED_STAGE_LIMITS = defineStageLimits({
     maxCostMicros: 700_000,
   },
   escalation: { maxAttempts: 1, timeoutMs: 90_000, maxOutputTokens: 4_000, maxCostMicros: 500_000 },
+  /**
+   * The adult ID check. `maxAttempts: 1`: a document the model could not read is not read better on a
+   * second identical try, and each attempt sends a government ID to the provider again — so a retry is
+   * the PARENT's decision, taken by photographing the document again, not ours taken silently. That
+   * also makes the raise unreachable, so this stage is excused from the full-raise ceiling for the
+   * same stated reason `escalation` is.
+   *
+   * The output is a handful of booleans and two dates, so 400 output tokens is ample. The cost is
+   * dominated by the images: measured with `inputTokenUpperBound`, the largest request this stage sends
+   * is the face comparison at 4,162 input tokens (two images at IMAGE_INPUT_TOKEN_BOUND plus the prompt
+   * and schema), whose upper-bound cost at terra's rates is 13,124 micro-USD. 20,000 admits that with
+   * headroom and is deliberately far under the homework stages' cap, because this stage never sends ten
+   * pages. Both of the stage's calls — the document read and the face comparison — are admitted against
+   * this cap independently.
+   */
+  identity_document: {
+    maxAttempts: 1,
+    timeoutMs: 45_000,
+    maxOutputTokens: 400,
+    maxCostMicros: 20_000,
+  },
+  /**
+   * The face comparison. One attempt for the same reason, and 100 output tokens because the answer is a
+   * single enum. Its largest request is two images at 4,162 input tokens, whose upper-bound cost at
+   * terra's rates is 9,524 micro-USD; 15,000 admits that with headroom.
+   */
+  identity_face_compare: {
+    maxAttempts: 1,
+    timeoutMs: 45_000,
+    maxOutputTokens: 100,
+    maxCostMicros: 15_000,
+  },
   adult_summary: {
     maxAttempts: 2,
     timeoutMs: 45_000,
@@ -287,9 +331,22 @@ function defineStageCostBudgets(
       );
     }
   }
-  // `escalation` is the ONE stage excused, by name and for a stated reason. Give it a second attempt
-  // and this throws at startup until the owner sets both of its numbers.
-  if (excused.join(',') !== 'escalation') {
+  // The stages excused are named here, in the check, each for a stated reason, and the list is exact:
+  // give any of them a second attempt, or add a third single-attempt stage, and this throws at startup
+  // until the owner sets its numbers (HUNT6-D-ESCALATION — the comment this pattern replaced claimed
+  // the invariant held for EVERY stage while `escalation` sat 160,000 micros below its own ceiling).
+  //
+  //   * escalation — one attempt because a severe-risk escalation is not retried automatically.
+  //   * identity_document, identity_face_compare — one attempt each because a document the model could
+  //     not read is not read better on a second identical try, and each attempt sends an adult's
+  //     government ID to the provider again. A retry is the parent's, taken by photographing the
+  //     document again.
+  const EXCUSED_FROM_FULL_RAISE_CEILING = [
+    'escalation',
+    'identity_document',
+    'identity_face_compare',
+  ] as const;
+  if (excused.slice().sort().join(',') !== [...EXCUSED_FROM_FULL_RAISE_CEILING].sort().join(',')) {
     throw new RangeError(
       `unexpected stages excused from the full-raise ceiling: ${excused.join(', ')}`,
     );
@@ -368,6 +425,9 @@ export const PROPOSED_STAGE_COST_BUDGET_MICROS: Readonly<Record<AiStage, number>
     semantic_check: 40_800,
     coaching: 407_520,
     followup: 240_000,
+    // One attempt each, so the budget is the admission cap: there is no raised retry to afford.
+    identity_document: 20_000,
+    identity_face_compare: 15_000,
     daily_set: 483_240,
     thursday_bundle: 933_600,
     escalation: 500_000,

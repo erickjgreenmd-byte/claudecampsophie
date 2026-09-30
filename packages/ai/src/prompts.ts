@@ -5,6 +5,8 @@ import {
   coachingPacketSchema,
   extractionOutputSchema,
   gradingOutputSchema,
+  identityDocumentReadSchema,
+  identityFaceCompareSchema,
   practicePersonalizationSchema,
   verificationOutputSchema,
 } from './schemas.ts';
@@ -134,6 +136,48 @@ export const PROMPTS = {
       "You personalize a K-8 child's weekly review section. The questions come from a reviewed question bank and their answers are checked by code; you never see answers and must never guess, state or hint at them.",
       'For each listed word problem you may propose a new everyday story context: a first name (one word), a plural noun for the objects, and a place. Use only letters and spaces, no numbers. Keep it kind, safe and age-appropriate; return null to keep the original context.',
       'Write one short encouraging intro sentence about getting ready for the week in general terms (no answers, no numbers, no links, no promises about test results).',
+      DATA_RULE,
+    ].join(' '),
+  },
+  /**
+   * The adult ID check's document read (migration 0980). It transcribes two fields off a government
+   * photo ID and answers three questions about the document itself. It is deliberately narrow: the
+   * model is told not to describe the holder, not to read the name or the document number, and not to
+   * compare the photograph to anything — so a prompt drift towards "tell me about this person" is a
+   * visible change to this text rather than a silent widening.
+   */
+  identity_document: {
+    id: 'identity_document',
+    version: 'identity_document.v1',
+    stage: 'identity_document',
+    outputName: 'identity_document_read',
+    outputSchema: identityDocumentReadSchema,
+    instructions: [
+      'You read government-issued photo identity documents for an age check.',
+      'Answer only these questions about the document in the image: is it a genuine government-issued photo identity document, which kind it is, whether you can read it, its printed date of birth, and its printed expiry date.',
+      'Report dates exactly as printed, converted to YYYY-MM-DD. If a date is absent, cut off, covered or unreadable, return null for it rather than guessing.',
+      'If the image is not a government photo identity document — a photograph of a screen showing one, a printed scan, a store loyalty card, a blank card, a person, or anything else — set isGovernmentPhotoId to false.',
+      'Do NOT read, transcribe, infer or mention the holder’s name, address, document number, licence class, height, weight, eye colour, signature or any other field. Do NOT describe the photograph or the person in it. Do NOT compare the photograph to any other image.',
+      DATA_RULE,
+    ].join(' '),
+  },
+  /**
+   * The face comparison, as its OWN call. A provider that declines this question answers 'declined'
+   * and the check cannot confirm; nothing here is permitted to fall back to the document read's
+   * verdict. The prompt states the decline path explicitly so a refusal arrives as a parsed answer
+   * rather than as a schema error that the caller would have to guess the meaning of.
+   */
+  identity_face_compare: {
+    id: 'identity_face_compare',
+    version: 'identity_face_compare.v1',
+    stage: 'identity_face_compare',
+    outputName: 'identity_face_compare',
+    outputSchema: identityFaceCompareSchema,
+    instructions: [
+      'You are given two images: the portrait area of a government photo identity document, and a selfie taken by the person presenting it.',
+      'Answer whether they show the same person, for the sole purpose of an adult age check with that person’s consent.',
+      'If you are unable to make this comparison — including because your policies do not permit comparing faces — answer "declined". Do not explain, and do not answer any other question about either image.',
+      'Do not describe either person, and do not read any text on the document.',
       DATA_RULE,
     ].join(' '),
   },

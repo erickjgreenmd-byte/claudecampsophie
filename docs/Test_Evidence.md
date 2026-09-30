@@ -262,3 +262,59 @@ satisfied it once the hold row was gone, so the test could not see the defect it
 is now bounded to the table with the header `| Hold | Stages summed | Micro-USD | USD |`, after which
 all five go red. ai 94 tests, floor raised.
 
+## The adult ID check (migration 0980) — 2026-09-30
+
+The owner's flow is: photograph a government photo ID, take a selfie, check the document and the face,
+**delete the images**, then add children with their attestations (0970), then pay, then one pairing code
+per child. What is built and tested here is everything except the face comparison, which no configured
+provider can do (see below).
+
+- **The database is what makes it un-bypassable** — `supabase/tests/identity_verification.test.ts`, 14
+  cases against real Postgres 16:
+  - The exact column list is asserted, plus a property check that no column name contains `image`,
+    `photo`, `selfie`, `template`, `biometric`, `document_number`, `licence`, `dob`, `birth`, a name
+    field or an address. `images_discarded_at` is exempt by exact name, because it is a timestamp
+    asserting the images are gone.
+  - `adult_confirmed` is GENERATED from the two independent checks, so a writer cannot assert it: the
+    attempt to insert it is refused by Postgres. All five non-matching face outcomes are checked
+    individually — `not_matched`, `inconclusive`, `not_attempted`, `refused`, `error` — so no single
+    outcome can be special-cased into a pass later.
+  - A confirmation, and only a confirmation, writes the `verified` `consent_records` row with method
+    `document_and_selfie`, in the same transaction, carrying the test-provider flag and pointing back at
+    the attempt. That row is what every gate already in the product reads, so nothing new had to be
+    wired into the pairing-code route, the job gates or child access.
+  - Every write is refused to `authenticated`, `anon` and a paired child; the recording function is
+    service-role only; RLS shows a parent their own family's attempts and no other family's.
+- **The readiness gate** — `apps/api/tests/config.test.ts`, 4 cases: the default is the labeled mock in
+  development and test and `unavailable` elsewhere; the mock cannot be wired outside development/test;
+  an unrecognised provider name makes the configuration fail to load at all; and the
+  `identity_provider` item exists and reads `blocked` for both the mock and `openai_document`, with a
+  detail naming the missing half.
+- **Cost** — the two new AI stages, `identity_document` and `identity_face_compare`, appear in both of
+  `docs/Cost_Analysis.md`'s tables with their real caps, budgets and ceilings, enforced by
+  `packages/ai/src/cost-doc.test.ts`. Their caps are measured with `inputTokenUpperBound`, not guessed:
+  the largest request either sends is the two-image comparison at 4,162 input tokens, 9,524 micro-USD.
+
+Mutation testing, nine mutations, each shown red and each file restored with `sha256sum -c`: drop the
+face match from the generated expression; make `adult_confirmed` an ordinary writable column; write the
+consent row for every attempt rather than only a confirmation; grant `authenticated` write on the table;
+let `failure_code` accept free prose; delete the Thursday-style readiness item; report
+`openai_document` as ready; allow the mock in production; and (from the stage work) give a one-attempt
+stage the ceiling check.
+
+**One mutation passed at first and the TEST was corrected, not the code**: making an unrecognised
+provider name fall back to the development mock changed nothing observable, because a configuration
+error stops the Worker from starting at all, so that branch's return value is unreachable. The test had
+claimed "an error rather than falling back"; it now asserts that the configuration fails to load, which
+is the fact that carries the requirement (L-054).
+
+**What is NOT done, and cannot be with OpenAI.** The face comparison is biometric identification.
+OpenAI's usage policies prohibit it and the vision models decline the question, so the adapter attempts
+it once, records `refused`, and — because `adult_confirmed` requires `matched` — never confirms an
+adult. `productionReadiness` reports `identity_provider` blocked until an identity vendor is
+configured, and the product therefore cannot issue a child pairing code. That is the intended
+fail-closed behaviour, not an outstanding bug.
+
+Suite totals at this slice: api 1180, db 467, ai 94, domain 3656, web 849, mobile 823, contracts 20,
+ui-tokens 4 — **7093 tests**, floors raised.
+

@@ -10,6 +10,7 @@ import {
   createOpenAiResponsesClient,
   createRefusingModerationClient,
   type ModerationClient,
+  type ResponsesClient,
 } from '@pencillift/ai';
 import { DEFAULT_HANDLERS, runScheduledTick, type JobHandler } from './jobs/dispatcher.ts';
 import { createLearningHandlers } from './jobs/learning-jobs.ts';
@@ -29,6 +30,12 @@ import {
   type EmailProvider,
   type StorageProvider,
 } from './providers/index.ts';
+import {
+  createDevelopmentIdentityMock,
+  createUnconfiguredIdentityProvider,
+  type IdentityProvider,
+} from './providers/identity.ts';
+import { createOpenAiIdentityProvider } from './providers/identity-openai.ts';
 import { cryptoRandom } from '@pencillift/domain';
 import {
   createRevenueCatProvider,
@@ -117,6 +124,43 @@ export function selectConsentProvider(
       provider = factory(env);
       break;
     }
+    default:
+      return NOT_CONFIGURED;
+  }
+  if (provider.isMock && !MOCK_ENVIRONMENTS.has(config.environment)) return NOT_READY;
+  return { ok: true, provider };
+}
+
+/**
+ * The adult ID check the configuration selects (migration 0980), explicitly and failing closed. The
+ * labeled mock only in development/test; `openai_document` needs the AI client, so a deployment with no
+ * AI provider gets `unavailable` rather than an adapter that cannot call anything; and nothing
+ * configured means every check is refused rather than skipped.
+ */
+export function selectIdentityProvider(
+  config: ApiConfig,
+  ai: ResponsesClient | null,
+): { ok: true; provider: IdentityProvider } | RuntimeFailure {
+  let provider: IdentityProvider;
+  switch (config.providers.identity) {
+    case 'development_mock':
+      provider = createDevelopmentIdentityMock();
+      break;
+    case 'openai_document':
+      if (!ai) return NOT_CONFIGURED;
+      provider = createOpenAiIdentityProvider({
+        ai,
+        zdrEvidence: config.zdrEvidence,
+        environment: config.environment,
+      });
+      break;
+    case 'vendor':
+      // No vendor adapter is implemented yet (owner action: choose one). Selecting it is refused
+      // rather than downgraded, so a deployment cannot believe it is verifying adults when it is not.
+      return NOT_CONFIGURED;
+    case 'unavailable':
+      provider = createUnconfiguredIdentityProvider();
+      break;
     default:
       return NOT_CONFIGURED;
   }
@@ -387,6 +431,18 @@ function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
   if (!storageAndEmail.ok) return storageAndEmail;
   const moderation = selectModerationClient(config, env);
   if (!moderation.ok) return moderation;
+  // The AI client the REQUEST path needs (the scheduled handler builds its own for the job handlers).
+  // The adult ID check is a request, not a job: the parent is waiting on the answer, and the images
+  // must not be parked in a job payload where they would persist until the job ran.
+  const requestAi =
+    typeof env.OPENAI_API_KEY === 'string' && env.OPENAI_API_KEY.length > 0
+      ? createOpenAiResponsesClient({
+          apiKey: env.OPENAI_API_KEY,
+          ...(typeof env.OPENAI_PROJECT === 'string' ? { project: env.OPENAI_PROJECT } : {}),
+        })
+      : null;
+  const identity = selectIdentityProvider(config, requestAi);
+  if (!identity.ok) return identity;
   let db: Db | null = null;
   const authAdmin = selectAuthAdmin(config, env, () => {
     if (!db) throw new Error('database client not ready');
@@ -406,6 +462,7 @@ function buildRuntimeOrThrow(env: WorkerEnv): RuntimeResult {
     rateLimiter: createDbRateLimiter(db),
     providers: {
       consent: consent.provider,
+      identity: identity.provider,
       storage: storageAndEmail.storage,
       email: storageAndEmail.email,
       subscriptions: billing.subscriptions,
