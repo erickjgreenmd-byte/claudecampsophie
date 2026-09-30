@@ -165,10 +165,46 @@ then gate, push and record as the earlier rounds did.
    cross-area residuals in the same round (`docs/Bug_Ledger.md` BUG-165..210, `docs/ECC_Runs.md` `wf_56274b45-95e`,
    code at `8bc022b`, 6,614 tests green). What was not reproduced, and what was deliberately left open, is listed
    in that ECC row rather than dropped. Next: a third finder round over the round-3 tree, or store submission.
-6. Owner actions in `docs/Owner_Actions.md` (#1–#46, all open; #45 was withdrawn in round 4 and RESTORED in round 6 when the recovery that closed it was removed) unblock everything else: accounts (Apple, Google Play, Amazon
+6. Owner actions in `docs/Owner_Actions.md` (#1–#49, all open; #45 was withdrawn in round 4 and RESTORED in round 6 when the recovery that closed it was removed; #47–#49 were created by round 7's consent, identity and grade work) unblock everything else: accounts (Apple, Google Play, Amazon
    developer, Cloudflare), a PencilLift Supabase staging project and a PencilLift Stripe account (test mode; the
    attached live account belongs to another business), consent provider, OpenAI key and ZDR approval, store
    products and prices, email provider, legal review incl. counsel's confirmation of the parent-only safety
    policy, spend budget, hosted Supabase checks, database production mark, child-safety package approval,
    BUG-096 residual.
 7. Repeat the resume check in the next real session (AC_ECC_09).
+
+## Round 7 (2026-09-30)
+
+The hunt returned 60 findings over `b802686`..`5ba16c3`, and TWO of them are against claims the lead wrote
+hours earlier in the round-6 commit itself: a captured child-refresh body called “worthless” after rotation
+(it is a repeatable remote unpair, and the false version was in the owner's own sign-off record), and a stage
+budget called “not money” while it bounds every later attempt cumulatively. Both are the recorded-residual-
+too-small defect that BUG-294 and L-058 exist to prevent — committed inside the change that corrected it.
+Both are now fixed in all their records, and the coverage matrix's SOURCE too, because that file is generated
+and the correction would otherwise have reverted on the next render (L-069).
+
+The round's largest single shape, 7 of the 60, is a fix that reached the portal and not the phone. Those are
+deliberately NOT split across a web fixer and a mobile fixer, because that split is how they diverged: one
+agent owns both surfaces of each finding, and a structural test now fails if a section re-derives a decision
+that a shared helper owns.
+
+Owner-directed work landed alongside the hunt, at the owner's instruction to carry everything to completion
+without further involvement:
+
+- **Parental consent, per child, enforced in the database.** Migration 0970 stamps version, instant and which
+  adult server-side, and two CHECK constraints make a child impossible to ACTIVATE without an attestation —
+  whichever writer makes the row, including `authenticated` reaching the table through the Data API. A tick
+  box alone would have left the requirement optional for anyone who read the API docs (L-060).
+- **The adult ID check.** Migration 0980 records each attempt and composes the outcome in a GENERATED column,
+  so no partial result reads as a pass. The document half works. The FACE COMPARISON does not and cannot: it
+  is biometric identification, which the provider's policies prohibit and its models decline, so the adapter
+  attempts it, records the refusal in the audit trail, declares `canCompareFaces: false` and fails closed.
+  No mock answers “matched”. Owner action #47 is the vendor choice; #48 is counsel on the wording (L-065).
+- **One code, one kid, one grade.** A pairing code is proven to bind to the child it was minted for and to
+  carry that child's own grade, and no subject hands a child content from a grade further than two away.
+  `SUBJECT_GRADE_REACH = 2` is the owner's amended number (“we can reach up or down 1 or 2”) and a test
+  asserts it LITERALLY, because every earlier assertion read `<= SUBJECT_GRADE_REACH` and so stayed green
+  with the reach set to 5 (L-067). Prerequisite work is deliberately uncapped: a grade-8 child with a
+  grade-2 gap still gets grade-2 practice. Owner action #49 asks whether the other direction should exist.
+
+Next: stage 4 (the 7 parity findings), then the round-7 coverage re-render and the remaining ledger rows.

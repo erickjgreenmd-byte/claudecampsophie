@@ -1,15 +1,17 @@
 # PencilLift ECC capability inventory (spec E5.1, AC_ECC_01)
 
-Inspected 2026-09-24 in the Claude Code **cloud session** that is building PencilLift (not the owner's
-local computer). Re-run this inventory in every new environment; a different machine can differ.
+Inspected 2026-09-24 and **re-inspected 2026-09-30** in the Claude Code **cloud session** that is
+building PencilLift (not the owner's local computer). Re-run this inventory in every new environment; a
+different machine can differ — and in the SAME environment after a container restart, which is what the
+re-inspection found: two of the facts below had moved while the record still asserted the old ones.
 
 ## Verified facts
 
 | Item | Observed value | Evidence |
 |---|---|---|
-| Claude Code version | 2.1.281 | `claude --version` |
+| Claude Code version | **2.1.285** (was 2.1.281 on 2026-09-24; the session's container restarted between the two inspections and the CLI moved with it) | `claude --version`, 2026-09-30 |
 | ECC (Everything Claude Code) plugin | **Not installed** | `~/.claude/plugins/` contains only an empty synced org bucket; no `ecc` manifest, skills or agents present |
-| Can ECC be installed here? | **Not installed** | `github.com` is denied by the environment's network policy (`curl https://github.com/affaan-m/ECC` → proxy 403), so the plugin marketplace install path fails. Correction (2026-09-24 coverage pass): `raw.githubusercontent.com` answers (a status-only request for the ECC `plugin.json` returned HTTP 200), so a manual file-by-file install would have been technically possible. It was not done: that would run unvetted third-party skill/agent code with this session's permissions, and every ECC role had a built-in fallback. The claim "cannot be installed" is therefore narrowed to "not installed by decision; marketplace path blocked" |
+| Can ECC be installed here? | **Not installed** | `github.com` is denied by the environment's network policy (`curl https://github.com/affaan-m/ECC` → proxy 403), so the plugin marketplace install path fails. Correction (2026-09-24 coverage pass): `raw.githubusercontent.com` answered a status-only request for the ECC `plugin.json` with HTTP 200, so a manual file-by-file install looked technically possible. **Re-probed 2026-09-30: that same URL now answers 404.** A 404 comes from GitHub, not from the proxy (github.com still answers proxy 403), so the HOST remains reachable and it is the path that is no longer there — which means the "technically possible" claim is no longer verified as written, and this record does not assert it. Either way it was not done, and would not be: that would run unvetted third-party skill and agent code with this session's permissions, and every ECC role has a built-in fallback. The claim "cannot be installed" stays narrowed to "not installed by decision; marketplace path blocked, manual path unverified" |
 | ECC upstream version named by spec | `ecc` 2.2.1 (spec E5.1) | Not verifiable from this environment |
 | Project `.claude/` settings | None existed before this session | `ls .claude` → absent |
 | Hooks active in this session | Platform stop hook `~/.claude/stop-hook-git-check.sh` (blocks stopping with uncommitted/unpushed work; has `stop_hook_active` recursion guard); reply-gate hooks for the session UI | File inspection; not project-configured |
@@ -25,7 +27,7 @@ This is an honest fallback, not an ECC run (spec E5.1: "Do not report ordinary r
 | Responsibility (spec E5.2) | ECC candidate (unavailable) | Capability actually used here | Invocation | Restrictions |
 |---|---|---|---|---|
 | Decomposition / risky design | `planner`, `architect` | Lead session + `docs/Architecture.md` decisions | Direct | Lead remains accountable |
-| Implement + reproduce defects (TDD) | `tdd-workflow`, `tdd-guide` | Claude Code **Workflow** tool subagents with a mandatory tests-first prompt contract | `Workflow` script, `agent()` per module | Directory ownership, no git/installs, max 2 concurrent (machine has 4 CPUs) |
+| Implement + reproduce defects (TDD) | `tdd-workflow`, `tdd-guide` | Claude Code **Workflow** tool subagents with a mandatory tests-first prompt contract | `Workflow` script, `agent()` per module | Directory ownership, no git/installs, max 2 concurrent — the cap is `min(16, CPUs − 2)` and `nproc` is 4, OBSERVED on 2026-09-30 when a four-agent round-7 stage started exactly two and queued the rest |
 | Code review | `code-reviewer` | Fresh-context adversarial reviewer subagents that must prove each finding with a failing test; built-in `code-review` skill for integrated diffs | `Workflow` review stage; `Skill: code-review` | Reviewer cannot edit implementation |
 | Database / RLS review | `database-reviewer` | Real-Postgres authorization tests + schema invariant tests + reviewer subagents | `pnpm test:db` | Tests run as real roles, never as superuser |
 | Security review | `security-review`, `security-reviewer` | Built-in `security-review` skill + adversarial security reviewer subagents | `Skill: security-review`; `Workflow` | Not an independent human assessment (spec V1) |
