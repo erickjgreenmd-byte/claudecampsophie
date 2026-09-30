@@ -1,7 +1,12 @@
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { DEFAULT_DATABASE_URL } from '@pencillift/db/testing';
-import { grantAdultUnlock, seedFamily, type SeededFamily } from '@pencillift/db/testing/fixtures';
+import {
+  grantAdultUnlock,
+  seedChild,
+  seedFamily,
+  type SeededFamily,
+} from '@pencillift/db/testing/fixtures';
 import { cryptoRandom } from '@pencillift/domain';
 import { createApp, MAX_JSON_BYTES } from '../src/app.ts';
 import { createParentVerifier } from '../src/auth/parent.ts';
@@ -266,6 +271,108 @@ describe('pairing codes (RV-lead-identity-access-7, review note e)', () => {
     const paired: number[] = [];
     for (const { code } of codes) paired.push((await pair(code, '203.0.113.41')).status);
     expect(paired.sort()).toEqual([201, 404, 404]);
+  });
+
+  /**
+   * OWNER RULE (2026-09-30): "make sure one code is used for one kid, and the system should ask the kid's
+   * grade so that when that child is logged in no other grade level work is put into the system."
+   *
+   * The single-use half is the case above. These two are the other halves, and neither was asserted:
+   * that a code BINDS to the one child it was minted for and cannot pair a device for a sibling, and
+   * that the session a redeemed code mints carries that child's own grade. The first held by the
+   * redeem claim's `c.id = p.child_id` and the second by the device row's child_id, but a property that
+   * holds because two statements happen to agree is a property with no test — which is how the grade
+   * substitution in the bank survived (see packages/domain/src/bank/grade-isolation.test.ts).
+   */
+  it('a code minted for one child cannot pair a device for a sibling', async () => {
+    const { fam, childId, token } = await familyWithActiveChild();
+    // A second ACTIVE child in the same family, so the only thing separating them is the code's binding
+    // — not the family, not consent, not the status. No paid slot is assigned: `seedFamily` buys no
+    // capacity and `app.enforce_slot_capacity` refuses one, and the redeem claim reads the child's
+    // STATUS rather than its slot, so a slot would add nothing to what this case isolates.
+    const sibling = await seedChild(api.db, fam.familyId, 'Sam', 'active', {
+      attestedBy: fam.ownerId,
+    });
+    const created = await newCode(token, childId);
+    expect(created.status).toBe(201);
+    const { code } = await json<{ code: string }>(created);
+
+    const paired = await pair(code, '203.0.113.71');
+    expect(paired.status).toBe(201);
+    // The device the code produced belongs to the child the code was minted for, and to no other.
+    // Scoped to the device THIS pairing created, by the label `pair` sends: seedFamily seeds devices of
+    // its own, so a family-wide count would be asserting the fixture rather than the redemption.
+    const paired_devices = await api.db.sql<{ child_id: string }[]>`
+      select child_id from public.child_devices
+       where family_id = ${fam.familyId} and label = 'Kitchen tablet'`;
+    expect(paired_devices.map((d) => d.child_id)).toEqual([childId]);
+    // And nothing the redemption did reached the sibling at all.
+    const siblingDevices = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.child_devices
+       where family_id = ${fam.familyId} and child_id = ${sibling.id} and label = 'Kitchen tablet'`;
+    expect(siblingDevices[0]!.n).toBe(0);
+    // And the code is spent, so it cannot be re-presented to reach the sibling either.
+    expect((await pair(code, '203.0.113.72')).status).toBe(404);
+  });
+
+  /**
+   * A live code for a child who is not active is UNREACHABLE, and it is a database trigger that makes it
+   * so: `child_profiles_end_pairing_codes` (migration 0720) fires `after update of status` whenever a
+   * child leaves 'active' and consumes every unredeemed code for them. The existing case above covers
+   * the archive route; this one covers the trigger's actual condition, which is ANY path out of
+   * 'active' — a draft downgrade from billing's `releaseSlotlessProfiles`, a Data API write, anything.
+   *
+   * WHAT THIS CASE CANNOT PROVE, stated so the next person to mutate it does not file a finding: the
+   * redeem claim in apps/api/src/routes/child-auth.ts also carries `c.id = p.child_id`, which ties the
+   * `c.status = 'active'` test to the code's OWN child rather than to any active child row. Removing it
+   * reds NOTHING behaviourally, because the trigger has already consumed the code and
+   * `p.consumed_at is null` refuses the claim first. It is defence in depth for a state the trigger
+   * prevents — worth keeping, and honestly unverifiable from the outside. The sibling case above is what
+   * proves the code's binding where it IS reachable.
+   */
+  it('any path out of active ends the child’s live codes, not only archiving', async () => {
+    const { fam, childId, token } = await familyWithActiveChild();
+    const { code } = await json<{ code: string }>(await newCode(token, childId));
+    const sibling = await seedChild(api.db, fam.familyId, 'Sam', 'active', {
+      attestedBy: fam.ownerId,
+    });
+    // A DRAFT downgrade rather than an archive: the route is not involved, only the trigger.
+    await api.db.sql`update public.child_profiles set status = 'draft' where id = ${childId}`;
+
+    const [live] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from private.child_pairing_codes
+       where child_id = ${childId} and consumed_at is null`;
+    expect(live!.n, 'the trigger consumes the live code on any exit from active').toBe(0);
+    // And the code is therefore dead, while the sibling stays untouched and pairable in its own right.
+    expect((await pair(code, '203.0.113.74')).status).toBe(404);
+    const [devices] = await api.db.sql<{ n: number }[]>`
+      select count(*)::int as n from public.child_devices
+       where family_id = ${fam.familyId} and label = 'Kitchen tablet'`;
+    expect(devices!.n).toBe(0);
+    const siblingCode = await newCode(token, sibling.id);
+    expect(siblingCode.status, 'the sibling is unaffected').toBe(201);
+  });
+
+  it('the session a code mints is for that child at that child’s own grade', async () => {
+    const { fam, childId, token } = await familyWithActiveChild();
+    // Two children at DIFFERENT grades, so a session that carried the wrong child's grade is visible.
+    await api.db.sql`
+      update public.child_profiles set grade_level = 3 where id = ${childId}`;
+    const sibling = await seedChild(api.db, fam.familyId, 'Sam', 'active', {
+      attestedBy: fam.ownerId,
+    });
+    await api.db.sql`
+      update public.child_profiles set grade_level = 7 where id = ${sibling.id}`;
+    const { code } = await json<{ code: string }>(await newCode(token, childId));
+    expect((await pair(code, '203.0.113.73')).status).toBe(201);
+    const [session] = await api.db.sql<{ child_id: string; grade_level: number }[]>`
+      select s.child_id, c.grade_level
+        from public.child_sessions s join public.child_profiles c on c.id = s.child_id
+       where s.family_id = ${fam.familyId} and s.revoked_at is null`;
+    expect(session!.child_id).toBe(childId);
+    // The grade the practice generator will be handed for this session is this child's, not the
+    // sibling's: apps/api/src/jobs/learning-jobs.ts loads it from the child row the session names.
+    expect(session!.grade_level).toBe(3);
   });
 
   it('a "new code" request takes the child row before any code row, so overlapping requests never deadlock (BUG-106)', async () => {

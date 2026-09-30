@@ -29,6 +29,7 @@ import {
   rethemeWordProblem,
   seededRandom,
   subjectGrade,
+  subjectStartsAtGrade,
   teacherWordItems,
   validateBankItem,
   validateContext,
@@ -300,10 +301,24 @@ describe('coverage report (AC_LEARNING_05)', () => {
     }
   });
 
+  /**
+   * OWNER RULE (2026-09-30): no practice above a child's grade is ever put in front of them. This case
+   * used to be named "(nearest grade when none exists)" and asserted `subjectGrade('grammar_writing', 0)
+   * === 1` — it PINNED the upward substitution the rule removes, which is how a kindergarten child came
+   * to be given grade-1 spelling and grammar.
+   *
+   * The coverage guarantee (AC_LEARNING_05) is not weakened, it is made exact: every (subject, grade)
+   * pair either yields usable items, or is one of the EXACTLY TWO pairs where the bank starts later, and
+   * each of those reports the grade it does start at so the product can say so. A new thin pair shows up
+   * here as a failure rather than being silently filled from a higher grade.
+   */
   it(
-    'every subject yields usable items at every grade K-8 (nearest grade when none exists)',
-    { timeout: 60_000 },
+    'yields usable items at every grade K-8, and names the pairs where the bank starts later',
+    {
+      timeout: 60_000,
+    },
     () => {
+      const startsLater: string[] = [];
       for (let grade = 0; grade <= 8; grade += 1) {
         const items = generateCandidates({
           subjects: [...BANK_SUBJECTS],
@@ -312,10 +327,21 @@ describe('coverage report (AC_LEARNING_05)', () => {
         });
         for (const subject of BANK_SUBJECTS) {
           const n = items.filter((i) => i.subject === subject).length;
+          const startsAt = subjectStartsAtGrade(subject);
+          if (startsAt !== null && startsAt > grade) {
+            // The bank has nothing for this subject this early. It must offer NOTHING rather than
+            // something from a higher grade, and it must know where it starts.
+            expect(n, `${subject} at grade ${grade} must offer no bank items`).toBe(0);
+            startsLater.push(`${subject}@${grade}->${startsAt}`);
+            continue;
+          }
           expect(n, `${subject} at grade ${grade}`).toBeGreaterThanOrEqual(3);
         }
       }
-      expect(subjectGrade('grammar_writing', 0)).toBe(1);
+      // Exactly the two known gaps, so a third one cannot arrive unnoticed.
+      expect(startsLater).toEqual(['spelling_vocabulary@0->1', 'grammar_writing@0->1']);
+      // And the child's own grade is always the grade used, clamped to the band.
+      expect(subjectGrade('grammar_writing', 0)).toBe(0);
       expect(subjectGrade('math', 11)).toBe(8);
     },
   );

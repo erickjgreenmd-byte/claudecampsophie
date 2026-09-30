@@ -163,17 +163,41 @@ export function generateCandidates(options: CandidateOptions): BankItem[] {
 }
 
 /**
- * The grade whose items a subject uses for a child. Decision: when a subject has no skill at the
- * child's grade (kindergarten grammar and spelling), the nearest supported grade is used and the
- * coverage report says so; grades above 8 use grade 8.
+ * The grade whose items a subject uses for a child: THE CHILD'S OWN GRADE, always, clamped to the
+ * 0-8 band by `bankGrade`.
+ *
+ * OWNER RULE (2026-09-30): no practice above a child's grade is ever put in front of them. This
+ * function used to reach UPWARD when a subject had no skill at the child's grade — "the nearest
+ * supported grade is used and the coverage report says so" — which in practice meant a KINDERGARTEN
+ * child was given grade-1 spelling and grade-1 grammar. Those were the only two cases in the whole
+ * band (measured: grade 0 spelling_vocabulary and grade 0 grammar_writing, and nothing else at any
+ * grade), and a coverage report the parent never reads is not consent for it.
+ *
+ * What replaces it is honesty rather than substitution: the subject offers NOTHING at that grade, and
+ * `subjectStartsAtGrade` below says where it does start so the product can tell the parent
+ * "Spelling and vocabulary starts at grade 1" instead of quietly handing their five-year-old a
+ * grade-1 word list. A kindergarten family therefore gets maths, reading and science practice and is
+ * told plainly that two subjects begin later.
+ *
+ * `packages/domain/src/bank/grade-isolation.test.ts` asserts the property over every grade and every
+ * subject, on the ITEMS rather than on this function, so a later change anywhere in the generation
+ * path that reintroduces an above-grade item reds.
  */
 export function subjectGrade(subject: BankSubject, grade: number): number {
-  const g = bankGrade(grade);
-  if (skillsForGrade(subject, g).some((d) => d.source !== 'family_material')) return g;
+  return bankGrade(grade);
+}
+
+/**
+ * The lowest grade at which a subject has any bank skill, or null when it has none at all. This is
+ * what the product tells a parent whose child's grade is below a subject's start, in place of the
+ * silent upward substitution `subjectGrade` used to make. Family material is excluded: a parent's own
+ * spelling list is theirs to set at any grade and is not what "the bank starts here" means.
+ */
+export function subjectStartsAtGrade(subject: BankSubject): number | null {
   const mins = SKILLS.filter((d) => d.subject === subject && d.source !== 'family_material').map(
     (d) => d.gradeMin,
   );
-  return mins.length === 0 ? g : Math.min(...mins.filter((m) => m >= g), bankGrade(8));
+  return mins.length === 0 ? null : Math.min(...mins);
 }
 
 /** The generated/curated skills a subject offers a child (grade fallback lists, diagnostics). */
