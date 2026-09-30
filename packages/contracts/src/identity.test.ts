@@ -14,6 +14,7 @@ import {
   identityRetryWorthwhile,
   type IdentityVerificationStatus,
 } from './identity.ts';
+import { BIRTH_YEAR_MIN } from './common.ts';
 
 /**
  * THE HONESTY PROPERTIES, asserted here rather than on either screen.
@@ -289,5 +290,44 @@ describe('[BUG-417] a corrected field stops being scolded, and only that field',
   it('is a no-op for a field that was never unmet', () => {
     const one = [{ field: 'document', message: IDENTITY_REQUIREMENT_COPY.document }] as const;
     expect(clearIdentityProblem(one, 'dateOfBirth')).toEqual(one);
+  });
+});
+
+/**
+ * [BUG-425] A shared sentence may not teach an INPUT FORMAT, because the two surfaces' controls are
+ * not the same control. The portal's date of birth is `<input type="date">` — a native picker showing
+ * `mm/dd/yyyy` in a US locale — and the phone's is a free-text field with a `YYYY-MM-DD` placeholder.
+ * One sentence saying "as year-month-day … for example 1990-04-12" was true of the phone and false of
+ * the portal, which a parent read beside a picker that does not work that way.
+ *
+ * This is the MIRROR of the divergences BUG-421..424 closed: not two copies of one sentence, but one
+ * sentence covering two things that genuinely differ. The remedy is the same in spirit — say what is
+ * actually shared (the value) and let each surface own what is actually its own (the format).
+ */
+describe('[BUG-425] a shared requirement names the value, never the control', () => {
+  const FORMAT_WORDS =
+    /year-month-day|yyyy|mm\/dd|dd\/mm|\bdd-mm\b|\d{4}-\d{2}-\d{2}|day-month-year/i;
+
+  it('no requirement sentence teaches an input format', () => {
+    for (const [field, sentence] of Object.entries(IDENTITY_REQUIREMENT_COPY)) {
+      expect(sentence, field).not.toMatch(FORMAT_WORDS);
+    }
+  });
+
+  it('the date-of-birth sentence still carries what IS shared: whose date, and the range', () => {
+    // Dropping the format must not drop the two things a parent actually needs, one of which
+    // (the floor) is the whole reason BUG-413 existed.
+    const sentence = IDENTITY_REQUIREMENT_COPY.dateOfBirth;
+    expect(sentence).toMatch(/your own date of birth/i);
+    expect(sentence).toContain(String(BIRTH_YEAR_MIN));
+    expect(sentence).toMatch(/printed on the ID/i);
+  });
+
+  it('the year floor in the sentence is the one the schema enforces', () => {
+    // Asserted against the VALUE, not against the symbol, so the sentence cannot drift from the
+    // rule it describes (L-067). 1900 is the decision; a person born earlier is not a parent of a
+    // K-8 child.
+    expect(BIRTH_YEAR_MIN).toBe(1900);
+    expect(IDENTITY_REQUIREMENT_COPY.dateOfBirth).toContain('1900');
   });
 });

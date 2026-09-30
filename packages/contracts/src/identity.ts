@@ -424,10 +424,23 @@ export type IdentityRequirement = (typeof IDENTITY_REQUIREMENTS)[number];
  * What a parent is told when a requirement is unmet. Each names the ACTION. `declaration` reuses
  * `IDENTITY_ATTESTATION_REQUIRED_COPY` rather than restating it, because that sentence already
  * exists for this exact refusal and two copies of one sentence is how they diverge.
+ *
+ * NONE OF THESE MAY TEACH AN INPUT FORMAT, and `dateOfBirth` used to. It read "Enter your date of
+ * birth as year-month-day … for example 1990-04-12", which is true of the PHONE, whose control is a
+ * free-text field with a `YYYY-MM-DD` placeholder, and false of the PORTAL, whose control is
+ * `<input type="date">` — a native picker that renders `mm/dd/yyyy` in a US locale and never takes
+ * that string as typed text. So the one shared sentence contradicted one of the two controls it
+ * serves. Found by rendering the screen and LOOKING at it; no test could see it, because every test
+ * asserts this constant against itself.
+ *
+ * The fix is not two sentences — that is the drift these constants exist to prevent. A format is a
+ * property of the CONTROL and the control already teaches it (the portal's picker by being one, the
+ * phone's field by its placeholder). What is shared is the VALUE: whose date it is and which range
+ * is plausible. `identity.test.ts` asserts no requirement sentence names a format.
  */
 export const IDENTITY_REQUIREMENT_COPY: Readonly<Record<IdentityRequirement, string>> = {
   document: 'Add a photo of your government photo ID.',
-  dateOfBirth: `Enter your date of birth as year-month-day, from ${BIRTH_YEAR_MIN} onwards — for example 1990-04-12.`,
+  dateOfBirth: `Add your own date of birth, from ${BIRTH_YEAR_MIN} onwards — the one printed on the ID.`,
   declaration: IDENTITY_ATTESTATION_REQUIRED_COPY,
 };
 
