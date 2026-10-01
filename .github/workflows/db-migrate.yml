@@ -1,0 +1,105 @@
+# Applies supabase/migrations to a hosted Supabase project.
+#
+# WHY FROM CI RATHER THAN FROM THE AGENT BUILD CONTAINER. Three independent blocks, each hit for real
+# on 2026-10-01 and recorded in docs/Deployment_Runbook.md §0:
+#   * The Supabase MCP connector times out on every statement containing DROP, and eleven of the
+#     forty-four migrations contain one, so a run through it strands the schema part-applied.
+#   * That container has no IPv6, and a new Supabase project's DIRECT host is IPv6-only unless the
+#     IPv4 add-on is bought — the host does not resolve there at all.
+#   * Its outbound traffic goes through an HTTP proxy, and Postgres is not HTTP, so 5432 and 6543 are
+#     closed to it whatever the address.
+# A GitHub runner has none of those limits, the secret lives where secrets belong, and every run
+# leaves a log. This is the shape production wants later, so it is not scaffolding.
+#
+# THE SECRET: SUPABASE_DB_URL, a full libpq URL. Take the SESSION POOLER string (port 5432) from the
+# project's Connect panel, NOT the transaction pooler (6543), which does not support every statement
+# a migration uses. Copy it from the dashboard rather than assembling it, so the host and the
+# `postgres.<ref>` user form come from Supabase and not from anyone's memory.
+name: Apply database migrations
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm you mean to change the target database'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+    steps:
+      - name: Refuse unless confirmed
+        if: inputs.confirm != 'APPLY'
+        run: |
+          echo "::error::Type APPLY in the confirm input. This workflow changes a real database."
+          exit 1
+
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install the psql client used by the checks below
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Name the target without revealing the secret
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "::error::Repository secret SUPABASE_DB_URL is not set."; exit 1
+          fi
+          python3 - <<'PY'
+          import os, urllib.parse as u
+          p = u.urlparse(os.environ['DATABASE_URL'])
+          print(f"host={p.hostname} port={p.port} db={p.path.lstrip('/')} user={p.username}")
+          PY
+          psql "$DATABASE_URL" -Atc "select current_user, current_database(), version();"
+
+      # The repository's OWN migrate script, not a second implementation of it in YAML. It applies
+      # every file in `listMigrations` order inside one transaction per file and throws naming the
+      # file that failed, which is exactly the behaviour this step needs — and it is the same code
+      # the authorization suite runs, so the hosted schema is built the way the tested one is.
+      - name: Apply every migration, one transaction per file
+        run: pnpm --filter @pencillift/db run migrate
+
+      - name: Every public table has row level security (CLAUDE.md, on the REAL database)
+        run: |
+          unprotected=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "
+            select coalesce(string_agg(c.relname, ', '), '')
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'public' and c.relkind = 'r' and not c.relrowsecurity;")
+          if [ -n "$unprotected" ]; then
+            echo "::error::public tables WITHOUT row level security: $unprotected"; exit 1
+          fi
+          echo "every public table has RLS enabled"
+
+      - name: Remove the capability probe, if it is still there
+        run: |
+          # Left by the owner-action-#20 probe because removing it is itself a DROP, which the
+          # connector that created it cannot issue. Harmless (the function returns OLD and writes
+          # nothing) but it has no business on a database about to hold real rows.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+            -c "drop trigger if exists probe_sessions_trg on auth.sessions;" \
+            -c "drop schema if exists probe_tmp cascade;"
+          echo "probe removed"
+
+      - name: What the schema now holds
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+            select n.nspname as schema, count(*) filter (where c.relkind = 'r') as tables,
+                   count(*) filter (where c.relkind = 'r' and c.relrowsecurity) as rls_on
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname in ('public','private','app') group by 1 order by 1;"
