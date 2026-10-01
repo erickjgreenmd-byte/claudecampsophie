@@ -115,7 +115,7 @@ describe('Responses transport', () => {
       jsonSchema: { type: 'object' },
       maxOutputTokens: 10,
       timeoutMs: 100,
-      metadata: {},
+      metadata: { stage: 'unit_test' },
     });
     expect(body.store).toBe(false);
     expect(body.text).toEqual({
@@ -152,7 +152,7 @@ describe('Responses transport', () => {
       jsonSchema: {},
       maxOutputTokens: 10,
       timeoutMs: 1000,
-      metadata: {},
+      metadata: { stage: 'unit_test' },
     });
     expect(result).toEqual({
       kind: 'ok',
@@ -179,7 +179,7 @@ describe('Responses transport', () => {
       jsonSchema: {},
       maxOutputTokens: 1,
       timeoutMs: 20,
-      metadata: {},
+      metadata: { stage: 'unit_test' },
     });
     expect(result).toMatchObject({ kind: 'error', timedOut: true, retryable: true });
   });
@@ -203,7 +203,11 @@ describe('runStage (spec P12 metering, F4 limits)', () => {
     limits: PROPOSED_STAGE_LIMITS.coaching,
     rates: DEFAULT_RATE_TABLE_2026_09_18,
     gate: { ...baseGate, environment: 'test' as const },
-    metadata: { child: 'pseudonymous-id' },
+    // WAS `{ child: 'pseudonymous-id' }`. Pseudonymous or not, a per-child key in request
+    // metadata is an identifier travelling to the provider and stored beside the request,
+    // and a fixture is where a pattern gets copied from. `ZdrSafeMetadata` makes it a compile
+    // error now; this was the only place in the repository that had it.
+    metadata: { stage: 'coaching' as const },
     estimatedInputTokens: 1500,
     sleep: () => Promise.resolve(),
   };

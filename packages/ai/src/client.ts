@@ -1,5 +1,15 @@
 import type { InputPart } from './prompts.ts';
 
+import {
+  assertApprovedProviderHost,
+  assertZdrEligibleEndpoint,
+  assertZdrSafeMetadata,
+  type ZdrSafeMetadata,
+} from './zdr.ts';
+
+/** Named so the eligibility test reads the same string the request uses, not a copy of it. */
+export const RESPONSES_ENDPOINT = 'https://api.openai.com/v1/responses';
+
 /**
  * Server-only OpenAI Responses API transport (spec P12). Plain fetch keeps it Workers-compatible.
  * `store: false` is always sent; it does NOT by itself provide zero data retention (see gate.ts).
@@ -15,7 +25,12 @@ export interface ResponsesRequest {
   readonly maxOutputTokens: number;
   readonly timeoutMs: number;
   /** Pseudonymous ids only (never names or homework). */
-  readonly metadata: Readonly<Record<string, string>>;
+  /**
+   * Closed to `ZdrSafeMetadata` (zdr.ts). It was `Record<string, string>`, which carried nothing
+   * sensitive and permitted anything: a `child_id` added for debugging would have been stored
+   * beside the request by the provider with nothing noticing.
+   */
+  readonly metadata: ZdrSafeMetadata;
 }
 
 export interface ResponsesUsage {
@@ -220,11 +235,19 @@ export function createOpenAiResponsesClient(options: {
     name: 'openai_responses',
     isMock: false,
     async create(request) {
+      // BEFORE the try, deliberately. These three are programming errors, not transport failures,
+      // and inside the try the catch below turned them into `{ kind: 'error', retryable: true }` —
+      // so a request carrying a child's identifier in metadata would have been RETRIED rather than
+      // refused, forever, by a job that could never succeed. Found by the test that drives this
+      // path rather than by review.
+      assertApprovedProviderHost(RESPONSES_ENDPOINT);
+      assertZdrEligibleEndpoint(RESPONSES_ENDPOINT);
+      assertZdrSafeMetadata(request.metadata);
       const started = clock();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), request.timeoutMs);
       try {
-        const response = await fetchImpl('https://api.openai.com/v1/responses', {
+        const response = await fetchImpl(RESPONSES_ENDPOINT, {
           method: 'POST',
           headers: {
             authorization: `Bearer ${options.apiKey}`,

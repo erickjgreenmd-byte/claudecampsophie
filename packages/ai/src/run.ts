@@ -1,3 +1,4 @@
+import type { ZdrSafeMetadata } from './zdr.ts';
 import { err, ok, type Result } from '@pencillift/domain';
 import {
   canAttempt,
@@ -207,7 +208,8 @@ export interface RunStageInput<S extends z.ZodType> {
   readonly maxStageCostMicros?: number;
   readonly rates: Parameters<typeof computeOperationCostMicros>[0];
   readonly gate: Omit<ChildDataGateInput, 'providerIsMock'>;
-  readonly metadata: Readonly<Record<string, string>>;
+  /** Closed to `ZdrSafeMetadata` (zdr.ts): request metadata names the software, never a person. */
+  readonly metadata: ZdrSafeMetadata;
   /** Estimated input tokens for the pre-flight cost check (upper bound). */
   readonly estimatedInputTokens: number;
   readonly sleep?: (ms: number) => Promise<void>;

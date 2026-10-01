@@ -740,7 +740,19 @@ describe('a malformed configuration is NOT_CONFIGURED, never an exception (LRD-4
   it('a deploy without --env carries no APP_ENV and serves NOT_CONFIGURED', () => {
     const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
     const { tables, appEnvIn } = wranglerVars(toml);
-    expect(appEnvIn).toEqual(['env.staging.vars', 'env.production.vars']);
+    // RE-AIMED, not relaxed. The enumeration is the valuable half — a new environment must be
+    // added here deliberately — so `testbed` is named rather than the check loosened to "any
+    // env.*.vars". What the lesson actually forbids is development being reached by ACCIDENT, and
+    // the assertions below still hold that: nothing at the TOP level sets APP_ENV, a bare deploy
+    // still serves NOT_CONFIGURED, and `development` appears in exactly one env that a deployer has
+    // to name on the command line.
+    expect(appEnvIn).toEqual(['env.testbed.vars', 'env.staging.vars', 'env.production.vars']);
+    // The testbed is the ONLY place `development` may appear, and staging and production may never
+    // carry it — which is the property that stops a mock reaching somewhere real.
+    expect(tables['env.testbed.vars']?.APP_ENV).toBe('development');
+    for (const name of ['staging', 'production']) {
+      expect(tables[`env.${name}.vars`]?.APP_ENV, name).not.toBe('development');
+    }
     const { APP_ENV: _omitted, ...secrets } = TEST_ENV;
     const bare = buildRuntime({ HYPERDRIVE, ...secrets, ...tables['vars'] });
     if (bare.ok) opened.push(bare.runtime.sql);

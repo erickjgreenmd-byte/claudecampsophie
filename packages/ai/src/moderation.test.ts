@@ -392,7 +392,7 @@ describe('the OpenAI moderation transport (scripted fetch; never the network)', 
         });
       })) as unknown as typeof fetch;
     const client = createOpenAiModerationClient({ apiKey: 'sk-synthetic-test-value', fetchImpl });
-    const out = await client.moderate(['slow'], { timeoutMs: 5, metadata: {} });
+    const out = await client.moderate(['slow'], { timeoutMs: 5, metadata: { stage: 'unit_test' } });
     expect(out).toMatchObject({ kind: 'error', status: null, retryable: true, timedOut: true });
   });
 

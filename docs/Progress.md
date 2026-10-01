@@ -208,3 +208,44 @@ without further involvement:
   grade-2 gap still gets grade-2 practice. Owner action #49 asks whether the other direction should exist.
 
 Next: stage 4 (the 7 parity findings), then the round-7 coverage re-render and the remaining ledger rows.
+
+## Zero data retention and the retention record (2026-10-01)
+
+Two separate questions were conflated everywhere before this round, and the conflation is how a privacy
+claim becomes untrue: what **OpenAI** keeps, which only OpenAI's approval decides, and what **PencilLift**
+keeps, which only this product's migrations and jobs decide. `docs/Data_Retention_And_ZDR.md` now answers
+them in separate sections and opens by saying that neither the document nor the code makes zero data
+retention active or makes this product legally compliant.
+
+The code half is `packages/ai/src/zdr.ts`: the eligible endpoints (`/v1/responses`, `/v1/moderations` and
+the three others ZDR covers), the INELIGIBLE ones with a retention reason beside each — `/v1/files` carries
+30-day abuse-monitoring retention AND application state until the file is explicitly deleted, which is why
+homework images go inline as `data:` URLs and never through it — the single approved provider host, and a
+metadata allow-list of `stage` and `prompt_version`. `store: false` is sent on every request even though an
+approved ZDR organization forces it anyway, because the request made BEFORE any approval exists is the one
+that needs it. Prompt caching is accepted and named rather than ignored; background mode, file search, code
+interpreter, web search and image generation are refused, each with its reason written down.
+
+Two real defects, found by writing the tests rather than by reading the code:
+
+- **A child identifier on the wire** (BUG-427). `ResponsesRequest.metadata` was `Record<string, string>` with
+  a docblock that said "pseudonymous ids only" — and the package's one fixture read
+  `metadata: { child: 'pseudonymous-id' }`, in the exact place a developer copies from. `metadata` is the
+  field a provider stores BESIDE the request, so it outlives the prompt. A docblock is not a control
+  (L-080): the type is now the allow-list, the transport asserts the same allow-list for callers that cast,
+  and a test scans this package's own fixtures for identifier-shaped keys.
+- **A refusal retried forever** (BUG-428). The three guards were the first statements INSIDE the transport's
+  `try`, whose `catch` answers `{ kind: 'error', retryable: true }` for anything thrown. So a request
+  carrying a child's identifier was reported as a transient network error and retried, forever, by a job
+  that could never succeed. The privacy control and the reliability control cancelled each other and both
+  looked right alone. They now sit above the `try`, with a comment saying why (L-079).
+
+`zdr.test.ts` is 23 synthetic-only cases over four areas — the production gate, the request settings, data
+minimisation, and the logging protections — and the `@pencillift/ai` floor rose from 96 to 119. Eight
+mutations red at least one case; the one survivor is stated as a residual in the test file rather than
+covered with a contrived case, because the risk it stands for (repointing the moderation endpoint at
+`/v1/files`) IS caught, by the eligibility test.
+
+Next: the two GitHub repository secrets (`SUPABASE_DB_URL`, `CLOUDFLARE_API_TOKEN`), then `Apply database
+migrations`, then `Deploy API` with environment `testbed` — the first live URL. Owner action #6 holds the
+seven ZDR account steps; none of them is code.

@@ -1,3 +1,4 @@
+import { assertApprovedProviderHost, assertZdrEligibleEndpoint } from './zdr.ts';
 import {
   SEVERE_SAFETY_CATEGORIES,
   type SafetyScreen,
@@ -303,6 +304,10 @@ export function createOpenAiModerationClient(options: {
       },
     });
     try {
+      // Same guard as the Responses transport, at this call site too: /v1/moderations is
+      // ZDR-eligible, but that is a fact to assert rather than remember.
+      assertApprovedProviderHost(MODERATION_ENDPOINT);
+      assertZdrEligibleEndpoint(MODERATION_ENDPOINT);
       const response = await fetchImpl(MODERATION_ENDPOINT, {
         method: 'POST',
         headers: {
