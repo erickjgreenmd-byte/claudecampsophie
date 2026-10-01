@@ -36,7 +36,7 @@ system**, and the code enforces that rather than trusting anyone to remember:
 |---|---|---|
 | An approved method establishes that a consenting ADULT is present. **CHANGED by the owner's decision of 2026-09-30, and this is the gate that moved** | **#48** (counsel), with #7 only if counsel requires a vendor | Two standards now exist and the code reads both through one predicate, `public.adult_identity_established`. The owner's method — a government photo ID whose own date of birth makes an adult, PLUS the holder's legal declaration that they are the person on it and the child's parent or guardian — is BUILT and reachable: migration 0990, `POST /v1/identity/verification`, and a verified `consent_records` row written in the same transaction, which every existing gate already reads. So this no longer waits on a vendor contract. What it waits on is counsel answering ONE question (#48): whether sending homework to a ZDR-bound processor is a disclosure to a third party. If it is not, the internal-use standard applies and this method very likely clears 16 CFR 312.5(b)(2); if it is, the stronger biometric standard is required and #7 returns. `public.adult_identity_basis` records which standard each adult met, so that reversal would re-verify only the affected adults. The residual is stated in 0990's header and in docs/Threat_Model.md: reading a licence is not the FTC's database check, and anyone holding an adult's licence passes the document half |
 | OpenAI ZDR approval for under-13 data is documented with a reference and a past verification date | #6 | `zdr_evidence`, and `checkChildDataGate` in `packages/ai` blocks child data from reaching any model without it |
-| Legal review of the public pages, the safety wording and the parent-only safety policy is signed off | #15, #24 | `safety_templates`; the web build fails without `VITE_LEGAL_REVIEWED=true`, an effective date and a support mailbox |
+| Legal review of the public pages, the safety wording and the parent-only safety policy is signed off | #15, #24 | `safety_templates`. **CORRECTED 2026-10-01**: this row said "the web build fails without `VITE_LEGAL_REVIEWED=true`, an effective date and a support mailbox". The opposite is true, and the difference decides how soon a beta can start. A build with the flag UNSET succeeds and ships a draft banner on every legal page (`isLegalReviewed` in `apps/web/src/lib/config.ts`, `DraftBanner`); proved by building the portal with none of the three set — exit 0. What throws is CLAIMING review without the evidence: `VITE_LEGAL_REVIEWED=true` with no effective date or support mailbox. So legal review gates the CLAIM, not the build, and it does not block the parent-only walkthrough below — which means that walkthrough waits on two accounts, not on counsel. It does still gate a real child, through the safety templates and #24 |
 
 A beta with a friendly family is still a beta with a real child. The consent and ZDR gates do not
 soften because the parent is someone the owner knows.
@@ -54,7 +54,11 @@ of findings kept landing in: copy that promises an action the server refuses, sc
 previous state, and flows that say "done" before the server was told.
 
 This still needs the deploy chain below (a Supabase project, a Worker, a web build). It does not need
-the consent provider, the OpenAI key, RevenueCat, or a store account.
+the consent provider, the OpenAI key, RevenueCat, a store account — or, per the correction above, legal
+sign-off: the pages carry a draft banner until #15 lands, which is the honest state for a beta anyway.
+In owner-action terms the whole of it is **#3 and #8**, plus the Supabase configuration those imply
+(#20, #21, #40, #41). That is the cheapest real information available about this product, and nothing
+in the code is holding it up.
 
 ## The ordered path, with what each step unblocks
 
