@@ -45,11 +45,18 @@ Hyperdrive config, which needs the same connection string. Do this one first.
 1. Supabase dashboard → project **pencillift-staging** → **Project Settings** → **Database**.
 2. Under **Database password**, choose **Reset database password**. Generate a strong one and copy it.
    (The original is shown once at project creation and is not recoverable; resetting is expected.)
-3. Put it in the build environment as `SUPABASE_DB_PASSWORD`. Never in a file in this repository,
-   never in a chat message.
+3. **CORRECTED 2026-10-01**: this said to put the password in the build environment. That is the
+   wrong place and would not have worked. The build container reaches `api.github.com` and almost
+   nothing else — `api.cloudflare.com` and `supabase.com` both answer 403 at the proxy, and
+   Postgres is not HTTP so 5432 and 6543 cannot be tunnelled at all. Everything that talks to a
+   provider therefore runs from GitHub Actions, and the credentials are GITHUB REPOSITORY SECRETS
+   (Settings → Secrets and variables → Actions). Store the full session-pooler URL, password
+   substituted, as `SUPABASE_DB_URL` — not the bare password, because the workflows take a URL.
 
-The connection string the builder then forms is
-`postgresql://postgres:<password>@db.uroolgscjkbpcsioqogm.supabase.co:5432/postgres?sslmode=require`.
+Take the connection string from the project's **Connect** panel, **Session pooler** (port 5432), and
+substitute the password. Do NOT use the direct `db.<ref>.supabase.co` host: it is IPv6-only on new
+projects without the IPv4 add-on. Do NOT use the transaction pooler on 6543: it does not support
+every statement a migration uses.
 
 **B. Cloudflare API token** — unblocks the Worker deploy only.
 
@@ -64,8 +71,9 @@ The connection string the builder then forms is
    R2, D1, KV, Queues or Vectorize). Without it `wrangler deploy --env staging` fails when it resolves
    the `HYPERDRIVE` binding, which is the only binding this Worker has.
 4. Scope **Account resources** to the one account that will host PencilLift, not "all accounts".
-5. Create, copy the token (shown once), and put it in the build environment as
-   `CLOUDFLARE_API_TOKEN`. Add `CLOUDFLARE_ACCOUNT_ID` too if the token can see more than one account
+5. Create, copy the token (shown once), and add it as the GitHub repository secret
+   `CLOUDFLARE_API_TOKEN` (not an environment variable — see the correction above). Add
+   `CLOUDFLARE_ACCOUNT_ID` too if the token can see more than one account
    — Wrangler needs it to disambiguate, and the id is on the same dashboard
    (<https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/>).
 

@@ -1,0 +1,108 @@
+# Deploys the API Worker to the STAGING environment, from CI.
+#
+# WHY FROM CI. The agent build container cannot reach api.cloudflare.com — the environment's network
+# policy answers 403 to the CONNECT — so `wrangler deploy` cannot run there whatever token it holds.
+# A GitHub runner reaches it. Same reason the migrations moved here (docs/Deployment_Runbook.md §0).
+#
+# SECRETS: CLOUDFLARE_API_TOKEN (Workers Scripts Edit + HYPERDRIVE EDIT — the "Edit Cloudflare
+# Workers" template does NOT include Hyperdrive, and HYPERDRIVE is the only binding this Worker has)
+# and SUPABASE_DB_URL (the session pooler URL; Hyperdrive stores it as the origin).
+#
+# RUN db-migrate.yml FIRST. A Worker pointed at an empty database answers errors that look like code
+# faults and are not.
+name: Deploy API to staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DEPLOY to confirm'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-api-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SUPABASE_PROJECT_REF: uroolgscjkbpcsioqogm
+    steps:
+      - name: Refuse unless confirmed
+        if: inputs.confirm != 'DEPLOY'
+        run: echo "::error::Type DEPLOY to confirm." && exit 1
+
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Create the Hyperdrive config if it does not exist, and capture its id
+        id: hyperdrive
+        working-directory: apps/api
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          [ -n "${SUPABASE_DB_URL:-}" ] || { echo "::error::SUPABASE_DB_URL not set"; exit 1; }
+          name=pencillift-staging-db
+          # `hyperdrive list` prints a table; ask for JSON so the id is parsed rather than scraped.
+          existing=$(npx wrangler hyperdrive list --json 2>/dev/null \
+            | python3 -c "import json,sys;d=json.load(sys.stdin);print(next((c['id'] for c in d if c.get('name')=='$name'),''))" \
+            || echo "")
+          if [ -z "$existing" ]; then
+            echo "creating Hyperdrive config $name"
+            existing=$(npx wrangler hyperdrive create "$name" \
+              --connection-string="$SUPABASE_DB_URL" --json \
+              | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
+          else
+            echo "reusing existing Hyperdrive config $name"
+          fi
+          [ -n "$existing" ] || { echo "::error::could not determine a Hyperdrive id"; exit 1; }
+          echo "id=$existing" >> "$GITHUB_OUTPUT"
+          echo "Hyperdrive id: $existing"
+
+      - name: Point the staging binding at that config
+        working-directory: apps/api
+        run: |
+          # Substituted at deploy time rather than committed, because the placeholder in
+          # wrangler.toml is deliberate: it makes a deploy fail closed rather than silently point at
+          # an invented database. The id is not a secret; once staging settles, commit it and delete
+          # this step so the repository and the deployed configuration agree.
+          sed -i 's|OWNER_ACTION_HYPERDRIVE_ID_STAGING|${{ steps.hyperdrive.outputs.id }}|' wrangler.toml
+          grep -A1 '\[\[env.staging.hyperdrive\]\]' wrangler.toml
+
+      - name: Token verification settings (public values, derived from the project ref)
+        working-directory: apps/api
+        run: |
+          # Neither is a secret: the JWKS endpoint is public by design and the issuer is a URL.
+          # They are the two things loadConfig refuses to start without, besides APP_ENV.
+          npx wrangler secret put SUPABASE_JWKS_URL --env staging <<< \
+            "https://${SUPABASE_PROJECT_REF}.supabase.co/auth/v1/.well-known/jwks.json"
+          npx wrangler secret put SUPABASE_JWT_ISSUER --env staging <<< \
+            "https://${SUPABASE_PROJECT_REF}.supabase.co/auth/v1"
+
+      - name: Deploy
+        working-directory: apps/api
+        run: npx wrangler deploy --env staging
+
+      - name: Prove it answers, and say what it reports about itself
+        run: |
+          sub=$(npx wrangler whoami 2>/dev/null | grep -oE '[a-z0-9-]+\.workers\.dev' | head -1 || true)
+          url="https://pencillift-api-staging.${sub:-workers.dev}"
+          echo "staging API: $url"
+          echo "A 503 NOT_CONFIGURED here is the gate working, not a failure: the Worker refuses to"
+          echo "run with mock consent, mock billing, mock AI or missing ZDR evidence."
+          curl -sS -o /tmp/health -w 'HTTP %{http_code}\n' --max-time 20 "$url/health" || true
+          head -c 400 /tmp/health || true
