@@ -103,5 +103,21 @@ jobs:
           psql "$DATABASE_URL" -Atc "select version();"
       - name: Authorization suite on PostgreSQL 17
         run: pnpm --filter @pencillift/db run test
-      - name: Floor still met on 17
-        run: node scripts/assert-test-count.mjs
+      # NOT `assert-test-count.mjs`: that audits EVERY package with a test script and this job runs
+      # only the db one, so it failed on the seven missing reports rather than on anything about
+      # PostgreSQL 17 — a red that said nothing about the thing the job exists to check. The
+      # guarantee it carries is still worth keeping, and it is the anti-vacuity one: a green run that
+      # executed zero tests is a failure. So the db report is read directly, against the same floor.
+      - name: The run was not vacuous, and met the db floor
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const min = JSON.parse(fs.readFileSync("scripts/test-minimums.json","utf8"))["@pencillift/db"];
+            const r = JSON.parse(fs.readFileSync("test-results/db.json","utf8"));
+            const problems = [];
+            if (r.numTotalTests < min) problems.push(`${r.numTotalTests} tests < floor ${min}`);
+            if (r.numFailedTests > 0) problems.push(`${r.numFailedTests} failed`);
+            if (r.numPendingTests > 0 || r.numTodoTests > 0) problems.push("skipped or todo tests");
+            if (problems.length) { console.error("✗ PostgreSQL 17: " + problems.join("; ")); process.exit(1); }
+            console.log(`✓ ${r.numTotalTests} authorization tests passed on PostgreSQL 17 (floor ${min})`);
+          '

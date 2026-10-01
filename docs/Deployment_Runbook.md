@@ -30,9 +30,17 @@ done
 loop stops, so the schema is never left between two migrations. The password comes from the project's
 database settings and belongs in the environment, never in a committed file or a chat message.
 
-The hosted project runs **PostgreSQL 17**, while `scripts/dev-db.sh` and all 484 DB authorization
-tests run on **PostgreSQL 16**. The migrations are not known to be 17-clean: that is an assumption
-until the suite has been run against the hosted database, and running it there is the check.
+The hosted project runs **PostgreSQL 17**, while `scripts/dev-db.sh` runs **PostgreSQL 16**. That
+difference is no longer an assumption: CI's `authorization-postgres-17` job runs the whole
+authorization suite against a `postgres:17` service container and all 484 cases pass, so the
+migrations and every RLS policy hold on 17.
+
+It is worth saying why that job exists rather than running the suite against the hosted database
+itself, which was the first plan and does not work: `createTestDb` issues `create database
+pl_test_<random>` per run and installs a shim that EMULATES Supabase's roles. Supabase does not
+permit the first, and the second would collide with the real roles it imitates. The suite needs a
+plain Postgres it owns — which is what makes it a good suite, and exactly why it cannot certify a
+hosted project.
 
 ## 0.1 The two credentials the builder cannot obtain, and how to make them (2026-10-01)
 
