@@ -34,6 +34,45 @@ The hosted project runs **PostgreSQL 17**, while `scripts/dev-db.sh` and all 484
 tests run on **PostgreSQL 16**. The migrations are not known to be 17-clean: that is an assumption
 until the suite has been run against the hosted database, and running it there is the check.
 
+## 0.1 The two credentials the builder cannot obtain, and how to make them (2026-10-01)
+
+Both were attempted from inside the build environment and both were refused; the refusals are recorded
+in `docs/Connections.md`. These are the only two manual steps between here and a live staging API.
+
+**A. Supabase database password** — unblocks BOTH the migrations (psql, §0) and the Cloudflare
+Hyperdrive config, which needs the same connection string. Do this one first.
+
+1. Supabase dashboard → project **pencillift-staging** → **Project Settings** → **Database**.
+2. Under **Database password**, choose **Reset database password**. Generate a strong one and copy it.
+   (The original is shown once at project creation and is not recoverable; resetting is expected.)
+3. Put it in the build environment as `SUPABASE_DB_PASSWORD`. Never in a file in this repository,
+   never in a chat message.
+
+The connection string the builder then forms is
+`postgresql://postgres:<password>@db.uroolgscjkbpcsioqogm.supabase.co:5432/postgres?sslmode=require`.
+
+**B. Cloudflare API token** — unblocks the Worker deploy only.
+
+1. Cloudflare dashboard → **My Profile** → **API Tokens**, or go straight to
+   <https://dash.cloudflare.com/?to=/:account/api-tokens>.
+2. **Create Token**. Under **Permission policies**, open the **Custom** dropdown and start from
+   **Edit Cloudflare Workers**. That template grants Account → Workers Scripts (Edit), Workers KV
+   Storage (Edit), Workers R2 Storage (Edit), Account Settings (Read), and Zone → Workers Routes
+   (Edit).
+3. **ADD ONE PERMISSION THE TEMPLATE OMITS**: Account → **Hyperdrive** → **Edit**. Cloudflare's own
+   authorization page states that product-level Workers roles do NOT grant access to Hyperdrive (nor
+   R2, D1, KV, Queues or Vectorize). Without it `wrangler deploy --env staging` fails when it resolves
+   the `HYPERDRIVE` binding, which is the only binding this Worker has.
+4. Scope **Account resources** to the one account that will host PencilLift, not "all accounts".
+5. Create, copy the token (shown once), and put it in the build environment as
+   `CLOUDFLARE_API_TOKEN`. Add `CLOUDFLARE_ACCOUNT_ID` too if the token can see more than one account
+   — Wrangler needs it to disambiguate, and the id is on the same dashboard
+   (<https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/>).
+
+COST: nothing here bills. Hyperdrive is included on the Workers Free plan (100,000 database queries
+per day, reset 00:00 UTC), and the Supabase project is on the free tier. The Workers Paid plan ($5/mo
+minimum) raises the Hyperdrive query limit to unlimited and is not needed for a beta.
+
 ## 1. Environments
 
 | Environment | API (Cloudflare Worker) | Database | Billing | AI | Consent |
