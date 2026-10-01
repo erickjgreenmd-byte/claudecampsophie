@@ -30,6 +30,10 @@ const MAX_DRAWS_PER_ITEM = 12;
 /**
  * Up to `count` distinct valid items from a parameterized generator. Returns fewer when valid
  * distinct draws run out (never an unvalidated item).
+ *
+ * `avoid` carries instance keys an EARLIER call already took, so a caller asking for a skill in
+ * several categories gets distinct items instead of duplicates a later dedupe silently drops: the
+ * collision redraws here, inside the draw budget, where there is still something to draw.
  */
 export function generateSkillItems(
   skill: string,
@@ -38,6 +42,7 @@ export function generateSkillItems(
     readonly grade: number;
     readonly category: BankCategory;
     readonly count: number;
+    readonly avoid?: ReadonlySet<string>;
   },
 ): BankItem[] {
   const generator = GENERATORS[skill];
@@ -48,12 +53,13 @@ export function generateSkillItems(
     category: options.category,
   };
   const out: BankItem[] = [];
-  const seen = new Set<string>();
-  for (
-    let draws = 0;
-    out.length < options.count && draws < options.count * MAX_DRAWS_PER_ITEM;
-    draws += 1
-  ) {
+  const seen = new Set<string>(options.avoid);
+  // The budget covers the items ALREADY taken as well as the ones wanted. A generator draws from a
+  // pool it cannot see, so the last item of a four-word grade-1 pool needs about four draws per
+  // attempt, not one: a budget of `count * MAX_DRAWS_PER_ITEM` gave the final `avoid`-constrained
+  // call 12 draws at a 1-in-4 hit rate and came up short for one child in fifty (BUG-429).
+  const budget = (options.count + seen.size) * MAX_DRAWS_PER_ITEM;
+  for (let draws = 0; out.length < options.count && draws < budget; draws += 1) {
     const item = generator(ctx);
     if (seen.has(item.instanceKey)) continue;
     seen.add(item.instanceKey);
@@ -115,13 +121,27 @@ export function generateCandidates(options: CandidateOptions): BankItem[] {
     const grade = subjectGrade(subject, childGrade);
     for (const def of skillsForGrade(subject, grade)) {
       if (!wanted(def.skill) || !hasGenerator(def.skill)) continue;
+      // One set per SKILL, spanning its three category draws. Without it the accessible or
+      // diagnostic draw could repeat a standard one, `uniqueByInstance` below would drop the
+      // repeat, and that child's pool for the skill would be short by one for the rest of the
+      // run — so the weak part of their daily set had one fewer question on the skill they are
+      // failing, decided by nothing but their random id (BUG-429).
+      const taken = new Set<string>();
       for (const [category, count] of [
         ['diagnostic', per.diagnostic],
         ['standard', per.standard],
         ['accessible', per.accessible],
       ] as const) {
-        if (count > 0)
-          items.push(...generateSkillItems(def.skill, { random, grade, category, count }));
+        if (count === 0) continue;
+        const drawn = generateSkillItems(def.skill, {
+          random,
+          grade,
+          category,
+          count,
+          avoid: taken,
+        });
+        for (const item of drawn) taken.add(item.instanceKey);
+        items.push(...drawn);
       }
     }
     if (subject === 'reading') {

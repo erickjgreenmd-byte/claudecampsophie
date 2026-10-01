@@ -246,6 +246,26 @@ mutations red at least one case; the one survivor is stated as a residual in the
 covered with a contrived case, because the risk it stands for (repointing the moderation endpoint at
 `/v1/files`) IS caught, by the eligibility test.
 
+### What the ZDR gate run itself found (BUG-429)
+
+The whole-repo gate on the ZDR tree reddened ONE case out of 1203 — "weights weak skills from homework
+evidence" — and passed on every isolated re-run. It was not a flake, and the word was not used: the
+suspected input was measured over 400 random child ids per grade, and `generateCandidates` turned out to
+hand about 13% of children 3 candidates for a skill where it handed others 4. It seeds itself with the
+practice set key, which contains the child's random uuid, and asked each skill for items three times
+(diagnostic, standard, accessible) with a `seen` set local to each call; the cross-call duplicate was then
+discarded after generation with nothing drawing again. So a child whose homework showed they were failing
+fractions could get ONE practice question on fractions instead of two, decided by nothing but their id.
+"Deterministic for a given seed" was true, was tested, and said nothing about this, because the seed is
+per-child (L-081).
+
+Fixed by carrying one set per SKILL across its three category draws and by sizing the draw budget to the
+items already taken as well as the ones wanted — the second half, which the grade-1 case found:
+`grammar.plural_nouns` has exactly four words at grade 1, so the last constrained draw faced a 1-in-4 pool
+on a 12-draw budget. No skill varies across 3600 probed seeds at grades 0–8 now. The residual is stated in
+the test rather than hidden: a pool the size of the request is the sharp edge, and growing it is content
+work.
+
 Next: the two GitHub repository secrets (`SUPABASE_DB_URL`, `CLOUDFLARE_API_TOKEN`), then `Apply database
 migrations`, then `Deploy API` with environment `testbed` — the first live URL. Owner action #6 holds the
 seven ZDR account steps; none of them is code.

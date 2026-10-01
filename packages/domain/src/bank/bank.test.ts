@@ -532,3 +532,55 @@ describe('math generators cover the requested topics', () => {
     }
   });
 });
+
+describe('a child’s id must not decide how many questions their weakest skill gets', () => {
+  /*
+   * `generateCandidates` is seeded with the practice set's key, which contains the child's random
+   * uuid — so "deterministic for a given seed" is NOT determinism from the child's point of view:
+   * each child draws a different pool. That is fine while every child's pool holds the SAME NUMBER
+   * of items per skill. It did not. `generateCandidates` asks for a skill three times (1 diagnostic,
+   * 2 standard, 1 accessible) with a `seen` set that is local to each call, then drops cross-call
+   * duplicates in `uniqueByInstance` and never draws again — so for roughly one child in eight a
+   * skill arrived with 3 candidates instead of 4, and the weak part of the daily set could only
+   * place one question on the skill the child is actually failing.
+   *
+   * The property is the one that matters to a child: the pool's SHAPE does not depend on the seed.
+   */
+  const seeds = Array.from({ length: 40 }, (_, i) => `daily:child-${i}:2026-09-24`);
+
+  function shape(seed: string, grade: number): [string, number][] {
+    const counts = new Map<string, number>();
+    for (const item of generateCandidates({ subjects: BANK_SUBJECTS, grade, seed })) {
+      counts.set(item.skill, (counts.get(item.skill) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }
+
+  // ALL SIX subjects, not only the two the failing case used: reading, science, social studies and
+  // spelling draw through `passageItems`, `factItems` and `teacherWordItems`, which are also called
+  // once per category and so could cannibalise each other the same way. Grade 1 is in the list
+  // because it found the second half of the defect: `grammar.plural_nouns` has exactly FOUR words
+  // at grade 1, so the last `avoid`-constrained draw hit a 1-in-4 pool on a 12-draw budget and came
+  // up short for one child in fifty. RESIDUAL, stated rather than hidden: the budget now covers the
+  // items already taken, which puts the shortfall at about (3/4)^48 per constrained draw — small
+  // enough to be invisible over 3600 probed seeds, but a probability, not a proof. A pool the size
+  // of the request is the real sharp edge; growing it is content work, not a test fix.
+  it.each([1, 3, 5, 8])('every seed yields the same candidates per skill (grade %i)', (grade) => {
+    const first = shape(seeds[0]!, grade);
+    expect(first.length).toBeGreaterThan(0);
+    for (const seed of seeds.slice(1)) {
+      expect(shape(seed, grade), seed).toEqual(first);
+    }
+  });
+
+  it('a generated math skill offers all four requested candidates, whatever the seed', () => {
+    // 1 diagnostic + 2 standard + 1 accessible. The three calls must not cannibalise each other.
+    for (const seed of seeds) {
+      const mine = generateCandidates({ subjects: ['math'], grade: 3, seed }).filter(
+        (i) => i.skill === 'math.fractions_add_like',
+      );
+      expect(mine.length, seed).toBe(4);
+      expect(new Set(mine.map((i) => i.instanceKey)).size, seed).toBe(4);
+    }
+  });
+});
