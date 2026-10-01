@@ -28,6 +28,42 @@ binding = "HYPERDRIVE"
 id = "OWNER_ACTION_HYPERDRIVE_ID_DEV"
 localConnectionString = "postgres://postgres:postgres@127.0.0.1:5432/postgres"
 
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE TESTBED: a deployed, mock-backed environment for exercising the whole product before any vendor
+# exists. Named `testbed` and NOT `development` on purpose, so nothing about it reads as "the
+# developer's machine" and nobody mistakes it for staging. Its Worker has its own name, so it cannot
+# collide with staging or production.
+#
+# WHY IT CARRIES APP_ENV = "development". `MOCK_ENVIRONMENTS` is {development, test}, and the labeled
+# mocks are what make the product walkable end to end with no OpenAI key, no RevenueCat, no Resend and
+# no consent vendor. In `staging` every one of those is `unavailable` and refuses, which is correct
+# for staging and useless for a testbed.
+#
+# WHAT THAT COSTS, stated rather than buried: the consent mock verifies anything, the identity mock
+# confirms any adult, the billing mock grants slots nobody paid for, and the AI mock returns canned
+# grading. NO REAL CHILD'S WORK MAY EVER GO HERE. The code's own guards are still on and still
+# visible — every row these mocks write is `is_test_provider`, `productionReadiness` reports blocked
+# for each one, and the database is left unmarked so it accepts fixtures (migration 0770).
+#
+# HOW IT BECOMES REAL, one provider at a time and with no rebuild: a credential always beats the
+# environment. Set OPENAI_API_KEY and the AI and moderation providers become `openai` here; set
+# RESEND_API_KEY and EMAIL_FROM and email becomes `resend`; set REVENUECAT_SECRET_API_KEY and billing
+# becomes `revenuecat`; set IDENTITY_PROVIDER=openai_document and the adult check reads a real
+# document. The mock is only ever the FALLBACK when nothing is configured. When every provider is
+# real, the move is to `--env staging`, where a mock is refused rather than chosen — and that refusal
+# is the proof that nothing mock-shaped is left.
+[env.testbed]
+name = "pencillift-api-testbed"
+workers_dev = true
+[env.testbed.vars]
+APP_ENV = "development"
+PROGRAM_TIMEZONE = "UTC"
+[env.testbed.triggers]
+crons = ["*/5 * * * *"]
+[[env.testbed.hyperdrive]]
+binding = "HYPERDRIVE"
+id = "OWNER_ACTION_HYPERDRIVE_ID_TESTBED"
+
 [env.staging]
 name = "pencillift-api-staging"
 # STAGING ONLY, and deliberately different from production. The top-level `workers_dev = false` is
