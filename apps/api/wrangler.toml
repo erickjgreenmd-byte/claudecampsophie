@@ -30,6 +30,15 @@ localConnectionString = "postgres://postgres:postgres@127.0.0.1:5432/postgres"
 
 [env.staging]
 name = "pencillift-api-staging"
+# STAGING ONLY, and deliberately different from production. The top-level `workers_dev = false` is
+# right for production — a production API must answer on its own domain and never on a workers.dev
+# URL nobody controls the reputation of. But NO ROUTES ARE DEFINED ANYWHERE in this file, so with
+# the flag inherited a staging deploy SUCCEEDS and produces a Worker that nothing can reach: the
+# only way to a URL would be DNS for PencilLift.com, which is owner action #8 and a separate
+# dependency with a separate waiting time. Staging does not need that. `workers_dev = true` here
+# gives https://pencillift-api-staging.<subdomain>.workers.dev the moment it deploys, which is what
+# the beta portal points at. Production keeps the inherited `false`, so this cannot leak upward.
+workers_dev = true
 [env.staging.vars]
 APP_ENV = "staging"
 PROGRAM_TIMEZONE = "UTC"
