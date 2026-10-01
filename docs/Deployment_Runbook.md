@@ -6,6 +6,34 @@ owner actions in `docs/Owner_Actions.md` (#3 Supabase, #4 RevenueCat/stores, #5 
 been run against a live account from this environment. Replace this banner with dated evidence as each
 step is actually performed.
 
+## 0. Applying migrations to a hosted project — read this first (added 2026-10-01)
+
+**Do not apply this schema through the Supabase MCP connector.** It stalls for 60 seconds and then
+times out on any statement containing `DROP`, through both `execute_sql` and `apply_migration` — the
+tools gate destructive statements behind a confirmation that never arrives in a background session.
+Eleven of the forty-four migrations contain `DROP` (0620, 0650, 0670, 0710, 0760, 0790, 0800, 0830,
+0850, 0900, 0950), so a run through the connector stops partway and leaves the schema half applied,
+which is worse than not starting. Established by four timeouts across both tools while every `create`
+and `select` in the same session returned normally.
+
+Apply them with **psql**, in filename order, one file per transaction:
+
+```bash
+export PGURI='postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres?sslmode=require'
+for f in supabase/migrations/*.sql; do
+  echo "== $f"
+  psql "$PGURI" -v ON_ERROR_STOP=1 --single-transaction -f "$f" || { echo "FAILED: $f"; break; }
+done
+```
+
+`ON_ERROR_STOP=1` with `--single-transaction` is the point: a failing file rolls back whole and the
+loop stops, so the schema is never left between two migrations. The password comes from the project's
+database settings and belongs in the environment, never in a committed file or a chat message.
+
+The hosted project runs **PostgreSQL 17**, while `scripts/dev-db.sh` and all 484 DB authorization
+tests run on **PostgreSQL 16**. The migrations are not known to be 17-clean: that is an assumption
+until the suite has been run against the hosted database, and running it there is the check.
+
 ## 1. Environments
 
 | Environment | API (Cloudflare Worker) | Database | Billing | AI | Consent |
