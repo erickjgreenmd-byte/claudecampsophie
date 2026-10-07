@@ -10,6 +10,7 @@ import {
   useLocation,
   type RouteObject,
 } from 'react-router';
+import { DataPracticesNotice } from './components/DataPracticesNotice.tsx';
 import { Logo } from './components/Logo.tsx';
 import { RouteError } from './components/RouteError.tsx';
 import { SignOutControl } from './components/SignOutControl.tsx';
@@ -183,6 +184,7 @@ function Shell() {
       <footer className="container" style={{ color: 'var(--muted)', fontSize: '0.9rem' }}>
         <Link to="/privacy">Privacy</Link> · <Link to="/terms">Terms</Link> ·{' '}
         <Link to="/account-deletion">Delete an account</Link> · <Link to="/contact">Contact</Link>
+        <DataPracticesNotice />
       </footer>
     </>
   );
@@ -214,6 +216,12 @@ function ShellLoading() {
       <main id="main" className="container">
         <Loading label="Loading PencilLift…" />
       </main>
+      {/* On the loading and error shells too. "Every page" is only true if it survives the states
+          where the page itself did not arrive — and those are exactly the states a parent is most
+          likely to be looking at the chrome rather than the content. */}
+      <footer className="container">
+        <DataPracticesNotice />
+      </footer>
     </>
   );
 }
@@ -226,6 +234,9 @@ function ShellError() {
       <main id="main" className="container">
         <RouteError />
       </main>
+      <footer className="container">
+        <DataPracticesNotice />
+      </footer>
     </>
   );
 }

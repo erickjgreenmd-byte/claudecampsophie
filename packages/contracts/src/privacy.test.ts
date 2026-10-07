@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   ACCOUNT_CLOSE_COPY,
+  DATA_PRACTICES_COPY,
+  DATA_PRACTICE_ADULT_ID_STATES,
+  DATA_PRACTICE_CHILD_WORK_STATES,
+  DATA_PRACTICE_UNKNOWN,
+  dataPracticeAdultIdText,
+  dataPracticeChildWorkText,
+  dataPracticesResponseSchema,
   DELETION_INTRO,
   deletionConfirmationCopy,
   deletionConfirmationMatches,
@@ -221,5 +228,78 @@ describe('the deletion requests list', () => {
     // A completed purge whose instant was not recorded claims no date rather than inventing one.
     expect(deletionStatusText(request({ status: 'completed' }), iso)).toBe('Deleted.');
     expect(deletionStatusText(request({ status: 'cancelled' }), iso)).toBe('Cancelled.');
+  });
+});
+
+describe('data-practices copy: the one place both surfaces read it from', () => {
+  it('every state has a sentence, and the view helpers are total', () => {
+    for (const state of DATA_PRACTICE_CHILD_WORK_STATES) {
+      expect(dataPracticeChildWorkText(state).length, state).toBeGreaterThan(40);
+    }
+    for (const state of DATA_PRACTICE_ADULT_ID_STATES) {
+      expect(dataPracticeAdultIdText(state)?.length, state).toBeGreaterThan(40);
+    }
+    expect(dataPracticeChildWorkText(DATA_PRACTICE_UNKNOWN)).toBe(DATA_PRACTICES_COPY.unconfirmed);
+    expect(dataPracticeAdultIdText(DATA_PRACTICE_UNKNOWN)).toBeNull();
+  });
+
+  it('a “not sent” state carries no retention claim and names no AI company', () => {
+    // BUG-430 as a rule rather than a story: zero data retention is a claim about a grant that may
+    // not exist, so the only sentences allowed to make it are the ones a verified state publishes.
+    for (const text of [
+      DATA_PRACTICES_COPY.childWork.not_sent,
+      DATA_PRACTICES_COPY.adultId.not_sent,
+    ]) {
+      expect(text.toLowerCase()).not.toContain('zero data retention');
+      expect(text).not.toContain('OpenAI');
+    }
+  });
+
+  it('the states that DO send name who receives it, and the retention position', () => {
+    expect(DATA_PRACTICES_COPY.childWork.openai_under_zdr).toContain('OpenAI');
+    expect(DATA_PRACTICES_COPY.childWork.openai_under_zdr.toLowerCase()).toContain('does not keep');
+    expect(DATA_PRACTICES_COPY.adultId.openai_under_zdr).toContain('OpenAI');
+    expect(DATA_PRACTICES_COPY.adultId.identity_vendor.toLowerCase()).toContain('identity vendor');
+  });
+
+  it('the unknown sentence discloses: it takes the wider case, not the comfortable one', () => {
+    /*
+     * The direction of the whole mechanism, and the one assertion that would survive someone
+     * "tidying" the fallback into something friendlier. The gate fails closed by refusing to SEND;
+     * a notice fails closed by assuming it was sent (L-082). Same words, opposite directions.
+     */
+    expect(DATA_PRACTICES_COPY.unconfirmed).toContain('OpenAI');
+    expect(DATA_PRACTICES_COPY.unconfirmed.toLowerCase()).not.toContain('nothing your child');
+    expect(DATA_PRACTICES_COPY.unconfirmed).not.toBe(DATA_PRACTICES_COPY.childWork.not_sent);
+  });
+
+  it('no shared sentence names a control, because the two surfaces have different ones', () => {
+    // L-078: a sentence both surfaces print may name the VALUE and not the widget. "Tap" is wrong
+    // on a portal, "click" is wrong on a phone, and "the link below" is wrong wherever the layout
+    // changes. The way out to the policy is each surface's own, which is why only a LABEL is shared.
+    const CONTROL_WORDS =
+      /\b(tap|click|press|swipe|button|the link below|below|above|on the right|on the left)\b/i;
+    for (const text of [
+      ...Object.values(DATA_PRACTICES_COPY.childWork),
+      ...Object.values(DATA_PRACTICES_COPY.adultId),
+      DATA_PRACTICES_COPY.unconfirmed,
+    ]) {
+      expect(CONTROL_WORDS.test(text), text).toBe(false);
+    }
+  });
+
+  it('the response shape is strict: no reference, no extra field, no “unknown”', () => {
+    expect(
+      dataPracticesResponseSchema.safeParse({ childWork: 'not_sent', adultId: 'not_sent' }).success,
+    ).toBe(true);
+    for (const body of [
+      { childWork: 'unknown', adultId: 'not_sent' },
+      { childWork: 'not_sent', adultId: 'unknown' },
+      { childWork: 'not_sent' },
+      { childWork: 'not_sent', adultId: 'not_sent', zdrReference: 'OAI-SYNTHETIC-0001' },
+      { childWork: 'not_sent', adultId: 'not_sent', verifiedAt: '2026-10-01' },
+    ]) {
+      expect(dataPracticesResponseSchema.safeParse(body).success, JSON.stringify(body)).toBe(false);
+    }
   });
 });

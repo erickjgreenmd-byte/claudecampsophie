@@ -266,6 +266,50 @@ on a 12-draw budget. No skill varies across 3600 probed seeds at grades 0–8 no
 the test rather than hidden: a pool the size of the request is the sharp edge, and growing it is content
 work.
 
+## The data-practices notice, and a false claim it replaced (2026-10-07)
+
+The owner asked for a notice on every page. The design question that decided everything about it: a
+hard-coded sentence is false in one of PencilLift's two states whichever way it is written. "Your child's
+work is read by OpenAI under zero data retention" is false today, because no approval exists and the gate
+refuses to send anything; "nothing is sent to an AI company" becomes false the day that approval is
+recorded. So the sentence cannot be a sentence — it has to be a state.
+
+`GET /v1/data-practices` publishes two enums, derived by asking `checkChildDataGate` the same question a
+child's request asks and reading its ANSWER, so no surface can claim zero data retention unless the gate
+would itself have produced a reference. It publishes nothing else: never the approval reference, which is
+the owner's OpenAI contract identifier and not a parent's business. The words live once, in
+`DATA_PRACTICES_COPY`, and the portal and the phone both read them.
+
+Mapping the surfaces found the claim already being made: the public privacy page ended its processor list
+with "(OpenAI, under zero data retention)" as a flat fact, and its draft label is gated on
+`VITE_LEGAL_REVIEWED` — a web build flag with no connection to whether the server holds ZDR evidence. So a
+build marked reviewed would have published the claim unqualified while the server sent nothing to any
+model (BUG-430). That is the BUG-426 shape again: two switches, one claim, nothing joining them.
+
+The notice's unknown state is the part worth remembering. The gate fails closed by REFUSING TO SEND; the
+notice fails closed by ASSUMING IT WAS SENT. Writing the second by analogy with the first would have told a
+parent their child's homework stays put whenever the server was unreachable — "fail closed" is not a
+direction but a choice about which error you prefer, and in a privacy notice the harmful error is the
+reassuring one (L-082). The direction is asserted on the WORDS, not the state name.
+
+It is on every page of the portal, the owner console and the public site — the loading and error shells
+included, asserted from the route object rather than by grepping for the component's name — and at the foot
+of every parent screen on the phone. Deliberately NOT on a child's screen: a child can neither act on a
+notice about which companies read homework nor consent to it.
+
+Three things pushed back during the build and all three were right. The repo-wide `Cache-Control: no-store`
+refused the five-minute cache header the route asked for, which was the correct answer twice over (a cached
+notice keeps saying "not sent" after that stopped being true). A mobile guard (HUNT6-I-1) rejected the
+privacy screen fetching through a client of its own, so the load folded into the screen's existing one. And
+HUNT6-J-2 pins the ticket check and the publish as adjacent text, so the new setter went after the publish
+rather than between them. None of the three was relaxed.
+
+Also closed: BUG-431, a source sweep that reported "no file imports this constant" when the truth was "the
+sweep had not read the file yet" — twice, each time on the first suite run in a fresh container, and seven
+consecutive green re-runs plus a 300-iteration probe showing the scan itself deterministic. It now refuses
+to answer unless it reached the files its expectations name (L-083).
+
 Next: the two GitHub repository secrets (`SUPABASE_DB_URL`, `CLOUDFLARE_API_TOKEN`), then `Apply database
 migrations`, then `Deploy API` with environment `testbed` — the first live URL. Owner action #6 holds the
-seven ZDR account steps; none of them is code.
+seven ZDR account steps; none of them is code, and step 2 now asks which ZDR is on offer, because Private
+Safety Processing requires customer-controlled storage and key management.

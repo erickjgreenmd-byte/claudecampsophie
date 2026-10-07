@@ -963,3 +963,101 @@ export function deletionStatusText(
       return 'Cancelled.';
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Data-practices notice (the strip on every adult-facing page)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * WHY THIS IS A SERVER-DERIVED STATE AND NOT A SENTENCE.
+ *
+ * A notice telling a parent what happens to their child's homework is false in one of PencilLift's
+ * two states whichever way it is written. "Your child's work is read by OpenAI under zero data
+ * retention" is false today, because no ZDR approval exists and the gate in packages/ai/src/gate.ts
+ * refuses to send anything. "Nothing is sent to an AI company" becomes false the day that approval
+ * is recorded. The public privacy page carried the first of those two as a bare parenthetical, with
+ * nothing connecting it to the gate that decides (BUG-430).
+ *
+ * So the states below are published by the API, derived from the SAME functions the gates call, and
+ * the words are chosen here once for both surfaces. The notice cannot claim zero data retention
+ * unless `checkChildDataGate` would itself have produced a ZDR reference for a child's request.
+ *
+ * The response schema deliberately has no `unknown` member: the server always knows, and a server
+ * reporting ignorance as a fact is the failure this is meant to prevent. `unknown` is a CLIENT state
+ * only, for the moment before the answer arrives or when it cannot be fetched, and its copy
+ * discloses rather than reassures — see `DATA_PRACTICES_COPY.unconfirmed`.
+ */
+export const DATA_PRACTICE_CHILD_WORK_STATES = ['not_sent', 'openai_under_zdr'] as const;
+export const DATA_PRACTICE_ADULT_ID_STATES = [
+  'not_sent',
+  'openai_under_zdr',
+  'identity_vendor',
+] as const;
+
+export type DataPracticeChildWorkState = (typeof DATA_PRACTICE_CHILD_WORK_STATES)[number];
+export type DataPracticeAdultIdState = (typeof DATA_PRACTICE_ADULT_ID_STATES)[number];
+
+/** What a client shows before the answer arrives, or when it cannot be fetched. Never published. */
+export const DATA_PRACTICE_UNKNOWN = 'unknown' as const;
+
+export type DataPracticeChildWorkView = DataPracticeChildWorkState | typeof DATA_PRACTICE_UNKNOWN;
+export type DataPracticeAdultIdView = DataPracticeAdultIdState | typeof DATA_PRACTICE_UNKNOWN;
+
+/** `GET /v1/data-practices`. Public and unauthenticated: the notice is on public pages too. */
+export const dataPracticesResponseSchema = z
+  .object({
+    childWork: z.enum(DATA_PRACTICE_CHILD_WORK_STATES),
+    adultId: z.enum(DATA_PRACTICE_ADULT_ID_STATES),
+  })
+  .strict();
+
+export type DataPracticesResponse = z.infer<typeof dataPracticesResponseSchema>;
+
+/**
+ * The sentences, once, for the portal and the phone. Shared because the FACT is the same on both
+ * surfaces; the control is not, so nothing here names a link, a tap or a widget (L-078). Each
+ * surface supplies its own way to reach the privacy page and uses `linkLabel` for it.
+ *
+ * Plain words, no hedging and no reassurance the state does not support: a parent deciding whether
+ * to photograph their eight-year-old's spelling test is the reader.
+ */
+export const DATA_PRACTICES_COPY = {
+  heading: 'What leaves PencilLift',
+  childWork: {
+    not_sent:
+      'Nothing your child writes or photographs is sent to an AI company on this version. Homework pages and answers stay in PencilLift’s own storage.',
+    openai_under_zdr:
+      'Homework pages your child sends and the answers they type are read by OpenAI, so PencilLift can mark them and build practice. OpenAI does not keep them and does not train on them.',
+  },
+  adultId: {
+    not_sent: 'No photo of a parent’s ID is sent to another company on this version.',
+    openai_under_zdr:
+      'When a parent proves they are an adult, the photo of their ID is read by OpenAI and kept by neither OpenAI nor PencilLift.',
+    identity_vendor:
+      'When a parent proves they are an adult, the photo of their ID is checked by our identity vendor.',
+  },
+  /**
+   * Shown INSTEAD of a state's sentence while the state is unknown. It discloses: the harmful error
+   * is telling a parent their child's work stays put when it does not, so an unknown state takes the
+   * wider case, not the comfortable one. This is the opposite direction from the gate, which fails
+   * closed by refusing to SEND — the same phrase, pointing the other way (L-082).
+   */
+  unconfirmed:
+    'PencilLift could not confirm this version’s settings just now. Until it can, take the wider case: a page your child sends and the answers they type may be read by OpenAI, and the photo of a parent’s ID may be read by OpenAI when they prove they are an adult.',
+  linkLabel: 'How PencilLift handles your family’s data',
+} as const;
+
+/**
+ * The child-work sentence for a view state, `unconfirmed` included. A function rather than one more
+ * map so the unknown case cannot be forgotten by a surface that indexes the maps directly.
+ */
+export function dataPracticeChildWorkText(state: DataPracticeChildWorkView): string {
+  return state === DATA_PRACTICE_UNKNOWN
+    ? DATA_PRACTICES_COPY.unconfirmed
+    : DATA_PRACTICES_COPY.childWork[state];
+}
+
+/** The adult-ID sentence for a view state. `unknown` is covered by the same one sentence. */
+export function dataPracticeAdultIdText(state: DataPracticeAdultIdView): string | null {
+  return state === DATA_PRACTICE_UNKNOWN ? null : DATA_PRACTICES_COPY.adultId[state];
+}

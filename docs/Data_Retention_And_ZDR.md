@@ -62,6 +62,23 @@ exists.**
 2. **Apply to OpenAI for zero data retention** for that organization. ZDR is granted by OpenAI after
    review; it is not a dashboard toggle a developer can set. Ask explicitly for the endpoints this
    product uses — `/v1/responses` and `/v1/moderations` — to be covered.
+
+   **Ask which ZDR you are being offered.** Since 2026-08-19 OpenAI has been rolling out *Zero Data
+   Retention with Private Safety Processing* (PSP), in which cross-session abuse detection runs
+   against content held in CUSTOMER-CONTROLLED STORAGE under customer-managed Enterprise Key
+   Management, and OpenAI receives only a narrow safety signal rather than prompts or responses. In
+   the project's Data retention settings the policy must read "Zero Data Retention with Private
+   Safety Processing", with a destination, provider and geography confirmed and a **Validated**
+   status. If that is the only ZDR on offer, this step is no longer a form: it means standing up a
+   storage destination PencilLift holds the keys to, and an enterprise key-management arrangement —
+   infrastructure and cost, not paperwork. Establish which variant applies BEFORE planning the beta
+   date, because the answer changes who has to build what. Nothing in this repository is affected
+   either way: PSP changes where content sits and who can read it, not the request PencilLift sends.
+
+   What you are opting OUT of by getting ZDR at all is the default: inputs and outputs retained for
+   **up to 30 days** for abuse monitoring, longer where law requires. Until an approval exists that
+   is the retention PencilLift would be subject to — which is why the gate refuses to send a child's
+   work rather than sending it and hoping.
 3. **Confirm in writing which models and endpoints the approval covers.** Approval is per
    configuration, not blanket. If the answer excludes an endpoint in
    `ZDR_ELIGIBLE_ENDPOINTS`, remove it from that list.
@@ -80,7 +97,33 @@ exists.**
    built web bundle, the Worker bundle and the Expo export for it on every CI run, with a negative
    control that plants a fake key and requires the scan to find it.
 
-## 4. Where the checks live
+## 4. What a parent is told, on every page
+
+`GET /v1/data-practices` publishes two states — one for a child's work, one for a parent's photo ID
+— and the notice in `apps/web/src/components/DataPracticesNotice.tsx` and
+`apps/mobile/src/privacy/DataPracticesNotice.tsx` prints a sentence for each. The states are DERIVED
+FROM THE GATES: `childWork` asks `checkChildDataGate` the same question a child's request asks and
+reads its answer, so no sentence can claim zero data retention unless the gate would itself have
+produced a ZDR reference. The endpoint publishes two enums and nothing else — never the approval
+reference, which belongs to the owner's OpenAI organization and is not a parent's business.
+
+Two directions of "fail closed" meet here, and they point opposite ways. The gate fails closed by
+REFUSING TO SEND. The notice fails closed by ASSUMING IT WAS SENT: before the server answers, and
+whenever it cannot be reached, the sentence takes the wider case, because the harmful error in a
+privacy notice is the reassuring one (L-082).
+
+The strip is on every page of the portal, the owner console and the public site, including the
+loading and error shells, and at the foot of every parent screen on the phone. It is deliberately
+NOT on a child's screen: a child can neither act on a notice about which companies read homework nor
+consent to it. The phone's strip carries the child-work sentence and the privacy screen carries
+both, which is a subset of the portal rather than a second wording — every sentence on both surfaces
+comes from `DATA_PRACTICES_COPY` in `@pencillift/contracts`.
+
+The public privacy page used to end its processor list with "(OpenAI, under zero data retention)" as
+a flat fact, with nothing connecting it to the gate; it now prints the same server-derived sentences
+(BUG-430).
+
+## 5. Where the checks live
 
 `packages/ai/src/gate.ts` refuses child personal data without documented evidence and refuses a mock
 provider in production. `packages/ai/src/zdr.ts` holds the eligible-endpoint list, the ineligible list

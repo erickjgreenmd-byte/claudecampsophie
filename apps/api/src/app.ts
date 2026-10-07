@@ -5,6 +5,7 @@ import { ApiError, isTransientDbError, knownConstraintError, pgErrorCode } from 
 import { withLiveSessionCheck } from './auth/parent.ts';
 import type { AppDeps, AppEnv } from './middleware/context.ts';
 import { toBase64Url, randomBytes } from './security/crypto.ts';
+import { dataPracticesRoutes } from './routes/data-practices.ts';
 import { healthRoutes } from './routes/health.ts';
 import { identityRoutes } from './routes/identity.ts';
 import { adultRoutes } from './routes/adult.ts';
@@ -146,6 +147,9 @@ export function createApp(appDeps: AppDeps): Hono<AppEnv> {
   );
 
   app.route('/', healthRoutes());
+  // Public and unauthenticated on purpose: the data-practices notice is on pages nobody has signed
+  // in to. It publishes two enums derived from the gates and never the ZDR approval reference.
+  app.route('/', dataPracticesRoutes());
   app.route('/v1/adult', adultRoutes());
   app.route('/v1/identity', identityRoutes()); // /v1/identity/verification
   app.route('/v1/child', childAuthRoutes());

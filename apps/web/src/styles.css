@@ -210,3 +210,23 @@ input[type='radio'] {
 .feature-card {
   border-top: 4px solid var(--teal);
 }
+
+/* Data-practices notice: the strip on every page (components/DataPracticesNotice.tsx). Quiet enough
+   not to compete with the page, legible enough to be a notice: body-size text, navy on off-white,
+   a teal rule above it so it reads as a separate region rather than more footer. */
+.data-practices {
+  border-top: 2px solid var(--teal);
+  margin-top: 24px;
+  padding: 16px 0 8px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+.data-practices h2 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+  color: var(--navy);
+}
+.data-practices p {
+  margin: 0 0 6px;
+  max-width: 70ch;
+}

@@ -1,4 +1,6 @@
+import { dataPracticeAdultIdText, dataPracticeChildWorkText } from '@pencillift/contracts';
 import { Link } from 'react-router';
+import { useDataPractices } from '../../components/DataPracticesNotice.tsx';
 import { DraftBanner } from '../../components/DraftBanner.tsx';
 import {
   DraftOnly,
@@ -37,6 +39,8 @@ import {
  * events carry no address (middleware/context.ts LogEvent).
  */
 export default function PrivacyPage() {
+  const { childWork, adultId } = useDataPractices();
+  const adultIdText = dataPracticeAdultIdText(adultId);
   return (
     <>
       <DraftBanner />
@@ -173,10 +177,20 @@ export default function PrivacyPage() {
           We share information only with service providers that help run PencilLift: our hosting and
           database services (Cloudflare and Supabase), our subscription service (RevenueCat), our
           email service (Resend), the consent provider that verifies parental consent, the AI
-          provider (OpenAI, under zero data retention), and {PAYMENT_STORES} for payments. Each
-          provider may use the information only to provide its service to us. We may also disclose
-          information when the law requires it.
+          provider (OpenAI), and {PAYMENT_STORES} for payments. Each provider may use the
+          information only to provide its service to us. We may also disclose information when the
+          law requires it.
         </p>
+        {/*
+         * BUG-430: this paragraph used to end the OpenAI entry with "(under zero data retention)" as
+         * a flat fact. Zero data retention is a grant OpenAI makes after review, and nothing in this
+         * build knew whether it existed — so a reviewed privacy page could assert it while the
+         * server was refusing every child request for want of that approval. The claim now comes
+         * from the same states the notice on every page shows, published by the API from the gate
+         * itself, and the sentences are the shared ones so the page and the strip cannot differ.
+         */}
+        <p>{dataPracticeChildWorkText(childWork)}</p>
+        {adultIdText === null ? null : <p>{adultIdText}</p>}
       </Section>
 
       <Section title="Notices and email">

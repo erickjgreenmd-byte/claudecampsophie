@@ -21,6 +21,7 @@ import {
   deletionRequestLabel,
   PARENT_SAFETY_FLAG_COPY,
   privacyRetentionLines,
+  DATA_PRACTICES_COPY,
 } from '@pencillift/contracts';
 import type {
   DeletionTarget,
@@ -32,6 +33,12 @@ import { storeChannelForBuild } from '../../src/billing/revenuecat.ts';
 import { BrandRow } from '../../src/brand/BrandMark.tsx';
 import { ParentAccessState, useParentAccess } from '../../src/family/ui.tsx';
 import { createMobileApi } from '../../src/lib/api.ts';
+import {
+  dataPracticesDetail,
+  loadDataPractices,
+  UNKNOWN_DATA_PRACTICES,
+  type DataPracticesState,
+} from '../../src/privacy/data-practices.ts';
 import { signOutClosedAccountOnDevice } from '../../src/family/runtime.ts';
 import {
   deletableChildren,
@@ -99,6 +106,17 @@ export default function ParentPrivacyScreen() {
     api ? { status: 'loading' } : { status: 'not_connected' },
   );
   const [refreshing, setRefreshing] = useState(false);
+  /**
+   * The published data-practices states for the section below.
+   *
+   * Loaded inside this screen's own `load`, through this screen's own client, NOT by a second effect
+   * with a client of its own: `screens-r2.review.test.ts`'s HUNT6-I-1 walker forbids a load hook a
+   * new client cannot re-run, and it was right to fire on the first version of this. The endpoint is
+   * public, so a parent token is not needed — but a fetch that ignores the gate's client is the
+   * shape of BUG-335 whether or not this particular fetch could go stale, and the strip in
+   * `(parent)/_layout.tsx` already covers the screens where there is no client at all.
+   */
+  const [practices, setPractices] = useState<DataPracticesState>(UNKNOWN_DATA_PRACTICES);
   const [busy, setBusy] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [feedbackCount, setFeedbackCount] = useState(0);
@@ -142,7 +160,12 @@ export default function ParentPrivacyScreen() {
       return;
     }
     try {
-      const data = await loadPrivacyOverview(api);
+      const [data, published] = await Promise.all([
+        loadPrivacyOverview(api),
+        // Never rejects: `loadDataPractices` answers with the unknown (disclosing) state on any
+        // failure, so a notice can neither fail this load nor delay it past the overview.
+        loadDataPractices(api),
+      ]);
       // A load superseded while its request was in flight publishes nothing. Two ways to be
       // superseded: a newer load, which for this screen means a new client and so the next adult at
       // the device (publishing here would show them the previous adult's children, exports and
@@ -150,6 +173,10 @@ export default function ParentPrivacyScreen() {
       // a closure that began while this request was out, whose outcome is what the screen now is.
       if (latestLoad.current !== ticket || closureStarted.current) return;
       setState({ status: 'ready', data });
+      // AFTER the publish, not between the ticket check and it: HUNT6-J-2's guard pins that pair as
+      // adjacent text, and it is pinned because the check and the publish belonging together is the
+      // claim. Both setters are inside the same guarded block and batch in one render either way.
+      setPractices(published);
     } catch (error) {
       if (latestLoad.current !== ticket || closureStarted.current) return;
       setState({ status: 'error', message: parentErrorMessage(error) });
@@ -354,6 +381,19 @@ export default function ParentPrivacyScreen() {
               {privacyRetentionLines(buildStore).map((line) => (
                 <Text key={line} style={[styles.body, styles.bullet]}>
                   {`• ${line}`}
+                </Text>
+              ))}
+            </Section>
+          ) : null}
+
+          {/* The fuller version of the strip at the foot of every parent screen: the strip carries
+              the child-work sentence alone, because a phone has no room for three permanent lines,
+              and the adult-ID sentence belongs here. Same constants, so the two cannot differ. */}
+          {state.status !== 'account_closed' && state.status !== 'closing' ? (
+            <Section title={DATA_PRACTICES_COPY.heading}>
+              {dataPracticesDetail(practices).map((line) => (
+                <Text key={line} style={styles.body}>
+                  {line}
                 </Text>
               ))}
             </Section>

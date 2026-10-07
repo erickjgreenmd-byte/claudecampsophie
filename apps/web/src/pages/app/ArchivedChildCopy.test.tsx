@@ -770,8 +770,37 @@ function sourceFiles(): string[] {
  * apps/mobile/src/homework/result-view.ts names both constants in order to say the app does NOT print
  * them — a sweep that counted that as an import would report the very claim it exists to refute.
  */
+/**
+ * Files this sweep MUST have reached for its answer to mean anything. Twice — each time on the first
+ * suite run in a fresh container — this case reported an empty importer list for a constant that
+ * `HomeworkPage.tsx` plainly imports, and passed on every re-run and on 300 iterations of a probe
+ * that replicated the scan. An empty list is indistinguishable from "no file imports this", which is
+ * the very thing the case exists to detect, so the red said something false (BUG-431).
+ *
+ * The precondition below cannot hide a real regression: if a page genuinely stopped importing a
+ * constant, the FILE is still there and the equality below still fails. It only separates "nobody
+ * imports it" from "the sweep did not read it", and names which.
+ */
+const MUST_BE_SCANNED = [
+  'apps/web/src/pages/app/HomeworkPage.tsx',
+  'apps/web/src/pages/app/PrivacyControlsPage.tsx',
+  'apps/mobile/src/privacy/parent-privacy.ts',
+] as const;
+
+/** `sourceFiles()`, refused unless it actually reached the files the expectations name. */
+function scannedFiles(): string[] {
+  const files = sourceFiles();
+  for (const path of MUST_BE_SCANNED) {
+    expect(
+      files,
+      `the source sweep did not reach ${path}, so nothing it reports about importers is evidence`,
+    ).toContain(path);
+  }
+  return files;
+}
+
 function importersOf(name: string): string[] {
-  return sourceFiles().filter(
+  return scannedFiles().filter(
     (path) =>
       path !== CONTRACT_FILE &&
       readFileSync(join(REPO, path), 'utf8')
