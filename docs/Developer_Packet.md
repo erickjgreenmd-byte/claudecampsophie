@@ -20,7 +20,7 @@ conflating them is how this product gets misjudged in either direction.
 | Suites | 7,498 passing, zero skipped, across 8 packages |
 | Database | 44 migrations, every `public` table under row-level security, 484 authorization cases run against a real PostgreSQL (16 **and** 17) |
 | API | 171 routes |
-| Defects | 431 recorded in `docs/Bug_Ledger.md`; 3 carried deliberately, each with an owner decision |
+| Defects | 432 recorded in `docs/Bug_Ledger.md`; **3 genuinely open** (BUG-096, BUG-244, BUG-420) plus two closed-with-residual rows a beta can still meet |
 | Hardening | 7 adversarial hunt-and-fix rounds; the last four found 9, 3, 2 and 3 high-severity defects |
 | Deployed | **Nothing.** No Worker, no portal, no native build, ever |
 
@@ -155,11 +155,25 @@ repeated here.
    beta without it is one where an outage is invisible. *Hours.*
 7. **A backup and restore rehearsal** — §6, never rehearsed. A beta without it is one where data loss
    is unrecoverable. *Hours.*
-8. **The three carried defects**: BUG-244 (a lost child-refresh response unpairs a tablet; the round-5
-   recovery was removed because it let a captured request body renew a session), BUG-252 (a dense
-   ten-page worksheet can be cut off in grading with no affordable retry), BUG-096 (the extraction
-   model can insert an answer into a child's transcription). Each has an owner decision attached —
-   #45, #46, #28. Do not close one without that decision. *Days each.*
+8. **The defects a beta family can actually meet.** Each has an owner decision attached; do not close
+   one without it. *Days each.*
+   - **BUG-244** (open) — a `/v1/child/refresh` response lost on the way back to a tablet unpairs it.
+     Round 5 shipped a recovery and round 6 removed it, because the recovery let an attacker holding a
+     captured request body renew a child session indefinitely. Frequency is unmeasured: no device or
+     network testing has ever run. Owner action #45.
+   - **BUG-096** (confirmed, mitigated) — the extraction model can insert an answer into a child's
+     transcription. Labelled answers are withheld; an unlabelled `(84)` or `= 84` still reaches the
+     child. Owner action #28.
+   - **BUG-420** (open, accepted, with a named trigger) — 97 response schemas in `packages/contracts`
+     are `z.strictObject`, which THROWS on an unknown key. The moment the server adds a field to a
+     response, every already-installed app whose bundled schema predates it rejects the whole
+     response and the parent sees a successful call reported as an error. This one matters more than
+     its Medium severity suggests, because it is a *release-process* constraint on a product shipping
+     to three stores where users stay on old builds: **it is not a bug you fix once, it is a rule
+     about how you may evolve the API.** Read the row before the first field addition.
+     **It appears in no readiness record** — this packet is its first.
+   - **BUG-309's residual** (closed with residual) — a dense ten-page worksheet can be cut off in
+     grading with no affordable retry; the caps are a floor guarantee only. Owner action #46.
 
 **Repository hygiene — do this before a second person touches the code**
 

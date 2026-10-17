@@ -111,7 +111,7 @@ Carried deliberately, each with an owner decision attached rather than hidden:
 | Defect | What the family experiences | Owner action |
 |---|---|---|
 | BUG-244 (High) | A `/v1/child/refresh` response lost on the way back to the tablet unpairs it; the parent mints a new pairing code. Round 5 shipped a recovery for this and round 6 removed it, because the recovery bought an attacker holding a captured request body a self-renewing child session. Frequency is unmeasured — no device or network testing has run | #45 |
-| BUG-252 | A dense ten-page worksheet can still be cut off in grading with no affordable retry (the bound is question bytes, not pages: reachable to about 85 questions of average length) | #46 |
+| BUG-309 (residual) | A dense ten-page worksheet can still be cut off in grading with no affordable retry (the bound is question bytes, not pages: reachable to about 85 questions of average length). **CITATION CORRECTED 2026-10-17 (BUG-432)**: this row said BUG-252, which is an unrelated closed defect about a docstring describing an unreachable state. The live residual is in BUG-309's Next column, with BUG-260 as its predecessor | #46 |
 | BUG-096 | The extraction model can insert an answer into a child's transcription; labelled answers are the mitigation | #28 |
 
 ## The stopping rule on hunting
