@@ -1,0 +1,56 @@
+# PencilLift parent portal — static hosting on Cloudflare Workers static assets.
+#
+# WHY THIS FILE EXISTS. Until it did, nothing in the repository deployed the portal anywhere. The
+# API Worker had `apps/api/wrangler.toml` and a workflow; the portal built to `apps/web/dist` and
+# stopped there. A deployed API with no portal is not a beta: the parent-only walkthrough in
+# docs/Beta_Readiness.md — the cheapest real information this product can buy — needs a URL a parent
+# can open, and there was no path to one.
+#
+# WHY WORKERS STATIC ASSETS rather than Pages, Vercel or Netlify. The same Cloudflare account and the
+# SAME API token already needed for the API deploy (Workers Scripts Edit) also publish this, so the
+# portal costs no new vendor, no new credential and no new bill. Static assets are free on the
+# Workers free plan.
+#
+# THERE IS NO `main`. This Worker runs no code of ours: it serves the Vite build and nothing else.
+# Adding a `main` here would put a request handler in front of a parent's session for no reason.
+name = "pencillift-web"
+compatibility_date = "2026-09-01"
+workers_dev = false
+
+[assets]
+directory = "./dist"
+# SPA, NOT the default. The portal is a client-side router (apps/web/src/routes.tsx): every path but
+# `/` is a route the server has no file for. With the default `none`, a parent who opens
+# https://…/privacy from an email, or reloads on /app/children, gets a 404 from the edge and never
+# reaches the application at all — and that is exactly how a beta family meets the product, because
+# the first thing anyone does with a link is open it directly. `apps/web/tests/deploy-config.test.ts`
+# asserts this value; the assertion is there because the default is the broken one.
+not_found_handling = "single-page-application"
+
+[observability]
+enabled = true
+
+# The testbed portal, pointing at the testbed API (every provider a labeled mock). This is the one a
+# beta family would be given first. NO REAL CHILD'S WORK MAY GO HERE — see apps/api/wrangler.toml.
+[env.testbed]
+name = "pencillift-web-testbed"
+workers_dev = true
+[env.testbed.assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+
+# Staging portal, pointing at the staging API, where every mock is refused rather than chosen.
+[env.staging]
+name = "pencillift-web-staging"
+workers_dev = true
+[env.staging.assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+
+# Production keeps the inherited `workers_dev = false`: a production portal answers on PencilLift.com
+# (owner action #8, DNS) and never on a workers.dev URL whose reputation nobody controls.
+[env.production]
+name = "pencillift-web-production"
+[env.production.assets]
+directory = "./dist"
+not_found_handling = "single-page-application"

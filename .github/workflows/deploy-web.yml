@@ -1,0 +1,123 @@
+# Builds and deploys the PARENT PORTAL (apps/web) to Cloudflare Workers static assets.
+#
+# WHY THIS WORKFLOW EXISTS. Until it did, nothing deployed the portal: `apps/api` had a Worker and a
+# deploy, and the portal built to `apps/web/dist` and stopped. The parent-only walkthrough in
+# docs/Beta_Readiness.md — a parent creating an account, adding draft children, walking the planner,
+# rewards, privacy and closure with NO child data and NO AI call — is the cheapest real information
+# this product can buy, and it needs a URL a parent can open.
+#
+# ORDER. Run `Apply database migrations`, then `Deploy API`, then this. The API deploy prints its
+# URL; paste it into `api_base_url` below. It is not derived here on purpose: a wrong guess compiles
+# a dead API address into the bundle, and the bundle is what a parent downloads.
+#
+# SECRETS: CLOUDFLARE_API_TOKEN only (Workers Scripts Edit). No Hyperdrive, no database, no origin —
+# this Worker serves files. The Supabase URL and publishable key below are PUBLIC by design: they
+# ship inside every client bundle, and `scripts/scan-secrets.mjs` lists the `sb_publishable_` shape
+# in DOCUMENTED_PUBLIC. Rotating the key means editing one line here.
+#
+# VITE_LEGAL_REVIEWED IS DELIBERATELY UNSET. Unset means the public legal pages carry their draft
+# banner, which is the honest state until owner action #15 lands. Setting it true without an
+# effective date and a support mailbox fails the build on purpose (apps/web/src/lib/config.ts).
+name: Deploy portal
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Which portal environment to deploy'
+        type: choice
+        required: true
+        default: testbed
+        options: [testbed, staging]
+      api_base_url:
+        description: 'The API URL printed by "Deploy API" (e.g. https://pencillift-api-testbed.<subdomain>.workers.dev)'
+        required: true
+        default: ''
+      confirm:
+        description: 'Type DEPLOY to confirm'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-web-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ENV_NAME: ${{ inputs.environment }}
+      # Public by design; see the header.
+      VITE_SUPABASE_URL: https://uroolgscjkbpcsioqogm.supabase.co
+      VITE_SUPABASE_PUBLISHABLE_KEY: sb_publishable_5dSHKvkHtIH1aELwKiAR_Q_2VkAl6S8
+      VITE_API_BASE_URL: ${{ inputs.api_base_url }}
+    steps:
+      - name: Refuse unless confirmed
+        if: inputs.confirm != 'DEPLOY'
+        run: echo "::error::Type DEPLOY to confirm." && exit 1
+
+      - name: Refuse an API URL that is not one
+        run: |
+          set -euo pipefail
+          case "${VITE_API_BASE_URL:-}" in
+            https://*) ;;
+            *) echo "::error::api_base_url must be the https URL that 'Deploy API' printed."; exit 1 ;;
+          esac
+          # A trailing slash doubles every path the client builds (`${base}/v1/...`).
+          case "$VITE_API_BASE_URL" in
+            */) echo "::error::Remove the trailing slash from api_base_url."; exit 1 ;;
+          esac
+          echo "portal will call: $VITE_API_BASE_URL"
+
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build the portal
+        run: pnpm --filter @pencillift/web build
+
+      # Owner action #22, enforced rather than remembered: scan the EXACT bytes about to be
+      # published, not a release-shaped rehearsal. CI already scans a build made with fake values;
+      # this is the one made with the real ones.
+      - name: Secret-scan the exact bundle that is about to ship
+        run: node scripts/scan-secrets.mjs --artifacts apps/web/dist
+
+      - name: Prove the API URL really is in the bundle
+        run: |
+          set -euo pipefail
+          # A missing VITE_* at build time does not fail Vite — it inlines `undefined` and the portal
+          # calls `/api` on its own origin, where nothing answers. That failure looks like a broken
+          # API and is a broken build, so it is caught here rather than by a confused parent.
+          grep -rq -- "$VITE_API_BASE_URL" apps/web/dist/assets \
+            || { echo "::error::the built bundle does not contain $VITE_API_BASE_URL"; exit 1; }
+          grep -rq -- "$VITE_SUPABASE_URL" apps/web/dist/assets \
+            || { echo "::error::the built bundle does not contain the Supabase URL"; exit 1; }
+          echo "both public URLs are compiled in"
+
+      - name: Deploy
+        working-directory: apps/web
+        run: npx wrangler deploy --env "$ENV_NAME"
+
+      - name: Prove it answers, and that a deep link does not 404
+        run: |
+          set -euo pipefail
+          sub=$(cd apps/api && npx wrangler whoami 2>/dev/null | grep -oE '[a-z0-9-]+\.workers\.dev' | head -1 || true)
+          url="https://pencillift-web-${ENV_NAME}.${sub:-workers.dev}"
+          echo "PORTAL: $url"
+          echo "Give a beta parent this URL."
+          curl -sS -o /dev/null -w 'GET /        HTTP %{http_code}\n' --max-time 20 "$url/" || true
+          # The SPA fallback is the whole point of apps/web/wrangler.toml: a parent opening an
+          # emailed /privacy link must get the application, not an edge 404.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$url/privacy" || echo 000)
+          echo "GET /privacy HTTP $code"
+          [ "$code" = 200 ] || echo "::warning::/privacy did not answer 200 — check not_found_handling"

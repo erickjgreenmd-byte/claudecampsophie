@@ -80,35 +80,71 @@ jobs:
           echo "id=$existing" >> "$GITHUB_OUTPUT"
           echo "Hyperdrive id: $existing"
 
-      - name: Point the staging binding at that config
+      - name: Point this environment's binding at that config
         working-directory: apps/api
         run: |
+          set -euo pipefail
           # Substituted at deploy time rather than committed, because the placeholder in
           # wrangler.toml is deliberate: it makes a deploy fail closed rather than silently point at
           # an invented database. The id is not a secret; once staging settles, commit it and delete
           # this step so the repository and the deployed configuration agree.
-          sed -i "s|OWNER_ACTION_HYPERDRIVE_ID_$(echo "$ENV_NAME" | tr a-z A-Z)|${{ steps.hyperdrive.outputs.id }}|" wrangler.toml
-          grep -A1 '\[\[env.staging.hyperdrive\]\]' wrangler.toml
+          upper=$(echo "$ENV_NAME" | tr a-z A-Z)
+          sed -i "s|OWNER_ACTION_HYPERDRIVE_ID_${upper}|${{ steps.hyperdrive.outputs.id }}|" wrangler.toml
+          # Printed for the environment BEING DEPLOYED. This grep used to name env.staging whatever
+          # was selected, so a testbed run printed an untouched staging block and looked like the
+          # substitution had silently failed.
+          grep -A2 "\[\[env.${ENV_NAME}.hyperdrive\]\]" wrangler.toml
+          if grep -q "OWNER_ACTION_HYPERDRIVE_ID_${upper}" wrangler.toml; then
+            echo "::error::the ${ENV_NAME} Hyperdrive placeholder was not substituted"; exit 1
+          fi
+
+      # DEPLOY FIRST, THEN SET SECRETS, THEN DEPLOY AGAIN — and the order is the point.
+      # `wrangler secret put` against a Worker that does not exist yet prompts to create one, which
+      # in a non-interactive runner fails the job. On a first-ever deploy to a fresh account that is
+      # EVERY run, so the original order (secrets, then deploy) could never have completed once.
+      # The first deploy creates the Worker; it answers 503 NOT_CONFIGURED for the few seconds
+      # before the secrets land, which is `loadConfig` refusing to start without them, not a fault.
+      - name: Deploy (creates the Worker if this is the first time)
+        working-directory: apps/api
+        run: npx wrangler deploy --env "$ENV_NAME"
 
       - name: Token verification settings (public values, derived from the project ref)
         working-directory: apps/api
         run: |
+          set -euo pipefail
           # Neither is a secret: the JWKS endpoint is public by design and the issuer is a URL.
-          # They are the two things loadConfig refuses to start without, besides APP_ENV.
+          # They are the two things loadConfig refuses to start without, besides APP_ENV. They are
+          # set as secrets rather than vars only so that rotating the project ref needs no commit.
           npx wrangler secret put SUPABASE_JWKS_URL --env "$ENV_NAME" <<< \
             "https://${SUPABASE_PROJECT_REF}.supabase.co/auth/v1/.well-known/jwks.json"
           npx wrangler secret put SUPABASE_JWT_ISSUER --env "$ENV_NAME" <<< \
             "https://${SUPABASE_PROJECT_REF}.supabase.co/auth/v1"
 
-      - name: Deploy
+      - name: Deploy again, now with the token settings in place
+        id: redeploy
         working-directory: apps/api
-        run: npx wrangler deploy --env "$ENV_NAME"
+        run: |
+          set -euo pipefail
+          npx wrangler deploy --env "$ENV_NAME" | tee /tmp/deploy.log
+          # The URL comes from wrangler's OWN output. It used to be assembled from
+          # `wrangler whoami`, which does not print the workers.dev subdomain at all, so the fallback
+          # branch ran every time and the job printed https://pencillift-api-<env>.workers.dev — an
+          # address that does not exist. A wrong URL in the log is worse than none: it is the URL
+          # somebody then pastes into the portal deploy.
+          url=$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' /tmp/deploy.log | head -1 || true)
+          if [ -z "$url" ]; then
+            echo "::warning::wrangler printed no workers.dev URL; read the deploy output above."
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Prove it answers, and say what it reports about itself
         run: |
-          sub=$(npx wrangler whoami 2>/dev/null | grep -oE '[a-z0-9-]+\.workers\.dev' | head -1 || true)
-          url="https://pencillift-api-${ENV_NAME}.${sub:-workers.dev}"
+          url="${{ steps.redeploy.outputs.url }}"
+          if [ -z "$url" ]; then echo "no URL to probe"; exit 0; fi
+          echo "======================================================================"
           echo "$ENV_NAME API: $url"
+          echo "Paste this into the 'Deploy portal' workflow's api_base_url input."
+          echo "======================================================================"
           if [ "$ENV_NAME" = staging ]; then
             echo "On staging a 503 NOT_CONFIGURED is the gate working, not a failure: the Worker"
             echo "refuses mock consent, mock billing, mock AI and missing ZDR evidence."
@@ -116,5 +152,8 @@ jobs:
             echo "On the testbed every labeled mock is active, so this should answer rather than"
             echo "refuse. NO REAL CHILD'S WORK MAY GO HERE: the consent mock verifies anything."
           fi
-          curl -sS -o /tmp/health -w 'HTTP %{http_code}\n' --max-time 20 "$url/health" || true
+          curl -sS -o /tmp/health -w 'GET /health  HTTP %{http_code}\n' --max-time 20 "$url/health" || true
           head -c 400 /tmp/health || true
+          echo
+          curl -sS -o /tmp/dp -w 'GET /v1/data-practices  HTTP %{http_code}\n' --max-time 20 "$url/v1/data-practices" || true
+          head -c 200 /tmp/dp || true
