@@ -106,13 +106,20 @@ jobs:
 
       - name: Deploy
         working-directory: apps/web
-        run: npx wrangler deploy --env "$ENV_NAME"
+        run: npx wrangler deploy --env "$ENV_NAME" | tee /tmp/web-deploy.log
 
       - name: Prove it answers, and that a deep link does not 404
         run: |
           set -euo pipefail
-          sub=$(cd apps/api && npx wrangler whoami 2>/dev/null | grep -oE '[a-z0-9-]+\.workers\.dev' | head -1 || true)
-          url="https://pencillift-web-${ENV_NAME}.${sub:-workers.dev}"
+          # The URL comes from wrangler's OWN deploy output, never from `wrangler whoami` — which
+          # does not print the workers.dev subdomain, so the `${sub:-workers.dev}` fallback ran
+          # every time and produced an address that does not exist. That matters more here than it
+          # did for the API: this is the URL the log tells the operator to hand a beta parent.
+          url=$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' /tmp/web-deploy.log | head -1 || true)
+          if [ -z "$url" ]; then
+            echo "::warning::wrangler printed no workers.dev URL; read the deploy output above."
+            exit 0
+          fi
           echo "PORTAL: $url"
           echo "Give a beta parent this URL."
           curl -sS -o /dev/null -w 'GET /        HTTP %{http_code}\n' --max-time 20 "$url/" || true

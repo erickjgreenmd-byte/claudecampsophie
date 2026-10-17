@@ -113,12 +113,56 @@ jobs:
         run: |
           set -euo pipefail
           # Neither is a secret: the JWKS endpoint is public by design and the issuer is a URL.
-          # They are the two things loadConfig refuses to start without, besides APP_ENV. They are
-          # set as secrets rather than vars only so that rotating the project ref needs no commit.
+          # They are set as secrets rather than vars only so that rotating the project ref needs no
+          # commit. They are NOT, on their own, enough to start the Worker — see the next step.
           npx wrangler secret put SUPABASE_JWKS_URL --env "$ENV_NAME" <<< \
             "https://${SUPABASE_PROJECT_REF}.supabase.co/auth/v1/.well-known/jwks.json"
           npx wrangler secret put SUPABASE_JWT_ISSUER --env "$ENV_NAME" <<< \
             "https://${SUPABASE_PROJECT_REF}.supabase.co/auth/v1"
+
+      # THE TWO SECRETS THE WORKER CANNOT START WITHOUT, and that nothing used to set.
+      #
+      # `loadConfig` requires CHILD_TOKEN_SECRET and HASH_PEPPER as secrets of at least 32
+      # characters (apps/api/src/config.ts, `secretBytes`). Neither is in wrangler.toml and neither
+      # was set here, so the Worker this workflow deployed answered 503 NOT_CONFIGURED on EVERY
+      # path — `/health` included — and the probe step below cheerfully called that "the testbed
+      # answering". Found by an adversarial verification pass, not by a test; the test that would
+      # have caught it is now apps/api/tests/deploy-secrets.test.ts.
+      #
+      # THEY MUST NOT CHANGE BETWEEN DEPLOYS. HASH_PEPPER is mixed into stored hashes (pairing
+      # codes, PINs); rotating it silently invalidates every one of them, and the failures look like
+      # a parent typing their own PIN wrongly. So: an explicit repository secret wins if one exists;
+      # otherwise a value already on the Worker is LEFT ALONE; only when neither is true is one
+      # generated. If `secret list` cannot be read, the job stops rather than risk generating over a
+      # live pepper.
+      - name: Signing secrets (generated once, then never touched again)
+        working-directory: apps/api
+        env:
+          OWNER_CHILD_TOKEN_SECRET: ${{ secrets.CHILD_TOKEN_SECRET }}
+          OWNER_HASH_PEPPER: ${{ secrets.HASH_PEPPER }}
+        run: |
+          set -euo pipefail
+          if ! existing=$(npx wrangler secret list --env "$ENV_NAME" --format json 2>/dev/null); then
+            echo "::error::could not read the Worker's secret list; refusing to guess whether a pepper exists"
+            exit 1
+          fi
+          # Matched on the JSON text rather than parsed, so no interpreter is spawned inside a
+          # YAML block scalar — a multi-line script there silently breaks the workflow file.
+          have() { printf '%s' "$existing" | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$1\""; }
+          set_secret() {
+            name=$1; supplied=$2
+            if [ -n "$supplied" ]; then
+              echo "$name: using the repository secret"
+              npx wrangler secret put "$name" --env "$ENV_NAME" <<< "$supplied"
+            elif have "$name"; then
+              echo "$name: already on the Worker, left unchanged"
+            else
+              echo "$name: generating one (first deploy of this environment)"
+              npx wrangler secret put "$name" --env "$ENV_NAME" <<< "$(openssl rand -hex 32)"
+            fi
+          }
+          set_secret CHILD_TOKEN_SECRET "${OWNER_CHILD_TOKEN_SECRET:-}"
+          set_secret HASH_PEPPER "${OWNER_HASH_PEPPER:-}"
 
       - name: Deploy again, now with the token settings in place
         id: redeploy
@@ -152,8 +196,17 @@ jobs:
             echo "On the testbed every labeled mock is active, so this should answer rather than"
             echo "refuse. NO REAL CHILD'S WORK MAY GO HERE: the consent mock verifies anything."
           fi
-          curl -sS -o /tmp/health -w 'GET /health  HTTP %{http_code}\n' --max-time 20 "$url/health" || true
+          code=$(curl -sS -o /tmp/health -w '%{http_code}' --max-time 20 "$url/health" || echo 000)
+          echo "GET /health  HTTP $code"
           head -c 400 /tmp/health || true
+          echo
+          # A 503 NOT_CONFIGURED on the TESTBED is a real failure, not the gate: every provider
+          # there is a labeled mock, so the only thing that answers 503 is missing configuration.
+          # Said as a check rather than as prose, because the prose used to claim the opposite.
+          if [ "$ENV_NAME" = testbed ] && [ "$code" != "200" ]; then
+            echo "::error::the testbed answered $code on /health — configuration is incomplete, not gated"
+            exit 1
+          fi
           echo
           curl -sS -o /tmp/dp -w 'GET /v1/data-practices  HTTP %{http_code}\n' --max-time 20 "$url/v1/data-practices" || true
           head -c 200 /tmp/dp || true

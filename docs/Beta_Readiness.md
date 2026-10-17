@@ -17,12 +17,14 @@ Written 2026-09-29 at code `5ba16c3`, after six hardening rounds. This page answ
 Those are two separate claims and they need separating, because conflating them is how a product gets
 put in front of a child before its consent path exists.
 
-- **As software**, the product is in the best state it has been in: 6,966 tests pass with zero skipped,
+- **As software**, the product is in the best state it has been in: **7,498** tests pass with zero skipped
+  (**CORRECTED 2026-10-17, BUG-433**: this read 6,966, which was its figure at `aa0fcbc` and is stale by 532;
+  the floors it listed below sum to 7,349, so the record was not even internally consistent),
   every package typechecks, seven adversarial hunt-and-fix rounds have worked 349 recorded
   defects (`docs/Bug_Ledger.md`), all closed but the three carried deliberately below plus BUG-411's
   open divergences, and the last four rounds found 9, 3, 2 and (round 7) 3 high-severity defects — a
-  curve that says the remaining density is low, not zero. At `aa0fcbc` the asserted floors are api
-  1,203, mobile 894, web 961, contracts 42, db 484, domain 3,665, ai 96, ui-tokens 4.
+  curve that says the remaining density is low, not zero. The floors in `scripts/test-minimums.json` are now api 1,219, mobile 941, web 991, contracts 70,
+  db 484, domain 3,670, ai 119, ui-tokens 4 — each exactly equal to the suite's actual count.
 - **As a running service**, nothing exists. No Supabase project is connected, no Worker is deployed, no
   native build has ever been produced, and no line of this code has run on a phone or a tablet
   (`docs/Connections.md` — every provider row is a named blocker).

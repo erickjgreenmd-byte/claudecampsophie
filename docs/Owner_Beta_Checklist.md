@@ -7,14 +7,16 @@ and stays the source of truth for detail; this page is the ORDER, the money and 
 
 ## Where this actually is, in one paragraph
 
-The software is built and tested (7,467 passing tests, zero skipped, seven adversarial hardening
-rounds, 431 recorded defects of which three are carried deliberately). **Nothing is deployed.** The
-GitHub workflows that would deploy it have existed since 1 October and have never run, because two
-repository secrets were never set. A Supabase project exists and is healthy; its schema has never
+The software is built and tested (**7,503** passing tests, zero skipped, seven adversarial hardening
+rounds, 434 recorded defects of which three are open). **Nothing is deployed.** The
+GitHub workflows that would deploy it have existed since 1 October and have never run, because the
+repository secrets they read were never set. A Supabase project exists and is healthy; its schema has never
 been applied. No Worker exists. No portal is hosted. No native build has ever been produced, so no
 line of this code has run on a phone or a tablet. The distance between here and "a parent can open a
 URL and make an account" is about **fifteen minutes of your clicking and three workflow runs** —
-nothing engineering is holding it up.
+nothing engineering is holding it up. Those three runs have never been executed, so expect the first
+attempt of each to surface something; the workflows are reviewed and validated as code, not
+exercised.
 
 ## Do these four things this week — they are the whole deployment
 
@@ -136,10 +138,16 @@ and the release-build secret scan.
 
 ## What this costs to run
 
-At beta scale (a handful of families), the infrastructure is **effectively free**: Supabase free
-tier, Cloudflare Workers free plan, Hyperdrive free (100,000 queries/day), Resend free tier,
-Workers static assets free. The only certain spend is the store accounts ($99/yr + $25) and whatever
-counsel charges.
+**You are already paying for Supabase.** The `Pencillift` organization is on the **Pro** plan
+(`tier_pro`, checked live 2026-10-17), not the free tier, so `pencillift-staging` sits in a billing
+organization at roughly **$25/month** before any usage. `docs/Deployment_Runbook.md` §0.1 said
+"nothing here bills" and was wrong about this half (BUG-433). Either accept it — Pro buys daily
+backups and no project pausing, both of which a beta actually wants — or move the project to a free
+organization now, while it holds no data.
+
+Everything else at beta scale is genuinely free: Cloudflare Workers, Hyperdrive (100,000
+queries/day, reset 00:00 UTC — confirmed on Cloudflare's live pricing page), Workers static assets,
+Resend's free tier. The other certain spend is the store accounts ($99/yr + $25) and counsel.
 
 **The AI is the one real variable, and every number in `docs/Cost_Analysis.md` is a priced hypothesis
 from a rate table — not one observation.** No real scan has ever run. The per-stage caps and the

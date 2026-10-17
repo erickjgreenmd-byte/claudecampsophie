@@ -75,12 +75,17 @@ jobs:
       - name: Apply every migration, one transaction per file
         run: pnpm --filter @pencillift/db run migrate
 
+      # `relkind in ('r','p')` matches supabase/tests/schema_invariants.test.ts exactly. It filtered
+      # 'r' alone, so a PARTITIONED table (relkind 'p') with RLS off would have passed here and
+      # failed the suite — the check that runs against the real database being the weaker of the two
+      # is the wrong way round. There are no partitioned tables today; this is closed while nothing
+      # depends on it.
       - name: Every public table has row level security (CLAUDE.md, on the REAL database)
         run: |
           unprotected=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "
             select coalesce(string_agg(c.relname, ', '), '')
             from pg_class c join pg_namespace n on n.oid = c.relnamespace
-            where n.nspname = 'public' and c.relkind = 'r' and not c.relrowsecurity;")
+            where n.nspname = 'public' and c.relkind in ('r','p') and not c.relrowsecurity;")
           if [ -n "$unprotected" ]; then
             echo "::error::public tables WITHOUT row level security: $unprotected"; exit 1
           fi

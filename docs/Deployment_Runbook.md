@@ -85,9 +85,15 @@ every statement a migration uses.
    — Wrangler needs it to disambiguate, and the id is on the same dashboard
    (<https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/>).
 
-COST: nothing here bills. Hyperdrive is included on the Workers Free plan (100,000 database queries
-per day, reset 00:00 UTC), and the Supabase project is on the free tier. The Workers Paid plan ($5/mo
-minimum) raises the Hyperdrive query limit to unlimited and is not needed for a beta.
+COST — **CORRECTED 2026-10-17 (BUG-433)**. This said "nothing here bills" and the Supabase half was
+wrong. Hyperdrive is included on the Workers Free plan (100,000 database queries per day, reset 00:00
+UTC) and the Workers Paid plan ($5/mo minimum) raises that to unlimited and is not needed for a beta
+— both still true. But `pencillift-staging` is **not** on the free tier: the `Pencillift`
+organization reports plan `pro` / `tier_pro` (checked live via the Supabase API, 2026-10-17), so the
+project sits in a billing organization at roughly **$25/month** before any usage. Pro buys daily
+backups and no project pausing, which a beta wants; the point is that it is a cost, not that it is
+wrong. Move the project to a free organization now if you would rather not pay it — it holds no data
+yet.
 
 ## 1. Environments
 
@@ -130,7 +136,11 @@ Worker **secrets** (`wrangler secret put <NAME> --env <env>`):
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Private homework storage adapter (`providers/supabase-storage.ts`) |
 
 Worker **vars** (`wrangler.toml`): `APP_ENV`, `PROGRAM_TIMEZONE` (donation month zone, default UTC),
-`PAYOUT_TRANSFERS_ENABLED` (keep `false` until owner action #12), `INACTIVITY_DELETION_ENABLED` (keep `false` until owner action #13; `INACTIVITY_MONTHS`/`INACTIVITY_NOTICE_DAYS` default 12/30).
+`PAYOUT_TRANSFERS_ENABLED` (keep `false` until owner action #12), `INACTIVITY_DELETION_ENABLED` (keep `false` until owner action #13; `INACTIVITY_MONTHS`/`INACTIVITY_NOTICE_DAYS` default 12/30),
+`IDENTITY_PROVIDER` (`development_mock` | `openai_document`; unset selects the mock in development/test and `unavailable` elsewhere), and four TTL integers with defaults — `ADULT_UNLOCK_TTL_SECONDS` (300), `CHILD_ACCESS_TTL_SECONDS` (900), `CHILD_REFRESH_TTL_SECONDS` (2592000), `PAIRING_CODE_TTL_SECONDS` (600).
+**Those five were undocumented here until 2026-10-17 (BUG-433)**; `loadConfig` reads 32 names and this
+section named 27. The authority is `apps/api/src/config.ts`, and `apps/api/tests/deploy-secrets.test.ts`
+now proves the deploy path supplies everything `loadConfig` refuses to start without.
 
 `APP_ENV` is required and never defaulted (LRD-5). It is set only in `[env.staging.vars]` and
 `[env.production.vars]`; the top-level `[vars]` deliberately leave it out. So always deploy with `--env
@@ -150,7 +160,18 @@ Mobile: `EXPO_PUBLIC_API_BASE_URL` (public), RevenueCat public SDK keys (public 
 
 1. **Verify the tree**: `scripts/verify.sh` (format → lint → typecheck → all tests → finance model → release
    artifact build, secret scan and negative control, §3.2) exits 0 on the exact commit; CI green on the same SHA.
-2. **Database**: `supabase link --project-ref <staging-ref>` then `supabase db push`. Migrations are forward-only
+2. **Database** — **CORRECTED 2026-10-17 (BUG-433): use `.github/workflows/db-migrate.yml`, not the
+   Supabase CLI.** The CLI path below is not executable in this repository: there is no
+   `supabase/config.toml` and no CLI dependency, so `supabase link` has nothing to link. The schema
+   is applied by the **Apply database migrations** workflow, which runs the repository's own
+   `pnpm --filter @pencillift/db run migrate` (`supabase/scripts/migrate.ts`) — the same code the
+   authorization suite runs, one transaction per file, in `listMigrations` order — and then checks
+   RLS on the real database. The paragraph that follows is kept because its CONTENT is still true of
+   the ordering, and it is the reason the migrate script sorts lexicographically rather than by
+   recorded history.
+
+   *(Historical, not a command to run: `supabase link --project-ref <staging-ref>` then
+   `supabase db push`.)* Migrations are forward-only
    and ordered by file name (0001 … 0810 at the time of writing; list `supabase/migrations`). Numbers were allocated
    per area, so a lower number can land after a higher one (0790 parent flag review was committed after 0800 Amazon
    Appstore): an environment that already applied a higher number needs `supabase db push --include-all`, which

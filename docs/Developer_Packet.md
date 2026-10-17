@@ -17,10 +17,10 @@ conflating them is how this product gets misjudged in either direction.
 |---|---|
 | Source | ~119,000 lines of TypeScript (excluding tests) |
 | Tests | ~124,000 lines — **more test code than source code** |
-| Suites | 7,498 passing, zero skipped, across 8 packages |
+| Suites | 7,503 passing, zero skipped, across 8 packages; every package's floor in `scripts/test-minimums.json` equals its actual count, so a deleted test fails CI |
 | Database | 44 migrations, every `public` table under row-level security, 484 authorization cases run against a real PostgreSQL (16 **and** 17) |
 | API | 171 routes |
-| Defects | 432 recorded in `docs/Bug_Ledger.md`; **3 genuinely open** (BUG-096, BUG-244, BUG-420) plus two closed-with-residual rows a beta can still meet |
+| Defects | 434 recorded in `docs/Bug_Ledger.md`; **3 genuinely open** (BUG-096, BUG-244, BUG-420) plus two closed-with-residual rows a beta can still meet |
 | Hardening | 7 adversarial hunt-and-fix rounds; the last four found 9, 3, 2 and 3 high-severity defects |
 | Deployed | **Nothing.** No Worker, no portal, no native build, ever |
 
@@ -132,30 +132,48 @@ repeated here.
 
 **Blocking a beta walkthrough — hours, not days**
 
-1. **Nothing.** As of this commit the deployment chain is complete and validated: migrations,
-   API and portal all deploy from GitHub Actions. It waits on two repository secrets, which are the
-   owner's. If a deploy fails, read the workflow log before touching code.
+1. **Nothing to write.** The deployment chain is complete and reviewed — migrations, API and portal
+   all deploy from GitHub Actions — and it waits on three repository secrets, which are the owner's:
+   `SUPABASE_DB_URL`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`. **"Reviewed" is not
+   "exercised":** no step of any of the three workflows has ever run, so treat the first run of each
+   as a test. If one fails, read the log before touching code.
+
+**Blocking a production deploy — found by an adversarial verification pass, not by a test**
+
+2. **`APP_ENV=production` cannot boot.** `CONSENT_ADAPTERS` in `apps/api/src/config.ts` is an empty
+   `Set` and `CONSENT_ADAPTER_FACTORIES` in `apps/api/src/index.ts` is an empty object, so
+   `config.providers.consent` can never be `'configured'`, and `buildRuntimeOrThrow` returns
+   NOT_READY for production unless it is. **Only `testbed` and `staging` can deploy today.** That is
+   correct fail-closed behaviour, not a bug — but it means "deploy to production" is blocked on
+   writing a consent adapter, not on configuration, and nothing in the readiness records said so.
+   *Weeks, and only after the owner has contracted a provider.*
+3. **`isProductionReady()` can never return true**, and nothing calls it. `productionReadiness()`'s
+   `identity_provider` row requires `providers.identity === 'vendor'`, while the config parser only
+   ever returns `openai_document | development_mock | unavailable` and refuses `'vendor'` outright.
+   So the row is permanently `blocked`. Decide whether the gate is wrong or the parser is, rather
+   than leaving a readiness predicate that no configuration can satisfy and no caller reads (L-074).
+   *Hours.*
 
 **Blocking a real child**
 
-2. **Wire ZDR evidence into the Worker** once OpenAI approval exists: `ZDR_APPROVAL_EVIDENCE_REFERENCE`
+4. **Wire ZDR evidence into the Worker** once OpenAI approval exists: `ZDR_APPROVAL_EVIDENCE_REFERENCE`
    and `ZDR_APPROVAL_VERIFIED_AT` as Worker secrets. No code change — the gate already reads them.
-3. **A consent provider adapter**, only if counsel's answer to owner action #48 requires one.
+5. **A consent provider adapter**, only if counsel's answer to owner action #48 requires one.
    `docs/design/Consent_Design.md` has the full design and the four questions for the vendor. The
    development adapter is a labeled mock that production readiness rejects. *Days to weeks.*
 
 **Quality work that will pay for itself in the first week of a beta**
 
-4. **Real-device verification of the mobile surfaces.** Camera capture, biometric unlock,
+6. **Real-device verification of the mobile surfaces.** Camera capture, biometric unlock,
    SecureStore, app-switcher screen privacy and the navigation back stack are marked
    `verified_by_inspection` in `docs/Requirement_Coverage.md` — i.e. someone read the code. *Days.*
-5. **Photo-quality floor for extraction.** Glare, shadow, skew, pencil on newsprint. The page and
+7. **Photo-quality floor for extraction.** Glare, shadow, skew, pencil on newsprint. The page and
    question-count limits are enforced; the quality floor is unknown. Needs real photographs. *Days.*
-6. **Monitoring and alerting** — `docs/Deployment_Runbook.md` §7 is a to-do, not a configuration. A
+8. **Monitoring and alerting** — `docs/Deployment_Runbook.md` §7 is a to-do, not a configuration. A
    beta without it is one where an outage is invisible. *Hours.*
-7. **A backup and restore rehearsal** — §6, never rehearsed. A beta without it is one where data loss
+9. **A backup and restore rehearsal** — §6, never rehearsed. A beta without it is one where data loss
    is unrecoverable. *Hours.*
-8. **The defects a beta family can actually meet.** Each has an owner decision attached; do not close
+10. **The defects a beta family can actually meet.** Each has an owner decision attached; do not close
    one without it. *Days each.*
    - **BUG-244** (open) — a `/v1/child/refresh` response lost on the way back to a tablet unpairs it.
      Round 5 shipped a recovery and round 6 removed it, because the recovery let an attacker holding a
@@ -177,7 +195,7 @@ repeated here.
 
 **Repository hygiene — do this before a second person touches the code**
 
-9. See §7. It is the single biggest difference between this repository and one a team can work in.
+11. See §7. It is the single biggest difference between this repository and one a team can work in.
 
 ---
 
@@ -240,14 +258,15 @@ against the code. Do the same.
 
 | File | What it is for |
 |---|---|
-| `Architecture.md` | binding engineering decisions |
+| `Architecture.md` | binding engineering decisions. **§1 claims the API has "queue consumers". It does not** — there is no `[[queues]]` binding and `index.ts` exports only `fetch` and `scheduled`; durable work is a Postgres job ledger drained by a 5-minute cron. §4's migration list also stops at 0720 while 0990 ships |
 | `Beta_Readiness.md` | what has to be true before a real family; the three absolute gates |
 | `Owner_Actions.md` | the 49-row register of things only the owner can do |
 | `Bug_Ledger.md` | every defect, with reproduction, root cause and the regression that holds it closed |
 | `Lessons_Learned.md` | 83 lessons, each tied to a defect |
 | `Deployment_Runbook.md` | environments, release order, readiness gates, incident procedures |
 | `Data_Retention_And_ZDR.md` | what leaves the product, what it keeps, and the seven ZDR account steps |
-| `Threat_Model.md`, `Cost_Analysis.md`, `Test_Evidence.md`, `Requirement_Coverage.md` | as named |
+| `Threat_Model.md`, `Cost_Analysis.md`, `Test_Evidence.md` | as named |
+| `Requirement_Coverage.md` | the AC matrix. **Its Evidence column is stale**: 379 of 388 dated strings are from 2026-09-24 and quote totals (api 378, mobile 370) that are now 1,224 and 941. Re-rendering does not fix it — the prose is hand-written inside `docs/coverage_status.json` and copied verbatim. Treat it as a record of what was once run, not of the current suite. The 34 ACs marked `integration_tested` drive the real app over real Postgres, but with labeled mocks behind every provider |
 | `Connections.md` | every external service and its exact blocker |
 
 The spec is `PencilLift_Claude_Code_Master_Prompt.md` Revision 8, preserved byte-for-byte.
