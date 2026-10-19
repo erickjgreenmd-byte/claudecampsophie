@@ -135,7 +135,7 @@ asserted:
 - Supabase Auth brings email verification, MFA/AAL levels and password reset, and the authorization
   model leans on claims it issues: `aal = aal2` is the owner-admin gate (`docs/Architecture.md` §3),
   and `session_id` is what binds an adult step-up unlock to one session.
-- The parts that *were* hand-rolled cost the most. Seven of the lessons are failures in token and
+- The parts that *were* hand-rolled cost the most. Eight of the lessons are failures in token and
   session handling this project owns: L-007 (a second refresher eventually replays a rotating token
   and the server revokes the session), L-034 (a PKCE link opened in another browser left `?code=`
   unexchanged with no error), L-038 (the API stated only a database deadline, so a device 20 minutes
@@ -166,8 +166,14 @@ asserted:
   claim about a different subject.
 - A trigger on `auth.sessions` (migration `0720_identity_hardening.sql`) is required so that sign-out
   ends API access; every parent token check requires `app.auth_session_active` and fails closed. That
-  is a write into Supabase's own schema and hosted Supabase must permit it — Owner Action 20. If it
-  does not, no parent token validates.
+  is a write into Supabase's own schema and hosted Supabase must permit it — Owner Action 20, which
+  this bullet first presented as an open risk. **Corrected 2026-10-19: it is answered.** It was
+  settled on 2026-10-01 by probing `pencillift-staging` directly: `create trigger … after delete on
+  auth.sessions` succeeded and a `security definer … set search_path = ''` function reading
+  `auth.sessions` returned a count, so 0720 and 0830 will apply (`docs/Owner_Actions.md` #20). Those
+  probe objects are the two leftovers still on the project, and `db-migrate.yml` drops them. The
+  fallback if a hosted role ever refuses is recorded in the same row — a Supabase Auth hook in place
+  of the trigger — and 0720 fails loudly rather than silently.
 - Cost: the Supabase organization is on the **Pro** plan, roughly 25 USD/month before usage,
   corrected into `docs/Deployment_Runbook.md` §0.1 on 2026-10-17 (BUG-433) after that document had
   said "nothing here bills".
@@ -270,7 +276,8 @@ chosen, use supported Postgres HTTP/pooler access and documented runtime-compati
 - **Deployment coupling.** The three ids in `wrangler.toml` are deliberate placeholders
   (`OWNER_ACTION_HYPERDRIVE_ID_*`) so that `wrangler deploy` fails rather than pointing at an invented
   database. The Cloudflare API token needs a permission the "Edit Cloudflare Workers" template omits —
-  Account → Hyperdrive → Edit — documented in `docs/Deployment_Runbook.md` §0.1 step 3 with the reason
+  Account → Hyperdrive → Edit — documented in `docs/Deployment_Runbook.md` §0.1 part **B** step 3
+  (§0.1 has two numbered lists, A for the Supabase password and B for the token) with the reason
   (product-level Workers roles grant no access to Hyperdrive, R2, D1, KV, Queues or Vectorize; see
   also `docs/Access_And_Least_Privilege.md`).
 - **The connection string must be a session pooler URL on port 5432.** The runbook forbids the direct
@@ -433,8 +440,16 @@ table carries `family_id` and has RLS enabled; policies call helpers defined in 
   the database (migrations `0730`, `0740`).
 - Lock ordering becomes an architectural concern: a route locked child rows then inserted, whose
   trigger locked the parent row then the same child rows; overlapping requests deadlocked into a 503
-  first dismissed as a flake (BUG-106, L-021). Rule: parent row first, then children, everywhere
-  (migration `0930_deletion_lock_order.sql`).
+  first dismissed as a flake (BUG-106, L-021). Rule: one order for every writer of the same rows.
+  **Corrected 2026-10-19:** BUG-106 itself was fixed in the *route*, not in a migration — the
+  pairing-code route now takes the child row `for no key update` before it touches any code row
+  (`apps/api/src/routes/family.ts`) — and the order is not the slogan "parent row first, then
+  children". The canonical order, stated in `0930_deletion_lock_order.sql`, is the family row, then
+  `public.child_slot_assignments`, then `public.child_profiles`. That migration realigns one later
+  writer (`request_deletion`, added by 0890) to it, and its own header is explicit that it is **a
+  defensive ordering, not the repair of a reachable deadlock** — and that the earlier rationale for
+  it, that the store's downgrade webhook took no family lock, was false and was retracted in the
+  file. Read the header before you rely on either claim.
 - Parent solutions live in schema `private`, unreachable through PostgREST, readable only through a
   `SECURITY DEFINER` function that checks membership **and** a recent adult unlock.
 
@@ -519,7 +534,17 @@ eligible list is treated as ineligible, which is the safe direction.
   anyway, once, so the refusal lands in the deployment's own audit trail; `adult_confirmed` is a
   generated column requiring `matched` (migration `0980_identity_verification.sql`), so no later code
   change can read a refusal as a pass. `canCompareFaces` is false, so a deployment with only this
-  adapter **cannot confirm an adult**. L-065 is the lesson: specifying it as one step would have
+  adapter **cannot meet 0980's standard**. **Corrected 2026-10-19:** that is not the standard the
+  product runs on, and this bullet read as if it were. `0990_adult_identity_declaration.sql` adds a
+  second, weaker, separately named standard — `public.identity_declarations.adult_declared`, also a
+  generated column, true only on government photo ID **and** an adult date of birth on it **and** a
+  versioned holder declaration — on an owner decision of 2026-09-30, and it is implemented
+  (`POST /v1/identity/verification`, `apps/api/src/routes/identity.ts`). 0990's own header calls
+  0980's biometric standard "currently UNREACHABLE … Kept for the day a vendor is contracted", and
+  deliberately did *not* redefine `adult_confirmed` so the two standards cannot be confused.
+  `public.adult_identity_basis()` reports which one an adult met (`'verified'` or `'declared'`).
+  Whether the declaration is legally sufficient is owner action #48, with counsel — **UNDECIDED**.
+  L-065 is the lesson: specifying it as one step would have
   produced an adapter that always answers "couldn't tell", "and the tempting next move is a mock that
   looks like verification."
 
@@ -631,13 +656,19 @@ with a comment saying so — "non-strict on purpose … the family vertical owns
 unknown fields are stripped (never rendered)". So the asymmetric fix below is not hypothetical;
 one schema already has it, with a reason. (`dataPracticesResponseSchema`, `privacy.ts:1007`, is
 `z.object({…}).strict()` — strict in effect, not spelled `strictObject`, so a mechanical grep misses
-it in the other direction.) My own count, classifying every `export const …Schema` in
-`packages/contracts/src/*.ts` by name, is **116** schemas named `*Response|Status|View Schema`, of
-which 98 are `z.strictObject`, 1 loose, 1 strict-by-`.strict()` and 16 are `z.enum` (not objects at
-all) — near the ledger's figures but not equal to them, and the ledger does not say what it counted.
+it in the other direction.) Re-derived 2026-10-19 by classifying every non-test
+`export const …Schema` in `packages/contracts/src` whose *name* carries `Response`, `Status` or
+`View` — whitespace normalised first, because 20 of these are written `z` newline `.strictObject(`
+and a naive `z\.strictObject` grep misses them — there are **117** such schemas:
+99 `z.strictObject`, 2 `z.discriminatedUnion` (`closeAccountResponseSchema`,
+`preparePayoutResponseSchema`), 14 `z.enum` (not objects at all), 1 loose `z.object`
+(`privacyFamilyViewSchema`) and 1 `z.object(…).strict()` (`dataPracticesResponseSchema`). So of the
+103 object-shaped ones, **exactly one is loose** — near the ledger's figures but not equal to them,
+and the ledger does not say what it counted.
 Treat 97/114 as **an order-of-magnitude measurement, not an audited number**; the argument does not
-depend on the exact value. The raw occurrence count is 307 `strictObject` across non-test files
-(`grep -o strictObject packages/contracts/src/*.ts | grep -v test.ts | wc -l`), requests included —
+depend on the exact value. The raw occurrence count is 306 `strictObject` constructions across
+non-test files plus one mention in prose (`family.ts:135`) — 307 raw string hits from
+`grep -o strictObject packages/contracts/src/*.ts | grep -v test.ts | wc -l`, requests included —
 not the 287 an earlier draft of this paragraph claimed. `strictObject` **throws** on an unknown key rather than
 ignoring it, so the moment the server adds a field to a response, every already-installed build whose
 bundled schema predates it rejects the whole response, and the parent sees a successful call reported
@@ -849,12 +880,26 @@ as the COPPA §312.5(b)(2) monetary-transaction method, which if answered yes ma
 is needed at all**. A quote that assumes a vendor integration may be quoting work that evaporates.
 Read `docs/design/Consent_Design.md` before pricing it.
 
-**6. Adult verification cannot be completed with the current provider set, by the adapter's own
-admission.** `canCompareFaces` is false, so `openai_document` can never confirm an adult
-(`apps/api/src/providers/identity-openai.ts`), and pairing codes are gated on the adult check
-(migration 0980). The sign-up funnel therefore has an unimplemented dependency — an identity vendor —
-that appears nowhere as a build line item. L-074 shows the shape of the risk: the whole feature was
-green and uncallable for a round.
+**6. Adult verification runs on the weaker of two named standards, and whether that is enough is a
+legal question nobody has answered.** **Corrected 2026-10-19 — this item was wrong, and wrong in the
+direction that costs money.** It said adult verification "cannot be completed with the current
+provider set" and that the funnel has an unimplemented dependency on an identity vendor. It does not.
+`canCompareFaces` is false, so `openai_document` can never satisfy
+`identity_verifications.adult_confirmed` (migration 0980, biometric) — but migration 0990 adds
+`identity_declarations.adult_declared` (government photo ID + an adult date of birth on it + the
+holder's versioned legal declaration), that path is built (`POST /v1/identity/verification`,
+`apps/api/src/routes/identity.ts`), and `docs/Owner_Actions.md` #47 states the vendor is "OPTIONAL
+NOW, and only if counsel says so in #48" because the owner's decision of 2026-09-30 took it off the
+critical path. **Do not quote an identity-vendor integration as a required line item.** What to price
+instead is the conditional: owner action #48 asks counsel whether sending homework to a ZDR-bound
+processor is a third-party disclosure under COPPA; if it is, the 0980 standard is required and a
+vendor comes back — **UNDECIDED**. Note also how the gate actually works, because the old wording
+("pairing codes are gated on the adult check (migration 0980)") is not what the code does: both
+recorders write a `verified` `public.consent_records` row when their standard is met, and the
+pairing-code route gates on `consentAllowsChildAccess` (`apps/api/src/routes/family.ts`), not on a
+direct identity read. `public.adult_identity_established()` exists for that purpose and is called by
+no API code today — only by `supabase/tests/identity_declaration.test.ts`. L-074 still shows the
+shape of the risk: the whole feature was green and uncallable for a round.
 
 **7. Single AI vendor, single flagship model, no fallback, and the model ids are unverified strings.**
 The privacy argument against automatic fallback is strong and I would keep the rule. The operational

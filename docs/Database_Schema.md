@@ -1925,7 +1925,22 @@ parent must mint a new pairing code (BUG-244, owner action #45).
 | Test count floors | `scripts/test-minimums.json` + `node scripts/assert-test-count.mjs` | a silently deleted test |
 
 At `70d352c`: **7,503 tests pass across 8 packages, zero skipped**, and the floors in
-`scripts/test-minimums.json` equal the actual counts exactly.
+`scripts/test-minimums.json` equal the actual counts exactly — every one of the eight, not just in
+total (`domain` 3670, `api` 1224, `web` 991, `mobile` 941, `db` 484, `ai` 119, `contracts` 70,
+`ui-tokens` 4; `assert-test-count.mjs` passes with zero slack, so any deleted test reds the gate).
+Re-verified 2026-10-19 package by package.
+
+**Expect `pnpm check` to go red on a slow or loaded machine, from one timeout and not a defect.**
+`packages/domain/src/bank/grade-isolation.test.ts` runs on vitest's **5 s default** `testTimeout`,
+and its heaviest case (*holds for every generated candidate, at every grade*) needs ~2.9 s when the
+file runs alone. Under the full `domain` run — 96 worker processes, one per test file — it exceeded
+5 s and failed twice in a row here, which stops `pnpm -r run test` at `domain` so the other six
+packages never report. It passes with `--testTimeout=30000`, or run on its own. Its sibling in the
+same directory, `bank.test.ts`, does set a budget (`vi.setConfig({ testTimeout: 120_000 })` at
+`packages/domain/src/bank/bank.test.ts:42`) and takes ~62 s; `grade-isolation.test.ts` was never
+given one. So "7,503 pass" is a true statement about the test *content* and a fragile one about any
+given run. This is a test-harness defect, not a schema or product defect, and nothing in §12 or the
+invariant table above depends on it.
 
 **What that table does not enforce, and an external engineer should price in.** Every row but one runs
 inside `schema_invariants.test.ts`, against a database CI built seconds earlier, and such a database
