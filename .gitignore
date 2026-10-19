@@ -25,3 +25,12 @@ __pycache__/
 
 # Expo generated
 apps/mobile/expo-env.d.ts
+
+# The developer handoff packet. The owner's "Developer Packet Specification" (section 4) says it is
+# built at the repository root, zipped, sent, and NOT committed — section 10.2 step 3 asks for the
+# folder to be deleted after zipping so it cannot reach git by accident. An ignore entry is the
+# stronger version of that instruction, and it also keeps the generated packet out of
+# scripts/check-doc-references.mjs, which requires every tracked or untracked markdown record to be
+# classified in docs/Source_Of_Truth.md. The packet is a deliverable, not one of this repository's
+# records.
+dev-packet/
