@@ -48,6 +48,9 @@ if [ -z "$ONLY" ]; then
     echo "▶ tests"; pnpm -s test
     # Same audit as CI: every package ran at least its floor of tests, none failed or skipped.
     echo "▶ gate audit"; node scripts/assert-test-count.mjs
+    # A test that runs close to its own deadline is a red on a slower machine and nothing about the
+    # code (BUG-442). Reads the durations the reporters just wrote, so it belongs after the tests.
+    echo "▶ timeout margins"; node scripts/check-test-timeout-margin.mjs
   fi
   echo "▶ finance"; pnpm -s finance:check
   if [ "$RUN_ARTIFACTS" = 1 ]; then

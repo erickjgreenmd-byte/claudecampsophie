@@ -9,6 +9,11 @@ import {
 } from './generate.ts';
 import { bankGrade, skillDefinition } from './skills.ts';
 
+// Heaviest case measured 2,892 ms against vitest's 5,000 ms default and failed twice under the full
+// `domain` run (BUG-442). The budget that fixes it is the package-level `testTimeout` in
+// `packages/domain/vitest.config.ts`, which covers the five files in this package with the same
+// shape, rather than one `setConfig` per file.
+
 /**
  * OWNER RULE (2026-09-30, as amended): the child's own grade is what practice is built for, and the bank
  * may "reach up or down 1 or 2" when that grade has no content for a subject. Anything further is not

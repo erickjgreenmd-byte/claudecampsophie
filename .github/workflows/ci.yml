@@ -64,6 +64,10 @@ jobs:
         run: pnpm finance:check
       - name: Gate audit (fails if zero tests ran)
         run: node scripts/assert-test-count.mjs
+      # A test whose duration sits inside a small multiple of its timeout fails on a slower or
+      # busier runner and the failure says nothing about the code (BUG-442). Two did.
+      - name: No test runs close to its timeout
+        run: node scripts/check-test-timeout-margin.mjs
       # AC_SECURITY_04: scan what would actually ship, not only tracked files. Nothing is deployed:
       # the web portal is built, the Worker is bundled with a wrangler dry run, the app is exported
       # for web and its native-embedded public config is written, all with fake values of the

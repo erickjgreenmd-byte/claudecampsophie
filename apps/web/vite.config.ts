@@ -34,6 +34,12 @@ export default defineConfig(({ command, mode }) => {
       reporters: ['default', ['json', { outputFile: '../../test-results/web.json' }]],
       include: ['src/**/*.test.tsx', 'src/**/*.test.ts'],
       environment: 'jsdom',
+      // These render real components under jsdom and drive them with userEvent, which is slow by
+      // nature: the heaviest case measured 2,069 ms against vitest's 5,000 ms default, a 2.4x margin
+      // that does not survive a loaded machine (BUG-442). `apps/api` and `supabase` already carry
+      // this same budget for the same reason. It bounds the harness, not what any test asserts;
+      // `scripts/check-test-timeout-margin.mjs` fails the gate if a test creeps up on it again.
+      testTimeout: 30_000,
     },
   };
 });

@@ -92,7 +92,7 @@ const DEBT = [
   ],
   [
     'Three tests assert wall-clock budgets and fail under CPU contention',
-    "`packages/domain/src/safety/screen.test.ts` bounds the hostile-input screen at 750 ms, and on a 4-core container running a second suite at the same time it measured 915 ms (BUG-440). The assertions are correct about the property they protect and were not weakened; they are simply not safe to run beside another full suite. A contractor who sees them red should check the machine's load before the code.",
+    "`packages/domain/src/safety/screen.test.ts` has three cases that measure elapsed time and assert it is under 750 ms. On a 4-core container running a second full suite at the same time they measured 915 ms and failed (BUG-440). These are the awkward kind: the 750 ms is an assertion about the code's cost, not a harness timeout, so `scripts/check-test-timeout-margin.mjs` — which guards the whole suite against tests creeping up on their *timeouts* (BUG-442) — does not and cannot cover them. They were not weakened. A contractor who sees exactly these three red should check the machine's load before the code; anything else red is real.",
   ],
   [
     'The records are large, numerous, and the thing that most needs discipline',
