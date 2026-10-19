@@ -8,11 +8,19 @@ area and a separate locked child space on iOS, Android and Fire tablets.
 **Status: built, not deployed.** Every suite passes and nothing is running anywhere. Those are
 different kinds of done — see the packet below before forming an estimate.
 
+## If you are reviewing this project
+
+Start with **[`docs/Packet_Index.md`](docs/Packet_Index.md)** — it maps every question a reviewer
+normally asks onto the document that answers it, and says what is deliberately absent (no secrets,
+no user data, and no need for database access to read the schema).
+
 ## If you are a developer
 
 Start with **[`docs/Developer_Packet.md`](docs/Developer_Packet.md)**: the architecture, what is
 built and how far each part has been proved, how to get a green local run, the conventions that are
-enforced rather than suggested, and what is actually left to do.
+enforced rather than suggested, and what is actually left to do. Then
+**[`docs/Source_Of_Truth.md`](docs/Source_Of_Truth.md)**, which says which documents bind you and
+which are history — read it before taking a sentence in `docs/` as a requirement.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -40,14 +48,16 @@ the four things that stand between today and a URL a parent can open.
 | `apps/web` | Vite + React parent portal and owner admin console |
 | `apps/mobile` | Expo — parent area and child space |
 | `supabase/` | 44 migrations and the real-Postgres authorization suite |
-| `docs/` | the project's records: progress, defects, lessons, runbook, threat model, costs |
+| `docs/` | the project's records: requirements, architecture decisions, schema, tests, defects, lessons, runbook, threat model, costs |
+| `docs/schema/schema.sql` | the complete database structure the 44 migrations produce — no data, readable without any credential |
 
 ## How this project works
 
 Changes are gated by `scripts/verify.sh` — the same checks CI runs — and nothing merges red. Every
 meaningful defect goes through the same loop: reproduce it, write the failing regression, fix it,
-re-test, review, and record the lesson. `docs/Bug_Ledger.md` has 431 entries written that way and
-`docs/Lessons_Learned.md` has the 83 lessons they produced. The records are candid, including about
+re-test, review, and record the lesson. `docs/Bug_Ledger.md` holds one row per defect written that
+way and `docs/Lessons_Learned.md` the rule each taught; `docs/Open_Work.md` is generated from both
+and carries the counts, what is still open and what each closed fix left behind. The records are candid, including about
 their own mistakes; three have been found materially wrong and corrected. Check a sentence against
 the code before you rely on it.
 

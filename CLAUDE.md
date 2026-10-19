@@ -37,6 +37,13 @@ Spec: `PencilLift_Claude_Code_Master_Prompt.md` **Revision 8** (authoritative, p
 - Shared registration points (`apps/api/src/app.ts`, `apps/web/src/routes.tsx`, contracts index, domain
   package exports, migrations numbering) are changed by the lead only.
 
+## Which documents bind you
+
+`docs/Source_Of_Truth.md` sets the tiers: what is binding, what is an authoritative record, what is an
+append-only ledger and what is history. Read it before treating any sentence in `docs/` as a
+requirement. A statement marked **TENTATIVE** or **UNDECIDED** is not a requirement. Where a document
+and the code disagree, the code wins and the document gets a dated correction — never a silent one.
+
 ## Records (read on resume, reconcile with Git/CI)
 
 `docs/Progress.md` · `docs/Requirement_Coverage.md` · `docs/Bug_Ledger.md` · `docs/Lessons_Learned.md` ·
@@ -44,4 +51,25 @@ Spec: `PencilLift_Claude_Code_Master_Prompt.md` **Revision 8** (authoritative, p
 `docs/Test_Evidence.md` · `docs/Cost_Analysis.md` · `docs/Threat_Model.md` ·
 `docs/Deployment_Runbook.md` · `docs/Release_Readiness.md` · `docs/Provider_Capability_Matrix.md` ·
 `docs/Beta_Readiness.md` ·
-`docs/design/Consent_Design.md` · `docs/design/Stitch_Brief.md`
+`docs/design/Consent_Design.md` · `docs/design/Stitch_Brief.md` ·
+`docs/Packet_Index.md` · `docs/Source_Of_Truth.md` · `docs/Product_Requirements.md` ·
+`docs/Architecture_Decisions.md` · `docs/Database_Schema.md` · `docs/Test_And_CI_Inventory.md` ·
+`docs/Access_And_Least_Privilege.md` · `docs/Open_Work.md` · `docs/API_Inventory.md`
+
+## Derived documents — regenerate, never hand-edit
+
+| Document | Regenerate with | In the same commit as |
+|---|---|---|
+| `docs/schema/schema.sql` | `scripts/dump-schema.sh` (needs a live Postgres) | any migration |
+| `docs/API_Inventory.md` | `node scripts/dump-api-inventory.mjs` | any route or middleware change |
+| `docs/Open_Work.md` | `node scripts/dump-open-work.mjs` | any `docs/Bug_Ledger.md` row |
+| `brand/ASSETS.md` | `node scripts/brand/export-assets.mjs` | any brand asset |
+
+`scripts/verify.sh` and CI fail on a stale one. `scripts/check-doc-references.mjs` additionally
+requires that every `docs/Threat_Model.md T<n>` citation resolves, that every tracked markdown record
+is classified in a tier of `docs/Source_Of_Truth.md`, that a test floor or total quoted in a Tier 1/2
+record matches `scripts/test-minimums.json`, that a ledger row count in prose matches the ledger, and
+that `private.child_pins` still has no writer (BUG-437). Ledgers are exempt from the figure checks:
+they are append-only, so a figure inside a dated run record is correct as history. When a correction
+quotes a superseded figure, put the old value in backticks — that is how the check tells a quotation
+from a claim.

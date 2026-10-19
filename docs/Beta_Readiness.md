@@ -17,14 +17,28 @@ Written 2026-09-29 at code `5ba16c3`, after six hardening rounds. This page answ
 Those are two separate claims and they need separating, because conflating them is how a product gets
 put in front of a child before its consent path exists.
 
-- **As software**, the product is in the best state it has been in: **7,498** tests pass with zero skipped
+- **As software**, the product is in the best state it has been in: **7,503** tests pass with zero skipped
   (**CORRECTED 2026-10-17, BUG-433**: this read 6,966, which was its figure at `aa0fcbc` and is stale by 532;
-  the floors it listed below sum to 7,349, so the record was not even internally consistent),
-  every package typechecks, seven adversarial hunt-and-fix rounds have worked 349 recorded
-  defects (`docs/Bug_Ledger.md`), all closed but the three carried deliberately below plus BUG-411's
-  open divergences, and the last four rounds found 9, 3, 2 and (round 7) 3 high-severity defects — a
-  curve that says the remaining density is low, not zero. The floors in `scripts/test-minimums.json` are now api 1,219, mobile 941, web 991, contracts 70,
-  db 484, domain 3,670, ai 119, ui-tokens 4 — each exactly equal to the suite's actual count.
+  the floors it listed below sum to 7,349, so the record was not even internally consistent.
+  **CORRECTED AGAIN 2026-10-19, BUG-436**: that correction wrote 7,498, and `70d352c` — the very
+  commit that wrote it — raised the api floor from 1,219 to 1,224 for five new deploy-secrets tests.
+  So the sentence was already wrong when it was committed, by the other half of its own commit. The
+  figure is 7,503, which is what the eight floors sum to),
+  every package typechecks, seven adversarial hunt-and-fix rounds have worked every defect in
+  `docs/Bug_Ledger.md` (`docs/Open_Work.md` carries the current count, what is still open and what
+  each closed fix left behind — all derived, so neither drifts), and the last four rounds found 9,
+  3, 2 and (round 7) 3 high-severity defects — a curve that says the remaining density is low, not
+  zero. The floors in `scripts/test-minimums.json` are now api 1,224,
+  mobile 941, web 991, contracts 70, db 484, domain 3,670, ai 119, ui-tokens 4 — each exactly equal
+  to the suite's actual count, and summing to 7,503.
+  **Corrected 2026-10-19 (BUG-436):** this paragraph said `api 1,219` and `349 recorded defects`.
+  The floor became 1,224 in `70d352c`, the same commit that wrote this paragraph's correction, so
+  the list summed to 7,498 rather than 7,503 — the same internal inconsistency it criticises the
+  record above it for, three sentences away from it. The defect count is now 434. `pnpm check` plus
+  `node scripts/assert-test-count.mjs` is the only authority for these numbers; a gate step
+  (`scripts/check-doc-references.mjs`) now re-checks every figure a current-state record quotes
+  against `scripts/test-minimums.json`, because this is the sixth record that read confidently and
+  was wrong, and the fifth found by a mechanical check rather than by reading.
 - **As a running service**, nothing exists. No Supabase project is connected, no Worker is deployed, no
   native build has ever been produced, and no line of this code has run on a phone or a tablet
   (`docs/Connections.md` — every provider row is a named blocker).

@@ -45,6 +45,15 @@ jobs:
         run: pnpm format:check
       - name: Secret scan
         run: node scripts/scan-secrets.mjs
+      # docs/API_Inventory.md and docs/schema/schema.sql are derived from the code and handed to
+      # people outside the project. A stale one is worse than none, so CI refuses a tree where
+      # either has drifted from what it describes.
+      - name: Derived documents are current
+        run: |
+          node scripts/dump-api-inventory.mjs --check
+          node scripts/dump-open-work.mjs --check
+          node scripts/check-schema-dump.mjs
+          node scripts/check-doc-references.mjs
       - name: Lint
         run: pnpm lint
       - name: Typecheck

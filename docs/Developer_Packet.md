@@ -262,7 +262,7 @@ against the code. Do the same.
 | `Beta_Readiness.md` | what has to be true before a real family; the three absolute gates |
 | `Owner_Actions.md` | the 49-row register of things only the owner can do |
 | `Bug_Ledger.md` | every defect, with reproduction, root cause and the regression that holds it closed |
-| `Lessons_Learned.md` | 83 lessons, each tied to a defect |
+| `Lessons_Learned.md` | one rule per defect that actually happened, each tied to its row |
 | `Deployment_Runbook.md` | environments, release order, readiness gates, incident procedures |
 | `Data_Retention_And_ZDR.md` | what leaves the product, what it keeps, and the seven ZDR account steps |
 | `Threat_Model.md`, `Cost_Analysis.md`, `Test_Evidence.md` | as named |

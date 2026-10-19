@@ -313,3 +313,50 @@ Next: the two GitHub repository secrets (`SUPABASE_DB_URL`, `CLOUDFLARE_API_TOKE
 migrations`, then `Deploy API` with environment `testbed` — the first live URL. Owner action #6 holds the
 seven ZDR account steps; none of them is code, and step 2 now asks which ZDR is on offer, because Private
 Safety Processing requires customer-controlled storage and key management.
+
+## The handoff packet, and the four records it broke (2026-10-19)
+
+An external developer asked for twelve things about this project — the repository state, a developer
+packet, the product requirements and every user flow, the architecture and the reasoning behind each
+service choice, the schema with reconciled migrations, the APIs and deployment, the security and
+privacy model, the test and CI inventory, the known bugs and debt, the planned work separated from
+the tentative, the specifications that shaped the build, and the minimum access they would need.
+They also asked for something more useful than a packet: a version-controlled structure that
+constrains a future coding agent, and least privilege from the start rather than production access
+for convenience. `docs/Packet_Index.md` maps all twelve; `docs/Source_Of_Truth.md` is the structure.
+
+**The interesting part is what writing it found.** Four of the twelve answers could not be written by
+hand without going stale, so they are generated from the code: `docs/API_Inventory.md` (all 171
+routes and what authenticates each), `docs/Open_Work.md` (every open defect and residual, from the
+ledger), `docs/schema/schema.sql` (the whole DDL, structure only, so nobody needs a database
+credential to read the schema) and `brand/ASSETS.md`, which already was. Writing the generators
+turned up defects that reading had not:
+
+- **BUG-435.** `packages/contracts/src/identity.ts`, `supabase/migrations/0990` and two rows of
+  `docs/Requirement_Coverage.md` all cite `docs/Threat_Model.md T41`. The threat model stopped at
+  T38 and always had. Four places told a reader the adult-ID residual was written down and it was
+  not. Fixed by writing the rows rather than the citations, because one citation sits in an applied
+  migration: T39 the child PIN, T40 the school-viewer role, T41 the residual the citations meant.
+- **BUG-436.** `docs/Beta_Readiness.md` said `7,498` tests and `api 1,219` — and `70d352c`, the
+  commit that wrote that correction, raised the api floor to 1,224 in its other half. A correction
+  derived from the record being corrected inherits its error (L-087).
+- **BUG-437**, the one that matters to a buyer. Spec P3 asks for a child PIN that selects a child on
+  an already paired device. `private.child_pins` has existed since migration 0001 with a hash, an
+  attempt counter and a lockout column, and **nothing in this repository has ever written it** —
+  three purge DELETEs and one privilege assertion are the only statements that touch it. No writer,
+  no verifier, no route, no screen. The same shape as L-074: a schema object standing in for a
+  feature nobody built. Left open deliberately and recorded in four places; a gate check now fails
+  the moment a writer appears, naming everything that has to ship with it.
+- **BUG-438.** `docs/Source_Of_Truth.md` was written to tell a reader which records bind them, and
+  classified 19 of 45. `Acceptance_Register.md` is binding and was absent.
+
+Five mechanical checks now run in `scripts/verify.sh` and CI, each proved by reverting it: every
+`Threat_Model.md T<n>` citation resolves; every tracked markdown record is in exactly one tier; test
+floors and totals quoted in a current-state record match `scripts/test-minimums.json`; a ledger row
+count in prose matches the ledger; and `private.child_pins` still has no writer. The ledgers are
+exempt from the figure checks and a negative control proves it — a floor inside a 2026-09-30 run
+record is correct as history, and "correcting" it would falsify the history.
+
+Next is unchanged, and the packet does not move it: the two GitHub repository secrets, then `Apply
+database migrations`, then `Deploy API` on `testbed`. What the packet changes is that someone else
+can now price the work without being given a credential.

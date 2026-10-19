@@ -33,6 +33,13 @@ dir_for() {
 echo "▶ secrets"; node scripts/scan-secrets.mjs
 # Committed brand assets keep their dimensions, opacity, icon safe zones and size budget (no browser needed).
 echo "▶ brand assets"; node scripts/brand/export-assets.mjs --check
+# Derived documents an outside reader is asked to trust. A stale one is worse than none, so the
+# staleness check runs on every gate even though regenerating needs a database (lesson L-084).
+echo "▶ derived docs"
+node scripts/dump-api-inventory.mjs --check
+node scripts/dump-open-work.mjs --check
+node scripts/check-schema-dump.mjs
+node scripts/check-doc-references.mjs
 if [ -z "$ONLY" ]; then
   echo "▶ format"; pnpm -s format:check
   echo "▶ lint"; pnpm -s lint

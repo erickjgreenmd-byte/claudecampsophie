@@ -8,7 +8,8 @@ and stays the source of truth for detail; this page is the ORDER, the money and 
 ## Where this actually is, in one paragraph
 
 The software is built and tested (**7,503** passing tests, zero skipped, seven adversarial hardening
-rounds, 434 recorded defects of which three are open). **Nothing is deployed.** The
+rounds, every recorded defect worked — see `docs/Open_Work.md` for the count and the few still
+open). **Nothing is deployed.** The
 GitHub workflows that would deploy it have existed since 1 October and have never run, because the
 repository secrets they read were never set. A Supabase project exists and is healthy; its schema has never
 been applied. No Worker exists. No portal is hosted. No native build has ever been produced, so no
