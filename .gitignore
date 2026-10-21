@@ -34,3 +34,5 @@ apps/mobile/expo-env.d.ts
 # classified in docs/Source_Of_Truth.md. The packet is a deliverable, not one of this repository's
 # records.
 dev-packet/
+# The packet archive itself, for the same reason: it is a deliverable, not repository content.
+*-dev-packet-*.zip
